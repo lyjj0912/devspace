@@ -23,6 +23,31 @@ export interface DevspaceUserConfig {
   artifactMaxFileBytes?: number;
   agentDir?: string;
   subagents?: boolean;
+  shortcuts?: DevspaceShortcutsConfig;
+}
+
+export interface DevspaceShortcutsConfig {
+  browserRead?: { enabled?: boolean };
+  remoteMcpRead?: {
+    enabled?: boolean;
+    routes?: Record<string, DevspaceRemoteMcpShortcutRouteConfig>;
+  };
+  jiraLookup?: {
+    enabled?: boolean;
+    route?: string;
+  };
+}
+
+export interface DevspaceRemoteMcpShortcutRouteConfig {
+  transport?: "ssh-stdio";
+  host: string;
+  command: string;
+  args?: string[];
+  env?: Record<string, string>;
+  allowedTools: string[];
+  toolDefaults?: Record<string, Record<string, unknown>>;
+  startupTimeoutSeconds?: number;
+  callTimeoutSeconds?: number;
 }
 
 export interface DevspaceAuthConfig {

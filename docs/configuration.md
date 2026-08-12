@@ -130,6 +130,62 @@ Both values accept milliseconds from config or environment variables:
 | `mcpSessionIdleTimeoutMs` | `DEVSPACE_MCP_SESSION_IDLE_TIMEOUT_MS` | `600000` |
 | `mcpSessionCleanupIntervalMs` | `DEVSPACE_MCP_SESSION_CLEANUP_INTERVAL_MS` | `60000` |
 
+## Personal Shortcut Tools
+
+Personal extensions use the `_shortcut` suffix so they remain distinct from
+upstream DevSpace tools. They are disabled by default and do not change the
+selected core tool mode.
+
+| Tool | Purpose |
+| --- | --- |
+| `browser_read_shortcut` | List Chrome tabs, open one HTTP(S) URL, and read bounded page text. It cannot click, type, submit, upload, download, or accept model-supplied JavaScript. |
+| `remote_mcp_read_shortcut` | List or invoke allowlisted read-only tools through a configured remote MCP route. One process-wide SSH/stdio session is reused per route. |
+| `jira_lookup_shortcut` | Run one compact Jira issue or JQL lookup through the configured remote MCP shortcut route. |
+
+Configuration keeps provider commands and credentials outside model-visible tool
+inputs:
+
+```json
+{
+  "shortcuts": {
+    "browserRead": { "enabled": true },
+    "remoteMcpRead": {
+      "enabled": true,
+      "routes": {
+        "company-jira": {
+          "transport": "ssh-stdio",
+          "host": "company",
+          "command": "/absolute/path/to/node",
+          "args": ["/absolute/path/to/atlassian-mcp.js"],
+          "env": { "PATH": "/usr/local/bin:/usr/bin:/bin" },
+          "allowedTools": [
+            "searchJiraIssuesUsingJql",
+            "getJiraIssue"
+          ],
+          "toolDefaults": {
+            "searchJiraIssuesUsingJql": { "cloudId": "example.atlassian.net" },
+            "getJiraIssue": { "cloudId": "example.atlassian.net" }
+          }
+        }
+      }
+    },
+    "jiraLookup": { "enabled": true, "route": "company-jira" }
+  }
+}
+```
+
+Environment variables may override enablement and the configured Jira route:
+
+```text
+DEVSPACE_SHORTCUT_BROWSER_READ_ENABLED
+DEVSPACE_SHORTCUT_REMOTE_MCP_READ_ENABLED
+DEVSPACE_SHORTCUT_JIRA_LOOKUP_ENABLED
+DEVSPACE_SHORTCUT_JIRA_LOOKUP_ROUTE
+```
+
+Remote route maps remain file-only. `jira_lookup_shortcut` does not accept a
+route input, so the local configuration owns the Jira provider selection.
+
 ## Skills
 
 | Variable | Purpose |

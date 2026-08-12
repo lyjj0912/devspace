@@ -13,6 +13,7 @@ import { ProcessSessionManager } from "./process-sessions.js";
 import { createMcpServer } from "./server.js";
 import { SqliteWorkspaceStore } from "./workspace-store.js";
 import { WorkspaceRegistry } from "./workspaces.js";
+import { createShortcutRuntime } from "./shortcuts/runtime.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -33,6 +34,40 @@ test("codex changes mode limits widgets to workspace and aggregate review", asyn
   for (const name of ["open_workspace", "show_changes"]) {
     const meta = (byName.get(name)?._meta as Record<string, unknown> | undefined) ?? {};
     assert.equal("ui" in meta, true, name);
+  }
+});
+
+test("personal shortcuts use distinct names and no widget metadata", async (t) => {
+  const context = await fixture(t, { shortcuts: true, toolMode: "codex", widgets: "changes" });
+  const tools = await context.client.listTools();
+  const byName = new Map(tools.tools.map((tool) => [tool.name, tool]));
+  for (const name of [
+    "browser_read_shortcut",
+    "remote_mcp_read_shortcut",
+    "jira_lookup_shortcut",
+  ]) {
+    assert.equal(byName.has(name), true, name);
+    const meta = (byName.get(name)?._meta as Record<string, unknown> | undefined) ?? {};
+    assert.equal("ui" in meta, false, name);
+    assert.equal("ui/resourceUri" in meta, false, name);
+  }
+  for (const oldName of ["browser_inspect", "remote_mcp_read", "jira_lookup"]) {
+    assert.equal(byName.has(oldName), false, oldName);
+  }
+  const browser = byName.get("browser_read_shortcut");
+  const schema = browser?.inputSchema as { properties?: Record<string, unknown> } | undefined;
+  assert.deepEqual(Object.keys(schema?.properties ?? {}).sort(), [
+    "matchText",
+    "maxCharacters",
+    "operation",
+    "selector",
+    "tabIndex",
+    "url",
+    "waitMs",
+    "windowIndex",
+  ]);
+  for (const forbidden of ["javascript", "script", "click", "fill", "type", "submit"]) {
+    assert.equal(forbidden in (schema?.properties ?? {}), false, forbidden);
   }
 });
 
@@ -169,6 +204,7 @@ test("checkout reuse and context suppression survive a registry restart", async 
     new ProcessSessionManager(),
     [],
     [],
+    createShortcutRuntime(context.config.shortcuts),
   );
   const [restoredClientTransport, restoredServerTransport] = InMemoryTransport.createLinkedPair();
   const restoredClient = new Client({ name: "devspace-restored-test-client", version: "1.0.0" });
@@ -211,6 +247,7 @@ async function fixture(
     git?: boolean;
     toolMode?: "minimal" | "full" | "codex";
     widgets?: "off" | "changes" | "full";
+    shortcuts?: boolean;
   } = {},
 ): Promise<ServerFixture> {
   const root = await mkdtemp(join(tmpdir(), "devspace-server-test-"));
@@ -250,6 +287,28 @@ async function fixture(
     DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
     PORT: "1",
   });
+  if (options.shortcuts) {
+    config.shortcuts = {
+      browserRead: { enabled: true },
+      remoteMcpRead: {
+        enabled: true,
+        routes: {
+          jira: {
+            transport: "ssh-stdio",
+            host: "company",
+            command: "/usr/bin/true",
+            args: [],
+            env: {},
+            allowedTools: ["searchJiraIssuesUsingJql", "getJiraIssue"],
+            toolDefaults: {},
+            startupTimeoutSeconds: 45,
+            callTimeoutSeconds: 60,
+          },
+        },
+      },
+      jiraLookup: { enabled: true, route: "jira" },
+    };
+  }
   const store = new SqliteWorkspaceStore(stateDir);
   const workspaces = new WorkspaceRegistry(config, store);
   const server = createMcpServer(
@@ -259,6 +318,7 @@ async function fixture(
     new ProcessSessionManager(),
     [],
     [],
+    createShortcutRuntime(config.shortcuts),
   );
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: "devspace-test-client", version: "1.0.0" });

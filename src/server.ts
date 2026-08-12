@@ -56,6 +56,12 @@ import { formatPathForPrompt } from "./skills.js";
 import { createWorkspaceStore } from "./workspace-store.js";
 import { formatAgentsPath, WorkspaceRegistry } from "./workspaces.js";
 import { summarizeLocalAgentProfile } from "./local-agent-profiles.js";
+import { registerShortcutTools } from "./shortcuts/register-tools.js";
+import {
+  createShortcutRuntime,
+  type ShortcutRuntime,
+  type ShortcutRuntimeOptions,
+} from "./shortcuts/runtime.js";
 import {
   formatLocalAgentProviderAvailabilitySummary,
   getLocalAgentProviderAvailabilitySnapshot,
@@ -697,6 +703,7 @@ export function createMcpServer(
   processSessions: ProcessSessionManager,
   localAgentProviders: LocalAgentProviderAvailability[],
   incomingArtifactAdapters: readonly IncomingArtifactAdapter[],
+  shortcuts: ShortcutRuntime,
 ): McpServer {
   const server = new McpServer(
     {
@@ -1651,11 +1658,17 @@ export function createMcpServer(
     });
   }
 
+  registerShortcutTools(server, {
+    runtime: shortcuts,
+    logging: config.logging,
+  });
+
   return server;
 }
 
 export interface CreateServerOptions {
   incomingArtifactAdapters?: readonly IncomingArtifactAdapter[];
+  shortcutRuntimeOptions?: ShortcutRuntimeOptions;
 }
 
 export function createServer(
@@ -1684,6 +1697,7 @@ export function createServer(
   const workspaces = new WorkspaceRegistry(config, workspaceStore);
   const reviewCheckpoints = createReviewCheckpointManager();
   const processSessions = new ProcessSessionManager();
+  const shortcuts = createShortcutRuntime(config.shortcuts, options.shortcutRuntimeOptions);
   const localAgentProviders = config.subagents
     ? getLocalAgentProviderAvailabilitySnapshot()
     : [];
@@ -1848,6 +1862,7 @@ export function createServer(
           processSessions,
           localAgentProviders,
           incomingArtifactAdapters,
+          shortcuts,
         );
         await server.connect(transport);
       } else {
@@ -1877,6 +1892,7 @@ export function createServer(
         clearInterval(sessionCleanupTimer);
         const results = await transports.closeAll();
         logSessionCloseResults("server_shutdown", results);
+        await shortcuts.close();
         processSessions.shutdown();
         oauthProvider.close();
         workspaceStore.close?.();
