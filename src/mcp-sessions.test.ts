@@ -16,6 +16,24 @@ function createTransport(closeError?: Error): FakeTransport {
   };
 }
 
+{
+  let churnNow = 0;
+  const churnRegistry = new McpSessionRegistry<FakeTransport>({ now: () => churnNow });
+  const abandoned = Array.from({ length: 100 }, () => createTransport());
+  abandoned.forEach((transport, index) => churnRegistry.register(`abandoned-${index}`, transport));
+  const reused = createTransport();
+  churnRegistry.register("reused", reused);
+
+  churnNow = 9 * 60 * 1_000;
+  assert.equal(churnRegistry.get("reused"), reused);
+  churnNow = 11 * 60 * 1_000;
+  const churnResults = await churnRegistry.closeIdle(10 * 60 * 1_000);
+  assert.equal(churnResults.length, 100);
+  assert.equal(abandoned.every((transport) => transport.closeCalls === 1), true);
+  assert.equal(reused.closeCalls, 0);
+  assert.equal(churnRegistry.size, 1);
+}
+
 let now = 0;
 const registry = new McpSessionRegistry<FakeTransport>({ now: () => now });
 const staleTransport = createTransport();

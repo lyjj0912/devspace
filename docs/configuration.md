@@ -115,9 +115,20 @@ sessions.
 
 | Value | Behavior |
 | --- | --- |
-| `full` | Default. Widget UI is attached to exposed workspace, file, edit, and shell tools. |
-| `changes` | Enables the aggregate `show_changes` tool and attaches widget UI to `open_workspace` and `show_changes`. |
+| `changes` | Default. Enables the aggregate `show_changes` tool and attaches widget UI only to `open_workspace` and `show_changes`. |
+| `full` | Widget UI is attached to exposed workspace, file, edit, and shell tools. |
 | `off` | Disables widget UI. |
+
+## MCP Session Retention
+
+DevSpace checks for abandoned MCP sessions once per minute and closes sessions
+that have been idle for 10 minutes. Active and recently reused sessions are kept.
+Both values accept milliseconds from config or environment variables:
+
+| Config key | Environment variable | Default |
+| --- | --- | --- |
+| `mcpSessionIdleTimeoutMs` | `DEVSPACE_MCP_SESSION_IDLE_TIMEOUT_MS` | `600000` |
+| `mcpSessionCleanupIntervalMs` | `DEVSPACE_MCP_SESSION_CLEANUP_INTERVAL_MS` | `60000` |
 
 ## Skills
 
@@ -192,7 +203,7 @@ DEVSPACE_PUBLIC_BASE_URL="https://devspace.example.com" \
 DEVSPACE_WORKTREE_ROOT="$HOME/.devspace/worktrees" \
 DEVSPACE_ARTIFACTS="1" \
 DEVSPACE_TOOL_MODE="minimal" \
-DEVSPACE_WIDGETS="full" \
+DEVSPACE_WIDGETS="changes" \
 npx @waishnav/devspace serve
 ```
 

@@ -16,6 +16,26 @@ import { WorkspaceRegistry } from "./workspaces.js";
 
 const execFileAsync = promisify(execFile);
 
+test("codex changes mode limits widgets to workspace and aggregate review", async (t) => {
+  const context = await fixture(t, { toolMode: "codex", widgets: "changes" });
+  const tools = await context.client.listTools();
+  const byName = new Map(tools.tools.map((tool) => [tool.name, tool]));
+
+  assert.deepEqual(
+    [...byName.keys()].sort(),
+    ["apply_patch", "exec_command", "open_workspace", "read", "show_changes", "write_stdin"],
+  );
+  for (const name of ["read", "apply_patch", "exec_command", "write_stdin"]) {
+    const meta = (byName.get(name)?._meta as Record<string, unknown> | undefined) ?? {};
+    assert.equal("ui" in meta, false, name);
+    assert.equal("ui/resourceUri" in meta, false, name);
+  }
+  for (const name of ["open_workspace", "show_changes"]) {
+    const meta = (byName.get(name)?._meta as Record<string, unknown> | undefined) ?? {};
+    assert.equal("ui" in meta, true, name);
+  }
+});
+
 test("open_workspace keeps lifecycle flags out of model output and preserves complete card metadata", async (t) => {
   const context = await fixture(t);
   const first = await callOpen(context.client, context.project, "chat-1");
@@ -185,7 +205,14 @@ interface ServerFixture {
   close: () => Promise<void>;
 }
 
-async function fixture(t: TestContext, options: { git?: boolean } = {}): Promise<ServerFixture> {
+async function fixture(
+  t: TestContext,
+  options: {
+    git?: boolean;
+    toolMode?: "minimal" | "full" | "codex";
+    widgets?: "off" | "changes" | "full";
+  } = {},
+): Promise<ServerFixture> {
   const root = await mkdtemp(join(tmpdir(), "devspace-server-test-"));
   const project = join(root, "project");
   const agentDir = join(root, "agent");
@@ -218,8 +245,8 @@ async function fixture(t: TestContext, options: { git?: boolean } = {}): Promise
     DEVSPACE_ALLOWED_ROOTS: root,
     DEVSPACE_WORKTREE_ROOT: join(root, ".worktrees"),
     DEVSPACE_AGENT_DIR: agentDir,
-    DEVSPACE_WIDGETS: "full",
-    DEVSPACE_TOOL_MODE: "full",
+    DEVSPACE_WIDGETS: options.widgets ?? "full",
+    DEVSPACE_TOOL_MODE: options.toolMode ?? "full",
     DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
     PORT: "1",
   });

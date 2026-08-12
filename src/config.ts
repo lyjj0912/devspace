@@ -10,6 +10,8 @@ export type WidgetMode = "off" | "changes" | "full";
 const DEFAULT_OAUTH_ACCESS_TOKEN_TTL_SECONDS = 60 * 60;
 const DEFAULT_OAUTH_REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
 const DEFAULT_ARTIFACT_MAX_FILE_BYTES = 100 * 1024 * 1024;
+const DEFAULT_MCP_SESSION_IDLE_TIMEOUT_MS = 10 * 60 * 1_000;
+const DEFAULT_MCP_SESSION_CLEANUP_INTERVAL_MS = 60 * 1_000;
 
 export interface ServerConfig {
   host: string;
@@ -20,6 +22,8 @@ export interface ServerConfig {
   publicBaseUrl: string;
   toolMode: ToolMode;
   widgets: WidgetMode;
+  mcpSessionIdleTimeoutMs: number;
+  mcpSessionCleanupIntervalMs: number;
   stateDir: string;
   worktreeRoot: string;
   artifactsEnabled: boolean;
@@ -156,8 +160,8 @@ function parseLoggingConfig(env: NodeJS.ProcessEnv): LoggingConfig {
 }
 
 function parseWidgetMode(value: string | undefined): WidgetMode {
-  if (!value || value === "full") return "full";
-  if (value === "off" || value === "changes") return value;
+  if (!value || value === "changes") return "changes";
+  if (value === "off" || value === "full") return value;
 
   throw new Error(`Invalid DEVSPACE_WIDGETS: ${value}`);
 }
@@ -232,6 +236,20 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     publicBaseUrl,
     toolMode: parseToolMode(env),
     widgets: parseWidgetMode(env.DEVSPACE_WIDGETS),
+    mcpSessionIdleTimeoutMs: parsePositiveInteger(
+      env.DEVSPACE_MCP_SESSION_IDLE_TIMEOUT_MS
+        ?? numberConfigValue(files.config.mcpSessionIdleTimeoutMs),
+      DEFAULT_MCP_SESSION_IDLE_TIMEOUT_MS,
+      "DEVSPACE_MCP_SESSION_IDLE_TIMEOUT_MS",
+      24 * 60 * 60 * 1_000,
+    ),
+    mcpSessionCleanupIntervalMs: parsePositiveInteger(
+      env.DEVSPACE_MCP_SESSION_CLEANUP_INTERVAL_MS
+        ?? numberConfigValue(files.config.mcpSessionCleanupIntervalMs),
+      DEFAULT_MCP_SESSION_CLEANUP_INTERVAL_MS,
+      "DEVSPACE_MCP_SESSION_CLEANUP_INTERVAL_MS",
+      60 * 60 * 1_000,
+    ),
     stateDir: resolve(expandHomePath(env.DEVSPACE_STATE_DIR ?? files.config.stateDir ?? defaultStateDir())),
     worktreeRoot: resolve(expandHomePath(env.DEVSPACE_WORKTREE_ROOT ?? files.config.worktreeRoot ?? defaultWorktreeRoot())),
     artifactsEnabled:

@@ -12,10 +12,22 @@ const baseEnv = {
   DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
 };
 
-assert.equal(loadConfig(baseEnv).widgets, "full");
+assert.equal(loadConfig(baseEnv).widgets, "changes");
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_WIDGETS: "changes" }).widgets, "changes");
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_WIDGETS: "full" }).widgets, "full");
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_WIDGETS: "off" }).widgets, "off");
+assert.equal(loadConfig(baseEnv).mcpSessionIdleTimeoutMs, 10 * 60 * 1_000);
+assert.equal(loadConfig(baseEnv).mcpSessionCleanupIntervalMs, 60 * 1_000);
+assert.equal(
+  loadConfig({ ...baseEnv, DEVSPACE_MCP_SESSION_IDLE_TIMEOUT_MS: "1234" })
+    .mcpSessionIdleTimeoutMs,
+  1234,
+);
+assert.equal(
+  loadConfig({ ...baseEnv, DEVSPACE_MCP_SESSION_CLEANUP_INTERVAL_MS: "567" })
+    .mcpSessionCleanupIntervalMs,
+  567,
+);
 assert.equal(loadConfig(baseEnv).toolMode, "minimal");
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_TOOL_MODE: "minimal" }).toolMode, "minimal");
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_TOOL_MODE: "full" }).toolMode, "full");
@@ -149,6 +161,14 @@ assert.throws(
   () => loadConfig({ ...baseEnv, DEVSPACE_ARTIFACT_MAX_FILE_BYTES: "0" }),
   /Invalid DEVSPACE_ARTIFACT_MAX_FILE_BYTES: 0/,
 );
+assert.throws(
+  () => loadConfig({ ...baseEnv, DEVSPACE_MCP_SESSION_IDLE_TIMEOUT_MS: "0" }),
+  /Invalid DEVSPACE_MCP_SESSION_IDLE_TIMEOUT_MS: 0/,
+);
+assert.throws(
+  () => loadConfig({ ...baseEnv, DEVSPACE_MCP_SESSION_CLEANUP_INTERVAL_MS: "1.5" }),
+  /Invalid DEVSPACE_MCP_SESSION_CLEANUP_INTERVAL_MS: 1.5/,
+);
 
 assert.equal(loadConfig(baseEnv).publicBaseUrl, "http://127.0.0.1:7676");
 assert.deepEqual(loadConfig(baseEnv).allowedHosts, ["localhost", "127.0.0.1", "::1"]);
@@ -173,6 +193,8 @@ writeFileSync(
     port: 8787,
     allowedRoots: [process.cwd()],
     publicBaseUrl: "https://devspace.example.com",
+    mcpSessionIdleTimeoutMs: 900_000,
+    mcpSessionCleanupIntervalMs: 90_000,
     subagents: true,
     artifactsEnabled: true,
     artifactMaxFileBytes: 321,
@@ -189,9 +211,18 @@ const fileConfig = loadConfig({ DEVSPACE_CONFIG_DIR: configDir });
 assert.equal(fileConfig.port, 8787);
 assert.equal(fileConfig.oauth.ownerToken, "persisted-owner-token-long-enough");
 assert.equal(fileConfig.publicBaseUrl, "https://devspace.example.com");
+assert.equal(fileConfig.mcpSessionIdleTimeoutMs, 900_000);
+assert.equal(fileConfig.mcpSessionCleanupIntervalMs, 90_000);
 assert.equal(fileConfig.subagents, true);
 assert.equal(fileConfig.artifactsEnabled, true);
 assert.equal(fileConfig.artifactMaxFileBytes, 321);
+assert.equal(
+  loadConfig({
+    DEVSPACE_CONFIG_DIR: configDir,
+    DEVSPACE_MCP_SESSION_IDLE_TIMEOUT_MS: "120000",
+  }).mcpSessionIdleTimeoutMs,
+  120_000,
+);
 assert.deepEqual(fileConfig.allowedHosts, [
   "localhost",
   "127.0.0.1",
