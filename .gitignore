@@ -3,3 +3,7 @@ dist/
 releases/
 .env
 *.log
+
+# Local agent task ledgers and analysis scratch data.
+.agent-harness/
+.tmp/
