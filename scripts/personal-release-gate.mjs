@@ -26,7 +26,12 @@ if (requireClean) {
   if (status.trim()) fail(`Tracked release tree is not clean:\n${status}`);
 }
 
-for (const path of ["dist/cli.js", "dist/server.js", "dist/maintenance.js"]) {
+for (const path of [
+  "dist/cli.js",
+  "dist/server.js",
+  "dist/maintenance.js",
+  "scripts/deploy-personal-pm2.sh",
+]) {
   if (!existsSync(resolve(root, path))) fail(`Missing build output: ${path}`);
 }
 const serverOutput = readFileSync(resolve(root, "dist/server.js"), "utf8");

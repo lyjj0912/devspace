@@ -33,8 +33,7 @@ definition:
 
 ```bash
 npm run release:verify
-pm2 startOrReload ecosystem.config.cjs --only devspace
-pm2 save
+npm run deploy:pm2
 npm run release:live
 ```
 
@@ -43,7 +42,10 @@ build, diff validation, and build-contract checks. `release:live` checks that th
 committed tree is clean, verifies the built tool/maintenance surface, and probes
 the local health and unauthenticated MCP boundary. The PM2 definition fixes the
 service working directory to this repository instead of inheriting the terminal
-directory that happened to launch PM2.
+directory that happened to launch PM2. `deploy:pm2` normally reloads the
+existing service; when it detects a legacy process whose actual cwd differs
+from the repository, it recreates only the `devspace` PM2 process once and then
+saves the corrected process definition.
 
 ## Core Environment Variables
 
