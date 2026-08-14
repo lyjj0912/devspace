@@ -39,8 +39,9 @@ import {
 } from "./user-config.js";
 import { expandHomePath } from "./roots.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
+import { runMaintenance } from "./maintenance.js";
 
-type Command = "serve" | "init" | "doctor" | "config" | "agents" | "help" | "version";
+type Command = "serve" | "init" | "doctor" | "maintenance" | "config" | "agents" | "help" | "version";
 const require = createRequire(import.meta.url);
 const SUPPORTED_NODE_RANGE = ">=20.12 <27";
 
@@ -61,6 +62,9 @@ async function main(argv: string[]): Promise<void> {
     case "doctor":
       await runDoctor();
       return;
+    case "maintenance":
+      await runMaintenanceCommand(args);
+      return;
     case "config":
       runConfigCommand(args);
       return;
@@ -78,7 +82,13 @@ async function main(argv: string[]): Promise<void> {
 
 function normalizeCommand(command: string | undefined): Command {
   if (!command || command === "serve" || command === "start") return "serve";
-  if (command === "init" || command === "doctor" || command === "config" || command === "agents") return command;
+  if (
+    command === "init"
+    || command === "doctor"
+    || command === "maintenance"
+    || command === "config"
+    || command === "agents"
+  ) return command;
   if (command === "help" || command === "--help" || command === "-h") return "help";
   if (command === "version" || command === "--version" || command === "-v") return "version";
   throw new Error(`Unknown command: ${command}`);
@@ -214,6 +224,18 @@ async function serve(): Promise<void> {
 
   const { createServer } = await import("./server.js");
   const config = loadConfig();
+  if (config.maintenance.enabled) {
+    try {
+      const maintenance = await runMaintenance(config, { scheduled: true });
+      console.log(`maintenance: ${JSON.stringify(maintenance)}`);
+    } catch (error) {
+      console.warn(
+        `maintenance failed; starting DevSpace without cleanup: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+    }
+  }
   const { app, close, localAgentProviders } = createServer(config);
   const httpServer = app.listen(config.port, config.host, () => {
     console.log(`devspace listening on http://${config.host}:${config.port}/mcp`);
@@ -265,9 +287,20 @@ async function runDoctor(): Promise<void> {
     console.log(`Public MCP URL: ${new URL("/mcp", config.publicBaseUrl).toString()}`);
     console.log(`Allowed roots: ${config.allowedRoots.join(", ")}`);
     console.log(`Allowed hosts: ${config.allowedHosts.join(", ")}`);
+    console.log(`Maintenance: ${config.maintenance.enabled ? "enabled" : "disabled"}`);
   } catch (error) {
     console.log(`Config status: ${error instanceof Error ? error.message : String(error)}`);
   }
+}
+
+async function runMaintenanceCommand(args: string[]): Promise<void> {
+  const unknown = args.filter((argument) => argument !== "--dry-run");
+  if (unknown.length > 0) {
+    throw new Error(`Unknown maintenance option: ${unknown.join(" ")}`);
+  }
+  const config = loadConfig();
+  const result = await runMaintenance(config, { dryRun: args.includes("--dry-run") });
+  console.log(JSON.stringify(result, null, 2));
 }
 
 function runConfigCommand(args: string[]): void {
@@ -308,6 +341,8 @@ function printHelp(): void {
       "  devspace serve           Start the server",
       "  devspace init            Create or update ~/.devspace/config.json and auth.json",
       "  devspace doctor          Show config, runtime, and native dependency status",
+      "  devspace maintenance     Prune stale DevSpace sessions, clean managed worktrees, and review refs",
+      "  devspace maintenance --dry-run",
       "  devspace config get      Print persisted config",
       "  devspace config set publicBaseUrl <url|null>",
       "  devspace agents ls       List subagent sessions",

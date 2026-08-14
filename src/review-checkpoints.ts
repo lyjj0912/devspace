@@ -47,6 +47,13 @@ export interface ReviewCheckpointManager {
 }
 
 const REVIEW_REF_PREFIX = "refs/devspace/review";
+const REVIEW_SNAPSHOT_PATHS = [
+  ".",
+  ":(exclude).agent-harness",
+  ":(exclude).agent-harness/**",
+  ":(exclude).tmp",
+  ":(exclude).tmp/**",
+];
 
 export function createReviewCheckpointManager(): ReviewCheckpointManager {
   const states = new Map<string, WorkspaceReviewState>();
@@ -222,7 +229,7 @@ async function createWorkingTreeSnapshot(gitRoot: string): Promise<string> {
 
   try {
     await git(gitRoot, ["read-tree", "HEAD"], { env });
-    await git(gitRoot, ["add", "-A", "--", "."], { env });
+    await git(gitRoot, ["add", "-A", "--", ...REVIEW_SNAPSHOT_PATHS], { env });
     const tree = (await git(gitRoot, ["write-tree"], { env })).stdout.trim();
     const parent = (await git(gitRoot, ["rev-parse", "--verify", "HEAD^{commit}"])).stdout.trim();
     return (await git(gitRoot, ["commit-tree", tree, "-p", parent, "-m", "DevSpace review snapshot"], { env })).stdout.trim();

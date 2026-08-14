@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
@@ -48,6 +48,26 @@ test("show_changes reports and advances the last-shown checkpoint", async (t) =>
   const afterReviewed = await manager.reviewChanges({ workspaceId: "ws_incremental", root });
   assert.equal(afterReviewed.summary.files, 0);
   assert.equal(afterReviewed.patch, "");
+});
+
+test("review snapshots exclude local harness and scratch directories", async (t) => {
+  const root = await committedRepository(t);
+  const manager = createReviewCheckpointManager();
+  await manager.initializeWorkspace({ workspaceId: "ws_local_residue", root });
+
+  await mkdir(join(root, ".agent-harness", "tasks", "local"), { recursive: true });
+  await mkdir(join(root, ".tmp", "analysis"), { recursive: true });
+  await writeFile(join(root, ".agent-harness", "tasks", "local", "STATE.md"), "local\n");
+  await writeFile(join(root, ".tmp", "analysis", "payload.bin"), "scratch\n");
+  await writeFile(join(root, "visible.txt"), "visible\n");
+
+  const review = await manager.reviewChanges({
+    workspaceId: "ws_local_residue",
+    root,
+    markReviewed: false,
+  });
+  assert.deepEqual(review.files.map((file) => file.path), ["visible.txt"]);
+  assert.doesNotMatch(review.patch, /agent-harness|payload\.bin|scratch/);
 });
 
 test("review checkpoints survive a manager restart", async (t) => {

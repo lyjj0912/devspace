@@ -524,6 +524,8 @@ const SKIPPED_CONTEXT_DIRS = new Set([
   ".next",
   ".turbo",
   ".cache",
+  ".agent-harness",
+  ".tmp",
 ]);
 
 export function formatAgentsPath(path: string, workspaceRoot: string | undefined): string {

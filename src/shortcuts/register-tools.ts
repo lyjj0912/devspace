@@ -33,6 +33,14 @@ export interface ShortcutToolRegistrationOptions {
   logging: LoggingConfig;
 }
 
+interface RemoteMcpShortcutInput {
+  operation: "list_tools" | "call";
+  route?: string;
+  tool?: string;
+  arguments?: Record<string, unknown>;
+  maxCharacters?: number;
+}
+
 export function registerShortcutTools(
   server: McpServer,
   options: ShortcutToolRegistrationOptions,
@@ -95,6 +103,18 @@ function registerRemoteMcpRead(
   runtime: ShortcutRuntime,
   logging: LoggingConfig,
 ): void {
+  const routeNames = runtime.remoteMcp.routeNames();
+  if (routeNames.length === 0) {
+    throw new Error("remote_mcp_read_shortcut requires at least one configured route.");
+  }
+  const soleRoute = routeNames.length === 1 ? routeNames[0] : undefined;
+  const routeInputSchema = soleRoute
+    ? {}
+    : {
+        route: z
+          .enum(routeNames as [string, ...string[]])
+          .describe("Configured remote MCP route."),
+      };
   registerAppTool(
     server,
     shortcutToolNames.remoteMcpRead,
@@ -107,10 +127,13 @@ function registerRemoteMcpRead(
             ? "Prefer jira_lookup_shortcut for ordinary Jira issue or JQL reads because it returns compact summaries and requested fields without raw provider payloads. Use this generic route for capability discovery or read operations the compact Jira shortcut cannot express."
             : undefined,
           "list_tools reports approved read tools; call invokes one approved tool. SSH host, command, environment, and credentials are local configuration only. A process-wide route session is reused and transport failures reconnect at most once.",
+          soleRoute
+            ? `The only configured route (${soleRoute}) is selected automatically; do not supply a route.`
+            : `Choose one configured route: ${routeNames.join(", ")}.`,
         ].filter(Boolean).join(" "),
       inputSchema: {
         operation: z.enum(["list_tools", "call"]),
-        route: z.string().min(1),
+        ...routeInputSchema,
         tool: z.string().min(1).optional(),
         arguments: z.record(z.string(), z.unknown()).optional(),
         maxCharacters: z.number().int().min(1).max(100_000).optional(),
@@ -119,38 +142,45 @@ function registerRemoteMcpRead(
       ...NO_WIDGET_META,
       annotations: READ_ONLY_ANNOTATIONS,
     },
-    async ({ operation, route, tool, arguments: args, maxCharacters }) => executeShortcut(
-      logging,
-      shortcutToolNames.remoteMcpRead,
-      { operation, route, remoteTool: tool },
-      async () => {
-        if (operation === "list_tools" && tool !== undefined) {
-          throw new ShortcutToolError("list_tools does not accept tool.", "INVALID_SHORTCUT_INPUT");
-        }
-        if (operation === "call" && !tool) {
-          throw new ShortcutToolError("call requires tool.", "INVALID_SHORTCUT_INPUT");
-        }
-        const result = await runtime.remoteMcp.invoke(
-          route,
-          operation === "call" ? tool : undefined,
-          args ?? {},
-        );
-        const bounded = remoteToolText(result.response, maxCharacters ?? 10_000);
-        const data = remoteResultData(result, bounded.text);
-        return {
-          data,
-          text: remoteResultText(result, bounded.text),
-          meta: {
-            providerCalls: result.providerCalls,
-            connectionReused: result.connectionReused,
-            retried: result.retried,
-            truncated: bounded.truncated,
-            livenessVerified: result.livenessVerified,
-            ...(result.recoveryReason ? { recoveryReason: result.recoveryReason } : {}),
-          },
-        };
-      },
-    ),
+    async (input: RemoteMcpShortcutInput) => {
+      const { operation, tool, arguments: args, maxCharacters } = input;
+      const route = soleRoute ?? input.route;
+      if (!route) {
+        throw new Error("remote_mcp_read_shortcut route resolution failed.");
+      }
+      return executeShortcut(
+        logging,
+        shortcutToolNames.remoteMcpRead,
+        { operation, route, remoteTool: tool },
+        async () => {
+          if (operation === "list_tools" && tool !== undefined) {
+            throw new ShortcutToolError("list_tools does not accept tool.", "INVALID_SHORTCUT_INPUT");
+          }
+          if (operation === "call" && !tool) {
+            throw new ShortcutToolError("call requires tool.", "INVALID_SHORTCUT_INPUT");
+          }
+          const result = await runtime.remoteMcp.invoke(
+            route,
+            operation === "call" ? tool : undefined,
+            args ?? {},
+          );
+          const bounded = remoteToolText(result.response, maxCharacters ?? 10_000);
+          const data = remoteResultData(result, bounded.text);
+          return {
+            data,
+            text: remoteResultText(result, bounded.text),
+            meta: {
+              providerCalls: result.providerCalls,
+              connectionReused: result.connectionReused,
+              retried: result.retried,
+              truncated: bounded.truncated,
+              livenessVerified: result.livenessVerified,
+              ...(result.recoveryReason ? { recoveryReason: result.recoveryReason } : {}),
+            },
+          };
+        },
+      );
+    },
   );
 }
 

@@ -40,6 +40,27 @@ assert.equal(loadConfig(baseEnv).devspaceAgentsDir, join(emptyConfigDir, "agents
 assert.equal(loadConfig(baseEnv).subagents, false);
 assert.equal(loadConfig(baseEnv).artifactsEnabled, false);
 assert.equal(loadConfig(baseEnv).artifactMaxFileBytes, 100 * 1024 * 1024);
+assert.deepEqual(loadConfig(baseEnv).maintenance, {
+  enabled: true,
+  minimumIntervalMs: 24 * 60 * 60 * 1_000,
+  conversationBindingRetentionMs: 30 * 24 * 60 * 60 * 1_000,
+  workspaceSessionRetentionMs: 7 * 24 * 60 * 60 * 1_000,
+  workspaceSessionLimit: 512,
+  managedWorktreeRetentionMs: 7 * 24 * 60 * 60 * 1_000,
+  managedWorktreeRecentProtectionMs: 24 * 60 * 60 * 1_000,
+  managedWorktreePerSourceLimit: 8,
+  reviewWorkspaceLimit: 32,
+});
+assert.equal(loadConfig({ ...baseEnv, DEVSPACE_MAINTENANCE: "0" }).maintenance.enabled, false);
+assert.equal(
+  loadConfig({ ...baseEnv, DEVSPACE_WORKSPACE_SESSION_LIMIT: "123" }).maintenance.workspaceSessionLimit,
+  123,
+);
+assert.equal(
+  loadConfig({ ...baseEnv, DEVSPACE_MANAGED_WORKTREE_RECENT_PROTECTION_MS: "456" })
+    .maintenance.managedWorktreeRecentProtectionMs,
+  456,
+);
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_ARTIFACTS: "1" }).artifactsEnabled, true);
 assert.equal(
   loadConfig({ ...baseEnv, DEVSPACE_ARTIFACT_MAX_FILE_BYTES: "123" }).artifactMaxFileBytes,
@@ -103,7 +124,9 @@ assert.equal(loadConfig({ ...baseEnv, DEVSPACE_LOG_REQUESTS: "0" }).logging.requ
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_LOG_ASSETS: "1" }).logging.assets, true);
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_LOG_TOOL_CALLS: "0" }).logging.toolCalls, false);
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_LOG_SHELL_COMMANDS: "1" }).logging.shellCommands, true);
-assert.equal(loadConfig({ ...baseEnv, DEVSPACE_TRUST_PROXY: "1" }).logging.trustProxy, true);
+assert.equal(loadConfig({ ...baseEnv, DEVSPACE_TRUST_PROXY: "1" }).logging.trustProxy, 1);
+assert.equal(loadConfig({ ...baseEnv, DEVSPACE_TRUST_PROXY: "true" }).logging.trustProxy, 1);
+assert.equal(loadConfig({ ...baseEnv, DEVSPACE_TRUST_PROXY: "2" }).logging.trustProxy, 2);
 
 assert.throws(
   () => loadConfig({ ...baseEnv, DEVSPACE_LOG_LEVEL: "trace" }),
@@ -113,6 +136,10 @@ assert.throws(
 assert.throws(
   () => loadConfig({ ...baseEnv, DEVSPACE_LOG_FORMAT: "color" }),
   /Invalid DEVSPACE_LOG_FORMAT: color/,
+);
+assert.throws(
+  () => loadConfig({ ...baseEnv, DEVSPACE_TRUST_PROXY: "all" }),
+  /Invalid DEVSPACE_TRUST_PROXY: all/,
 );
 
 assert.equal(loadConfig(baseEnv).oauth.ownerToken, "test-owner-token-that-is-long-enough");
@@ -198,6 +225,11 @@ writeFileSync(
     subagents: true,
     artifactsEnabled: true,
     artifactMaxFileBytes: 321,
+    maintenance: {
+      minimumIntervalMs: 654,
+      workspaceSessionLimit: 42,
+      managedWorktreePerSourceLimit: 3,
+    },
   }),
 );
 writeFileSync(
@@ -216,6 +248,9 @@ assert.equal(fileConfig.mcpSessionCleanupIntervalMs, 90_000);
 assert.equal(fileConfig.subagents, true);
 assert.equal(fileConfig.artifactsEnabled, true);
 assert.equal(fileConfig.artifactMaxFileBytes, 321);
+assert.equal(fileConfig.maintenance.workspaceSessionLimit, 42);
+assert.equal(fileConfig.maintenance.minimumIntervalMs, 654);
+assert.equal(fileConfig.maintenance.managedWorktreePerSourceLimit, 3);
 assert.equal(
   loadConfig({
     DEVSPACE_CONFIG_DIR: configDir,

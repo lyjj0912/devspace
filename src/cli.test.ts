@@ -9,6 +9,7 @@ import { LocalAgentStore } from "./local-agent-store.js";
 const packageJson = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
   version: string;
 };
+const TEST_CREDENTIAL = "x".repeat(32);
 
 for (const flag of ["-v", "--version"]) {
   const output = execFileSync("node", ["--import", "tsx", "src/cli.ts", flag], {
@@ -17,6 +18,38 @@ for (const flag of ["-v", "--version"]) {
   }).trim();
 
   assert.equal(output, packageJson.version);
+}
+
+const maintenanceRoot = mkdtempSync(join(tmpdir(), "devspace-cli-maintenance-test-"));
+try {
+  const output = execFileSync(
+    "node",
+    ["--import", "tsx", "src/cli.ts", "maintenance", "--dry-run"],
+    {
+      cwd: process.cwd(),
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        DEVSPACE_CONFIG_DIR: join(maintenanceRoot, ".config"),
+        DEVSPACE_ALLOWED_ROOTS: maintenanceRoot,
+        DEVSPACE_STATE_DIR: join(maintenanceRoot, ".state"),
+        DEVSPACE_WORKTREE_ROOT: join(maintenanceRoot, ".worktrees"),
+        DEVSPACE_OAUTH_OWNER_TOKEN: TEST_CREDENTIAL,
+      },
+    },
+  );
+  const result = JSON.parse(output) as {
+    enabled: boolean;
+    dryRun: boolean;
+    sessionsDeleted: number;
+    failures: unknown[];
+  };
+  assert.equal(result.enabled, true);
+  assert.equal(result.dryRun, true);
+  assert.equal(result.sessionsDeleted, 0);
+  assert.deepEqual(result.failures, []);
+} finally {
+  rmSync(maintenanceRoot, { recursive: true, force: true });
 }
 
 const root = mkdtempSync(join(tmpdir(), "devspace-cli-agents-test-"));

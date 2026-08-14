@@ -170,6 +170,32 @@ test("personal shortcuts use distinct names and no widget metadata", async (t) =
   for (const forbidden of ["javascript", "script", "click", "fill", "type", "submit"]) {
     assert.equal(forbidden in (schema?.properties ?? {}), false, forbidden);
   }
+  const remote = byName.get("remote_mcp_read_shortcut");
+  const remoteSchema = remote?.inputSchema as { properties?: Record<string, unknown> } | undefined;
+  assert.deepEqual(Object.keys(remoteSchema?.properties ?? {}).sort(), [
+    "arguments",
+    "maxCharacters",
+    "operation",
+    "tool",
+  ]);
+  assert.match(remote?.description ?? "", /only configured route \(jira\) is selected automatically/i);
+});
+
+test("multiple remote MCP routes expose a closed configured enum", async (t) => {
+  const context = await fixture(t, {
+    shortcuts: "remote-multiple",
+    toolMode: "codex",
+    widgets: "off",
+  });
+  const tools = await context.client.listTools();
+  const remote = tools.tools.find((tool) => tool.name === "remote_mcp_read_shortcut");
+  assert.ok(remote);
+  const schema = remote.inputSchema as {
+    properties?: Record<string, { enum?: string[] }>;
+    required?: string[];
+  };
+  assert.deepEqual(schema.properties?.route?.enum, ["jira", "wiki"]);
+  assert.equal(schema.required?.includes("route"), true);
 });
 
 test("generic remote MCP description does not recommend a disabled Jira shortcut", async (t) => {
@@ -404,7 +430,7 @@ async function fixture(
     git?: boolean;
     toolMode?: "minimal" | "full" | "codex";
     widgets?: "off" | "changes" | "full";
-    shortcuts?: boolean | "remote-only";
+    shortcuts?: boolean | "remote-only" | "remote-multiple";
   } = {},
 ): Promise<ServerFixture> {
   const root = await mkdtemp(join(tmpdir(), "devspace-server-test-"));
@@ -470,22 +496,24 @@ async function fixture(
   });
   if (options.shortcuts) {
     const jiraEnabled = options.shortcuts !== "remote-only";
+    const route = {
+      transport: "ssh-stdio" as const,
+      host: "company",
+      command: "/usr/bin/true",
+      args: [],
+      env: {},
+      allowedTools: ["searchJiraIssuesUsingJql", "getJiraIssue"],
+      toolDefaults: {},
+      startupTimeoutSeconds: 45,
+      callTimeoutSeconds: 60,
+    };
     config.shortcuts = {
       browserRead: { enabled: options.shortcuts === true },
       remoteMcpRead: {
         enabled: true,
         routes: {
-          jira: {
-            transport: "ssh-stdio",
-            host: "company",
-            command: "/usr/bin/true",
-            args: [],
-            env: {},
-            allowedTools: ["searchJiraIssuesUsingJql", "getJiraIssue"],
-            toolDefaults: {},
-            startupTimeoutSeconds: 45,
-            callTimeoutSeconds: 60,
-          },
+          jira: route,
+          ...(options.shortcuts === "remote-multiple" ? { wiki: route } : {}),
         },
       },
       jiraLookup: jiraEnabled

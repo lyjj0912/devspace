@@ -150,9 +150,24 @@ shows the combined changes and advances the review point automatically.
 
 ## Data Retention
 
-DevSpace does not currently prune workspace sessions, conversation bindings,
-or review refs. A future product retention policy will define safe cleanup for
-these records; no automatic deletion is performed today.
+DevSpace runs a conservative maintenance pass before server startup. It prunes
+expired conversation bindings, stale or missing unbound workspace sessions,
+expired clean managed worktrees, and obsolete review refs. Dirty managed
+worktrees are retained. A clean worktree containing commits beyond its recorded
+base is retained unless those commits remain reachable from a permanent local
+branch, remote branch, or tag.
+
+Inspect the exact candidates before applying maintenance manually:
+
+```bash
+npx @waishnav/devspace maintenance --dry-run
+npx @waishnav/devspace maintenance
+```
+
+Retention values are configurable under `maintenance` in
+`~/.devspace/config.json` or through the corresponding environment variables in
+the configuration reference. Orphan directories that have no retained database
+record are reported but not automatically removed.
 
 ## Workspace Path Rejected
 

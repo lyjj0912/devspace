@@ -13,6 +13,26 @@ const DEFAULT_OAUTH_REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
 const DEFAULT_ARTIFACT_MAX_FILE_BYTES = 100 * 1024 * 1024;
 const DEFAULT_MCP_SESSION_IDLE_TIMEOUT_MS = 10 * 60 * 1_000;
 const DEFAULT_MCP_SESSION_CLEANUP_INTERVAL_MS = 60 * 1_000;
+const DEFAULT_CONVERSATION_BINDING_RETENTION_MS = 30 * 24 * 60 * 60 * 1_000;
+const DEFAULT_MAINTENANCE_MINIMUM_INTERVAL_MS = 24 * 60 * 60 * 1_000;
+const DEFAULT_WORKSPACE_SESSION_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
+const DEFAULT_WORKSPACE_SESSION_LIMIT = 512;
+const DEFAULT_MANAGED_WORKTREE_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
+const DEFAULT_MANAGED_WORKTREE_RECENT_PROTECTION_MS = 24 * 60 * 60 * 1_000;
+const DEFAULT_MANAGED_WORKTREE_PER_SOURCE_LIMIT = 8;
+const DEFAULT_REVIEW_WORKSPACE_LIMIT = 32;
+
+export interface MaintenanceConfig {
+  enabled: boolean;
+  minimumIntervalMs: number;
+  conversationBindingRetentionMs: number;
+  workspaceSessionRetentionMs: number;
+  workspaceSessionLimit: number;
+  managedWorktreeRetentionMs: number;
+  managedWorktreeRecentProtectionMs: number;
+  managedWorktreePerSourceLimit: number;
+  reviewWorkspaceLimit: number;
+}
 
 export interface ServerConfig {
   host: string;
@@ -29,6 +49,7 @@ export interface ServerConfig {
   worktreeRoot: string;
   artifactsEnabled: boolean;
   artifactMaxFileBytes: number;
+  maintenance: MaintenanceConfig;
   skillsEnabled: boolean;
   skillPaths: string[];
   devspaceSkillsDir: string;
@@ -157,7 +178,80 @@ function parseLoggingConfig(env: NodeJS.ProcessEnv): LoggingConfig {
     assets: parseBoolean(env.DEVSPACE_LOG_ASSETS),
     toolCalls: env.DEVSPACE_LOG_TOOL_CALLS === undefined ? true : parseBoolean(env.DEVSPACE_LOG_TOOL_CALLS),
     shellCommands: parseBoolean(env.DEVSPACE_LOG_SHELL_COMMANDS),
-    trustProxy: parseBoolean(env.DEVSPACE_TRUST_PROXY),
+    trustProxy: parseTrustProxy(env.DEVSPACE_TRUST_PROXY),
+  };
+}
+
+function parseTrustProxy(value: string | undefined): false | number {
+  if (!value || ["0", "false", "no", "off"].includes(value.toLowerCase())) return false;
+  if (["true", "yes", "on"].includes(value.toLowerCase())) return 1;
+  const hops = Number(value);
+  if (!Number.isInteger(hops) || hops < 1 || hops > 10) {
+    throw new Error(`Invalid DEVSPACE_TRUST_PROXY: ${value}`);
+  }
+  return hops;
+}
+
+function parseMaintenanceConfig(
+  env: NodeJS.ProcessEnv,
+  config: ReturnType<typeof loadDevspaceFiles>["config"]["maintenance"],
+): MaintenanceConfig {
+  return {
+    enabled:
+      env.DEVSPACE_MAINTENANCE === undefined
+        ? config?.enabled !== false
+        : parseBoolean(env.DEVSPACE_MAINTENANCE),
+    minimumIntervalMs: parsePositiveInteger(
+      env.DEVSPACE_MAINTENANCE_MINIMUM_INTERVAL_MS
+        ?? numberConfigValue(config?.minimumIntervalMs),
+      DEFAULT_MAINTENANCE_MINIMUM_INTERVAL_MS,
+      "DEVSPACE_MAINTENANCE_MINIMUM_INTERVAL_MS",
+    ),
+    conversationBindingRetentionMs: parsePositiveInteger(
+      env.DEVSPACE_CONVERSATION_BINDING_RETENTION_MS
+        ?? numberConfigValue(config?.conversationBindingRetentionMs),
+      DEFAULT_CONVERSATION_BINDING_RETENTION_MS,
+      "DEVSPACE_CONVERSATION_BINDING_RETENTION_MS",
+    ),
+    workspaceSessionRetentionMs: parsePositiveInteger(
+      env.DEVSPACE_WORKSPACE_SESSION_RETENTION_MS
+        ?? numberConfigValue(config?.workspaceSessionRetentionMs),
+      DEFAULT_WORKSPACE_SESSION_RETENTION_MS,
+      "DEVSPACE_WORKSPACE_SESSION_RETENTION_MS",
+    ),
+    workspaceSessionLimit: parsePositiveInteger(
+      env.DEVSPACE_WORKSPACE_SESSION_LIMIT
+        ?? numberConfigValue(config?.workspaceSessionLimit),
+      DEFAULT_WORKSPACE_SESSION_LIMIT,
+      "DEVSPACE_WORKSPACE_SESSION_LIMIT",
+      100_000,
+    ),
+    managedWorktreeRetentionMs: parsePositiveInteger(
+      env.DEVSPACE_MANAGED_WORKTREE_RETENTION_MS
+        ?? numberConfigValue(config?.managedWorktreeRetentionMs),
+      DEFAULT_MANAGED_WORKTREE_RETENTION_MS,
+      "DEVSPACE_MANAGED_WORKTREE_RETENTION_MS",
+    ),
+    managedWorktreeRecentProtectionMs: parsePositiveInteger(
+      env.DEVSPACE_MANAGED_WORKTREE_RECENT_PROTECTION_MS
+        ?? numberConfigValue(config?.managedWorktreeRecentProtectionMs),
+      DEFAULT_MANAGED_WORKTREE_RECENT_PROTECTION_MS,
+      "DEVSPACE_MANAGED_WORKTREE_RECENT_PROTECTION_MS",
+    ),
+    managedWorktreePerSourceLimit: parsePositiveInteger(
+      env.DEVSPACE_MANAGED_WORKTREE_PER_SOURCE_LIMIT
+        ?? numberConfigValue(config?.managedWorktreePerSourceLimit),
+      DEFAULT_MANAGED_WORKTREE_PER_SOURCE_LIMIT,
+      "DEVSPACE_MANAGED_WORKTREE_PER_SOURCE_LIMIT",
+      10_000,
+    ),
+    reviewWorkspaceLimit: parsePositiveInteger(
+      env.DEVSPACE_REVIEW_WORKSPACE_LIMIT
+        ?? numberConfigValue(config?.reviewWorkspaceLimit),
+      DEFAULT_REVIEW_WORKSPACE_LIMIT,
+      "DEVSPACE_REVIEW_WORKSPACE_LIMIT",
+      10_000,
+    ),
   };
 }
 
@@ -263,6 +357,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
       DEFAULT_ARTIFACT_MAX_FILE_BYTES,
       "DEVSPACE_ARTIFACT_MAX_FILE_BYTES",
     ),
+    maintenance: parseMaintenanceConfig(env, files.config.maintenance),
     skillsEnabled: env.DEVSPACE_SKILLS === undefined ? true : parseBoolean(env.DEVSPACE_SKILLS),
     skillPaths: parsePathList(env.DEVSPACE_SKILL_PATHS),
     devspaceSkillsDir: devspaceSkillsDir(env),

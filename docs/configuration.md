@@ -22,9 +22,28 @@ DEVSPACE_CONFIG_DIR=/path/to/config npx @waishnav/devspace serve
 npx @waishnav/devspace init
 npx @waishnav/devspace serve
 npx @waishnav/devspace doctor
+npx @waishnav/devspace maintenance --dry-run
+npx @waishnav/devspace maintenance
 npx @waishnav/devspace config get
 npx @waishnav/devspace config set publicBaseUrl https://devspace.example.com
 ```
+
+This personal checkout also includes a reproducible release gate and PM2
+definition:
+
+```bash
+npm run release:verify
+pm2 startOrReload ecosystem.config.cjs --only devspace
+pm2 save
+npm run release:live
+```
+
+`release:verify` runs type checking, the complete test suite, the production
+build, diff validation, and build-contract checks. `release:live` checks that the
+committed tree is clean, verifies the built tool/maintenance surface, and probes
+the local health and unauthenticated MCP boundary. The PM2 definition fixes the
+service working directory to this repository instead of inheriting the terminal
+directory that happened to launch PM2.
 
 ## Core Environment Variables
 
@@ -139,6 +158,43 @@ Both values accept milliseconds from config or environment variables:
 | `mcpSessionIdleTimeoutMs` | `DEVSPACE_MCP_SESSION_IDLE_TIMEOUT_MS` | `600000` |
 | `mcpSessionCleanupIntervalMs` | `DEVSPACE_MCP_SESSION_CLEANUP_INTERVAL_MS` | `60000` |
 
+## Persistent Workspace Maintenance
+
+DevSpace performs a conservative maintenance pass before the server starts.
+The same pass can be inspected or run explicitly with `devspace maintenance`.
+It removes expired conversation bindings, missing or stale unbound workspace
+sessions, expired clean managed worktrees, and obsolete review refs. A managed
+worktree with tracked or untracked changes is never deleted automatically. A
+clean worktree whose HEAD diverged from its recorded base is retained unless
+that HEAD remains reachable from a permanent local branch, remote branch, or
+tag.
+Recently used worktrees are protected even when a source repository temporarily
+exceeds its configured per-source limit.
+
+The maintenance defaults are intentionally longer than MCP transport retention:
+
+| Config key under `maintenance` | Environment variable | Default |
+| --- | --- | --- |
+| `enabled` | `DEVSPACE_MAINTENANCE` | `true` |
+| `minimumIntervalMs` | `DEVSPACE_MAINTENANCE_MINIMUM_INTERVAL_MS` | `86400000` (24 hours) |
+| `conversationBindingRetentionMs` | `DEVSPACE_CONVERSATION_BINDING_RETENTION_MS` | `2592000000` (30 days) |
+| `workspaceSessionRetentionMs` | `DEVSPACE_WORKSPACE_SESSION_RETENTION_MS` | `604800000` (7 days) |
+| `workspaceSessionLimit` | `DEVSPACE_WORKSPACE_SESSION_LIMIT` | `512` |
+| `managedWorktreeRetentionMs` | `DEVSPACE_MANAGED_WORKTREE_RETENTION_MS` | `604800000` (7 days) |
+| `managedWorktreeRecentProtectionMs` | `DEVSPACE_MANAGED_WORKTREE_RECENT_PROTECTION_MS` | `86400000` (24 hours) |
+| `managedWorktreePerSourceLimit` | `DEVSPACE_MANAGED_WORKTREE_PER_SOURCE_LIMIT` | `8` |
+| `reviewWorkspaceLimit` | `DEVSPACE_REVIEW_WORKSPACE_LIMIT` | `32` per Git repository |
+
+The session limit only removes the oldest unbound checkout sessions. Active
+conversation bindings and retained managed worktrees remain authoritative even
+when those protected records prevent the database from reaching the numeric
+limit. Directories under the managed-worktree root that are not represented by
+retained database state are reported but not deleted automatically.
+
+`.agent-harness` and `.tmp` are local workflow/scratch roots. Workspace
+instruction discovery skips them, and review snapshots exclude them even when a
+repository has not added corresponding ignore rules.
+
 ## Personal Shortcut Tools
 
 Personal extensions use the `_shortcut` suffix so they remain distinct from
@@ -148,7 +204,7 @@ selected core tool mode.
 | Tool | Purpose |
 | --- | --- |
 | `browser_read_shortcut` | List Chrome tabs, open one HTTP(S) URL, and read bounded page text. It cannot click, type, submit, upload, download, or accept model-supplied JavaScript. |
-| `remote_mcp_read_shortcut` | List or invoke allowlisted read-only tools through a configured remote MCP route. One process-wide SSH/stdio session is reused per route. `list_tools` reports approved/cached capabilities and is explicitly not a provider-liveness check. Generic call output defaults to 10,000 characters; request a larger bound only when necessary. |
+| `remote_mcp_read_shortcut` | List or invoke allowlisted read-only tools through a configured remote MCP route. With one route, DevSpace selects it automatically and omits the route input. With multiple routes, the schema exposes only the configured route names as an enum. One process-wide SSH/stdio session is reused per route. `list_tools` reports approved/cached capabilities and is explicitly not a provider-liveness check. Generic call output defaults to 10,000 characters; request a larger bound only when necessary. |
 | `jira_lookup_shortcut` | Preferred path for ordinary Jira issue or JQL reads. Returns compact summaries and explicitly requested fields instead of raw provider payloads. |
 
 Configuration keeps provider commands and credentials outside model-visible tool
@@ -192,8 +248,10 @@ DEVSPACE_SHORTCUT_JIRA_LOOKUP_ENABLED
 DEVSPACE_SHORTCUT_JIRA_LOOKUP_ROUTE
 ```
 
-Remote route maps remain file-only. `jira_lookup_shortcut` does not accept a
-route input, so the local configuration owns the Jira provider selection.
+Remote route maps remain file-only. A single generic remote route is selected
+without model input; multiple routes become a closed configured enum rather than
+a free-form string. `jira_lookup_shortcut` does not accept a route input, so the
+local configuration owns the Jira provider selection.
 
 ## Skills
 
@@ -252,7 +310,7 @@ npx @waishnav/devspace serve
 | `DEVSPACE_LOG_ASSETS` | `0` |
 | `DEVSPACE_LOG_TOOL_CALLS` | `1` |
 | `DEVSPACE_LOG_SHELL_COMMANDS` | `0` |
-| `DEVSPACE_TRUST_PROXY` | `0` |
+| `DEVSPACE_TRUST_PROXY` | `0`; set a positive hop count such as `1` when behind one trusted reverse proxy. Boolean `true` is normalized to one hop, never an unrestricted proxy trust function. |
 
 Set `DEVSPACE_LOG_FORMAT=pretty` for local debugging.
 

@@ -21,9 +21,22 @@ export interface DevspaceUserConfig {
   mcpSessionCleanupIntervalMs?: number;
   artifactsEnabled?: boolean;
   artifactMaxFileBytes?: number;
+  maintenance?: DevspaceMaintenanceConfig;
   agentDir?: string;
   subagents?: boolean;
   shortcuts?: DevspaceShortcutsConfig;
+}
+
+export interface DevspaceMaintenanceConfig {
+  enabled?: boolean;
+  minimumIntervalMs?: number;
+  conversationBindingRetentionMs?: number;
+  workspaceSessionRetentionMs?: number;
+  workspaceSessionLimit?: number;
+  managedWorktreeRetentionMs?: number;
+  managedWorktreeRecentProtectionMs?: number;
+  managedWorktreePerSourceLimit?: number;
+  reviewWorkspaceLimit?: number;
 }
 
 export interface DevspaceShortcutsConfig {
