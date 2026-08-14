@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { mkdtemp, mkdir, rm, stat, symlink, writeFile } from "node:fs/promises";
-import { platform, tmpdir } from "node:os";
-import { join } from "node:path";
+import { homedir, platform, tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import test, { type TestContext } from "node:test";
 import { promisify } from "node:util";
 import { loadConfig, type ServerConfig } from "./config.js";
@@ -136,6 +136,27 @@ test("workspace paths outside the allowed roots are rejected", async (t) => {
     () => context.registry.openWorkspace(context.outsideRoot),
     /outside allowed roots/,
   );
+});
+
+test("advertised tilde skill paths resolve before workspace-relative paths", async (t) => {
+  const context = await fixture(t);
+  const opened = await context.registry.openWorkspace(context.root);
+  const skillFilePath = join(homedir(), ".codex", "skills", "devspace-test", "SKILL.md");
+  opened.workspace.skills.push({
+    name: "devspace-test",
+    description: "test skill",
+    filePath: skillFilePath,
+    baseDir: dirname(skillFilePath),
+  } as never);
+
+  const resolved = context.registry.resolveReadPath(
+    opened.workspace,
+    "~/.codex/skills/devspace-test/SKILL.md",
+  );
+
+  assert.equal(resolved.absolutePath, skillFilePath);
+  assert.equal(resolved.skillRead?.isSkillFile, true);
+  assert.equal(resolved.readRoots.includes(dirname(skillFilePath)), true);
 });
 
 test("a symlinked allowed root preserves checkout and worktree path behavior", { skip: platform() === "win32" }, async (t) => {

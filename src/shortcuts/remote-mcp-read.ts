@@ -20,6 +20,9 @@ export interface RemoteMcpReadResult {
   providerCalls: number;
   connectionReused: boolean;
   retried: boolean;
+  livenessVerified: boolean;
+  recoveryReason?: string;
+  lastDisconnectReason?: string;
 }
 
 export class RemoteMcpReadError extends Error {
@@ -30,8 +33,13 @@ export class RemoteMcpReadError extends Error {
 }
 
 export class RemoteMcpReader {
-  private readonly sessions = new Map<string, Promise<RemoteMcpSession>>();
+  private readonly sessions = new Map<string, {
+    generation: number;
+    session: Promise<RemoteMcpSession>;
+  }>();
   private closePromise?: Promise<void>;
+  private nextGeneration = 1;
+  private readonly lastDisconnectReasons = new Map<string, string>();
 
   constructor(
     private readonly routes: Record<string, RemoteMcpShortcutRouteConfig>,
@@ -59,6 +67,10 @@ export class RemoteMcpReader {
         providerCalls: 0,
         connectionReused: initial.reused,
         retried: false,
+        livenessVerified: false,
+        ...(this.lastDisconnectReasons.get(routeName)
+          ? { lastDisconnectReason: this.lastDisconnectReasons.get(routeName) }
+          : {}),
       };
     }
     this.assertExposed(routeName, toolName, session);
@@ -72,6 +84,7 @@ export class RemoteMcpReader {
         toolArguments,
         route.callTimeoutSeconds,
       ), routeName, toolName);
+      this.lastDisconnectReasons.delete(routeName);
       return {
         route: routeName,
         availableTools: exposedTools(route, session),
@@ -80,10 +93,13 @@ export class RemoteMcpReader {
         providerCalls: 1,
         connectionReused: initial.reused,
         retried: false,
+        livenessVerified: true,
       };
     } catch (error) {
       if (!isTransportFailure(error)) throw error;
-      await this.reset(routeName);
+      const recoveryReason = transportFailureReason(error);
+      this.lastDisconnectReasons.set(routeName, recoveryReason);
+      await this.reset(routeName, initial.generation);
       const retry = this.session(routeName);
       session = await retry.session;
       this.assertExposed(routeName, toolName, session);
@@ -95,6 +111,7 @@ export class RemoteMcpReader {
           toolArguments,
           route.callTimeoutSeconds,
         ), routeName, toolName);
+        this.lastDisconnectReasons.delete(routeName);
         return {
           route: routeName,
           availableTools: exposedTools(route, session),
@@ -103,9 +120,14 @@ export class RemoteMcpReader {
           providerCalls: 2,
           connectionReused: initial.reused,
           retried: true,
+          livenessVerified: true,
+          recoveryReason,
         };
       } catch (retryError) {
-        if (isTransportFailure(retryError)) await this.reset(routeName);
+        if (isTransportFailure(retryError)) {
+          this.lastDisconnectReasons.set(routeName, transportFailureReason(retryError));
+          await this.reset(routeName, retry.generation);
+        }
         throw new RemoteMcpReadError(
           `Remote MCP route ${routeName} failed before and after one reconnect: ${errorMessage(error)}; retry: ${errorMessage(retryError)}`,
         );
@@ -117,8 +139,8 @@ export class RemoteMcpReader {
     this.closePromise ??= (async () => {
       const sessions = [...this.sessions.values()];
       this.sessions.clear();
-      await Promise.allSettled(sessions.map(async (pending) => {
-        const session = await pending.catch(() => undefined);
+      await Promise.allSettled(sessions.map(async (entry) => {
+        const session = await entry.session.catch(() => undefined);
         await session?.client.close().catch(() => undefined);
         await session?.transport.close().catch(() => undefined);
       }));
@@ -138,15 +160,32 @@ export class RemoteMcpReader {
     );
   }
 
-  private session(name: string): { session: Promise<RemoteMcpSession>; reused: boolean } {
+  private session(name: string): {
+    session: Promise<RemoteMcpSession>;
+    reused: boolean;
+    generation: number;
+  } {
     const existing = this.sessions.get(name);
-    if (existing) return { session: existing, reused: true };
-    const pending = (this.sessionFactory ? this.sessionFactory(name) : this.connect(name)).catch((error) => {
-      this.sessions.delete(name);
-      throw error;
-    });
-    this.sessions.set(name, pending);
-    return { session: pending, reused: false };
+    if (existing) {
+      return {
+        session: existing.session,
+        reused: true,
+        generation: existing.generation,
+      };
+    }
+
+    const generation = this.nextGeneration++;
+    const pending = (this.sessionFactory ? this.sessionFactory(name) : this.connect(name))
+      .then((session) => {
+        this.attachDisconnectEviction(name, generation, session);
+        return session;
+      })
+      .catch((error) => {
+        this.evictGeneration(name, generation);
+        throw error;
+      });
+    this.sessions.set(name, { generation, session: pending });
+    return { session: pending, reused: false, generation };
   }
 
   private async connect(name: string): Promise<RemoteMcpSession> {
@@ -186,13 +225,34 @@ export class RemoteMcpReader {
     }
   }
 
-  private async reset(name: string): Promise<void> {
-    const pending = this.sessions.get(name);
+  private async reset(name: string, generation: number): Promise<void> {
+    const entry = this.sessions.get(name);
+    if (!entry || entry.generation !== generation) return;
     this.sessions.delete(name);
-    if (!pending) return;
-    const session = await pending.catch(() => undefined);
+    const session = await entry.session.catch(() => undefined);
     await session?.client.close().catch(() => undefined);
     await session?.transport.close().catch(() => undefined);
+  }
+
+  private attachDisconnectEviction(
+    name: string,
+    generation: number,
+    session: RemoteMcpSession,
+  ): void {
+    const previousOnClose = session.client.onclose;
+    session.client.onclose = () => {
+      previousOnClose?.();
+      if (this.sessions.get(name)?.generation !== generation) return;
+      if (!this.lastDisconnectReasons.has(name)) {
+        this.lastDisconnectReasons.set(name, "transport_closed");
+      }
+      this.evictGeneration(name, generation);
+    };
+  }
+
+  private evictGeneration(name: string, generation: number): void {
+    const entry = this.sessions.get(name);
+    if (entry?.generation === generation) this.sessions.delete(name);
   }
 
   private assertAllowedTool(
@@ -226,7 +286,11 @@ export class RemoteMcpReader {
 }
 
 class RemoteMcpToolResultError extends RemoteMcpReadError {}
-class RemoteMcpTransportError extends RemoteMcpReadError {}
+class RemoteMcpTransportError extends RemoteMcpReadError {
+  constructor(message: string, readonly reason = "transport_error") {
+    super(message);
+  }
+}
 
 export function isReadOnlyRemoteToolDefinition(tool: {
   annotations?: { readOnlyHint?: boolean; destructiveHint?: boolean };
@@ -280,8 +344,12 @@ async function callRemoteTool(
     );
   } catch (error) {
     if (error instanceof RemoteMcpReadError) throw error;
-    if (isMcpTransportFailure(error) || isNodeTransportFailure(error)) {
-      throw new RemoteMcpTransportError(errorMessage(error));
+    if (
+      isMcpTransportFailure(error)
+      || isMcpDisconnectedError(error)
+      || isNodeTransportFailure(error)
+    ) {
+      throw new RemoteMcpTransportError(errorMessage(error), rawTransportFailureReason(error));
     }
     throw error;
   }
@@ -318,9 +386,32 @@ function isTransportFailure(error: unknown): boolean {
   return error instanceof RemoteMcpTransportError;
 }
 
+function transportFailureReason(error: unknown): string {
+  return error instanceof RemoteMcpTransportError ? error.reason : "transport_error";
+}
+
+function rawTransportFailureReason(error: unknown): string {
+  if (error instanceof McpError) {
+    if (error.code === ErrorCode.ConnectionClosed) return "mcp_connection_closed";
+    if (error.code === ErrorCode.RequestTimeout) return "mcp_request_timeout";
+  }
+  if (isMcpDisconnectedError(error)) return "sdk_not_connected";
+  if (typeof error === "object" && error !== null && "code" in error) {
+    const code = String((error as { code: unknown }).code).toLowerCase();
+    if (["epipe", "econnreset", "econnrefused", "etimedout"].includes(code)) {
+      return `node_${code}`;
+    }
+  }
+  return "transport_error";
+}
+
 function isMcpTransportFailure(error: unknown): boolean {
   return error instanceof McpError
     && (error.code === ErrorCode.ConnectionClosed || error.code === ErrorCode.RequestTimeout);
+}
+
+function isMcpDisconnectedError(error: unknown): boolean {
+  return error instanceof Error && error.message === "Not connected";
 }
 
 function isNodeTransportFailure(error: unknown): boolean {

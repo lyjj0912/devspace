@@ -6,7 +6,7 @@ import type {
   WorkspaceStore,
 } from "./workspace-store.js";
 import { mkdir, opendir, readFile, realpath, stat } from "node:fs/promises";
-import { basename, dirname, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { loadProjectContextFiles } from "@earendil-works/pi-coding-agent";
 import type { ServerConfig } from "./config.js";
 import { createManagedWorktree } from "./git-worktrees.js";
@@ -291,6 +291,23 @@ export class WorkspaceRegistry {
   }
 
   resolveReadPath(workspace: Workspace, inputPath: string): WorkspaceReadPath {
+    const preferSkillResolution =
+      isAbsolute(inputPath) || inputPath === "~" || inputPath.startsWith("~/");
+    const preferredSkillRead = preferSkillResolution
+      ? resolveSkillReadPath(
+          workspace.skills,
+          workspace.activatedSkillDirs,
+          inputPath,
+        )
+      : undefined;
+    if (preferredSkillRead) {
+      return {
+        absolutePath: preferredSkillRead.absolutePath,
+        readRoots: [workspace.root, preferredSkillRead.skill.baseDir],
+        skillRead: preferredSkillRead,
+      };
+    }
+
     try {
       return {
         absolutePath: this.resolvePath(workspace, inputPath),

@@ -101,7 +101,13 @@ function registerRemoteMcpRead(
     {
       title: "Read a configured remote MCP (personal shortcut)",
       description:
-        "Personal DevSpace shortcut for a preconfigured allowlisted remote MCP route. list_tools reports approved read tools; call invokes one approved tool. SSH host, command, environment, and credentials are local configuration only. A process-wide route session is reused and transport failures reconnect at most once.",
+        [
+          "Personal DevSpace shortcut for a preconfigured allowlisted remote MCP route.",
+          runtime.config.jiraLookup.enabled
+            ? "Prefer jira_lookup_shortcut for ordinary Jira issue or JQL reads because it returns compact summaries and requested fields without raw provider payloads. Use this generic route for capability discovery or read operations the compact Jira shortcut cannot express."
+            : undefined,
+          "list_tools reports approved read tools; call invokes one approved tool. SSH host, command, environment, and credentials are local configuration only. A process-wide route session is reused and transport failures reconnect at most once.",
+        ].filter(Boolean).join(" "),
       inputSchema: {
         operation: z.enum(["list_tools", "call"]),
         route: z.string().min(1),
@@ -129,7 +135,7 @@ function registerRemoteMcpRead(
           operation === "call" ? tool : undefined,
           args ?? {},
         );
-        const bounded = remoteToolText(result.response, maxCharacters ?? 20_000);
+        const bounded = remoteToolText(result.response, maxCharacters ?? 10_000);
         const data = remoteResultData(result, bounded.text);
         return {
           data,
@@ -139,6 +145,8 @@ function registerRemoteMcpRead(
             connectionReused: result.connectionReused,
             retried: result.retried,
             truncated: bounded.truncated,
+            livenessVerified: result.livenessVerified,
+            ...(result.recoveryReason ? { recoveryReason: result.recoveryReason } : {}),
           },
         };
       },
@@ -157,7 +165,7 @@ function registerJiraLookup(
     {
       title: "Look up Jira issues (personal shortcut)",
       description:
-        "Personal DevSpace shortcut for one compact Jira lookup on the locally configured route. Direct issue lookup calls the provider once. JQL calls search once and fetches detail only for one unique result when requested. It does not fan out, return raw provider payloads, or perform Jira mutations.",
+        "Preferred shortcut for ordinary Jira issue and JQL reads. It returns compact summaries plus explicitly requested fields, avoiding large raw provider payloads. Direct issue lookup calls the provider once. JQL calls search once and fetches detail only for one unique result when requested. It does not fan out or perform Jira mutations.",
       inputSchema: {
         jql: z.string().min(1).optional(),
         issueKey: z.string().min(1).optional(),
@@ -206,6 +214,8 @@ interface ShortcutSuccess {
     connectionReused: boolean;
     retried: boolean;
     truncated: boolean;
+    livenessVerified?: boolean;
+    recoveryReason?: string;
   };
 }
 
@@ -284,6 +294,8 @@ function shortcutOutputSchema(): z.ZodRawShape {
       connectionReused: z.boolean(),
       retried: z.boolean(),
       truncated: z.boolean(),
+      livenessVerified: z.boolean().optional(),
+      recoveryReason: z.string().optional(),
     }),
   };
 }
@@ -309,6 +321,9 @@ function remoteResultData(result: RemoteMcpReadResult, content: string): Record<
   return {
     route: result.route,
     availableTools: result.availableTools,
+    livenessVerified: result.livenessVerified,
+    ...(result.recoveryReason ? { recoveryReason: result.recoveryReason } : {}),
+    ...(result.lastDisconnectReason ? { lastDisconnectReason: result.lastDisconnectReason } : {}),
     ...(result.tool ? { tool: result.tool } : {}),
     ...(content ? { content } : {}),
   };
@@ -319,8 +334,13 @@ function remoteResultText(result: RemoteMcpReadResult, content: string): string 
     `Remote MCP route: ${result.route}`,
     `Available read tools: ${result.availableTools.join(", ") || "none"}`,
     result.tool ? `Called: ${result.tool}` : "Route inspection only",
+    result.livenessVerified
+      ? "Provider liveness verified by this tool call."
+      : "Provider liveness not verified; list_tools reports cached/approved capabilities only.",
     result.connectionReused ? "Connection reused." : "Connection opened.",
     result.retried ? "Transport reconnected once." : "No reconnect.",
+    result.recoveryReason ? `Recovery reason: ${result.recoveryReason}.` : "",
+    result.lastDisconnectReason ? `Last disconnect reason: ${result.lastDisconnectReason}.` : "",
     content,
   ].filter(Boolean).join("\n");
 }

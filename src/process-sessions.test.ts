@@ -58,6 +58,16 @@ const environment = await manager.start({
 assert.equal(environment.running, false);
 assert.match(environment.output, /1,dumb,cat,cat,cat,1,workspace-a,\/tmp\/devspace-workspace-a/);
 
+const defaultYield = await manager.start({
+  workspaceId: "workspace-a",
+  cwd: process.cwd(),
+  command: `${node} -e "setTimeout(() => console.log('default-yield-finished'), 1250)"`,
+});
+assert.equal(defaultYield.running, false);
+assert.equal(defaultYield.exitCode, 0);
+assert.equal(defaultYield.sessionId, undefined);
+assert.match(defaultYield.output, /default-yield-finished/);
+
 const background = await manager.start({
   workspaceId: "workspace-a",
   cwd: process.cwd(),

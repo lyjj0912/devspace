@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { access, realpath } from "node:fs/promises";
+import { homedir } from "node:os";
+import { isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
@@ -139,6 +141,57 @@ interface ToolWidgetDescriptorMeta {
   _meta: ToolDefinitionMeta | EmptyToolDefinitionMeta;
 }
 
+interface ConversationBootstrapState {
+  categories: Map<string, Set<string>>;
+  lastUsedAt: number;
+}
+
+export class ConversationBootstrapRegistry {
+  private readonly conversations = new Map<string, ConversationBootstrapState>();
+
+  constructor(private readonly maximumConversations = 256) {}
+
+  select<T>(
+    conversationScopeId: string | undefined,
+    category: string,
+    items: readonly T[],
+    keyFor: (item: T) => string,
+    includeBootstrapContext: boolean,
+  ): T[] {
+    if (!conversationScopeId) {
+      return includeBootstrapContext ? [...items] : [];
+    }
+
+    const state = this.conversations.get(conversationScopeId) ?? {
+      categories: new Map<string, Set<string>>(),
+      lastUsedAt: Date.now(),
+    };
+    this.conversations.set(conversationScopeId, state);
+    const seen = state.categories.get(category) ?? new Set<string>();
+    state.categories.set(category, seen);
+
+    const selected: T[] = [];
+    for (const item of items) {
+      const key = keyFor(item);
+      if (includeBootstrapContext && !seen.has(key)) selected.push(item);
+      seen.add(key);
+    }
+    state.lastUsedAt = Date.now();
+    this.prune();
+    return selected;
+  }
+
+  private prune(): void {
+    if (this.conversations.size <= this.maximumConversations) return;
+    const oldest = [...this.conversations.entries()]
+      .sort((left, right) => left[1].lastUsedAt - right[1].lastUsedAt)
+      .slice(0, this.conversations.size - this.maximumConversations);
+    for (const [conversationScopeId] of oldest) {
+      this.conversations.delete(conversationScopeId);
+    }
+  }
+}
+
 function shouldAttachWidget(mode: WidgetMode, kind: ToolWidgetKind): boolean {
   switch (mode) {
     case "off":
@@ -175,6 +228,7 @@ const toolNames = {
   glob: "glob",
   ls: "ls",
   shell: "bash",
+  localShell: "local_shell",
 } as const;
 
 interface ToolLogFields {
@@ -184,6 +238,9 @@ interface ToolLogFields {
   workingDirectory?: string;
   command?: string;
   commandLength?: number;
+  background?: boolean;
+  requestedYieldTimeMs?: number;
+  effectiveYieldTimeMs?: number;
   success: boolean;
   durationMs: number;
   error?: string;
@@ -199,7 +256,7 @@ function serverInstructions(config: ServerConfig): string {
       : "";
 
   if (config.toolMode === "codex") {
-    return `Use DevSpace as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree and reuse its workspaceId. Open it again when the workspaceId is invalid, the project changes, checkout/worktree mode changes, or another isolated worktree is needed. Use ${toolNames.read} for direct file reads, apply_patch for all file modifications, exec_command for inspection, tests, builds, and other commands, and write_stdin to poll or interact with running processes. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.${artifactInstruction}${showChangesInstruction}`;
+    return `Use DevSpace as a local coding workspace. Open the narrowest project folder that contains the required targets; broad parent folders can discover many unrelated instruction files and add unnecessary context. Call ${toolNames.openWorkspace} once per project folder or worktree and reuse its workspaceId. Open it again when the workspaceId is invalid, the project changes, checkout/worktree mode changes, or another isolated worktree is needed. Use ${toolNames.read} for direct file reads, apply_patch for all file modifications, exec_command for inspection, tests, builds, and other commands, and write_stdin to poll or interact with running processes. Omit exec_command yieldTimeMs for ordinary commands so multi-second work can complete in one tool call; set background=true for a command known to be long-running or interactive, then use write_stdin. If a stale client schema cannot send background, prefix cmd with '@background '. The ${toolNames.localShell} tool is an explicitly authorized personal-Mac shell that does not require ${toolNames.openWorkspace}; use it for user-requested personal file management or local automation outside coding projects, and do not open an unrelated project merely to obtain shell access. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.${artifactInstruction}${showChangesInstruction}`;
   }
 
   const inspection = config.toolMode !== "full"
@@ -211,8 +268,9 @@ function serverInstructions(config: ServerConfig): string {
     : "";
 
   const agentsMd = `Follow instructions returned by ${toolNames.openWorkspace}. Before working under a path listed in availableAgentsFiles, use ${toolNames.read} to inspect that instruction file and follow it. `;
+  const localShellInstruction = `The ${toolNames.localShell} tool is an explicitly authorized personal-Mac shell and does not require ${toolNames.openWorkspace}. Use it for user-requested personal file management or local system automation outside coding projects; do not open an unrelated project merely to obtain shell access. It runs with the current DevSpace service user's authority, and DevSpace does not add privilege elevation. Prefer workspace-scoped tools for normal project changes. `;
 
-  return `Use DevSpace as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree to obtain a workspaceId. Reuse that same workspaceId for all later file, search, edit, write, show-changes, and shell tools in that folder; do not call ${toolNames.openWorkspace} again unless switching to a different project folder, changing checkout/worktree mode, the workspaceId is rejected as unknown, or a new isolated worktree is requested. ${agentsMd}${skills}${inspection}Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not create or modify files with ${toolNames.shell}; avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or any command whose purpose is to write project files.${artifactInstruction}${showChangesInstruction}`;
+  return `Use DevSpace as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree to obtain a workspaceId. Reuse that same workspaceId for all later file, search, edit, write, show-changes, and shell tools in that folder; do not call ${toolNames.openWorkspace} again unless switching to a different project folder, changing checkout/worktree mode, the workspaceId is rejected as unknown, or a new isolated worktree is requested. ${agentsMd}${skills}${inspection}${localShellInstruction}Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not create or modify files with ${toolNames.shell}; avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or any command whose purpose is to write project files.${artifactInstruction}${showChangesInstruction}`;
 }
 
 function formatVisibleAgent(agent: {
@@ -552,6 +610,42 @@ function processToolResponse(
   };
 }
 
+const BACKGROUND_COMMAND_PREFIX = "@background ";
+
+function commandExecutionMode(command: string, background: boolean | undefined): {
+  command: string;
+  background: boolean;
+} {
+  if (!command.startsWith(BACKGROUND_COMMAND_PREFIX)) {
+    return { command, background: background === true };
+  }
+
+  const stripped = command.slice(BACKGROUND_COMMAND_PREFIX.length);
+  if (!stripped.trim()) {
+    throw new Error("@background must be followed by a shell command.");
+  }
+  return { command: stripped, background: true };
+}
+
+async function resolveLocalShellWorkingDirectory(
+  workingDirectory: string | undefined,
+): Promise<string> {
+  const home = homedir();
+  const candidate = workingDirectory === undefined || workingDirectory === "~"
+    ? home
+    : workingDirectory.startsWith("~/")
+      ? resolve(home, workingDirectory.slice(2))
+      : workingDirectory;
+
+  if (!isAbsolute(candidate)) {
+    throw new Error(
+      "local_shell workingDirectory must be an absolute path or a leading-tilde home path.",
+    );
+  }
+
+  return realpath(candidate);
+}
+
 function registerCodexProcessTools(
   server: McpServer,
   config: ServerConfig,
@@ -564,10 +658,10 @@ function registerCodexProcessTools(
     {
       title: "Execute command",
       description:
-        "Run a command inside an open workspace. Returns its result when it exits during the yield window, otherwise returns a sessionId for write_stdin. Use this for file inspection, tests, builds, package scripts, and long-running processes. Call open_workspace first and pass workspaceId.",
+        "Run a command inside an open workspace. Returns its result when it exits during the yield window, otherwise returns a sessionId for write_stdin. Omit yieldTimeMs for ordinary commands so multi-second work can finish in one call. Set background=true for a command known to be long-running or interactive, then use write_stdin to poll or interact. Clients with a stale schema may instead prefix cmd with '@background '; DevSpace removes the marker before execution. Use this for file inspection, tests, builds, package scripts, and long-running processes. Call open_workspace first and pass workspaceId.",
       inputSchema: {
         workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
-        cmd: z.string().min(1).describe("Shell command to execute."),
+        cmd: z.string().min(1).describe("Shell command to execute. Prefix with '@background ' when a stale client cannot send background=true."),
         tty: z
           .boolean()
           .optional()
@@ -578,13 +672,17 @@ function registerCodexProcessTools(
           .string()
           .optional()
           .describe("Working directory relative to the workspace root. Defaults to the workspace root."),
+        background: z
+          .boolean()
+          .optional()
+          .describe("Return a sessionId immediately for a known long-running or interactive command. Defaults to false."),
         yieldTimeMs: z
           .number()
           .int()
           .min(0)
           .max(30_000)
           .optional()
-          .describe("Milliseconds to wait before returning a running session. Defaults to 10000."),
+          .describe("Milliseconds to wait before returning a running session. Defaults to 10000. Prefer background=true instead of tuning this for known long-running or interactive commands."),
         maxOutputTokens: z
           .number()
           .int()
@@ -597,19 +695,21 @@ function registerCodexProcessTools(
       ...toolWidgetDescriptorMeta(config, "shell"),
       annotations: SHELL_TOOL_ANNOTATIONS,
     },
-    async ({ workspaceId, cmd, tty, columns, rows, workingDirectory, yieldTimeMs, maxOutputTokens }) => {
+    async ({ workspaceId, cmd, tty, columns, rows, workingDirectory, background, yieldTimeMs, maxOutputTokens }) => {
       const startedAt = performance.now();
       const workspace = workspaces.getWorkspace(workspaceId);
       const cwd = workspaces.resolveWorkingDirectory(workspace, workingDirectory);
+      const execution = commandExecutionMode(cmd, background);
+      const effectiveYieldTimeMs = execution.background ? 0 : yieldTimeMs;
       const snapshot = await processSessions.start({
         workspaceId,
-        command: cmd,
+        command: execution.command,
         cwd,
         workspaceRoot: workspace.root,
         tty,
         columns,
         rows,
-        yieldTimeMs,
+        yieldTimeMs: effectiveYieldTimeMs,
         maxOutputTokens,
       });
 
@@ -617,14 +717,17 @@ function registerCodexProcessTools(
         tool: "exec_command",
         workspaceId,
         workingDirectory: workingDirectory ?? ".",
-        command: cmd,
-        commandLength: cmd.length,
+        command: execution.command,
+        commandLength: execution.command.length,
+        background: execution.background,
+        requestedYieldTimeMs: yieldTimeMs,
+        effectiveYieldTimeMs,
         success: true,
         durationMs: Math.round(performance.now() - startedAt),
       });
 
       return processToolResponse("exec_command", workspaceId, snapshot, {
-        command: cmd,
+        command: execution.command,
         workingDirectory: workingDirectory ?? ".",
         running: snapshot.running,
         exitCode: snapshot.exitCode,
@@ -652,7 +755,7 @@ function registerCodexProcessTools(
           .min(0)
           .max(30_000)
           .optional()
-          .describe("Milliseconds to wait for process output or completion. Defaults to 10000."),
+          .describe("Milliseconds to wait for process output or completion. When waiting, defaults to 5000 for passive polling and 250 for interaction."),
         maxOutputTokens: z
           .number()
           .int()
@@ -704,6 +807,7 @@ export function createMcpServer(
   localAgentProviders: LocalAgentProviderAvailability[],
   incomingArtifactAdapters: readonly IncomingArtifactAdapter[],
   shortcuts: ShortcutRuntime,
+  conversationBootstrap = new ConversationBootstrapRegistry(),
 ): McpServer {
   const server = new McpServer(
     {
@@ -755,7 +859,7 @@ export function createMcpServer(
     {
       title: "Open workspace",
       description:
-        "Open a local project directory as a coding workspace. Call this once before working in a project or worktree, then reuse the returned workspaceId for later file, search, edit, show-changes, and shell calls. By default this opens the actual checkout; set mode=\"worktree\" when you need isolated or parallel work. Open another workspace when changing projects, switching modes, or starting another isolated worktree.",
+        "Open the narrowest local project directory that contains the required targets as a coding workspace. Broad parent directories can discover many unrelated nested instruction files and add unnecessary context. Call this once before working in a project or worktree, then reuse the returned workspaceId for later file, search, edit, show-changes, and shell calls. By default this opens the actual checkout; set mode=\"worktree\" when you need isolated or parallel work. Open another workspace when changing projects, switching modes, or starting another isolated worktree.",
       inputSchema: {
         path: z
           .string()
@@ -801,6 +905,7 @@ export function createMcpServer(
     },
     async ({ path, mode, baseRef }, { _meta }) => {
       const startedAt = performance.now();
+      const conversationScopeId = openAiConversationScopeId(_meta);
       const {
         workspace,
         agentsFiles,
@@ -809,7 +914,7 @@ export function createMcpServer(
         includeBootstrapContext,
       } = await workspaces.openWorkspace(
         { path, mode, baseRef },
-        { conversationScopeId: openAiConversationScopeId(_meta) },
+        { conversationScopeId },
       );
       if (config.widgets === "changes") {
         await reviewCheckpoints.initializeWorkspace({
@@ -817,15 +922,31 @@ export function createMcpServer(
           root: workspace.root,
         });
       }
-      const cardSkills = workspace.skills
-        .filter((skill) => !skill.disableModelInvocation)
-        .map((skill) => ({
+      const activeSkills = workspace.skills.filter((skill) => !skill.disableModelInvocation);
+      const formatSkill = (skill: (typeof activeSkills)[number]) => ({
           name: skill.name,
           description: skill.description,
           path: formatPathForPrompt(skill.filePath),
-        }));
+        });
+      const cardSkills = activeSkills.map(formatSkill);
+      const visibleSkills = conversationBootstrap
+        .select(
+          conversationScopeId,
+          "skills",
+          activeSkills,
+          (skill) => skill.filePath,
+          includeBootstrapContext,
+        )
+        .map(formatSkill);
       const cardAgentProviders = config.subagents ? localAgentProviders : [];
-      const cardAgents = workspace.agentProfiles.map((profile) => {
+      const visibleAgentProviders = conversationBootstrap.select(
+        conversationScopeId,
+        "agent-providers",
+        cardAgentProviders,
+        (provider) => provider.name,
+        includeBootstrapContext,
+      );
+      const formatAgent = (profile: (typeof workspace.agentProfiles)[number]) => {
         const summary = summarizeLocalAgentProfile(profile);
         const availability = cardAgentProviders.find((provider) => provider.name === summary.provider);
         return {
@@ -833,19 +954,62 @@ export function createMcpServer(
           providerAvailable: availability?.available,
           providerUnavailableReason: availability?.reason,
         };
-      });
-      const cardAgentsFiles = agentsFiles.map((file) => ({
+      };
+      const cardAgents = workspace.agentProfiles.map(formatAgent);
+      const visibleAgents = conversationBootstrap
+        .select(
+          conversationScopeId,
+          "agents",
+          workspace.agentProfiles,
+          (profile) => profile.filePath,
+          includeBootstrapContext,
+        )
+        .map(formatAgent);
+      const formatLoadedAgentsFile = (file: (typeof agentsFiles)[number]) => ({
         path: formatAgentsPath(file.path, workspace.root),
         content: file.content,
-      }));
-      const cardAvailableAgentsFiles = availableAgentsFiles.map((file) => ({
+      });
+      const cardAgentsFiles = agentsFiles.map(formatLoadedAgentsFile);
+      const loadedAgentsFiles = conversationBootstrap
+        .select(
+          conversationScopeId,
+          "agents-files",
+          agentsFiles,
+          (file) => file.path,
+          includeBootstrapContext,
+        )
+        .map(formatLoadedAgentsFile);
+      const formatAvailableAgentsFile = (file: (typeof availableAgentsFiles)[number]) => ({
         path: formatAgentsPath(file.path, workspace.root),
-      }));
-      const visibleSkills = includeBootstrapContext ? cardSkills : [];
-      const visibleAgentProviders = includeBootstrapContext ? cardAgentProviders : [];
-      const visibleAgents = includeBootstrapContext ? cardAgents : [];
-      const loadedAgentsFiles = includeBootstrapContext ? cardAgentsFiles : [];
-      const availableAgentsFileOutputs = includeBootstrapContext ? cardAvailableAgentsFiles : [];
+      });
+      const cardAvailableAgentsFiles = availableAgentsFiles.map(formatAvailableAgentsFile);
+      const availableAgentsFileOutputs = conversationBootstrap
+        .select(
+          conversationScopeId,
+          "available-agents-files",
+          availableAgentsFiles,
+          (file) => file.path,
+          includeBootstrapContext,
+        )
+        .map(formatAvailableAgentsFile);
+      const visibleSkillDiagnostics = conversationBootstrap.select(
+        conversationScopeId,
+        "skill-diagnostics",
+        workspace.skillDiagnostics,
+        (diagnostic) => JSON.stringify(diagnostic),
+        includeBootstrapContext,
+      );
+      const sharedBootstrapOmitted = includeBootstrapContext && (
+        visibleSkills.length < cardSkills.length
+        || visibleAgentProviders.length < cardAgentProviders.length
+        || visibleAgents.length < cardAgents.length
+        || loadedAgentsFiles.length < cardAgentsFiles.length
+        || availableAgentsFileOutputs.length < cardAvailableAgentsFiles.length
+        || visibleSkillDiagnostics.length < workspace.skillDiagnostics.length
+      );
+      const sharedBootstrapInstruction = sharedBootstrapOmitted
+        ? "Shared instructions, skills, provider metadata, and profiles already advertised earlier in this conversation are omitted here but remain active. Only newly discovered workspace-specific additions are listed."
+        : undefined;
       const cardInstruction = config.skillsEnabled
         ? "Use this workspaceId in all subsequent tool calls for this project. Do not call open_workspace again for this same folder unless this workspaceId stops working, you switch to a different project folder or checkout/worktree mode, or the user requests a new isolated worktree. Follow loaded agentsFiles instructions. Before working under a path listed in availableAgentsFiles, read that instruction file. When a task matches an available skill in skills, read its path before proceeding."
         : "Use this workspaceId in all subsequent tool calls for this project. Do not call open_workspace again for this same folder unless this workspaceId stops working, you switch to a different project folder or checkout/worktree mode, or the user requests a new isolated worktree. Follow loaded agentsFiles instructions. Before working under a path listed in availableAgentsFiles, read that instruction file.";
@@ -856,8 +1020,11 @@ export function createMcpServer(
             "Continue following the project instructions, nested instruction files, skills, agent profiles, and diagnostics previously provided for this workspace. They remain the active workspace context and are not repeated here.",
           ].join("\n\n")
         : workspace.mode === "worktree"
-          ? "Use this workspaceId for subsequent tool calls. Follow the project instructions, nested instruction files, skills, agent profiles, and diagnostics returned for this isolated worktree."
-          : cardInstruction;
+          ? [
+              "Use this workspaceId for subsequent tool calls. Follow the project instructions, nested instruction files, skills, agent profiles, and diagnostics returned for this isolated worktree.",
+              sharedBootstrapInstruction,
+            ].filter(Boolean).join("\n\n")
+          : [cardInstruction, sharedBootstrapInstruction].filter(Boolean).join("\n\n");
       const resultContent: ToolContent[] = [
         {
           type: "text" as const,
@@ -941,7 +1108,7 @@ export function createMcpServer(
                 skills: visibleSkills,
                 agentProviders: visibleAgentProviders,
                 agents: visibleAgents,
-                skillDiagnostics: workspace.skillDiagnostics,
+                skillDiagnostics: visibleSkillDiagnostics,
               }
             : {}),
           instruction,
@@ -1036,6 +1203,76 @@ export function createMcpServer(
           card: {
             workspaceId,
             path: input.path,
+            summary,
+            payload: { content: response.content },
+          },
+        },
+        structuredContent: {
+          result: contentText(response.content),
+        },
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
+    toolNames.localShell,
+    {
+      title: "Personal Mac shell",
+      description:
+        "Run a shell command directly on the user's personal Mac without opening a DevSpace workspace. Use this for explicitly requested personal file management and local system automation outside coding projects. It may inspect, create, modify, move, rename, copy, trash, or delete files. It runs with the current DevSpace service user's authority; DevSpace does not add privilege elevation. Prefer workspace-scoped tools for normal project changes.",
+      inputSchema: {
+        command: z.string().min(1).describe("Shell command to execute on the personal Mac."),
+        workingDirectory: z
+          .string()
+          .optional()
+          .describe("Absolute path or a leading-tilde home path. Defaults to the user's home directory."),
+        timeout: z
+          .number()
+          .positive()
+          .max(300)
+          .optional()
+          .describe("Timeout in seconds. Defaults to 30, max 300."),
+      },
+      outputSchema: resultOutputSchema(),
+      ...toolWidgetDescriptorMeta(config, "shell"),
+      annotations: SHELL_TOOL_ANNOTATIONS,
+    },
+    async ({ workingDirectory, ...input }) => {
+      const startedAt = performance.now();
+      const cwd = await resolveLocalShellWorkingDirectory(workingDirectory);
+      const response = await runShellTool(input, { cwd, root: cwd });
+
+      if (response.isError) {
+        logFailedToolResponse(config, {
+          tool: toolNames.localShell,
+          workingDirectory: cwd,
+          command: input.command,
+          commandLength: input.command.length,
+        }, response.content, startedAt);
+        return response;
+      }
+
+      const summary = {
+        command: input.command,
+        workingDirectory: cwd,
+        ...textSummary(response.content),
+      };
+      logToolCall(config, {
+        tool: toolNames.localShell,
+        workingDirectory: cwd,
+        command: input.command,
+        commandLength: input.command.length,
+        success: true,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+
+      return {
+        ...response,
+        _meta: {
+          tool: toolNames.localShell,
+          card: {
+            path: cwd,
             summary,
             payload: { content: response.content },
           },
@@ -1698,6 +1935,7 @@ export function createServer(
   const reviewCheckpoints = createReviewCheckpointManager();
   const processSessions = new ProcessSessionManager();
   const shortcuts = createShortcutRuntime(config.shortcuts, options.shortcutRuntimeOptions);
+  const conversationBootstrap = new ConversationBootstrapRegistry();
   const localAgentProviders = config.subagents
     ? getLocalAgentProviderAvailabilitySnapshot()
     : [];
@@ -1863,6 +2101,7 @@ export function createServer(
           localAgentProviders,
           incomingArtifactAdapters,
           shortcuts,
+          conversationBootstrap,
         );
         await server.connect(transport);
       } else {

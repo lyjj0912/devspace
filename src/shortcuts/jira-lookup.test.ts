@@ -10,6 +10,7 @@ function mcpJson(value: unknown, retried = false): RemoteMcpReadResult {
     providerCalls: 1,
     connectionReused: true,
     retried,
+    livenessVerified: true,
     response: { content: [{ type: "text", text: JSON.stringify(value) }], isError: false },
   };
 }

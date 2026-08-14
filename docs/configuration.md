@@ -99,6 +99,15 @@ MCP clients discover metadata from:
 | `full` | Exposes the minimal tools plus dedicated `grep`, `glob`, and `ls` tools. |
 | `codex` | Experimental. Exposes `open_workspace`, `read`, `apply_patch`, `exec_command`, and `write_stdin`. Existing mutation and shell tools are hidden. |
 
+This personal deployment also exposes `local_shell` in every tool mode. It does
+not take a `workspaceId`; use it only for explicitly requested personal file
+management or local automation outside coding projects. Its working directory
+must be an absolute path or a leading-tilde home path and defaults to the
+DevSpace service user's home directory. The command runs with that user's
+existing authority, and DevSpace does not add privilege elevation. Because this
+tool intentionally bypasses workspace and allowed-root containment, keep the
+server behind strong authentication.
+
 `DEVSPACE_MINIMAL_TOOLS` remains a backward-compatible alias when
 `DEVSPACE_TOOL_MODE` is unset: `1` selects `minimal` and `0` selects `full`.
 The `codex` mode must be selected through `DEVSPACE_TOOL_MODE` and always uses
@@ -139,8 +148,8 @@ selected core tool mode.
 | Tool | Purpose |
 | --- | --- |
 | `browser_read_shortcut` | List Chrome tabs, open one HTTP(S) URL, and read bounded page text. It cannot click, type, submit, upload, download, or accept model-supplied JavaScript. |
-| `remote_mcp_read_shortcut` | List or invoke allowlisted read-only tools through a configured remote MCP route. One process-wide SSH/stdio session is reused per route. |
-| `jira_lookup_shortcut` | Run one compact Jira issue or JQL lookup through the configured remote MCP shortcut route. |
+| `remote_mcp_read_shortcut` | List or invoke allowlisted read-only tools through a configured remote MCP route. One process-wide SSH/stdio session is reused per route. `list_tools` reports approved/cached capabilities and is explicitly not a provider-liveness check. Generic call output defaults to 10,000 characters; request a larger bound only when necessary. |
+| `jira_lookup_shortcut` | Preferred path for ordinary Jira issue or JQL reads. Returns compact summaries and explicitly requested fields instead of raw provider payloads. |
 
 Configuration keeps provider commands and credentials outside model-visible tool
 inputs:
