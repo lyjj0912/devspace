@@ -44,8 +44,11 @@ the local health and unauthenticated MCP boundary. The PM2 definition fixes the
 service working directory to this repository instead of inheriting the terminal
 directory that happened to launch PM2. `deploy:pm2` normally reloads the
 existing service; when it detects a legacy process whose actual cwd differs
-from the repository, it recreates only the `devspace` PM2 process once and then
-saves the corrected process definition.
+from the repository or still carries the owner credential environment key, it
+recreates only the `devspace` PM2 process once and then saves the corrected
+process definition. The deployment command explicitly removes that credential
+key from its own environment before invoking PM2; the canonical owner
+credential is read from the mode-`0600` `~/.devspace/auth.json` file instead.
 
 ## Core Environment Variables
 

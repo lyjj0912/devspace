@@ -42,6 +42,19 @@ const cliOutput = readFileSync(resolve(root, "dist/cli.js"), "utf8");
 if (!cliOutput.includes('case "maintenance"')) {
   fail("Build output does not contain the maintenance command.");
 }
+const deployOutput = readFileSync(
+  resolve(root, "scripts/deploy-personal-pm2.sh"),
+  "utf8",
+);
+if (!deployOutput.includes("credential_key=DEVSPACE_OAUTH_OWNER_TOKEN")) {
+  fail("PM2 deployment does not define the owner credential environment key.");
+}
+if (!deployOutput.includes('unset "$credential_key"')) {
+  fail("PM2 deployment does not scrub the owner credential environment key.");
+}
+if (!deployOutput.includes("credential environment residue")) {
+  fail("PM2 deployment does not detect credential environment residue.");
+}
 
 const distFiles = walkFiles(resolve(root, "dist"));
 const digest = createHash("sha256");
