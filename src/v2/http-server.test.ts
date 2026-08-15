@@ -54,7 +54,7 @@ test("parallel v2 HTTP skeleton has an independent health endpoint and protected
   };
   assert.equal(healthBody.ok, true);
   assert.equal(healthBody.name, "devspace-universal-broker");
-  assert.equal(healthBody.phase, "phase-2-target-context");
+  assert.equal(healthBody.phase, "phase-4-filesystem");
   assert.equal(healthBody.targetCount, 1);
   assert.equal(typeof healthBody.targetGeneration, "string");
   assert.deepEqual({ ok: healthBody.ok, name: healthBody.name }, {
@@ -121,6 +121,38 @@ test("parallel v2 HTTP skeleton has an independent health endpoint and protected
     } | undefined;
     const contextError = contextStructured?.error;
     assert.equal(contextError?.code, "PATH_NOT_FOUND");
+
+    const filePath = join(root, "http-fs-v2.txt");
+    const fileWrite = await client.callTool({
+      name: "fs",
+      arguments: {
+        operation: "write",
+        path: filePath,
+        content: "http-filesystem-v2\n",
+      },
+    });
+    assert.notEqual(fileWrite.isError, true);
+    const fileRead = await client.callTool({
+      name: "fs",
+      arguments: {
+        operation: "read",
+        path: filePath,
+      },
+    });
+    const fileReadData = (fileRead.structuredContent as {
+      data?: { content?: string; encoding?: string };
+    } | undefined)?.data;
+    assert.equal(fileReadData?.encoding, "utf8");
+    assert.equal(fileReadData?.content, "http-filesystem-v2\n");
+    const fileRemove = await client.callTool({
+      name: "fs",
+      arguments: {
+        operation: "remove",
+        path: filePath,
+        disposition: "permanent",
+      },
+    });
+    assert.notEqual(fileRemove.isError, true);
 
     const executed = await client.callTool({
       name: "exec",

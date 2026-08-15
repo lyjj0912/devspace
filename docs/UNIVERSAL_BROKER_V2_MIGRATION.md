@@ -43,10 +43,18 @@ Implement local and SSH execution, PTY, automatic background conversion,
 stdin/poll/signal/resize, bounded output resources, SSH connection reuse, and
 unknown-dispatch protection.
 
+Status: implemented and fixed at tag
+`universal-broker-v2-phase3-exec-process-20260815`.
+
 ### Phase 4 — filesystem
 
 Implement local and SFTP adapters, atomic writes, patch preconditions, explicit
-deletion, copy/move/sync, external storage, and cross-target transfer.
+deletion, copy/move/sync, and external storage. Cross-target transfer uses the
+artifact plane rather than overloading one-target filesystem operations.
+
+Status: implemented for local filesystems and POSIX SSH/SFTP targets on
+`feat/universal-broker-v2-phase4-filesystem-20260815`. Windows SFTP and local
+administrator filesystem access remain explicit later-phase work.
 
 ### Phase 5 — administrator helper
 

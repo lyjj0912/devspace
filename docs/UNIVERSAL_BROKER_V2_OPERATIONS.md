@@ -25,7 +25,7 @@ Do not point the production connector at `/mcp-next` during development.
 
 ## 2. Configuration
 
-Supported Phase 1 variables:
+Supported parallel-development variables:
 
 ```text
 DEVSPACE_NEXT_HOST
@@ -58,8 +58,9 @@ chmod 600 ~/.devspace/targets.v2.json
 ```
 
 `target list`, `target resolve`, and `target probe` are implemented. Probe output
-separates configured claims from observed capability. Phase 2 intentionally
-reports remote PTY and SFTP probes as not run rather than assuming support.
+separates configured claims from observed capability. Runtime execution and
+filesystem operations perform their own transport checks instead of treating a
+cached target probe as authority.
 
 `context open` accepts existing local absolute/tilde paths and existing remote
 paths on configured SSH targets. It never creates a missing path. Context state
@@ -83,7 +84,7 @@ node dist/cli.js serve-next
 `release:verify` builds v2 and runs the budget gate in addition to all legacy
 tests. A descriptor or server-instruction regression fails the release.
 
-## 4. Phase 1 health checks
+## 4. Parallel endpoint health checks
 
 ```bash
 curl -fsS http://127.0.0.1:7677/healthz-next
@@ -97,12 +98,42 @@ Expected results:
 /mcp-next without bearer token -> 401
 ```
 
-An authenticated client sees exactly eight tools. `target` and the non-diff
-operations of `context` are implemented. The other six tools, context worktree,
-and context diff return `CAPABILITY_UNAVAILABLE` until their implementation
-phases land.
+An authenticated client sees exactly eight tools. `target`, the non-diff
+operations of `context`, `exec`, `process`, and `fs` are implemented. The
+remaining top-level tool names remain stable and return explicit capability
+errors until their implementation phases land.
 
-## 5. Budget report
+## 5. Filesystem behavior
+
+`fs` accepts local absolute or tilde paths, context-relative paths, and POSIX
+paths on configured SSH targets. A context supplies a target and default path;
+it is not a filesystem authority boundary.
+
+Implemented operations:
+
+```text
+stat list read search write patch mkdir copy move remove hash sync
+```
+
+Writes use same-directory staging, file `fsync`, atomic replacement, and an
+optional SHA-256 precondition. A destination symlink is never used for
+publication. POSIX SSH writes above 64 KiB use SFTP staging before a remote
+atomic publish. Remote single-file patching downloads one file, applies the
+shared Codex patch parser locally, then republishes only after rechecking the
+original remote hash.
+
+Deletion is deliberately explicit:
+
+```text
+disposition=permanent
+recursive=true for directories
+```
+
+Trash semantics, Windows SFTP, local administrator filesystem access, and
+cross-target copies are not silently emulated. Cross-target file movement is
+owned by `artifact`.
+
+## 6. Budget report
 
 `npm run v2:budget` prints:
 
@@ -114,7 +145,7 @@ phases land.
 
 The report must be attached to every phase completion record.
 
-## 6. Branch and tag policy
+## 7. Branch and tag policy
 
 Baseline tag:
 
@@ -131,7 +162,7 @@ feat/universal-broker-v2-phase0-1-20260815
 Production deployment is forbidden from this branch. Phase branches merge only
 after their contract, budget, unit, integration, and rollback gates pass.
 
-## 7. Logs
+## 8. Logs
 
 Phase 1 v2 events use the `v2_` prefix, including:
 
@@ -145,13 +176,13 @@ v2_auth_denied
 
 Owner credentials and bearer tokens must never appear in these records.
 
-## 8. Failure handling
+## 9. Failure handling
 
 If the v2 skeleton fails, stop only the v2 process. Production `/mcp` must remain
 available. Delete or archive only the separate v2 state after preserving evidence.
 Do not rotate production OAuth credentials for a v2 development failure.
 
-## 9. Phase completion evidence
+## 10. Phase completion evidence
 
 Each phase records:
 

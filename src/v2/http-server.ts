@@ -21,6 +21,7 @@ import {
 import { SingleUserOAuthProvider } from "../oauth-provider.js";
 import { ContextRegistry } from "./contexts.js";
 import { UniversalExecutionPlane } from "./execution.js";
+import { UniversalFilesystemService } from "./filesystem.js";
 import { createUniversalBrokerMcpServer } from "./server.js";
 import { TargetRegistry } from "./targets.js";
 import {
@@ -36,6 +37,7 @@ export interface RunningUniversalBrokerNextServer {
   targets: TargetRegistry;
   contexts: ContextRegistry;
   execution: UniversalExecutionPlane;
+  filesystem: UniversalFilesystemService;
   close(): Promise<void>;
 }
 
@@ -67,6 +69,12 @@ export function createUniversalBrokerNextServer(
     processOutputMaxBytes: config.processOutputMaxBytes,
     completedProcessTtlMs: config.completedProcessTtlMs,
   });
+  const filesystem = new UniversalFilesystemService(
+    targets,
+    contexts,
+    execution,
+    { sshControlDir: config.sshControlDir },
+  );
   const mcpUrl = new URL(config.endpointPath, config.publicBaseUrl);
   const resourceServerUrl = resourceUrlFromServerUrl(mcpUrl);
   const oauthProvider = new SingleUserOAuthProvider(
@@ -151,7 +159,7 @@ export function createUniversalBrokerNextServer(
       res.json({
         ok: true,
         name: "devspace-universal-broker",
-        phase: "phase-2-target-context",
+        phase: "phase-4-filesystem",
         targetGeneration: snapshot.generation,
         targetCount: snapshot.targets.length,
       });
@@ -159,7 +167,7 @@ export function createUniversalBrokerNextServer(
       res.status(503).json({
         ok: false,
         name: "devspace-universal-broker",
-        phase: "phase-2-target-context",
+        phase: "phase-4-filesystem",
         error: error instanceof Error ? error.message : String(error),
       });
     }
@@ -221,6 +229,7 @@ export function createUniversalBrokerNextServer(
           targets,
           contexts,
           execution,
+          filesystem,
         });
         await server.connect(transport);
       } else {
@@ -247,6 +256,7 @@ export function createUniversalBrokerNextServer(
     targets,
     contexts,
     execution,
+    filesystem,
     close: () => {
       closePromise ??= (async () => {
         clearInterval(cleanupTimer);

@@ -7,6 +7,10 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
 import type { ContextRegistry } from "./contexts.js";
 import type { UniversalExecutionPlane } from "./execution.js";
+import type {
+  UniversalFilesystemInput,
+  UniversalFilesystemService,
+} from "./filesystem.js";
 import {
   UNIVERSAL_BROKER_INSTRUCTIONS,
   UNIVERSAL_BROKER_VERSION,
@@ -29,6 +33,7 @@ export interface UniversalBrokerServices {
   targets?: TargetRegistry;
   contexts?: ContextRegistry;
   execution?: UniversalExecutionPlane;
+  filesystem?: UniversalFilesystemService;
 }
 
 export function createUniversalBrokerMcpServer(
@@ -56,6 +61,8 @@ export function createUniversalBrokerMcpServer(
       registerExecTool(server, services.execution);
     } else if (name === "process" && services.execution) {
       registerProcessTool(server, services.execution);
+    } else if (name === "fs" && services.filesystem) {
+      registerFilesystemTool(server, services.filesystem);
     } else {
       registerUnavailableTool(
         server,
@@ -66,6 +73,39 @@ export function createUniversalBrokerMcpServer(
   }
 
   return server;
+}
+
+function registerFilesystemTool(
+  server: McpServer,
+  filesystem: UniversalFilesystemService,
+): void {
+  const contract = UNIVERSAL_TOOL_CONTRACTS.fs;
+  registerAppTool(
+    server,
+    "fs",
+    {
+      title: contract.title,
+      description: contract.description,
+      inputSchema: contract.inputSchema,
+      annotations: contract.annotations,
+      _meta: {},
+    },
+    async (input, extra) => executeUniversalTool(async () => {
+      requireScope(
+        extra.authInfo?.scopes,
+        isFilesystemMutation(input.operation) ? "devspace.write" : "devspace.read",
+      );
+      if (input.privilege === "admin") {
+        requireScope(extra.authInfo?.scopes, "devspace.admin");
+      }
+      const data = await filesystem.execute(input as UniversalFilesystemInput);
+      return successfulToolResult(
+        data,
+        undefined,
+        filesystemSummaryText(input.operation, data),
+      );
+    }),
+  );
 }
 
 function registerExecTool(server: McpServer, execution: UniversalExecutionPlane): void {
@@ -324,6 +364,24 @@ function processSummaryText(data: Record<string, unknown>): string {
     ? `\n${data.output}`
     : "";
   return `${processId}: ${state}${exitCode}${output}`;
+}
+
+function isFilesystemMutation(
+  operation: UniversalFilesystemInput["operation"],
+): boolean {
+  return !["stat", "list", "read", "search", "hash"].includes(operation);
+}
+
+function filesystemSummaryText(
+  operation: UniversalFilesystemInput["operation"],
+  data: Record<string, unknown>,
+): string {
+  const path = typeof data.path === "string"
+    ? data.path
+    : typeof data.destination === "string"
+      ? data.destination
+      : undefined;
+  return path ? `${operation}: ${path}` : `Filesystem operation completed: ${operation}`;
 }
 
 function templateVariable(value: string | string[] | undefined, name: string): string {
