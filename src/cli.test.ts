@@ -20,6 +20,12 @@ for (const flag of ["-v", "--version"]) {
   assert.equal(output, packageJson.version);
 }
 
+const help = execFileSync("node", ["--import", "tsx", "src/cli.ts", "--help"], {
+  encoding: "utf8",
+  env: { ...process.env, DEVSPACE_CONFIG_DIR: "/tmp/devspace-cli-help-test" },
+});
+assert.match(help, /devspace serve-next/);
+
 const maintenanceRoot = mkdtempSync(join(tmpdir(), "devspace-cli-maintenance-test-"));
 try {
   const output = execFileSync(

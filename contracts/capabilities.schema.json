@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://devspace.local/contracts/capabilities.schema.json",
+  "title": "DevSpace Universal Broker v2 Observed Target Capability",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["targetId", "status", "observedAt", "capabilities"],
+  "properties": {
+    "targetId": { "type": "string", "minLength": 1 },
+    "status": { "enum": ["ONLINE", "OFFLINE", "DEGRADED", "UNKNOWN"] },
+    "observedAt": { "type": "string", "format": "date-time" },
+    "expiresAt": { "type": "string", "format": "date-time" },
+    "platform": { "enum": ["macos", "linux", "windows", "unknown"] },
+    "architecture": { "type": "string" },
+    "homeDirectory": { "type": "string" },
+    "temporaryDirectory": { "type": "string" },
+    "capabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fs", "exec", "pty", "admin", "sftp", "gui", "mcp"],
+      "properties": {
+        "fs": { "type": "boolean" },
+        "exec": { "type": "boolean" },
+        "pty": { "type": "boolean" },
+        "admin": { "type": "boolean" },
+        "sftp": { "type": "boolean" },
+        "rsync": { "type": "boolean" },
+        "git": { "type": "boolean" },
+        "gui": { "type": "boolean" },
+        "mcp": { "type": "boolean" },
+        "durableProcess": { "type": "boolean" }
+      }
+    },
+    "reason": { "type": "string" }
+  }
+}

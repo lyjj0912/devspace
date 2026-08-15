@@ -41,7 +41,7 @@ import { expandHomePath } from "./roots.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
 import { runMaintenance } from "./maintenance.js";
 
-type Command = "serve" | "init" | "doctor" | "maintenance" | "config" | "agents" | "help" | "version";
+type Command = "serve" | "serve-next" | "init" | "doctor" | "maintenance" | "config" | "agents" | "help" | "version";
 const require = createRequire(import.meta.url);
 const SUPPORTED_NODE_RANGE = ">=20.12 <27";
 
@@ -55,6 +55,10 @@ async function main(argv: string[]): Promise<void> {
     case "serve":
       await ensureConfigured();
       await serve();
+      return;
+    case "serve-next":
+      await ensureConfigured();
+      await serveNext();
       return;
     case "init":
       await runInit({ force: args.includes("--force") });
@@ -84,6 +88,7 @@ function normalizeCommand(command: string | undefined): Command {
   if (!command || command === "serve" || command === "start") return "serve";
   if (
     command === "init"
+    || command === "serve-next"
     || command === "doctor"
     || command === "maintenance"
     || command === "config"
@@ -269,6 +274,53 @@ async function serve(): Promise<void> {
   process.once("SIGTERM", handleShutdown);
 }
 
+async function serveNext(): Promise<void> {
+  const sqliteStatus = checkSqliteNative();
+  if (sqliteStatus !== "ok") {
+    throw new Error(
+      [
+        "better-sqlite3 could not load for this Node runtime.",
+        sqliteStatus,
+        "",
+        "Try reinstalling or rebuilding dependencies under the active Node version:",
+        "  npm rebuild better-sqlite3",
+      ].join("\n"),
+    );
+  }
+
+  const [{ createUniversalBrokerNextServer }, { loadUniversalBrokerNextConfig }] = await Promise.all([
+    import("./v2/http-server.js"),
+    import("./v2/config.js"),
+  ]);
+  const config = loadUniversalBrokerNextConfig(loadConfig());
+  const { app, close } = createUniversalBrokerNextServer(config);
+  const httpServer = app.listen(config.port, config.host, () => {
+    console.log(
+      `devspace universal broker skeleton listening on http://${config.host}:${config.port}${config.endpointPath}`,
+    );
+    console.log(`public base url: ${config.publicBaseUrl}`);
+    console.log(`state dir: ${config.stateDir}`);
+    console.log("phase: phase-1-skeleton");
+    console.log("auth: Owner password approval required");
+  });
+
+  let shuttingDown = false;
+  const shutdown = async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    await shutdownHttpServer(httpServer, close);
+    process.exit(0);
+  };
+  const handleShutdown = () => {
+    void shutdown().catch((error) => {
+      console.error("devspace universal broker shutdown failed", error);
+      process.exit(1);
+    });
+  };
+  process.once("SIGINT", handleShutdown);
+  process.once("SIGTERM", handleShutdown);
+}
+
 async function runDoctor(): Promise<void> {
   const files = loadDevspaceFiles();
   console.log(`Config dir: ${files.dir}`);
@@ -288,6 +340,11 @@ async function runDoctor(): Promise<void> {
     console.log(`Allowed roots: ${config.allowedRoots.join(", ")}`);
     console.log(`Allowed hosts: ${config.allowedHosts.join(", ")}`);
     console.log(`Maintenance: ${config.maintenance.enabled ? "enabled" : "disabled"}`);
+    const { loadUniversalBrokerNextConfig } = await import("./v2/config.js");
+    const next = loadUniversalBrokerNextConfig(config);
+    console.log(`Universal Broker v2 local URL: http://${next.host}:${next.port}${next.endpointPath}`);
+    console.log(`Universal Broker v2 public URL: ${new URL(next.endpointPath, next.publicBaseUrl).toString()}`);
+    console.log(`Universal Broker v2 state dir: ${next.stateDir}`);
   } catch (error) {
     console.log(`Config status: ${error instanceof Error ? error.message : String(error)}`);
   }
@@ -339,6 +396,7 @@ function printHelp(): void {
       "Usage:",
       "  devspace                 Run first-time setup if needed, then start the server",
       "  devspace serve           Start the server",
+      "  devspace serve-next      Start the isolated Universal Broker v2 skeleton",
       "  devspace init            Create or update ~/.devspace/config.json and auth.json",
       "  devspace doctor          Show config, runtime, and native dependency status",
       "  devspace maintenance     Prune stale DevSpace sessions, clean managed worktrees, and review refs",

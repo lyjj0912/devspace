@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://devspace.local/contracts/mcp-routes.schema.json",
+  "title": "DevSpace Universal Broker v2 MCP Route Registry",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "routes"],
+  "properties": {
+    "version": { "const": 1 },
+    "routes": {
+      "type": "object",
+      "propertyNames": {
+        "pattern": "^[a-z][a-z0-9._-]{0,63}$"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/route"
+      }
+    }
+  },
+  "$defs": {
+    "route": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["displayName", "transport"],
+      "properties": {
+        "displayName": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "aliases": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1, "maxLength": 128 }
+        },
+        "transport": { "enum": ["local-stdio", "ssh-stdio", "streamable-http"] },
+        "target": { "type": "string", "minLength": 1 },
+        "command": { "type": "string", "minLength": 1 },
+        "args": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "url": { "type": "string", "format": "uri" },
+        "envProfile": { "type": "string", "minLength": 1 },
+        "startupTimeoutMs": { "type": "integer", "minimum": 100, "maximum": 300000 },
+        "callTimeoutMs": { "type": "integer", "minimum": 100, "maximum": 300000 },
+        "idleTimeoutMs": { "type": "integer", "minimum": 1000, "maximum": 3600000 }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "transport": { "const": "local-stdio" } },
+            "required": ["transport"]
+          },
+          "then": { "required": ["command"] }
+        },
+        {
+          "if": {
+            "properties": { "transport": { "const": "ssh-stdio" } },
+            "required": ["transport"]
+          },
+          "then": { "required": ["target", "command"] }
+        },
+        {
+          "if": {
+            "properties": { "transport": { "const": "streamable-http" } },
+            "required": ["transport"]
+          },
+          "then": { "required": ["url"] }
+        }
+      ]
+    }
+  }
+}

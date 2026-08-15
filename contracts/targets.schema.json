@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://devspace.local/contracts/targets.schema.json",
+  "title": "DevSpace Universal Broker v2 Target Registry",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "targets"],
+  "properties": {
+    "version": { "const": 1 },
+    "targets": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": {
+        "pattern": "^[a-z][a-z0-9._-]{0,63}$"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/target"
+      }
+    }
+  },
+  "$defs": {
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["displayName", "transport", "platform", "privilege"],
+      "properties": {
+        "displayName": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "aliases": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "minLength": 1, "maxLength": 128 }
+        },
+        "transport": { "enum": ["local", "ssh"] },
+        "sshHost": { "type": "string", "minLength": 1 },
+        "platform": { "enum": ["macos", "linux", "windows", "unknown"] },
+        "shell": { "enum": ["auto", "sh", "bash", "zsh", "powershell", "cmd"] },
+        "defaultCwd": { "type": "string", "minLength": 1 },
+        "envProfile": { "type": "string", "minLength": 1 },
+        "probeTtlMs": { "type": "integer", "minimum": 1000, "maximum": 3600000 },
+        "privilege": {
+          "$ref": "#/$defs/privilege"
+        },
+        "durableProcess": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode"],
+          "properties": {
+            "mode": { "enum": ["none", "tmux", "systemd-run", "launchd", "task-scheduler"] }
+          }
+        },
+        "gui": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode"],
+          "properties": {
+            "mode": { "enum": ["none", "local-ipc", "ssh-stdio"] },
+            "command": { "type": "string", "minLength": 1 }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "transport": { "const": "ssh" } },
+            "required": ["transport"]
+          },
+          "then": { "required": ["sshHost"] }
+        }
+      ]
+    },
+    "privilege": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["user", "admin"],
+      "properties": {
+        "user": { "const": true },
+        "admin": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode"],
+          "properties": {
+            "mode": { "enum": ["unavailable", "helper", "sudo-n"] },
+            "socketPath": { "type": "string", "minLength": 1 },
+            "helperCommand": { "type": "string", "minLength": 1 }
+          }
+        }
+      }
+    }
+  }
+}

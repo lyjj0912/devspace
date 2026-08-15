@@ -18,7 +18,9 @@ if (!liveOnly) {
   run("npm", ["run", "typecheck"]);
   run("npm", ["test"]);
   run("npm", ["run", "build"]);
+  run("npm", ["run", "v2:budget"]);
   run("git", ["diff", "--check"]);
+  run("git", ["diff", "--cached", "--check"]);
 }
 
 if (requireClean) {
@@ -30,7 +32,21 @@ for (const path of [
   "dist/cli.js",
   "dist/server.js",
   "dist/maintenance.js",
+  "dist/v2/server.js",
+  "dist/v2/http-server.js",
+  "dist/v2/budgets.js",
+  "contracts/tools-v2.schema.json",
+  "contracts/targets.schema.json",
+  "contracts/mcp-routes.schema.json",
+  "contracts/errors.schema.json",
+  "contracts/capabilities.schema.json",
+  "contracts/universal-broker-v2-baseline.json",
+  "docs/UNIVERSAL_BROKER_V2_ARCHITECTURE.md",
+  "docs/UNIVERSAL_BROKER_V2_SECURITY.md",
+  "docs/UNIVERSAL_BROKER_V2_OPERATIONS.md",
+  "docs/UNIVERSAL_BROKER_V2_MIGRATION.md",
   "scripts/deploy-personal-pm2.sh",
+  "scripts/check-universal-broker-v2-budgets.mjs",
 ]) {
   if (!existsSync(resolve(root, path))) fail(`Missing build output: ${path}`);
 }
