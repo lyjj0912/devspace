@@ -1,0 +1,64 @@
+{
+  "version": 1,
+  "targets": {
+    "local": {
+      "displayName": "Local machine",
+      "aliases": ["local", "localhost"],
+      "transport": "local",
+      "platform": "macos",
+      "shell": "zsh",
+      "privilege": {
+        "user": true,
+        "admin": {
+          "mode": "unavailable"
+        }
+      },
+      "durableProcess": {
+        "mode": "none"
+      },
+      "gui": {
+        "mode": "none"
+      }
+    },
+    "company": {
+      "displayName": "Company Mac",
+      "aliases": ["company", "company-mac"],
+      "transport": "ssh",
+      "sshHost": "company",
+      "platform": "macos",
+      "shell": "zsh",
+      "privilege": {
+        "user": true,
+        "admin": {
+          "mode": "unavailable"
+        }
+      },
+      "durableProcess": {
+        "mode": "none"
+      },
+      "gui": {
+        "mode": "none"
+      }
+    },
+    "linux-build": {
+      "displayName": "Linux build server",
+      "aliases": ["build"],
+      "transport": "ssh",
+      "sshHost": "linux-build",
+      "platform": "linux",
+      "shell": "bash",
+      "privilege": {
+        "user": true,
+        "admin": {
+          "mode": "sudo-n"
+        }
+      },
+      "durableProcess": {
+        "mode": "none"
+      },
+      "gui": {
+        "mode": "none"
+      }
+    }
+  }
+}

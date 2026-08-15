@@ -33,10 +33,31 @@ DEVSPACE_NEXT_PORT
 DEVSPACE_NEXT_PUBLIC_BASE_URL
 DEVSPACE_NEXT_MCP_PATH
 DEVSPACE_NEXT_STATE_DIR
+DEVSPACE_NEXT_TARGETS_FILE
+DEVSPACE_NEXT_MCP_ROUTES_FILE
+DEVSPACE_NEXT_CONTEXT_STORE
 DEVSPACE_NEXT_ALLOWED_HOSTS
 DEVSPACE_NEXT_MCP_SESSION_IDLE_TIMEOUT_MS
 DEVSPACE_NEXT_MCP_SESSION_CLEANUP_INTERVAL_MS
 ```
+
+The default target registry is `~/.devspace/targets.v2.json`. The file is hot
+reloaded by content hash. Adding, removing, or renaming a target does not change
+the MCP tool schema or require a DevSpace rebuild. Start from:
+
+```bash
+cp examples/targets.v2.json ~/.devspace/targets.v2.json
+chmod 600 ~/.devspace/targets.v2.json
+```
+
+`target list`, `target resolve`, and `target probe` are implemented. Probe output
+separates configured claims from observed capability. Phase 2 intentionally
+reports remote PTY and SFTP probes as not run rather than assuming support.
+
+`context open` accepts existing local absolute/tilde paths and existing remote
+paths on configured SSH targets. It never creates a missing path. Context state
+is stored in the isolated v2 context store and contains references and hashes,
+not complete instruction or Skill bodies.
 
 During parallel public testing, use a distinct public origin for v2 so its OAuth
 authorization and token endpoints cannot conflict with production.
@@ -69,8 +90,10 @@ Expected results:
 /mcp-next without bearer token -> 401
 ```
 
-An authenticated client sees exactly eight tools. Every tool returns
-`CAPABILITY_UNAVAILABLE` until its implementation phase lands.
+An authenticated client sees exactly eight tools. `target` and the non-diff
+operations of `context` are implemented. The other six tools, context worktree,
+and context diff return `CAPABILITY_UNAVAILABLE` until their implementation
+phases land.
 
 ## 5. Budget report
 

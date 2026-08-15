@@ -19,7 +19,9 @@ import {
   type McpSessionCloseResult,
 } from "../mcp-sessions.js";
 import { SingleUserOAuthProvider } from "../oauth-provider.js";
+import { ContextRegistry } from "./contexts.js";
 import { createUniversalBrokerMcpServer } from "./server.js";
+import { TargetRegistry } from "./targets.js";
 import {
   loadUniversalBrokerNextConfig,
   type UniversalBrokerNextConfig,
@@ -30,6 +32,8 @@ type NextTransport = StreamableHTTPServerTransport;
 export interface RunningUniversalBrokerNextServer {
   app: ReturnType<typeof createMcpExpressApp>;
   config: UniversalBrokerNextConfig;
+  targets: TargetRegistry;
+  contexts: ContextRegistry;
   close(): Promise<void>;
 }
 
@@ -44,6 +48,12 @@ export function createUniversalBrokerNextServer(
     ...(allowedHosts ? { allowedHosts } : {}),
   });
   const transports = new McpSessionRegistry<NextTransport>();
+  const targets = new TargetRegistry({ configPath: config.targetConfigPath });
+  const contexts = new ContextRegistry({
+    storePath: config.contextStorePath,
+    targets,
+    serverConfig: config.serverConfig,
+  });
   const mcpUrl = new URL(config.endpointPath, config.publicBaseUrl);
   const resourceServerUrl = resourceUrlFromServerUrl(mcpUrl);
   const oauthProvider = new SingleUserOAuthProvider(
@@ -122,12 +132,24 @@ export function createUniversalBrokerNextServer(
     }),
   );
 
-  app.get("/healthz-next", (_req, res) => {
-    res.json({
-      ok: true,
-      name: "devspace-universal-broker",
-      phase: "phase-1-skeleton",
-    });
+  app.get("/healthz-next", async (_req, res) => {
+    try {
+      const snapshot = await targets.inspect();
+      res.json({
+        ok: true,
+        name: "devspace-universal-broker",
+        phase: "phase-2-target-context",
+        targetGeneration: snapshot.generation,
+        targetCount: snapshot.targets.length,
+      });
+    } catch (error) {
+      res.status(503).json({
+        ok: false,
+        name: "devspace-universal-broker",
+        phase: "phase-2-target-context",
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
   });
 
   app.all(config.endpointPath, async (req, res) => {
@@ -182,7 +204,7 @@ export function createUniversalBrokerNextServer(
             });
           }
         };
-        const server: McpServer = createUniversalBrokerMcpServer();
+        const server: McpServer = createUniversalBrokerMcpServer({ targets, contexts });
         await server.connect(transport);
       } else {
         sendJsonRpcError(res, 400, -32000, "No valid MCP session");
@@ -205,6 +227,8 @@ export function createUniversalBrokerNextServer(
   return {
     app,
     config,
+    targets,
+    contexts,
     close: () => {
       closePromise ??= (async () => {
         clearInterval(cleanupTimer);

@@ -1,4 +1,4 @@
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import type { ServerConfig } from "../config.js";
 import type { LoggingConfig } from "../logger.js";
 import type { OAuthConfig } from "../oauth-provider.js";
@@ -10,11 +10,15 @@ const DEFAULT_NEXT_SESSION_IDLE_TIMEOUT_MS = 90_000;
 const DEFAULT_NEXT_SESSION_CLEANUP_INTERVAL_MS = 15_000;
 
 export interface UniversalBrokerNextConfig {
+  serverConfig: ServerConfig;
   host: string;
   port: number;
   publicBaseUrl: string;
   endpointPath: string;
   stateDir: string;
+  targetConfigPath: string;
+  mcpRouteConfigPath: string;
+  contextStorePath: string;
   allowedHosts: string[];
   oauth: OAuthConfig;
   logging: LoggingConfig;
@@ -58,13 +62,27 @@ export function loadUniversalBrokerNextConfig(
   if (publicBaseUrl === new URL(base.publicBaseUrl).origin) {
     throw new Error("DEVSPACE_NEXT_PUBLIC_BASE_URL must use a separate origin during parallel development.");
   }
+  const configDir = env.DEVSPACE_CONFIG_DIR
+    ? resolve(expandHomePath(env.DEVSPACE_CONFIG_DIR))
+    : dirname(base.devspaceSkillsDir);
 
   return {
+    serverConfig: base,
     host,
     port,
     publicBaseUrl,
     endpointPath,
     stateDir,
+    targetConfigPath: resolve(expandHomePath(
+      env.DEVSPACE_NEXT_TARGETS_FILE ?? join(configDir, "targets.v2.json"),
+    )),
+    mcpRouteConfigPath: resolve(expandHomePath(
+      env.DEVSPACE_NEXT_MCP_ROUTES_FILE ?? join(configDir, "mcp-routes.v2.json"),
+    )),
+    contextStorePath: resolve(expandHomePath(
+      env.DEVSPACE_NEXT_CONTEXT_STORE
+        ?? join(stateDir, "contexts.json"),
+    )),
     allowedHosts,
     oauth: {
       ownerToken: base.oauth.ownerToken,

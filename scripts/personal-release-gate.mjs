@@ -35,6 +35,9 @@ for (const path of [
   "dist/v2/server.js",
   "dist/v2/http-server.js",
   "dist/v2/budgets.js",
+  "dist/v2/errors.js",
+  "dist/v2/targets.js",
+  "dist/v2/contexts.js",
   "contracts/tools-v2.schema.json",
   "contracts/targets.schema.json",
   "contracts/mcp-routes.schema.json",
@@ -45,6 +48,8 @@ for (const path of [
   "docs/UNIVERSAL_BROKER_V2_SECURITY.md",
   "docs/UNIVERSAL_BROKER_V2_OPERATIONS.md",
   "docs/UNIVERSAL_BROKER_V2_MIGRATION.md",
+  "docs/UNIVERSAL_BROKER_V2_PHASE2_RESULT.md",
+  "examples/targets.v2.json",
   "scripts/deploy-personal-pm2.sh",
   "scripts/check-universal-broker-v2-budgets.mjs",
 ]) {

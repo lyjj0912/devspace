@@ -45,10 +45,21 @@ test("parallel v2 HTTP skeleton has an independent health endpoint and protected
   const origin = `http://127.0.0.1:${address.port}`;
   const health = await fetch(`${origin}/healthz-next`);
   assert.equal(health.status, 200);
-  assert.deepEqual(await health.json(), {
+  const healthBody = await health.json() as {
+    ok: boolean;
+    name: string;
+    phase: string;
+    targetGeneration: string;
+    targetCount: number;
+  };
+  assert.equal(healthBody.ok, true);
+  assert.equal(healthBody.name, "devspace-universal-broker");
+  assert.equal(healthBody.phase, "phase-2-target-context");
+  assert.equal(healthBody.targetCount, 1);
+  assert.equal(typeof healthBody.targetGeneration, "string");
+  assert.deepEqual({ ok: healthBody.ok, name: healthBody.name }, {
     ok: true,
     name: "devspace-universal-broker",
-    phase: "phase-1-skeleton",
   });
 
   const unauthenticated = await fetch(`${origin}${config.endpointPath}`);
@@ -88,7 +99,28 @@ test("parallel v2 HTTP skeleton has an independent health endpoint and protected
       name: "target",
       arguments: { operation: "list" },
     });
-    assert.equal(target.isError, true);
+    assert.notEqual(target.isError, true);
+    const targetStructured = target.structuredContent as {
+      data?: {
+        targets?: Array<{ targetId?: string }>;
+      };
+    } | undefined;
+    const targetData = targetStructured?.data as {
+      targets?: Array<{ targetId?: string }>;
+    } | undefined;
+    assert.equal(targetData?.targets?.[0]?.targetId, "local");
+
+    const missing = join(root, "does-not-exist");
+    const context = await client.callTool({
+      name: "context",
+      arguments: { operation: "open", path: missing },
+    });
+    assert.equal(context.isError, true);
+    const contextStructured = context.structuredContent as {
+      error?: { code?: string };
+    } | undefined;
+    const contextError = contextStructured?.error;
+    assert.equal(contextError?.code, "PATH_NOT_FOUND");
   } finally {
     await client.close();
   }

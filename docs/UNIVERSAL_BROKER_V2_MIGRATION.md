@@ -33,6 +33,10 @@ Implement target registry, alias resolution, capability probes, existing-path
 context open, lazy instruction discovery, and task-relevant Skill search. Add
 executable context and metadata budgets.
 
+Status: implemented on `feat/universal-broker-v2-phase2-target-context-20260815`.
+Context worktree and diff remain intentionally deferred to the filesystem and
+execution phases.
+
 ### Phase 3 — execution and process
 
 Implement local and SSH execution, PTY, automatic background conversion,

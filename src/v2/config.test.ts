@@ -17,6 +17,9 @@ test("next config uses an isolated port, endpoint, state directory, and full own
   assert.equal(next.endpointPath, "/mcp-next");
   assert.equal(next.publicBaseUrl, `http://127.0.0.1:${base.port + 1}`);
   assert.equal(next.stateDir, join(base.stateDir, "universal-broker-v2"));
+  assert.equal(next.targetConfigPath, join(root, ".config", "targets.v2.json"));
+  assert.equal(next.mcpRouteConfigPath, join(root, ".config", "mcp-routes.v2.json"));
+  assert.equal(next.contextStorePath, join(next.stateDir, "contexts.json"));
   assert.deepEqual(next.oauth.scopes, [...UNIVERSAL_OWNER_SCOPES]);
   assert.notEqual(next.stateDir, base.stateDir);
 });
@@ -30,6 +33,9 @@ test("next config accepts explicit parallel deployment values", async (t) => {
     DEVSPACE_NEXT_PUBLIC_BASE_URL: "https://devspace-next.example.com",
     DEVSPACE_NEXT_MCP_PATH: "/mcp-next/v2",
     DEVSPACE_NEXT_STATE_DIR: join(root, "next-state"),
+    DEVSPACE_NEXT_TARGETS_FILE: join(root, "targets.json"),
+    DEVSPACE_NEXT_MCP_ROUTES_FILE: join(root, "routes.json"),
+    DEVSPACE_NEXT_CONTEXT_STORE: join(root, "context-state.json"),
     DEVSPACE_NEXT_ALLOWED_HOSTS: "devspace-next.example.com,127.0.0.1",
     DEVSPACE_NEXT_MCP_SESSION_IDLE_TIMEOUT_MS: "60000",
     DEVSPACE_NEXT_MCP_SESSION_CLEANUP_INTERVAL_MS: "5000",
@@ -42,6 +48,9 @@ test("next config accepts explicit parallel deployment values", async (t) => {
   assert.deepEqual(next.allowedHosts, ["devspace-next.example.com", "127.0.0.1"]);
   assert.equal(next.mcpSessionIdleTimeoutMs, 60_000);
   assert.equal(next.mcpSessionCleanupIntervalMs, 5_000);
+  assert.equal(next.targetConfigPath, join(root, "targets.json"));
+  assert.equal(next.mcpRouteConfigPath, join(root, "routes.json"));
+  assert.equal(next.contextStorePath, join(root, "context-state.json"));
 });
 
 test("next config cannot replace production /mcp or use a pathful public base URL", async (t) => {
@@ -83,7 +92,7 @@ test("next config cannot replace production /mcp or use a pathful public base UR
 
 function baseConfig(root: string) {
   return loadConfig({
-    DEVSPACE_CONFIG_DIR: join(root, "config"),
+    DEVSPACE_CONFIG_DIR: join(root, ".config"),
     DEVSPACE_ALLOWED_ROOTS: root,
     DEVSPACE_STATE_DIR: join(root, "state"),
     DEVSPACE_WORKTREE_ROOT: join(root, "worktrees"),

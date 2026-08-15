@@ -1,6 +1,6 @@
 # DevSpace Universal Broker v2 Architecture
 
-Status: Phase 0 contract frozen; Phase 1 skeleton implemented on an isolated branch.
+Status: Phase 0 contract frozen; Phase 1 skeleton and Phase 2 target/context services implemented on isolated branches.
 
 Baseline: `ea32ae5bb3518734309f4b95f222df997c045b61`, tagged
 `universal-broker-v2-baseline-20260815`.
@@ -245,7 +245,7 @@ v2 does not:
 - silently downgrade a write request to read-only behavior;
 - create missing paths when the caller intended to open existing context.
 
-## 10. Phase 1 implementation status
+## 10. Current implementation status
 
 Implemented:
 
@@ -257,13 +257,25 @@ Implemented:
 - `serve-next` CLI command;
 - baseline, target, route, error, and capability contracts;
 - in-memory and HTTP boundary tests.
+- dynamic target registry loaded from `targets.v2.json`;
+- exact ID/display-name/alias resolution without fuzzy retries;
+- cached local, POSIX SSH, and Windows SSH capability probes;
+- existing-path-only local and remote context opening;
+- persistent context handles in isolated v2 state;
+- instruction references by path, size, and SHA-256 without eager content;
+- task-ranked Skill suggestions limited to five;
+- hard initial/reused context payload budgets with deterministic trimming;
+- bounded explicit context search and close;
+- live validation against local external storage and an SSH-reachable Mac.
 
 Not implemented yet:
 
-- target registry and probes;
-- context index and lazy Skill search;
+- context worktree creation and context diff resources;
 - filesystem and execution adapters;
 - privileged helper;
 - generic downstream MCP proxy;
 - artifact and GUI implementation;
 - v2 production deployment.
+
+The checked-in `examples/targets.v2.json` demonstrates the configuration shape.
+The active machine-specific registry is stored outside Git with mode `0600`.

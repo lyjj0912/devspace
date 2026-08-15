@@ -293,14 +293,17 @@ async function serveNext(): Promise<void> {
     import("./v2/config.js"),
   ]);
   const config = loadUniversalBrokerNextConfig(loadConfig());
-  const { app, close } = createUniversalBrokerNextServer(config);
+  const { app, close, targets } = createUniversalBrokerNextServer(config);
+  const targetSnapshot = await targets.inspect();
   const httpServer = app.listen(config.port, config.host, () => {
     console.log(
       `devspace universal broker skeleton listening on http://${config.host}:${config.port}${config.endpointPath}`,
     );
     console.log(`public base url: ${config.publicBaseUrl}`);
     console.log(`state dir: ${config.stateDir}`);
-    console.log("phase: phase-1-skeleton");
+    console.log("phase: phase-2-target-context");
+    console.log(`target registry: ${config.targetConfigPath}`);
+    console.log(`targets: ${targetSnapshot.targets.length} (${targetSnapshot.generation})`);
     console.log("auth: Owner password approval required");
   });
 
@@ -345,6 +348,10 @@ async function runDoctor(): Promise<void> {
     console.log(`Universal Broker v2 local URL: http://${next.host}:${next.port}${next.endpointPath}`);
     console.log(`Universal Broker v2 public URL: ${new URL(next.endpointPath, next.publicBaseUrl).toString()}`);
     console.log(`Universal Broker v2 state dir: ${next.stateDir}`);
+    const { TargetRegistry } = await import("./v2/targets.js");
+    const targets = await new TargetRegistry({ configPath: next.targetConfigPath }).inspect();
+    console.log(`Universal Broker v2 target registry: ${next.targetConfigPath}`);
+    console.log(`Universal Broker v2 targets: ${targets.targets.length} (${targets.generation})`);
   } catch (error) {
     console.log(`Config status: ${error instanceof Error ? error.message : String(error)}`);
   }
