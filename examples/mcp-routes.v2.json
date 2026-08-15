@@ -1,0 +1,34 @@
+{
+  "version": 1,
+  "routes": {
+    "local-example": {
+      "displayName": "Local Example MCP",
+      "aliases": ["example"],
+      "transport": "local-stdio",
+      "command": "/absolute/path/to/node",
+      "args": ["/absolute/path/to/server.js"],
+      "startupTimeoutMs": 15000,
+      "callTimeoutMs": 120000,
+      "idleTimeoutMs": 300000
+    },
+    "remote-example": {
+      "displayName": "Remote Example MCP",
+      "aliases": ["remote example"],
+      "transport": "ssh-stdio",
+      "target": "company",
+      "command": "/absolute/remote/path/to/server",
+      "args": [],
+      "startupTimeoutMs": 30000,
+      "callTimeoutMs": 120000,
+      "idleTimeoutMs": 300000
+    },
+    "http-example": {
+      "displayName": "HTTPS Example MCP",
+      "transport": "streamable-http",
+      "url": "https://mcp.example.com/mcp",
+      "startupTimeoutMs": 15000,
+      "callTimeoutMs": 120000,
+      "idleTimeoutMs": 300000
+    }
+  }
+}

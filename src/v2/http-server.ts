@@ -22,6 +22,8 @@ import { SingleUserOAuthProvider } from "../oauth-provider.js";
 import { ContextRegistry } from "./contexts.js";
 import { UniversalExecutionPlane } from "./execution.js";
 import { UniversalFilesystemService } from "./filesystem.js";
+import { UniversalMcpProxy } from "./mcp-proxy.js";
+import { UniversalMcpRouteRegistry } from "./mcp-routes.js";
 import { createUniversalBrokerMcpServer } from "./server.js";
 import { TargetRegistry } from "./targets.js";
 import {
@@ -38,6 +40,8 @@ export interface RunningUniversalBrokerNextServer {
   contexts: ContextRegistry;
   execution: UniversalExecutionPlane;
   filesystem: UniversalFilesystemService;
+  mcpRoutes: UniversalMcpRouteRegistry;
+  mcpProxy: UniversalMcpProxy;
   close(): Promise<void>;
 }
 
@@ -73,6 +77,12 @@ export function createUniversalBrokerNextServer(
     targets,
     contexts,
     execution,
+    { sshControlDir: config.sshControlDir },
+  );
+  const mcpRoutes = new UniversalMcpRouteRegistry(config.mcpRouteConfigPath);
+  const mcpProxy = new UniversalMcpProxy(
+    mcpRoutes,
+    targets,
     { sshControlDir: config.sshControlDir },
   );
   const mcpUrl = new URL(config.endpointPath, config.publicBaseUrl);
@@ -156,18 +166,21 @@ export function createUniversalBrokerNextServer(
   app.get("/healthz-next", async (_req, res) => {
     try {
       const snapshot = await targets.inspect();
+      const routeSnapshot = await mcpRoutes.inspect();
       res.json({
         ok: true,
         name: "devspace-universal-broker",
-        phase: "phase-4-filesystem",
+        phase: "phase-6-generic-mcp",
         targetGeneration: snapshot.generation,
         targetCount: snapshot.targets.length,
+        mcpRouteGeneration: routeSnapshot.generation,
+        mcpRouteCount: routeSnapshot.routes.length,
       });
     } catch (error) {
       res.status(503).json({
         ok: false,
         name: "devspace-universal-broker",
-        phase: "phase-4-filesystem",
+        phase: "phase-6-generic-mcp",
         error: error instanceof Error ? error.message : String(error),
       });
     }
@@ -230,6 +243,7 @@ export function createUniversalBrokerNextServer(
           contexts,
           execution,
           filesystem,
+          mcpProxy,
         });
         await server.connect(transport);
       } else {
@@ -257,11 +271,14 @@ export function createUniversalBrokerNextServer(
     contexts,
     execution,
     filesystem,
+    mcpRoutes,
+    mcpProxy,
     close: () => {
       closePromise ??= (async () => {
         clearInterval(cleanupTimer);
         const results = await transports.closeAll();
         logSessionCloseResults("server_shutdown", results);
+        await mcpProxy.close();
         await execution.close();
         oauthProvider.close();
       })();

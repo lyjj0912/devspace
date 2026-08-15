@@ -127,3 +127,27 @@ Every operation has a non-secret operation ID. Audit metadata may include target
 adapter, privilege, duration, result class, exit state, byte count, and hashes.
 Raw file contents, full commands, credentials, and downstream payloads are not
 default audit fields.
+
+## 11. Downstream MCP credentials
+
+MCP route files are configuration, not secret stores. Do not place bearer
+tokens, passwords, private keys, or secret environment values in route command
+arguments or URLs.
+
+Permitted patterns are:
+
+- a local `envProfile` resolved into the child environment without logging;
+- a remote credential file or platform credential store read by the remote MCP;
+- an authenticated HTTPS MCP whose credential provider does not embed secrets
+  in the URL;
+- a local stdio wrapper that obtains secrets from an owner-only source without
+  putting them in argv.
+
+SSH route arguments may reference a remote owner-only environment file, but
+secret values themselves must not appear in the route registry or SSH argv.
+Route files and remote credential files use mode `0600`.
+
+Downstream write and destructive tools require the owner OAuth scope
+`devspace.mcp`; there is no mutation-name denylist. Provider errors are returned
+as `MCP_PROVIDER_ERROR`. A connection loss after dispatch is
+`MCP_RESULT_UNKNOWN` and is never automatically retried.

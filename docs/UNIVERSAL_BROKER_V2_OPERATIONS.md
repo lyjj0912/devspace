@@ -48,6 +48,17 @@ DEVSPACE_NEXT_MCP_SESSION_IDLE_TIMEOUT_MS
 DEVSPACE_NEXT_MCP_SESSION_CLEANUP_INTERVAL_MS
 ```
 
+The default downstream MCP route registry is:
+
+```text
+~/.devspace/mcp-routes.v2.json
+```
+
+It follows `contracts/mcp-routes.schema.json`. Use
+`examples/mcp-routes.v2.json` as a shape reference, replace placeholder paths,
+and set mode `0600`. Configuration is hot reloaded; route changes do not require
+a top-level MCP schema refresh.
+
 The default target registry is `~/.devspace/targets.v2.json`. The file is hot
 reloaded by content hash. Adding, removing, or renaming a target does not change
 the MCP tool schema or require a DevSpace rebuild. Start from:
@@ -102,6 +113,23 @@ An authenticated client sees exactly eight tools. `target`, the non-diff
 operations of `context`, `exec`, `process`, and `fs` are implemented. The
 remaining top-level tool names remain stable and return explicit capability
 errors until their implementation phases land.
+
+`mcp` is also implemented. Its operations are:
+
+```text
+routes search_tools describe_tool invoke
+list_resources read_resource list_prompts get_prompt close
+```
+
+`search_tools` returns at most five relevant tools. `describe_tool` returns one
+exact provider schema. `invoke` accepts provider read, write, and destructive
+tools under `devspace.mcp`. `list_resources` includes static resources and
+resource templates. Large provider results are paged through
+`devspace://mcp-result/...`.
+
+Route files must not contain secret values. For an SSH route whose provider
+needs secrets, provision an owner-only credential source on the remote target
+and make the configured remote command load it before `exec`-ing the MCP.
 
 ## 5. Filesystem behavior
 

@@ -67,6 +67,11 @@ Implement local stdio, SSH stdio, and Streamable HTTP routes; tools, resources,
 and prompts; lazy schema discovery; full read/write/destructive invocation; and
 unknown-result protection.
 
+Status: implemented on
+`feat/universal-broker-v2-phase6-generic-mcp-20260815`. Downstream
+read/write/destructive fixture calls and a real company Jira read route were
+verified without adding a Jira-specific top-level tool.
+
 ### Phase 7 — artifact and GUI
 
 Implement bidirectional host file exchange and generic local/remote GUI nodes.

@@ -151,6 +151,20 @@ Service-specific parsers and read-only tool-name filters are outside the v2 core
 contract. A downstream mutation is authorized by scope and route policy, not by
 English prefixes in the downstream tool name.
 
+Routes are runtime data loaded from `~/.devspace/mcp-routes.v2.json` by default.
+The registry hot reloads by content hash; adding Jira, Chrome, database, or
+another downstream MCP does not change the eight top-level tool descriptors.
+
+Downstream sessions are pooled by route with an LRU limit and route-specific
+idle TTL. A changed route fingerprint replaces the previous session. Tool
+schemas are discovered lazily: search returns at most five candidates and
+describe returns only one exact schema.
+
+Potentially mutating downstream calls are never replayed after dispatch. A
+transport failure after `tools/call` begins returns `MCP_RESULT_UNKNOWN`. Large
+results are projected into a bounded preview and retained behind
+`devspace://mcp-result/...` resources with TTL and character quotas.
+
 ### 3.6 Artifact plane
 
 `artifact` streams files between the MCP host, local target, and remote targets.

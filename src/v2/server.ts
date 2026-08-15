@@ -11,6 +11,10 @@ import type {
   UniversalFilesystemInput,
   UniversalFilesystemService,
 } from "./filesystem.js";
+import type {
+  UniversalMcpInput,
+  UniversalMcpProxy,
+} from "./mcp-proxy.js";
 import {
   UNIVERSAL_BROKER_INSTRUCTIONS,
   UNIVERSAL_BROKER_VERSION,
@@ -34,6 +38,7 @@ export interface UniversalBrokerServices {
   contexts?: ContextRegistry;
   execution?: UniversalExecutionPlane;
   filesystem?: UniversalFilesystemService;
+  mcpProxy?: UniversalMcpProxy;
 }
 
 export function createUniversalBrokerMcpServer(
@@ -51,6 +56,7 @@ export function createUniversalBrokerMcpServer(
   );
 
   if (services.execution) registerProcessOutputResource(server, services.execution);
+  if (services.mcpProxy) registerMcpResultResource(server, services.mcpProxy);
 
   for (const name of UNIVERSAL_TOOL_NAMES) {
     if (name === "target" && services.targets) {
@@ -63,6 +69,8 @@ export function createUniversalBrokerMcpServer(
       registerProcessTool(server, services.execution);
     } else if (name === "fs" && services.filesystem) {
       registerFilesystemTool(server, services.filesystem);
+    } else if (name === "mcp" && services.mcpProxy) {
+      registerMcpTool(server, services.mcpProxy);
     } else {
       registerUnavailableTool(
         server,
@@ -73,6 +81,30 @@ export function createUniversalBrokerMcpServer(
   }
 
   return server;
+}
+
+function registerMcpTool(server: McpServer, proxy: UniversalMcpProxy): void {
+  const contract = UNIVERSAL_TOOL_CONTRACTS.mcp;
+  registerAppTool(
+    server,
+    "mcp",
+    {
+      title: contract.title,
+      description: contract.description,
+      inputSchema: contract.inputSchema,
+      annotations: contract.annotations,
+      _meta: {},
+    },
+    async (input, extra) => executeUniversalTool(async () => {
+      requireScope(extra.authInfo?.scopes, "devspace.mcp");
+      const data = await proxy.execute(input as UniversalMcpInput);
+      return successfulToolResult(
+        data,
+        undefined,
+        mcpSummaryText(input.operation, data),
+      );
+    }),
+  );
 }
 
 function registerFilesystemTool(
@@ -191,6 +223,38 @@ function registerProcessOutputResource(
             totalBytes: chunk.totalBytes,
             truncated: chunk.truncated,
           },
+        }],
+      };
+    },
+  );
+}
+
+function registerMcpResultResource(
+  server: McpServer,
+  proxy: UniversalMcpProxy,
+): void {
+  server.registerResource(
+    "Universal Broker MCP result",
+    new ResourceTemplate(
+      "devspace://mcp-result/{resultId}/{offset}/{limit}",
+      { list: undefined },
+    ),
+    {
+      title: "Paged downstream MCP result",
+      description: "Bounded JSON chunk from a downstream MCP result retained in the v2 result store.",
+      mimeType: "application/json",
+    },
+    async (uri, _variables, extra) => {
+      requireScope(extra.authInfo?.scopes, "devspace.mcp");
+      const page = proxy.readStoredResult(uri.href);
+      return {
+        contents: [{
+          uri: uri.href,
+          mimeType: "application/json",
+          text: String(page.text ?? ""),
+          _meta: Object.fromEntries(
+            Object.entries(page).filter(([key]) => !["uri", "mimeType", "text"].includes(key)),
+          ),
         }],
       };
     },
@@ -382,6 +446,24 @@ function filesystemSummaryText(
       ? data.destination
       : undefined;
   return path ? `${operation}: ${path}` : `Filesystem operation completed: ${operation}`;
+}
+
+function mcpSummaryText(
+  operation: UniversalMcpInput["operation"],
+  data: Record<string, unknown>,
+): string {
+  const route = data.route;
+  const routeId = route && typeof route === "object"
+    ? (route as Record<string, unknown>).routeId
+    : undefined;
+  const count = Array.isArray(data.routes)
+    ? data.routes.length
+    : Array.isArray(data.tools)
+      ? data.tools.length
+      : undefined;
+  if (typeof routeId === "string") return `${operation}: ${routeId}`;
+  if (typeof count === "number") return `${operation}: ${count} result(s)`;
+  return `MCP operation completed: ${operation}`;
 }
 
 function templateVariable(value: string | string[] | undefined, name: string): string {

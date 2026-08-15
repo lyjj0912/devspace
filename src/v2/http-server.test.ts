@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -16,6 +16,19 @@ import { loadUniversalBrokerNextConfig } from "./config.js";
 test("parallel v2 HTTP skeleton has an independent health endpoint and protected MCP endpoint", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "devspace-v2-http-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));
+  const mcpRoutes = join(root, "mcp-routes.json");
+  await writeFile(mcpRoutes, JSON.stringify({
+    version: 1,
+    routes: {
+      fixture: {
+        displayName: "Fixture MCP",
+        aliases: ["fixture"],
+        transport: "local-stdio",
+        command: process.execPath,
+        args: ["--import", "tsx", "src/v2/fixtures/mcp-fixture.ts"],
+      },
+    },
+  }, null, 2));
   const base = loadConfig({
     DEVSPACE_CONFIG_DIR: join(root, "config"),
     DEVSPACE_ALLOWED_ROOTS: root,
@@ -29,6 +42,7 @@ test("parallel v2 HTTP skeleton has an independent health endpoint and protected
   });
   const config = loadUniversalBrokerNextConfig(base, {
     DEVSPACE_NEXT_PUBLIC_BASE_URL: "http://127.0.0.1:17677",
+    DEVSPACE_NEXT_MCP_ROUTES_FILE: mcpRoutes,
   });
   const running = createUniversalBrokerNextServer(config);
   const httpServer = running.app.listen(0, "127.0.0.1");
@@ -51,12 +65,16 @@ test("parallel v2 HTTP skeleton has an independent health endpoint and protected
     phase: string;
     targetGeneration: string;
     targetCount: number;
+    mcpRouteGeneration: string;
+    mcpRouteCount: number;
   };
   assert.equal(healthBody.ok, true);
   assert.equal(healthBody.name, "devspace-universal-broker");
-  assert.equal(healthBody.phase, "phase-4-filesystem");
+  assert.equal(healthBody.phase, "phase-6-generic-mcp");
   assert.equal(healthBody.targetCount, 1);
+  assert.equal(healthBody.mcpRouteCount, 1);
   assert.equal(typeof healthBody.targetGeneration, "string");
+  assert.equal(typeof healthBody.mcpRouteGeneration, "string");
   assert.deepEqual({ ok: healthBody.ok, name: healthBody.name }, {
     ok: true,
     name: "devspace-universal-broker",
@@ -153,6 +171,95 @@ test("parallel v2 HTTP skeleton has an independent health endpoint and protected
       },
     });
     assert.notEqual(fileRemove.isError, true);
+
+    const mcpRoutesResult = await client.callTool({
+      name: "mcp",
+      arguments: { operation: "routes" },
+    });
+    const mcpRoutesData = (mcpRoutesResult.structuredContent as {
+      data?: { routes?: Array<{ routeId?: string }> };
+    } | undefined)?.data;
+    assert.equal(mcpRoutesData?.routes?.[0]?.routeId, "fixture");
+
+    const mcpWrite = await client.callTool({
+      name: "mcp",
+      arguments: {
+        operation: "invoke",
+        route: "fixture",
+        name: "write_value",
+        arguments: { key: "http", value: "proxied" },
+      },
+    });
+    assert.notEqual(mcpWrite.isError, true);
+    const mcpRead = await client.callTool({
+      name: "mcp",
+      arguments: {
+        operation: "invoke",
+        route: "fixture",
+        name: "read_value",
+        arguments: { key: "http" },
+      },
+    });
+    assert.match(JSON.stringify(mcpRead.structuredContent), /proxied/);
+
+    const mcpResource = await client.callTool({
+      name: "mcp",
+      arguments: {
+        operation: "read_resource",
+        route: "fixture",
+        uri: "fixture://state",
+      },
+    });
+    assert.match(JSON.stringify(mcpResource.structuredContent), /http/);
+
+    const mcpPrompt = await client.callTool({
+      name: "mcp",
+      arguments: {
+        operation: "get_prompt",
+        route: "fixture",
+        name: "fixture_prompt",
+        arguments: { subject: "HTTP proxy" },
+      },
+    });
+    assert.match(JSON.stringify(mcpPrompt.structuredContent), /Inspect HTTP proxy/);
+
+    const mcpLarge = await client.callTool({
+      name: "mcp",
+      arguments: {
+        operation: "invoke",
+        route: "fixture",
+        name: "large_result",
+        arguments: { characters: 20_000 },
+        responsePolicy: { maxCharacters: 500, preserveFullResult: true },
+      },
+    });
+    const largeData = (mcpLarge.structuredContent as {
+      data?: { result?: { resourceUri?: string; truncated?: boolean } };
+    } | undefined)?.data?.result;
+    assert.equal(largeData?.truncated, true);
+    assert.equal(typeof largeData?.resourceUri, "string");
+    const mcpResultResource = await client.readResource({ uri: largeData!.resourceUri! });
+    const mcpResultContent = mcpResultResource.contents[0];
+    assert.ok(mcpResultContent && "text" in mcpResultContent);
+    assert.match(mcpResultContent.text, /^\{"content"/);
+    assert.equal(mcpResultContent.text.length, 12_000);
+    const mcpResultMeta = mcpResultContent._meta as {
+      truncated?: boolean;
+      nextResourceUri?: string;
+    } | undefined;
+    assert.equal(mcpResultMeta?.truncated, true);
+    assert.equal(typeof mcpResultMeta?.nextResourceUri, "string");
+
+    const mcpDelete = await client.callTool({
+      name: "mcp",
+      arguments: {
+        operation: "invoke",
+        route: "fixture",
+        name: "delete_value",
+        arguments: { key: "http" },
+      },
+    });
+    assert.notEqual(mcpDelete.isError, true);
 
     const executed = await client.callTool({
       name: "exec",
