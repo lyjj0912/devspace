@@ -77,6 +77,11 @@ verified without adding a Jira-specific top-level tool.
 Implement bidirectional host file exchange and generic local/remote GUI nodes.
 Migrate Chrome to a downstream Chrome DevTools MCP route.
 
+Artifact status: implemented on
+`feat/universal-broker-v2-phase7-artifact-gui-20260815`. Native/URL receive,
+local/remote copy, and one-time publish have deterministic and real-target
+evidence. Generic GUI remains the next milestone on the same branch lineage.
+
 ### Phase 8 — lifecycle and load
 
 Add session LRU, process and buffer quotas, downstream connection quotas,

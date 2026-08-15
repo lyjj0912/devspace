@@ -4,10 +4,12 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { Readable } from "node:stream";
 import test from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { loadConfig } from "../config.js";
+import type { IncomingArtifactAdapter } from "../incoming-artifacts.js";
 import { SqliteOAuthStore } from "../oauth-store.js";
 import { UNIVERSAL_TOOL_NAMES } from "./contracts.js";
 import { createUniversalBrokerNextServer } from "./http-server.js";
@@ -44,7 +46,28 @@ test("parallel v2 HTTP skeleton has an independent health endpoint and protected
     DEVSPACE_NEXT_PUBLIC_BASE_URL: "http://127.0.0.1:17677",
     DEVSPACE_NEXT_MCP_ROUTES_FILE: mcpRoutes,
   });
-  const running = createUniversalBrokerNextServer(config);
+  const nativeArtifactAdapter: IncomingArtifactAdapter = {
+    id: "http-fixture",
+    canHandle(value) {
+      return Boolean(
+        value
+        && typeof value === "object"
+        && (value as { httpFixture?: boolean }).httpFixture === true
+      );
+    },
+    async open() {
+      const content = Buffer.from("native-http-artifact\n");
+      return {
+        name: "native-http.txt",
+        mimeType: "text/plain",
+        size: content.length,
+        stream: Readable.from(content),
+      };
+    },
+  };
+  const running = createUniversalBrokerNextServer(config, {
+    incomingArtifactAdapters: [nativeArtifactAdapter],
+  });
   const httpServer = running.app.listen(0, "127.0.0.1");
   await new Promise<void>((resolve, reject) => {
     httpServer.once("listening", resolve);
@@ -70,7 +93,7 @@ test("parallel v2 HTTP skeleton has an independent health endpoint and protected
   };
   assert.equal(healthBody.ok, true);
   assert.equal(healthBody.name, "devspace-universal-broker");
-  assert.equal(healthBody.phase, "phase-6-generic-mcp");
+  assert.equal(healthBody.phase, "phase-7-artifact");
   assert.equal(healthBody.targetCount, 1);
   assert.equal(healthBody.mcpRouteCount, 1);
   assert.equal(typeof healthBody.targetGeneration, "string");
@@ -260,6 +283,91 @@ test("parallel v2 HTTP skeleton has an independent health endpoint and protected
       },
     });
     assert.notEqual(mcpDelete.isError, true);
+
+    const receivedPath = join(root, "http-artifact-received.txt");
+    const copiedPath = join(root, "http-artifact-copied.txt");
+    const artifactReceive = await client.callTool({
+      name: "artifact",
+      arguments: {
+        operation: "receive",
+        source: { file: { httpFixture: true } },
+        destination: { path: receivedPath },
+      },
+    });
+    assert.notEqual(artifactReceive.isError, true);
+    const artifactReceiveData = (artifactReceive.structuredContent as {
+      data?: { sourceKind?: string; size?: number };
+    } | undefined)?.data;
+    assert.equal(artifactReceiveData?.sourceKind, "native:http-fixture");
+    assert.equal(artifactReceiveData?.size, 21);
+
+    const receivedRead = await client.callTool({
+      name: "fs",
+      arguments: { operation: "read", path: receivedPath },
+    });
+    const receivedReadData = (receivedRead.structuredContent as {
+      data?: { content?: string };
+    } | undefined)?.data;
+    assert.equal(receivedReadData?.content, "native-http-artifact\n");
+
+    const artifactCopy = await client.callTool({
+      name: "artifact",
+      arguments: {
+        operation: "copy",
+        source: { path: receivedPath },
+        destination: { path: copiedPath },
+      },
+    });
+    assert.notEqual(artifactCopy.isError, true);
+    const copiedRead = await client.callTool({
+      name: "fs",
+      arguments: { operation: "read", path: copiedPath },
+    });
+    const copiedReadData = (copiedRead.structuredContent as {
+      data?: { content?: string };
+    } | undefined)?.data;
+    assert.equal(copiedReadData?.content, "native-http-artifact\n");
+
+    const artifactPublish = await client.callTool({
+      name: "artifact",
+      arguments: {
+        operation: "publish",
+        source: {
+          path: copiedPath,
+          name: "published-http-artifact.txt",
+          mimeType: "text/plain",
+        },
+        ttlSeconds: 60,
+      },
+    });
+    assert.notEqual(artifactPublish.isError, true);
+    const publishedData = (artifactPublish.structuredContent as {
+      data?: { resourceUri?: string; oneTime?: boolean };
+    } | undefined)?.data;
+    assert.equal(publishedData?.oneTime, true);
+    assert.equal(typeof publishedData?.resourceUri, "string");
+    const artifactPublishContent = artifactPublish.content as Array<{
+      type?: string;
+      name?: string;
+      uri?: string;
+    }>;
+    const resourceLink = artifactPublishContent.find(
+      (entry) => entry.type === "resource_link",
+    );
+    assert.ok(resourceLink && resourceLink.type === "resource_link");
+    assert.equal(resourceLink.name, "published-http-artifact.txt");
+
+    for (const path of [receivedPath, copiedPath]) {
+      const removed = await client.callTool({
+        name: "fs",
+        arguments: {
+          operation: "remove",
+          path,
+          disposition: "permanent",
+        },
+      });
+      assert.notEqual(removed.isError, true);
+    }
 
     const executed = await client.callTool({
       name: "exec",

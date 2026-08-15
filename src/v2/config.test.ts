@@ -26,6 +26,11 @@ test("next config uses an isolated port, endpoint, state directory, and full own
   assert.equal(next.processBufferCharacters, 1_000_000);
   assert.equal(next.processOutputMaxBytes, 100 * 1024 * 1024);
   assert.equal(next.completedProcessTtlMs, 15 * 60 * 1_000);
+  assert.equal(next.artifactStagingDir, join(next.stateDir, "artifacts"));
+  assert.equal(next.artifactMaximumEntries, 64);
+  assert.equal(next.artifactMaximumTotalBytes, 2 * 1024 * 1024 * 1024);
+  assert.equal(next.artifactMaximumFileBytes, 1024 * 1024 * 1024);
+  assert.equal(next.artifactTtlMs, 15 * 60 * 1_000);
   assert.deepEqual(next.oauth.scopes, [...UNIVERSAL_OWNER_SCOPES]);
   assert.notEqual(next.stateDir, base.stateDir);
 });
@@ -49,6 +54,11 @@ test("next config accepts explicit parallel deployment values", async (t) => {
     DEVSPACE_NEXT_PROCESS_BUFFER_CHARACTERS: "200000",
     DEVSPACE_NEXT_PROCESS_OUTPUT_MAX_BYTES: "4000000",
     DEVSPACE_NEXT_COMPLETED_PROCESS_TTL_MS: "120000",
+    DEVSPACE_NEXT_ARTIFACT_STAGING_DIR: join(root, "artifact-staging"),
+    DEVSPACE_NEXT_ARTIFACT_MAXIMUM_ENTRIES: "10",
+    DEVSPACE_NEXT_ARTIFACT_MAXIMUM_TOTAL_BYTES: "2000000",
+    DEVSPACE_NEXT_ARTIFACT_MAXIMUM_FILE_BYTES: "1000000",
+    DEVSPACE_NEXT_ARTIFACT_TTL_MS: "60000",
     DEVSPACE_NEXT_ALLOWED_HOSTS: "devspace-next.example.com,127.0.0.1",
     DEVSPACE_NEXT_MCP_SESSION_IDLE_TIMEOUT_MS: "60000",
     DEVSPACE_NEXT_MCP_SESSION_CLEANUP_INTERVAL_MS: "5000",
@@ -71,6 +81,11 @@ test("next config accepts explicit parallel deployment values", async (t) => {
   assert.equal(next.processBufferCharacters, 200_000);
   assert.equal(next.processOutputMaxBytes, 4_000_000);
   assert.equal(next.completedProcessTtlMs, 120_000);
+  assert.equal(next.artifactStagingDir, join(root, "artifact-staging"));
+  assert.equal(next.artifactMaximumEntries, 10);
+  assert.equal(next.artifactMaximumTotalBytes, 2_000_000);
+  assert.equal(next.artifactMaximumFileBytes, 1_000_000);
+  assert.equal(next.artifactTtlMs, 60_000);
 });
 
 test("next config cannot replace production /mcp or use a pathful public base URL", async (t) => {

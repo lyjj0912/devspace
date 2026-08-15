@@ -9,6 +9,10 @@ import { checkResourceAllowed, resourceUrlFromServerUrl } from "@modelcontextpro
 import type { Request, Response } from "express";
 import { loadConfig, type ServerConfig } from "../config.js";
 import {
+  createOpenAIIncomingArtifactAdapter,
+  type IncomingArtifactAdapter,
+} from "../incoming-artifacts.js";
+import {
   logEvent,
   requestIp,
   requestPath,
@@ -19,6 +23,7 @@ import {
   type McpSessionCloseResult,
 } from "../mcp-sessions.js";
 import { SingleUserOAuthProvider } from "../oauth-provider.js";
+import { UniversalArtifactService } from "./artifact-service.js";
 import { ContextRegistry } from "./contexts.js";
 import { UniversalExecutionPlane } from "./execution.js";
 import { UniversalFilesystemService } from "./filesystem.js";
@@ -42,11 +47,17 @@ export interface RunningUniversalBrokerNextServer {
   filesystem: UniversalFilesystemService;
   mcpRoutes: UniversalMcpRouteRegistry;
   mcpProxy: UniversalMcpProxy;
+  artifacts: UniversalArtifactService;
   close(): Promise<void>;
+}
+
+export interface CreateUniversalBrokerNextServerOptions {
+  incomingArtifactAdapters?: readonly IncomingArtifactAdapter[];
 }
 
 export function createUniversalBrokerNextServer(
   config = loadUniversalBrokerNextConfig(loadConfig()),
+  options: CreateUniversalBrokerNextServerOptions = {},
 ): RunningUniversalBrokerNextServer {
   const allowedHosts = config.allowedHosts.includes("*")
     ? undefined
@@ -85,6 +96,16 @@ export function createUniversalBrokerNextServer(
     targets,
     { sshControlDir: config.sshControlDir },
   );
+  const artifacts = new UniversalArtifactService(filesystem, {
+    baseUrl: config.publicBaseUrl,
+    stagingRoot: config.artifactStagingDir,
+    incomingAdapters: options.incomingArtifactAdapters
+      ?? [createOpenAIIncomingArtifactAdapter()],
+    maximumEntries: config.artifactMaximumEntries,
+    maximumTotalBytes: config.artifactMaximumTotalBytes,
+    maximumArtifactBytes: config.artifactMaximumFileBytes,
+    ttlMs: config.artifactTtlMs,
+  });
   const mcpUrl = new URL(config.endpointPath, config.publicBaseUrl);
   const resourceServerUrl = resourceUrlFromServerUrl(mcpUrl);
   const oauthProvider = new SingleUserOAuthProvider(
@@ -170,7 +191,7 @@ export function createUniversalBrokerNextServer(
       res.json({
         ok: true,
         name: "devspace-universal-broker",
-        phase: "phase-6-generic-mcp",
+        phase: "phase-7-artifact",
         targetGeneration: snapshot.generation,
         targetCount: snapshot.targets.length,
         mcpRouteGeneration: routeSnapshot.generation,
@@ -180,10 +201,17 @@ export function createUniversalBrokerNextServer(
       res.status(503).json({
         ok: false,
         name: "devspace-universal-broker",
-        phase: "phase-6-generic-mcp",
+        phase: "phase-7-artifact",
         error: error instanceof Error ? error.message : String(error),
       });
     }
+  });
+
+  app.head("/artifacts-next/:artifactId", (req, res) => {
+    void artifacts.handleHttp(req, res);
+  });
+  app.get("/artifacts-next/:artifactId", (req, res) => {
+    void artifacts.handleHttp(req, res);
   });
 
   app.all(config.endpointPath, async (req, res) => {
@@ -244,6 +272,7 @@ export function createUniversalBrokerNextServer(
           execution,
           filesystem,
           mcpProxy,
+          artifacts,
         });
         await server.connect(transport);
       } else {
@@ -273,11 +302,13 @@ export function createUniversalBrokerNextServer(
     filesystem,
     mcpRoutes,
     mcpProxy,
+    artifacts,
     close: () => {
       closePromise ??= (async () => {
         clearInterval(cleanupTimer);
         const results = await transports.closeAll();
         logSessionCloseResults("server_shutdown", results);
+        await artifacts.close();
         await mcpProxy.close();
         await execution.close();
         oauthProvider.close();

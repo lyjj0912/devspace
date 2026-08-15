@@ -5,6 +5,10 @@ import {
 } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
+import type {
+  UniversalArtifactInput,
+  UniversalArtifactService,
+} from "./artifact-service.js";
 import type { ContextRegistry } from "./contexts.js";
 import type { UniversalExecutionPlane } from "./execution.js";
 import type {
@@ -39,6 +43,7 @@ export interface UniversalBrokerServices {
   execution?: UniversalExecutionPlane;
   filesystem?: UniversalFilesystemService;
   mcpProxy?: UniversalMcpProxy;
+  artifacts?: UniversalArtifactService;
 }
 
 export function createUniversalBrokerMcpServer(
@@ -71,6 +76,8 @@ export function createUniversalBrokerMcpServer(
       registerFilesystemTool(server, services.filesystem);
     } else if (name === "mcp" && services.mcpProxy) {
       registerMcpTool(server, services.mcpProxy);
+    } else if (name === "artifact" && services.artifacts) {
+      registerArtifactTool(server, services.artifacts);
     } else {
       registerUnavailableTool(
         server,
@@ -81,6 +88,52 @@ export function createUniversalBrokerMcpServer(
   }
 
   return server;
+}
+
+function registerArtifactTool(
+  server: McpServer,
+  artifacts: UniversalArtifactService,
+): void {
+  const contract = UNIVERSAL_TOOL_CONTRACTS.artifact;
+  registerAppTool(
+    server,
+    "artifact",
+    {
+      title: contract.title,
+      description: contract.description,
+      inputSchema: contract.inputSchema,
+      annotations: contract.annotations,
+      _meta: {},
+    },
+    async (input, extra) => executeUniversalTool(async () => {
+      requireScope(extra.authInfo?.scopes, "devspace.artifact");
+      requireScope(
+        extra.authInfo?.scopes,
+        input.operation === "publish" ? "devspace.read" : "devspace.write",
+      );
+      const data = await artifacts.execute(input as UniversalArtifactInput);
+      const result = successfulToolResult(
+        data,
+        undefined,
+        artifactSummaryText(input.operation, data),
+      );
+      if (
+        input.operation === "publish"
+        && typeof data.resourceUri === "string"
+        && typeof data.resourceName === "string"
+      ) {
+        result.content.push({
+          type: "resource_link",
+          uri: data.resourceUri,
+          name: data.resourceName,
+          title: data.resourceName,
+          ...(typeof data.mimeType === "string" ? { mimeType: data.mimeType } : {}),
+          ...(typeof data.size === "number" ? { size: data.size } : {}),
+        });
+      }
+      return result;
+    }),
+  );
 }
 
 function registerMcpTool(server: McpServer, proxy: UniversalMcpProxy): void {
@@ -464,6 +517,23 @@ function mcpSummaryText(
   if (typeof routeId === "string") return `${operation}: ${routeId}`;
   if (typeof count === "number") return `${operation}: ${count} result(s)`;
   return `MCP operation completed: ${operation}`;
+}
+
+function artifactSummaryText(
+  operation: UniversalArtifactInput["operation"],
+  data: Record<string, unknown>,
+): string {
+  if (operation === "publish" && typeof data.resourceName === "string") {
+    return `Published artifact: ${data.resourceName}`;
+  }
+  const path = typeof data.path === "string"
+    ? data.path
+    : data.destination && typeof data.destination === "object"
+      ? (data.destination as Record<string, unknown>).path
+      : undefined;
+  return typeof path === "string"
+    ? `${operation}: ${path}`
+    : `Artifact operation completed: ${operation}`;
 }
 
 function templateVariable(value: string | string[] | undefined, name: string): string {

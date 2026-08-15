@@ -151,3 +151,20 @@ Downstream write and destructive tools require the owner OAuth scope
 `devspace.mcp`; there is no mutation-name denylist. Provider errors are returned
 as `MCP_PROVIDER_ERROR`. A connection loss after dispatch is
 `MCP_RESULT_UNKNOWN` and is never automatically retried.
+
+## 12. Artifact capabilities
+
+Artifacts are not represented as base64 or signed URLs in model-visible logs.
+Receive uses either a trusted host-native adapter or an HTTPS source whose URL
+and every redirect are validated. Userinfo in URLs is rejected.
+
+All incoming bytes pass through owner-only staging and configured per-file and
+total-byte quotas. Optional size and SHA-256 evidence are checked before the
+destination is published through the generic filesystem plane.
+
+Outbound publish uses an unguessable capability token, timing-safe comparison,
+bounded TTL, `Cache-Control: private, no-store`, `nosniff`, and a restrictive
+content security policy. `HEAD` may inspect metadata without claiming the
+artifact. The first successful `GET` claims the capability and cleanup occurs on
+response finish or close. Tokens are never included in audit logs or completion
+evidence.

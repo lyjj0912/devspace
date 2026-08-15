@@ -173,6 +173,17 @@ tool text. Transfers produce size and hash evidence. Outbound host delivery is
 reported as unavailable when the connected host lacks the required file-result
 capability.
 
+Incoming host-native file values are accepted only through registered trusted
+adapters. Generic URL receive accepts HTTPS and loopback HTTP test sources,
+revalidates every redirect, streams into owner-only staging, and enforces byte,
+size, and SHA-256 limits before filesystem publication.
+
+Cross-target copy is implemented as target-to-owner-only-staging-to-target and
+therefore reuses the same local/SFTP atomic publication rules as `fs` without
+placing file bytes in tool text. Publish creates a random, TTL-bound, one-time
+capability URL and returns it as an MCP resource link. `HEAD` does not consume
+the capability; the first `GET` claims it and later requests fail closed.
+
 ### 3.7 GUI plane
 
 `gui` is optional and generic. Browser automation should use an application MCP
@@ -231,8 +242,8 @@ The following are build gates, not recommendations:
 | Reused context payload | 800 characters |
 | Per-response `_meta` | 8,000 characters |
 
-The current Phase 1 gate measures tool descriptors and server instructions. The
-context and metadata gates become executable with the Phase 2 context service.
+The release gate measures tool descriptors, server instructions, initial context,
+and reused-context payloads on every v2 milestone.
 
 ## 8. Parallel development boundary
 

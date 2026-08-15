@@ -13,6 +13,10 @@ const DEFAULT_MAX_RUNNING_PROCESSES_PER_TARGET = 16;
 const DEFAULT_PROCESS_BUFFER_CHARACTERS = 1_000_000;
 const DEFAULT_PROCESS_OUTPUT_MAX_BYTES = 100 * 1024 * 1024;
 const DEFAULT_COMPLETED_PROCESS_TTL_MS = 15 * 60 * 1_000;
+const DEFAULT_ARTIFACT_MAXIMUM_ENTRIES = 64;
+const DEFAULT_ARTIFACT_MAXIMUM_TOTAL_BYTES = 2 * 1024 * 1024 * 1024;
+const DEFAULT_ARTIFACT_MAXIMUM_FILE_BYTES = 1024 * 1024 * 1024;
+const DEFAULT_ARTIFACT_TTL_MS = 15 * 60 * 1_000;
 
 export interface UniversalBrokerNextConfig {
   serverConfig: ServerConfig;
@@ -31,6 +35,11 @@ export interface UniversalBrokerNextConfig {
   processBufferCharacters: number;
   processOutputMaxBytes: number;
   completedProcessTtlMs: number;
+  artifactStagingDir: string;
+  artifactMaximumEntries: number;
+  artifactMaximumTotalBytes: number;
+  artifactMaximumFileBytes: number;
+  artifactTtlMs: number;
   allowedHosts: string[];
   oauth: OAuthConfig;
   logging: LoggingConfig;
@@ -131,6 +140,34 @@ export function loadUniversalBrokerNextConfig(
       env.DEVSPACE_NEXT_COMPLETED_PROCESS_TTL_MS,
       DEFAULT_COMPLETED_PROCESS_TTL_MS,
       "DEVSPACE_NEXT_COMPLETED_PROCESS_TTL_MS",
+      24 * 60 * 60 * 1_000,
+    ),
+    artifactStagingDir: resolve(expandHomePath(
+      env.DEVSPACE_NEXT_ARTIFACT_STAGING_DIR
+        ?? join(stateDir, "artifacts"),
+    )),
+    artifactMaximumEntries: parseBoundedPositiveInteger(
+      env.DEVSPACE_NEXT_ARTIFACT_MAXIMUM_ENTRIES,
+      DEFAULT_ARTIFACT_MAXIMUM_ENTRIES,
+      "DEVSPACE_NEXT_ARTIFACT_MAXIMUM_ENTRIES",
+      10_000,
+    ),
+    artifactMaximumTotalBytes: parseBoundedPositiveInteger(
+      env.DEVSPACE_NEXT_ARTIFACT_MAXIMUM_TOTAL_BYTES,
+      DEFAULT_ARTIFACT_MAXIMUM_TOTAL_BYTES,
+      "DEVSPACE_NEXT_ARTIFACT_MAXIMUM_TOTAL_BYTES",
+      100 * 1024 * 1024 * 1024,
+    ),
+    artifactMaximumFileBytes: parseBoundedPositiveInteger(
+      env.DEVSPACE_NEXT_ARTIFACT_MAXIMUM_FILE_BYTES,
+      DEFAULT_ARTIFACT_MAXIMUM_FILE_BYTES,
+      "DEVSPACE_NEXT_ARTIFACT_MAXIMUM_FILE_BYTES",
+      10 * 1024 * 1024 * 1024,
+    ),
+    artifactTtlMs: parseBoundedPositiveInteger(
+      env.DEVSPACE_NEXT_ARTIFACT_TTL_MS,
+      DEFAULT_ARTIFACT_TTL_MS,
+      "DEVSPACE_NEXT_ARTIFACT_TTL_MS",
       24 * 60 * 60 * 1_000,
     ),
     allowedHosts,

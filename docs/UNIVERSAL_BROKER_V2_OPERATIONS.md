@@ -46,6 +46,11 @@ DEVSPACE_NEXT_COMPLETED_PROCESS_TTL_MS
 DEVSPACE_NEXT_ALLOWED_HOSTS
 DEVSPACE_NEXT_MCP_SESSION_IDLE_TIMEOUT_MS
 DEVSPACE_NEXT_MCP_SESSION_CLEANUP_INTERVAL_MS
+DEVSPACE_NEXT_ARTIFACT_STAGING_DIR
+DEVSPACE_NEXT_ARTIFACT_MAXIMUM_ENTRIES
+DEVSPACE_NEXT_ARTIFACT_MAXIMUM_TOTAL_BYTES
+DEVSPACE_NEXT_ARTIFACT_MAXIMUM_FILE_BYTES
+DEVSPACE_NEXT_ARTIFACT_TTL_MS
 ```
 
 The default downstream MCP route registry is:
@@ -130,6 +135,26 @@ resource templates. Large provider results are paged through
 Route files must not contain secret values. For an SSH route whose provider
 needs secrets, provision an owner-only credential source on the remote target
 and make the configured remote command load it before `exec`-ing the MCP.
+
+`artifact` is implemented with the following shapes:
+
+```text
+receive: source.file or source.url -> destination.target/path
+copy:    source.target/path -> destination.target/path
+publish: source.target/path -> one-time MCP resource link
+```
+
+`source.file` is recognized only by configured incoming adapters. URL receive
+accepts HTTPS and loopback HTTP tests. Copy and receive use the same generic
+filesystem atomic publication path as `fs`. Publish serves:
+
+```text
+HEAD /artifacts-next/:artifactId?token=...
+GET  /artifacts-next/:artifactId?token=...
+```
+
+`HEAD` is non-consuming. The first `GET` is one-time. Capability URLs must not be
+printed in logs, reports, shell history, or support transcripts.
 
 ## 5. Filesystem behavior
 
