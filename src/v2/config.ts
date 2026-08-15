@@ -8,6 +8,11 @@ import { UNIVERSAL_OWNER_SCOPES } from "./contracts.js";
 const DEFAULT_NEXT_ENDPOINT_PATH = "/mcp-next";
 const DEFAULT_NEXT_SESSION_IDLE_TIMEOUT_MS = 90_000;
 const DEFAULT_NEXT_SESSION_CLEANUP_INTERVAL_MS = 15_000;
+const DEFAULT_MAX_RUNNING_PROCESSES = 32;
+const DEFAULT_MAX_RUNNING_PROCESSES_PER_TARGET = 16;
+const DEFAULT_PROCESS_BUFFER_CHARACTERS = 1_000_000;
+const DEFAULT_PROCESS_OUTPUT_MAX_BYTES = 100 * 1024 * 1024;
+const DEFAULT_COMPLETED_PROCESS_TTL_MS = 15 * 60 * 1_000;
 
 export interface UniversalBrokerNextConfig {
   serverConfig: ServerConfig;
@@ -19,6 +24,13 @@ export interface UniversalBrokerNextConfig {
   targetConfigPath: string;
   mcpRouteConfigPath: string;
   contextStorePath: string;
+  processOutputDir: string;
+  sshControlDir: string;
+  maxRunningProcesses: number;
+  maxRunningProcessesPerTarget: number;
+  processBufferCharacters: number;
+  processOutputMaxBytes: number;
+  completedProcessTtlMs: number;
   allowedHosts: string[];
   oauth: OAuthConfig;
   logging: LoggingConfig;
@@ -83,6 +95,44 @@ export function loadUniversalBrokerNextConfig(
       env.DEVSPACE_NEXT_CONTEXT_STORE
         ?? join(stateDir, "contexts.json"),
     )),
+    processOutputDir: resolve(expandHomePath(
+      env.DEVSPACE_NEXT_PROCESS_OUTPUT_DIR
+        ?? join(stateDir, "process-output"),
+    )),
+    sshControlDir: resolve(expandHomePath(
+      env.DEVSPACE_NEXT_SSH_CONTROL_DIR
+        ?? join(process.env.HOME ?? "~", ".devspace", "run", "v2-ssh"),
+    )),
+    maxRunningProcesses: parseBoundedPositiveInteger(
+      env.DEVSPACE_NEXT_MAX_RUNNING_PROCESSES,
+      DEFAULT_MAX_RUNNING_PROCESSES,
+      "DEVSPACE_NEXT_MAX_RUNNING_PROCESSES",
+      1_024,
+    ),
+    maxRunningProcessesPerTarget: parseBoundedPositiveInteger(
+      env.DEVSPACE_NEXT_MAX_RUNNING_PROCESSES_PER_TARGET,
+      DEFAULT_MAX_RUNNING_PROCESSES_PER_TARGET,
+      "DEVSPACE_NEXT_MAX_RUNNING_PROCESSES_PER_TARGET",
+      1_024,
+    ),
+    processBufferCharacters: parseBoundedPositiveInteger(
+      env.DEVSPACE_NEXT_PROCESS_BUFFER_CHARACTERS,
+      DEFAULT_PROCESS_BUFFER_CHARACTERS,
+      "DEVSPACE_NEXT_PROCESS_BUFFER_CHARACTERS",
+      100_000_000,
+    ),
+    processOutputMaxBytes: parseBoundedPositiveInteger(
+      env.DEVSPACE_NEXT_PROCESS_OUTPUT_MAX_BYTES,
+      DEFAULT_PROCESS_OUTPUT_MAX_BYTES,
+      "DEVSPACE_NEXT_PROCESS_OUTPUT_MAX_BYTES",
+      10 * 1024 * 1024 * 1024,
+    ),
+    completedProcessTtlMs: parseBoundedPositiveInteger(
+      env.DEVSPACE_NEXT_COMPLETED_PROCESS_TTL_MS,
+      DEFAULT_COMPLETED_PROCESS_TTL_MS,
+      "DEVSPACE_NEXT_COMPLETED_PROCESS_TTL_MS",
+      24 * 60 * 60 * 1_000,
+    ),
     allowedHosts,
     oauth: {
       ownerToken: base.oauth.ownerToken,
@@ -121,6 +171,19 @@ function parsePositiveInteger(
   const parsed = value === undefined ? fallback : Number(value);
   if (!Number.isInteger(parsed) || parsed < 1) {
     throw new Error(`Invalid ${name}: ${value ?? String(fallback)}`);
+  }
+  return parsed;
+}
+
+function parseBoundedPositiveInteger(
+  value: string | undefined,
+  fallback: number,
+  name: string,
+  maximum: number,
+): number {
+  const parsed = parsePositiveInteger(value, fallback, name);
+  if (parsed > maximum) {
+    throw new Error(`Invalid ${name}: ${parsed} exceeds ${maximum}`);
   }
   return parsed;
 }

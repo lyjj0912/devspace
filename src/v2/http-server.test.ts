@@ -121,6 +121,55 @@ test("parallel v2 HTTP skeleton has an independent health endpoint and protected
     } | undefined;
     const contextError = contextStructured?.error;
     assert.equal(contextError?.code, "PATH_NOT_FOUND");
+
+    const executed = await client.callTool({
+      name: "exec",
+      arguments: {
+        target: "local",
+        cwd: root,
+        command: "printf 'http-exec-v2'",
+        mode: "auto",
+        yieldMs: 2_000,
+      },
+    });
+    assert.notEqual(executed.isError, true);
+    const executedData = (executed.structuredContent as {
+      data?: { state?: string; output?: string; resourceUri?: string };
+    } | undefined)?.data;
+    assert.equal(executedData?.state, "EXITED");
+    assert.equal(executedData?.output, "http-exec-v2");
+    assert.equal(typeof executedData?.resourceUri, "string");
+    const resource = await client.readResource({ uri: executedData!.resourceUri! });
+    const resourceContent = resource.contents[0];
+    assert.ok(resourceContent && "text" in resourceContent);
+    assert.equal(resourceContent.text, "http-exec-v2");
+
+    const background = await client.callTool({
+      name: "exec",
+      arguments: {
+        target: "local",
+        cwd: root,
+        command: "sleep 0.1; printf 'http-background-v2'",
+        mode: "background",
+      },
+    });
+    const backgroundData = (background.structuredContent as {
+      data?: { processId?: string; state?: string };
+    } | undefined)?.data;
+    assert.equal(backgroundData?.state, "RUNNING");
+    const waited = await client.callTool({
+      name: "process",
+      arguments: {
+        operation: "wait",
+        processId: backgroundData!.processId!,
+        waitMs: 2_000,
+      },
+    });
+    const waitedData = (waited.structuredContent as {
+      data?: { state?: string; output?: string };
+    } | undefined)?.data;
+    assert.equal(waitedData?.state, "EXITED");
+    assert.match(waitedData?.output ?? "", /http-background-v2/);
   } finally {
     await client.close();
   }

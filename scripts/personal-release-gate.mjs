@@ -38,6 +38,7 @@ for (const path of [
   "dist/v2/errors.js",
   "dist/v2/targets.js",
   "dist/v2/contexts.js",
+  "dist/v2/execution.js",
   "contracts/tools-v2.schema.json",
   "contracts/targets.schema.json",
   "contracts/mcp-routes.schema.json",

@@ -1,8 +1,12 @@
 import { randomUUID } from "node:crypto";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import {
+  McpServer,
+  ResourceTemplate,
+} from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
 import type { ContextRegistry } from "./contexts.js";
+import type { UniversalExecutionPlane } from "./execution.js";
 import {
   UNIVERSAL_BROKER_INSTRUCTIONS,
   UNIVERSAL_BROKER_VERSION,
@@ -24,6 +28,7 @@ import {
 export interface UniversalBrokerServices {
   targets?: TargetRegistry;
   contexts?: ContextRegistry;
+  execution?: UniversalExecutionPlane;
 }
 
 export function createUniversalBrokerMcpServer(
@@ -40,11 +45,17 @@ export function createUniversalBrokerMcpServer(
     { instructions: UNIVERSAL_BROKER_INSTRUCTIONS },
   );
 
+  if (services.execution) registerProcessOutputResource(server, services.execution);
+
   for (const name of UNIVERSAL_TOOL_NAMES) {
     if (name === "target" && services.targets) {
       registerTargetTool(server, services.targets);
     } else if (name === "context" && services.contexts) {
       registerContextTool(server, services.contexts);
+    } else if (name === "exec" && services.execution) {
+      registerExecTool(server, services.execution);
+    } else if (name === "process" && services.execution) {
+      registerProcessTool(server, services.execution);
     } else {
       registerUnavailableTool(
         server,
@@ -55,6 +66,95 @@ export function createUniversalBrokerMcpServer(
   }
 
   return server;
+}
+
+function registerExecTool(server: McpServer, execution: UniversalExecutionPlane): void {
+  const contract = UNIVERSAL_TOOL_CONTRACTS.exec;
+  registerAppTool(
+    server,
+    "exec",
+    {
+      title: contract.title,
+      description: contract.description,
+      inputSchema: contract.inputSchema,
+      annotations: contract.annotations,
+      _meta: {},
+    },
+    async (input, extra) => executeUniversalTool(async () => {
+      requireScope(extra.authInfo?.scopes, "devspace.exec");
+      if (input.privilege === "admin") {
+        requireScope(extra.authInfo?.scopes, "devspace.admin");
+      }
+      const data = await execution.execute(input);
+      return successfulToolResult(
+        data,
+        undefined,
+        processSummaryText(data),
+      );
+    }),
+  );
+}
+
+function registerProcessTool(server: McpServer, execution: UniversalExecutionPlane): void {
+  const contract = UNIVERSAL_TOOL_CONTRACTS.process;
+  registerAppTool(
+    server,
+    "process",
+    {
+      title: contract.title,
+      description: contract.description,
+      inputSchema: contract.inputSchema,
+      annotations: contract.annotations,
+      _meta: {},
+    },
+    async (input, extra) => executeUniversalTool(async () => {
+      requireScope(extra.authInfo?.scopes, "devspace.exec");
+      const data = await execution.operate(input);
+      const text = input.operation === "list"
+        ? `Managed processes: ${Array.isArray(data.processes) ? data.processes.length : 0}`
+        : processSummaryText(data);
+      return successfulToolResult(data, undefined, text);
+    }),
+  );
+}
+
+function registerProcessOutputResource(
+  server: McpServer,
+  execution: UniversalExecutionPlane,
+): void {
+  server.registerResource(
+    "Universal Broker process output",
+    new ResourceTemplate(
+      "devspace://process/{processId}/output/{offset}/{limit}",
+      { list: undefined },
+    ),
+    {
+      title: "Managed process output",
+      description: "Bounded UTF-8 chunk from the full output retained for a managed process.",
+      mimeType: "text/plain",
+    },
+    async (uri, variables, extra) => {
+      requireScope(extra.authInfo?.scopes, "devspace.exec");
+      const processId = templateVariable(variables.processId, "processId");
+      const offset = numericTemplateVariable(variables.offset, "offset", 0, Number.MAX_SAFE_INTEGER);
+      const limit = numericTemplateVariable(variables.limit, "limit", 1, 1_048_576);
+      const chunk = await execution.readOutput(processId, offset, limit);
+      return {
+        contents: [{
+          uri: uri.href,
+          mimeType: "text/plain",
+          text: chunk.text,
+          _meta: {
+            processId,
+            offset,
+            nextOffset: chunk.nextOffset,
+            totalBytes: chunk.totalBytes,
+            truncated: chunk.truncated,
+          },
+        }],
+      };
+    },
+  );
 }
 
 function registerTargetTool(server: McpServer, targets: TargetRegistry): void {
@@ -214,4 +314,39 @@ function requireScope(scopes: string[] | undefined, required: string): void {
       },
     },
   );
+}
+
+function processSummaryText(data: Record<string, unknown>): string {
+  const processId = typeof data.processId === "string" ? data.processId : "process";
+  const state = typeof data.state === "string" ? data.state : "updated";
+  const exitCode = typeof data.exitCode === "number" ? `, exit ${data.exitCode}` : "";
+  const output = typeof data.output === "string" && data.output
+    ? `\n${data.output}`
+    : "";
+  return `${processId}: ${state}${exitCode}${output}`;
+}
+
+function templateVariable(value: string | string[] | undefined, name: string): string {
+  if (typeof value === "string" && value.length > 0) return value;
+  throw new UniversalBrokerError(
+    "PRECONDITION_FAILED",
+    `Missing resource template variable: ${name}`,
+  );
+}
+
+function numericTemplateVariable(
+  value: string | string[] | undefined,
+  name: string,
+  minimum: number,
+  maximum: number,
+): number {
+  const raw = templateVariable(value, name);
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < minimum || parsed > maximum) {
+    throw new UniversalBrokerError(
+      "PRECONDITION_FAILED",
+      `Invalid resource template variable ${name}: ${raw}`,
+    );
+  }
+  return parsed;
 }

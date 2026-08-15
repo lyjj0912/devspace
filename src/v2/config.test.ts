@@ -20,6 +20,12 @@ test("next config uses an isolated port, endpoint, state directory, and full own
   assert.equal(next.targetConfigPath, join(root, ".config", "targets.v2.json"));
   assert.equal(next.mcpRouteConfigPath, join(root, ".config", "mcp-routes.v2.json"));
   assert.equal(next.contextStorePath, join(next.stateDir, "contexts.json"));
+  assert.equal(next.processOutputDir, join(next.stateDir, "process-output"));
+  assert.equal(next.maxRunningProcesses, 32);
+  assert.equal(next.maxRunningProcessesPerTarget, 16);
+  assert.equal(next.processBufferCharacters, 1_000_000);
+  assert.equal(next.processOutputMaxBytes, 100 * 1024 * 1024);
+  assert.equal(next.completedProcessTtlMs, 15 * 60 * 1_000);
   assert.deepEqual(next.oauth.scopes, [...UNIVERSAL_OWNER_SCOPES]);
   assert.notEqual(next.stateDir, base.stateDir);
 });
@@ -36,6 +42,13 @@ test("next config accepts explicit parallel deployment values", async (t) => {
     DEVSPACE_NEXT_TARGETS_FILE: join(root, "targets.json"),
     DEVSPACE_NEXT_MCP_ROUTES_FILE: join(root, "routes.json"),
     DEVSPACE_NEXT_CONTEXT_STORE: join(root, "context-state.json"),
+    DEVSPACE_NEXT_PROCESS_OUTPUT_DIR: join(root, "process-output"),
+    DEVSPACE_NEXT_SSH_CONTROL_DIR: join(root, "ssh-control"),
+    DEVSPACE_NEXT_MAX_RUNNING_PROCESSES: "10",
+    DEVSPACE_NEXT_MAX_RUNNING_PROCESSES_PER_TARGET: "4",
+    DEVSPACE_NEXT_PROCESS_BUFFER_CHARACTERS: "200000",
+    DEVSPACE_NEXT_PROCESS_OUTPUT_MAX_BYTES: "4000000",
+    DEVSPACE_NEXT_COMPLETED_PROCESS_TTL_MS: "120000",
     DEVSPACE_NEXT_ALLOWED_HOSTS: "devspace-next.example.com,127.0.0.1",
     DEVSPACE_NEXT_MCP_SESSION_IDLE_TIMEOUT_MS: "60000",
     DEVSPACE_NEXT_MCP_SESSION_CLEANUP_INTERVAL_MS: "5000",
@@ -51,6 +64,13 @@ test("next config accepts explicit parallel deployment values", async (t) => {
   assert.equal(next.targetConfigPath, join(root, "targets.json"));
   assert.equal(next.mcpRouteConfigPath, join(root, "routes.json"));
   assert.equal(next.contextStorePath, join(root, "context-state.json"));
+  assert.equal(next.processOutputDir, join(root, "process-output"));
+  assert.equal(next.sshControlDir, join(root, "ssh-control"));
+  assert.equal(next.maxRunningProcesses, 10);
+  assert.equal(next.maxRunningProcessesPerTarget, 4);
+  assert.equal(next.processBufferCharacters, 200_000);
+  assert.equal(next.processOutputMaxBytes, 4_000_000);
+  assert.equal(next.completedProcessTtlMs, 120_000);
 });
 
 test("next config cannot replace production /mcp or use a pathful public base URL", async (t) => {

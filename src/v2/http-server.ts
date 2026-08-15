@@ -20,6 +20,7 @@ import {
 } from "../mcp-sessions.js";
 import { SingleUserOAuthProvider } from "../oauth-provider.js";
 import { ContextRegistry } from "./contexts.js";
+import { UniversalExecutionPlane } from "./execution.js";
 import { createUniversalBrokerMcpServer } from "./server.js";
 import { TargetRegistry } from "./targets.js";
 import {
@@ -34,6 +35,7 @@ export interface RunningUniversalBrokerNextServer {
   config: UniversalBrokerNextConfig;
   targets: TargetRegistry;
   contexts: ContextRegistry;
+  execution: UniversalExecutionPlane;
   close(): Promise<void>;
 }
 
@@ -53,6 +55,17 @@ export function createUniversalBrokerNextServer(
     storePath: config.contextStorePath,
     targets,
     serverConfig: config.serverConfig,
+  });
+  const execution = new UniversalExecutionPlane({
+    targets,
+    contexts,
+    outputDir: config.processOutputDir,
+    sshControlDir: config.sshControlDir,
+    maxRunningProcesses: config.maxRunningProcesses,
+    maxRunningProcessesPerTarget: config.maxRunningProcessesPerTarget,
+    processBufferCharacters: config.processBufferCharacters,
+    processOutputMaxBytes: config.processOutputMaxBytes,
+    completedProcessTtlMs: config.completedProcessTtlMs,
   });
   const mcpUrl = new URL(config.endpointPath, config.publicBaseUrl);
   const resourceServerUrl = resourceUrlFromServerUrl(mcpUrl);
@@ -204,7 +217,11 @@ export function createUniversalBrokerNextServer(
             });
           }
         };
-        const server: McpServer = createUniversalBrokerMcpServer({ targets, contexts });
+        const server: McpServer = createUniversalBrokerMcpServer({
+          targets,
+          contexts,
+          execution,
+        });
         await server.connect(transport);
       } else {
         sendJsonRpcError(res, 400, -32000, "No valid MCP session");
@@ -229,11 +246,13 @@ export function createUniversalBrokerNextServer(
     config,
     targets,
     contexts,
+    execution,
     close: () => {
       closePromise ??= (async () => {
         clearInterval(cleanupTimer);
         const results = await transports.closeAll();
         logSessionCloseResults("server_shutdown", results);
+        await execution.close();
         oauthProvider.close();
       })();
       return closePromise;
