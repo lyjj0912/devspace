@@ -3,7 +3,10 @@
   "targets": {
     "local": {
       "displayName": "Local machine",
-      "aliases": ["local", "localhost"],
+      "aliases": [
+        "local",
+        "localhost"
+      ],
       "transport": "local",
       "platform": "macos",
       "shell": "zsh",
@@ -17,12 +20,15 @@
         "mode": "none"
       },
       "gui": {
-        "mode": "none"
+        "mode": "local-ipc"
       }
     },
     "company": {
       "displayName": "Company Mac",
-      "aliases": ["company", "company-mac"],
+      "aliases": [
+        "company",
+        "company-mac"
+      ],
       "transport": "ssh",
       "sshHost": "company",
       "platform": "macos",
@@ -37,12 +43,14 @@
         "mode": "none"
       },
       "gui": {
-        "mode": "none"
+        "mode": "ssh-stdio"
       }
     },
     "linux-build": {
       "displayName": "Linux build server",
-      "aliases": ["build"],
+      "aliases": [
+        "build"
+      ],
       "transport": "ssh",
       "sshHost": "linux-build",
       "platform": "linux",

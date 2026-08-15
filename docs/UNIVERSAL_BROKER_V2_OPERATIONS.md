@@ -51,6 +51,9 @@ DEVSPACE_NEXT_ARTIFACT_MAXIMUM_ENTRIES
 DEVSPACE_NEXT_ARTIFACT_MAXIMUM_TOTAL_BYTES
 DEVSPACE_NEXT_ARTIFACT_MAXIMUM_FILE_BYTES
 DEVSPACE_NEXT_ARTIFACT_TTL_MS
+DEVSPACE_NEXT_GUI_MAXIMUM_SESSIONS
+DEVSPACE_NEXT_GUI_SESSION_TTL_MS
+DEVSPACE_NEXT_GUI_PAYLOAD_BUDGET_CHARACTERS
 ```
 
 The default downstream MCP route registry is:
@@ -155,6 +158,40 @@ GET  /artifacts-next/:artifactId?token=...
 
 `HEAD` is non-consuming. The first `GET` is one-time. Capability URLs must not be
 printed in logs, reports, shell history, or support transcripts.
+
+`gui` uses target configuration rather than application-specific top-level tools:
+
+```json
+{
+  "gui": {
+    "mode": "local-ipc"
+  }
+}
+```
+
+For an SSH-accessible macOS target use `ssh-stdio`. `capabilities` is the
+authoritative availability check; configured transport alone is not proof of
+Accessibility permission.
+
+Ordinary workflow:
+
+```text
+gui.capabilities(target)
+gui.observe(target)
+gui.act(sessionId, generation, action)
+gui.wait(sessionId, generation, timeoutMs)
+```
+
+`observe` defaults to 100 and permits at most 1,000 meaningful Accessibility
+elements. The model-visible response is trimmed to the configured character
+budget, 12,000 by default. Sessions are LRU-bounded and expire after five
+minutes by default.
+
+When `GUI_STATE_CHANGED` is returned, discard the old element ID and call
+`observe` again. Never repeat the same action automatically. When
+`CAPABILITY_UNAVAILABLE` is returned for a remote Mac, grant Accessibility/TCC
+to the actual remote GUI-node execution context or use a semantic downstream MCP;
+do not bypass the denial with coordinate-click scripts.
 
 ## 5. Filesystem behavior
 

@@ -27,6 +27,10 @@ import { UniversalArtifactService } from "./artifact-service.js";
 import { ContextRegistry } from "./contexts.js";
 import { UniversalExecutionPlane } from "./execution.js";
 import { UniversalFilesystemService } from "./filesystem.js";
+import {
+  type GuiNodeRunner,
+  UniversalGuiService,
+} from "./gui.js";
 import { UniversalMcpProxy } from "./mcp-proxy.js";
 import { UniversalMcpRouteRegistry } from "./mcp-routes.js";
 import { createUniversalBrokerMcpServer } from "./server.js";
@@ -48,11 +52,13 @@ export interface RunningUniversalBrokerNextServer {
   mcpRoutes: UniversalMcpRouteRegistry;
   mcpProxy: UniversalMcpProxy;
   artifacts: UniversalArtifactService;
+  gui: UniversalGuiService;
   close(): Promise<void>;
 }
 
 export interface CreateUniversalBrokerNextServerOptions {
   incomingArtifactAdapters?: readonly IncomingArtifactAdapter[];
+  guiRunner?: GuiNodeRunner;
 }
 
 export function createUniversalBrokerNextServer(
@@ -106,6 +112,17 @@ export function createUniversalBrokerNextServer(
     maximumArtifactBytes: config.artifactMaximumFileBytes,
     ttlMs: config.artifactTtlMs,
   });
+  const gui = new UniversalGuiService(
+    targets,
+    filesystem,
+    execution,
+    {
+      runner: options.guiRunner,
+      maximumSessions: config.guiMaximumSessions,
+      sessionTtlMs: config.guiSessionTtlMs,
+      payloadBudgetCharacters: config.guiPayloadBudgetCharacters,
+    },
+  );
   const mcpUrl = new URL(config.endpointPath, config.publicBaseUrl);
   const resourceServerUrl = resourceUrlFromServerUrl(mcpUrl);
   const oauthProvider = new SingleUserOAuthProvider(
@@ -191,7 +208,7 @@ export function createUniversalBrokerNextServer(
       res.json({
         ok: true,
         name: "devspace-universal-broker",
-        phase: "phase-7-artifact",
+        phase: "phase-7-artifact-gui",
         targetGeneration: snapshot.generation,
         targetCount: snapshot.targets.length,
         mcpRouteGeneration: routeSnapshot.generation,
@@ -201,7 +218,7 @@ export function createUniversalBrokerNextServer(
       res.status(503).json({
         ok: false,
         name: "devspace-universal-broker",
-        phase: "phase-7-artifact",
+        phase: "phase-7-artifact-gui",
         error: error instanceof Error ? error.message : String(error),
       });
     }
@@ -273,6 +290,7 @@ export function createUniversalBrokerNextServer(
           filesystem,
           mcpProxy,
           artifacts,
+          gui,
         });
         await server.connect(transport);
       } else {
@@ -303,11 +321,13 @@ export function createUniversalBrokerNextServer(
     mcpRoutes,
     mcpProxy,
     artifacts,
+    gui,
     close: () => {
       closePromise ??= (async () => {
         clearInterval(cleanupTimer);
         const results = await transports.closeAll();
         logSessionCloseResults("server_shutdown", results);
+        gui.close();
         await artifacts.close();
         await mcpProxy.close();
         await execution.close();

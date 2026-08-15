@@ -184,6 +184,53 @@ placing file bytes in tool text. Publish creates a random, TTL-bound, one-time
 capability URL and returns it as an MCP resource link. `HEAD` does not consume
 the capability; the first `GET` claims it and later requests fail closed.
 
+### `gui`
+
+`gui` is an optional generic operating-system GUI plane. It is not a browser,
+Finder, email, Jira, or application-specific adapter. The built-in node currently
+uses macOS Accessibility through System Events and exposes four operations:
+
+```text
+capabilities
+observe
+act
+wait
+```
+
+`observe` returns bounded metadata for the frontmost application, front window,
+and meaningful Accessibility elements. Each observation creates or refreshes an
+opaque `sessionId` and a generation hash. The generation includes application,
+window identity, element order and identity, value, enabled state, and advertised
+actions. Volatile focus and geometry fields remain visible but are excluded from
+the generation so harmless layout settling does not make every action stale.
+
+`act` accepts only an element ID from the referenced observation or a global
+keystroke/key-code action. Before dispatch, DevSpace re-observes the target and
+requires the same generation. The GUI node then independently verifies the
+frontmost PID, front-window title, element index, role, subrole, name, and
+description. A mismatch returns `GUI_STATE_CHANGED`; the action is not retried.
+
+Supported generic actions are:
+
+```text
+perform an advertised AX action
+press/click through AXPress
+set_value
+focus
+keystroke with modifiers
+key_code with modifiers
+```
+
+The local node is stored under `~/.devspace/run` and invoked through the same
+generic execution and filesystem planes as every other target. An SSH target may
+use `gui.mode=ssh-stdio`, but remote availability is determined by the target's
+actual macOS TCC/Accessibility state. A configured node that lacks permission
+reports `CAPABILITY_UNAVAILABLE`; it never claims GUI parity.
+
+Chrome web inspection and automation should use a downstream Chrome DevTools MCP
+route when available. The generic GUI plane is the application-agnostic fallback
+for native operating-system UI and workflows unavailable through a semantic MCP.
+
 ### 3.7 GUI plane
 
 `gui` is optional and generic. Browser automation should use an application MCP

@@ -31,6 +31,9 @@ test("next config uses an isolated port, endpoint, state directory, and full own
   assert.equal(next.artifactMaximumTotalBytes, 2 * 1024 * 1024 * 1024);
   assert.equal(next.artifactMaximumFileBytes, 1024 * 1024 * 1024);
   assert.equal(next.artifactTtlMs, 15 * 60 * 1_000);
+  assert.equal(next.guiMaximumSessions, 32);
+  assert.equal(next.guiSessionTtlMs, 5 * 60 * 1_000);
+  assert.equal(next.guiPayloadBudgetCharacters, 12_000);
   assert.deepEqual(next.oauth.scopes, [...UNIVERSAL_OWNER_SCOPES]);
   assert.notEqual(next.stateDir, base.stateDir);
 });
@@ -59,6 +62,9 @@ test("next config accepts explicit parallel deployment values", async (t) => {
     DEVSPACE_NEXT_ARTIFACT_MAXIMUM_TOTAL_BYTES: "2000000",
     DEVSPACE_NEXT_ARTIFACT_MAXIMUM_FILE_BYTES: "1000000",
     DEVSPACE_NEXT_ARTIFACT_TTL_MS: "60000",
+    DEVSPACE_NEXT_GUI_MAXIMUM_SESSIONS: "8",
+    DEVSPACE_NEXT_GUI_SESSION_TTL_MS: "90000",
+    DEVSPACE_NEXT_GUI_PAYLOAD_BUDGET_CHARACTERS: "4000",
     DEVSPACE_NEXT_ALLOWED_HOSTS: "devspace-next.example.com,127.0.0.1",
     DEVSPACE_NEXT_MCP_SESSION_IDLE_TIMEOUT_MS: "60000",
     DEVSPACE_NEXT_MCP_SESSION_CLEANUP_INTERVAL_MS: "5000",
@@ -86,6 +92,9 @@ test("next config accepts explicit parallel deployment values", async (t) => {
   assert.equal(next.artifactMaximumTotalBytes, 2_000_000);
   assert.equal(next.artifactMaximumFileBytes, 1_000_000);
   assert.equal(next.artifactTtlMs, 60_000);
+  assert.equal(next.guiMaximumSessions, 8);
+  assert.equal(next.guiSessionTtlMs, 90_000);
+  assert.equal(next.guiPayloadBudgetCharacters, 4_000);
 });
 
 test("next config cannot replace production /mcp or use a pathful public base URL", async (t) => {

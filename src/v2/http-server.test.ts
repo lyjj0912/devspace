@@ -12,13 +12,65 @@ import { loadConfig } from "../config.js";
 import type { IncomingArtifactAdapter } from "../incoming-artifacts.js";
 import { SqliteOAuthStore } from "../oauth-store.js";
 import { UNIVERSAL_TOOL_NAMES } from "./contracts.js";
+import type { GuiNodeRunner } from "./gui.js";
 import { createUniversalBrokerNextServer } from "./http-server.js";
 import { loadUniversalBrokerNextConfig } from "./config.js";
+
+function guiObservation(applicationName: string) {
+  return {
+    application: {
+      name: applicationName,
+      bundleIdentifier: "com.example.http-gui",
+      pid: 4321,
+    },
+    window: {
+      title: "HTTP GUI Fixture",
+      role: "AXWindow",
+      subrole: "AXStandardWindow",
+      position: [0, 0],
+      size: [800, 600],
+    },
+    elements: [
+      {
+        elementId: "e0",
+        index: 0,
+        role: "AXWindow",
+        subrole: "AXStandardWindow",
+        name: "HTTP GUI Fixture",
+        description: "",
+        value: "",
+        enabled: true,
+        focused: true,
+        position: [0, 0],
+        size: [800, 600],
+        actions: [],
+      },
+      {
+        elementId: "e1",
+        index: 1,
+        role: "AXButton",
+        subrole: "",
+        name: "Confirm",
+        description: "confirm",
+        value: "",
+        enabled: true,
+        focused: false,
+        position: [100, 100],
+        size: [80, 24],
+        actions: ["AXPress"],
+      },
+    ],
+    totalElements: 2,
+    omittedElements: 0,
+    truncated: false,
+  };
+}
 
 test("parallel v2 HTTP skeleton has an independent health endpoint and protected MCP endpoint", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "devspace-v2-http-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const mcpRoutes = join(root, "mcp-routes.json");
+  const targetsFile = join(root, "targets.json");
   await writeFile(mcpRoutes, JSON.stringify({
     version: 1,
     routes: {
@@ -28,6 +80,19 @@ test("parallel v2 HTTP skeleton has an independent health endpoint and protected
         transport: "local-stdio",
         command: process.execPath,
         args: ["--import", "tsx", "src/v2/fixtures/mcp-fixture.ts"],
+      },
+    },
+  }, null, 2));
+  await writeFile(targetsFile, JSON.stringify({
+    version: 1,
+    targets: {
+      local: {
+        displayName: "Local",
+        aliases: ["local"],
+        transport: "local",
+        platform: "macos",
+        privilege: { user: true, admin: { mode: "unavailable" } },
+        gui: { mode: "local-ipc" },
       },
     },
   }, null, 2));
@@ -45,6 +110,7 @@ test("parallel v2 HTTP skeleton has an independent health endpoint and protected
   const config = loadUniversalBrokerNextConfig(base, {
     DEVSPACE_NEXT_PUBLIC_BASE_URL: "http://127.0.0.1:17677",
     DEVSPACE_NEXT_MCP_ROUTES_FILE: mcpRoutes,
+    DEVSPACE_NEXT_TARGETS_FILE: targetsFile,
   });
   const nativeArtifactAdapter: IncomingArtifactAdapter = {
     id: "http-fixture",
@@ -65,8 +131,28 @@ test("parallel v2 HTTP skeleton has an independent health endpoint and protected
       };
     },
   };
+  let guiState = guiObservation("Before GUI action");
+  const guiRunner: GuiNodeRunner = {
+    async call(_target, request) {
+      if (request.operation === "capabilities") {
+        return {
+          platform: "macos",
+          accessibility: true,
+          screenCapture: "not_probed",
+          frontmostProcess: {
+            name: guiState.application.name,
+            pid: guiState.application.pid,
+          },
+        };
+      }
+      if (request.operation === "observe") return structuredClone(guiState);
+      guiState = guiObservation("After GUI action");
+      return { performed: true, actionType: request.actionType };
+    },
+  };
   const running = createUniversalBrokerNextServer(config, {
     incomingArtifactAdapters: [nativeArtifactAdapter],
+    guiRunner,
   });
   const httpServer = running.app.listen(0, "127.0.0.1");
   await new Promise<void>((resolve, reject) => {
@@ -93,7 +179,7 @@ test("parallel v2 HTTP skeleton has an independent health endpoint and protected
   };
   assert.equal(healthBody.ok, true);
   assert.equal(healthBody.name, "devspace-universal-broker");
-  assert.equal(healthBody.phase, "phase-7-artifact");
+  assert.equal(healthBody.phase, "phase-7-artifact-gui");
   assert.equal(healthBody.targetCount, 1);
   assert.equal(healthBody.mcpRouteCount, 1);
   assert.equal(typeof healthBody.targetGeneration, "string");
@@ -368,6 +454,57 @@ test("parallel v2 HTTP skeleton has an independent health endpoint and protected
       });
       assert.notEqual(removed.isError, true);
     }
+
+    const guiCapabilities = await client.callTool({
+      name: "gui",
+      arguments: { operation: "capabilities", target: "local" },
+    });
+    const guiCapabilitiesData = (guiCapabilities.structuredContent as {
+      data?: { available?: boolean; accessibility?: boolean };
+    } | undefined)?.data;
+    assert.equal(guiCapabilitiesData?.available, true);
+    assert.equal(guiCapabilitiesData?.accessibility, true);
+
+    const guiObserved = await client.callTool({
+      name: "gui",
+      arguments: { operation: "observe", target: "local", maxElements: 50 },
+    });
+    const guiObservedData = (guiObserved.structuredContent as {
+      data?: {
+        sessionId?: string;
+        generation?: string;
+        elements?: Array<{ elementId?: string; name?: string }>;
+      };
+    } | undefined)?.data;
+    const confirmElement = guiObservedData?.elements?.find(
+      (element) => element.name === "Confirm",
+    );
+    assert.equal(typeof guiObservedData?.sessionId, "string");
+    assert.equal(typeof guiObservedData?.generation, "string");
+    assert.equal(confirmElement?.elementId, "e1");
+
+    const guiActed = await client.callTool({
+      name: "gui",
+      arguments: {
+        operation: "act",
+        target: "local",
+        sessionId: guiObservedData!.sessionId!,
+        generation: guiObservedData!.generation!,
+        action: {
+          type: "perform",
+          elementId: confirmElement!.elementId!,
+          actionName: "AXPress",
+        },
+      },
+    });
+    assert.notEqual(guiActed.isError, true);
+    const guiActedData = (guiActed.structuredContent as {
+      data?: {
+        performed?: Record<string, unknown>;
+        observation?: { application?: { name?: string } };
+      };
+    } | undefined)?.data;
+    assert.equal(guiActedData?.observation?.application?.name, "After GUI action");
 
     const executed = await client.callTool({
       name: "exec",

@@ -19,6 +19,10 @@ import type {
   UniversalMcpInput,
   UniversalMcpProxy,
 } from "./mcp-proxy.js";
+import type {
+  UniversalGuiInput,
+  UniversalGuiService,
+} from "./gui.js";
 import {
   UNIVERSAL_BROKER_INSTRUCTIONS,
   UNIVERSAL_BROKER_VERSION,
@@ -44,6 +48,7 @@ export interface UniversalBrokerServices {
   filesystem?: UniversalFilesystemService;
   mcpProxy?: UniversalMcpProxy;
   artifacts?: UniversalArtifactService;
+  gui?: UniversalGuiService;
 }
 
 export function createUniversalBrokerMcpServer(
@@ -78,6 +83,8 @@ export function createUniversalBrokerMcpServer(
       registerMcpTool(server, services.mcpProxy);
     } else if (name === "artifact" && services.artifacts) {
       registerArtifactTool(server, services.artifacts);
+    } else if (name === "gui" && services.gui) {
+      registerGuiTool(server, services.gui);
     } else {
       registerUnavailableTool(
         server,
@@ -88,6 +95,26 @@ export function createUniversalBrokerMcpServer(
   }
 
   return server;
+}
+
+function registerGuiTool(server: McpServer, gui: UniversalGuiService): void {
+  const contract = UNIVERSAL_TOOL_CONTRACTS.gui;
+  registerAppTool(
+    server,
+    "gui",
+    {
+      title: contract.title,
+      description: contract.description,
+      inputSchema: contract.inputSchema,
+      annotations: contract.annotations,
+      _meta: {},
+    },
+    async (input, extra) => executeUniversalTool(async () => {
+      requireScope(extra.authInfo?.scopes, "devspace.gui");
+      const data = await gui.execute(input as UniversalGuiInput);
+      return successfulToolResult(data, undefined, guiSummaryText(input.operation, data));
+    }),
+  );
 }
 
 function registerArtifactTool(
@@ -534,6 +561,22 @@ function artifactSummaryText(
   return typeof path === "string"
     ? `${operation}: ${path}`
     : `Artifact operation completed: ${operation}`;
+}
+
+function guiSummaryText(
+  operation: UniversalGuiInput["operation"],
+  data: Record<string, unknown>,
+): string {
+  if (operation === "capabilities") {
+    return `GUI capabilities: ${String(data.targetId ?? "target")} ${data.available === true ? "available" : "unavailable"}`;
+  }
+  if (operation === "observe") {
+    return `Observed GUI session ${String(data.sessionId ?? "unknown")}.`;
+  }
+  if (operation === "wait") {
+    return data.changed === true ? "GUI state changed." : "GUI wait timed out without change.";
+  }
+  return "GUI action completed.";
 }
 
 function templateVariable(value: string | string[] | undefined, name: string): string {

@@ -168,3 +168,29 @@ content security policy. `HEAD` may inspect metadata without claiming the
 artifact. The first successful `GET` claims the capability and cleanup occurs on
 response finish or close. Tokens are never included in audit logs or completion
 evidence.
+
+## 13. Generic GUI authority
+
+GUI capability is target data, not an implicit side effect of shell access.
+`gui.mode=none`, `local-ipc`, or `ssh-stdio` declares the intended transport, and
+the node must separately prove Accessibility availability. A configured remote
+macOS target whose SSH session lacks TCC permission remains unavailable.
+
+Observations return bounded Accessibility metadata only. They do not return a
+screen recording, hidden application data, passwords, or unrestricted generated
+JavaScript. The initial built-in node reports screen capture as `not_probed`.
+
+Every action is bound to an opaque session and generation. DevSpace re-observes
+before action dispatch, and the node verifies the process, window, and element
+fingerprint again. Any mismatch is `GUI_STATE_CHANGED`; no click, keystroke, or
+mutation is attempted. Transport failures after action dispatch are not replayed.
+
+Element IDs are ephemeral indexes scoped to one observed front-window tree. They
+are not persisted selectors and must not be reused after a generation change.
+Only Accessibility actions advertised by the element may be used with generic
+`perform`. Global keystroke and key-code actions remain explicit operations and
+require the owner OAuth `devspace.gui` scope.
+
+GUI helper source is published through the generic filesystem plane and checked
+by SHA-256. Local and remote copies are owner-only. The helper contains no target
+credential, application credential, or owner OAuth secret.

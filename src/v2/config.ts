@@ -17,6 +17,9 @@ const DEFAULT_ARTIFACT_MAXIMUM_ENTRIES = 64;
 const DEFAULT_ARTIFACT_MAXIMUM_TOTAL_BYTES = 2 * 1024 * 1024 * 1024;
 const DEFAULT_ARTIFACT_MAXIMUM_FILE_BYTES = 1024 * 1024 * 1024;
 const DEFAULT_ARTIFACT_TTL_MS = 15 * 60 * 1_000;
+const DEFAULT_GUI_MAXIMUM_SESSIONS = 32;
+const DEFAULT_GUI_SESSION_TTL_MS = 5 * 60 * 1_000;
+const DEFAULT_GUI_PAYLOAD_BUDGET_CHARACTERS = 12_000;
 
 export interface UniversalBrokerNextConfig {
   serverConfig: ServerConfig;
@@ -40,6 +43,9 @@ export interface UniversalBrokerNextConfig {
   artifactMaximumTotalBytes: number;
   artifactMaximumFileBytes: number;
   artifactTtlMs: number;
+  guiMaximumSessions: number;
+  guiSessionTtlMs: number;
+  guiPayloadBudgetCharacters: number;
   allowedHosts: string[];
   oauth: OAuthConfig;
   logging: LoggingConfig;
@@ -169,6 +175,24 @@ export function loadUniversalBrokerNextConfig(
       DEFAULT_ARTIFACT_TTL_MS,
       "DEVSPACE_NEXT_ARTIFACT_TTL_MS",
       24 * 60 * 60 * 1_000,
+    ),
+    guiMaximumSessions: parseBoundedPositiveInteger(
+      env.DEVSPACE_NEXT_GUI_MAXIMUM_SESSIONS,
+      DEFAULT_GUI_MAXIMUM_SESSIONS,
+      "DEVSPACE_NEXT_GUI_MAXIMUM_SESSIONS",
+      1_000,
+    ),
+    guiSessionTtlMs: parseBoundedPositiveInteger(
+      env.DEVSPACE_NEXT_GUI_SESSION_TTL_MS,
+      DEFAULT_GUI_SESSION_TTL_MS,
+      "DEVSPACE_NEXT_GUI_SESSION_TTL_MS",
+      24 * 60 * 60 * 1_000,
+    ),
+    guiPayloadBudgetCharacters: parseBoundedPositiveInteger(
+      env.DEVSPACE_NEXT_GUI_PAYLOAD_BUDGET_CHARACTERS,
+      DEFAULT_GUI_PAYLOAD_BUDGET_CHARACTERS,
+      "DEVSPACE_NEXT_GUI_PAYLOAD_BUDGET_CHARACTERS",
+      100_000,
     ),
     allowedHosts,
     oauth: {

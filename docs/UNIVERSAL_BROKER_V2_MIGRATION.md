@@ -82,6 +82,14 @@ Artifact status: implemented on
 local/remote copy, and one-time publish have deterministic and real-target
 evidence. Generic GUI remains the next milestone on the same branch lineage.
 
+GUI status: implemented on the same branch lineage. The generic macOS
+Accessibility node, generation-bound observe/act/wait contract, authenticated
+top-level MCP integration, local live press/input canaries, target capability
+configuration, payload budgets, TTL, and stale-action rejection are complete.
+The company Mac is configured for `ssh-stdio` but its SSH execution context does
+not currently have Accessibility permission, so it correctly remains
+`CAPABILITY_UNAVAILABLE` pending operator-side TCC approval.
+
 ### Phase 8 — lifecycle and load
 
 Add session LRU, process and buffer quotas, downstream connection quotas,
