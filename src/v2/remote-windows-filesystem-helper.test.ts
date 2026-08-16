@@ -17,6 +17,8 @@ test("Windows filesystem helper is one bounded encoded PowerShell command", () =
   const source = Buffer.from(encoded, "base64").toString("utf16le");
   assert.match(source, new RegExp(REMOTE_WINDOWS_FILESYSTEM_RESULT_MARKER));
   assert.match(source, /write_content/);
+  assert.match(source, /\(\[DateTimeOffset\]\$item\.LastWriteTimeUtc\)\.ToUnixTimeMilliseconds\(\)/u);
+  assert.match(source, /\(\[DateTimeOffset\]\$item\.CreationTimeUtc\)\.ToUnixTimeMilliseconds\(\)/u);
   const requestMatch = source.match(/\$RequestBase64 = '([^']+)'/);
   assert.ok(requestMatch);
   const request = JSON.parse(Buffer.from(requestMatch[1]!, "base64").toString("utf8"));

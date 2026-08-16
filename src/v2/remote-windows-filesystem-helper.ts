@@ -42,8 +42,8 @@ function Metadata([string]$Path) {
     type = ItemType $item
     size = if ($item.PSIsContainer) { 0 } else { [int64]$item.Length }
     mode = $null
-    mtimeMs = [DateTimeOffset]$item.LastWriteTimeUtc.ToUniversalTime().ToUnixTimeMilliseconds()
-    birthtimeMs = [DateTimeOffset]$item.CreationTimeUtc.ToUniversalTime().ToUnixTimeMilliseconds()
+    mtimeMs = ([DateTimeOffset]$item.LastWriteTimeUtc).ToUnixTimeMilliseconds()
+    birthtimeMs = ([DateTimeOffset]$item.CreationTimeUtc).ToUnixTimeMilliseconds()
   }
 }
 
