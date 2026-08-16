@@ -39,7 +39,7 @@ import {
 } from "./remote-filesystem-helper.js";
 import {
   REMOTE_WINDOWS_FILESYSTEM_RESULT_MARKER,
-  windowsFilesystemCommand as buildWindowsFilesystemCommand,
+  windowsFilesystemScript as buildWindowsFilesystemScript,
 } from "./remote-windows-filesystem-helper.js";
 import type { TargetDefinition, TargetRegistry } from "./targets.js";
 
@@ -452,12 +452,83 @@ export class UniversalFilesystemService {
     target: TargetDefinition,
     request: Record<string, unknown>,
   ): Promise<unknown> {
-    const windows = target.platform === "windows";
-    const command = windows
-      ? buildWindowsFilesystemCommand(request)
-      : `python3 -c ${shellQuote(REMOTE_FILESYSTEM_HELPER_SOURCE)} ${shellQuote(
-          Buffer.from(JSON.stringify(request), "utf8").toString("base64"),
-        )}`;
+    if (target.platform === "windows") {
+      return this.windowsRemoteRequest(target, request);
+    }
+    const command = `python3 -c ${shellQuote(REMOTE_FILESYSTEM_HELPER_SOURCE)} ${shellQuote(
+      Buffer.from(JSON.stringify(request), "utf8").toString("base64"),
+    )}`;
+    return this.executeRemoteFilesystemCommand(
+      target,
+      command,
+      REMOTE_FILESYSTEM_RESULT_MARKER,
+    );
+  }
+
+  private async windowsRemoteRequest(
+    target: TargetDefinition,
+    request: Record<string, unknown>,
+  ): Promise<unknown> {
+    const observation = await this.targets.probe(target.id);
+    const temporaryDirectory = observation.temporaryDirectory;
+    if (!temporaryDirectory) {
+      throw new UniversalBrokerError(
+        "CAPABILITY_UNAVAILABLE",
+        `Windows target ${target.id} did not report a temporary directory.`,
+      );
+    }
+    const directory = await mkdtemp(join(tmpdir(), "devspace-v2-windows-fs-"));
+    const localScript = join(directory, "filesystem.ps1");
+    const remoteScript = normalizeWindowsPath(win32.join(
+      temporaryDirectory.replaceAll("/", "\\"),
+      `.devspace-v2-fs-${randomUUID()}.ps1`,
+    ));
+    try {
+      await writeFile(localScript, buildWindowsFilesystemScript(request), { mode: 0o600 });
+      await this.sftpPut({ target, localPath: localScript, remotePath: remoteScript });
+      return await this.executeRemoteFilesystemCommand(
+        target,
+        `& powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ${powershellLiteral(remoteScript)}`,
+        REMOTE_WINDOWS_FILESYSTEM_RESULT_MARKER,
+      );
+    } finally {
+      await this.removeWindowsRemoteScript(target, remoteScript);
+      await rm(directory, { recursive: true, force: true });
+    }
+  }
+
+  private async removeWindowsRemoteScript(
+    target: TargetDefinition,
+    remoteScript: string,
+  ): Promise<void> {
+    try {
+      let result = await this.execution.execute({
+        target: target.id,
+        cwd: target.defaultCwd ?? "~",
+        command: `Remove-Item -LiteralPath ${powershellLiteral(remoteScript)} -Force -ErrorAction SilentlyContinue`,
+        mode: "foreground",
+        yieldMs: 30_000,
+        maxOutputChars: 8_000,
+      });
+      if (result.state === "RUNNING" || result.state === "STARTING") {
+        result = await this.execution.operate({
+          operation: "wait",
+          processId: result.processId,
+          waitMs: 30_000,
+          maxOutputChars: 8_000,
+        }) as typeof result;
+      }
+    } catch {
+      // The staged script is random, owner-level, and short-lived. The caller's
+      // original filesystem error remains authoritative if cleanup also fails.
+    }
+  }
+
+  private async executeRemoteFilesystemCommand(
+    target: TargetDefinition,
+    command: string,
+    responseMarker: string,
+  ): Promise<unknown> {
     let result = await this.execution.execute({
       target: target.id,
       cwd: target.defaultCwd ?? "~",
@@ -489,9 +560,6 @@ export class UniversalFilesystemService {
         },
       );
     }
-    const responseMarker = windows
-      ? REMOTE_WINDOWS_FILESYSTEM_RESULT_MARKER
-      : REMOTE_FILESYSTEM_RESULT_MARKER;
     const marker = result.output.lastIndexOf(responseMarker);
     if (marker < 0) {
       throw new UniversalBrokerError(
@@ -1360,6 +1428,10 @@ function asRecord(value: unknown): Record<string, unknown> {
 
 function shellQuote(value: string): string {
   return `'${value.replaceAll("'", `'"'"'`)}'`;
+}
+
+function powershellLiteral(value: string): string {
+  return `'${value.replaceAll("'", "''")}'`;
 }
 
 function sftpQuote(value: string): string {

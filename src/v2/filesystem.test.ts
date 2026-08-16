@@ -584,22 +584,45 @@ async function createWindowsRemoteFixture(
     DEVSPACE_LOG_LEVEL: "silent",
     DEVSPACE_SKILL_PATHS: join(root, "skills"),
   });
-  const targets = new TargetRegistry({ configPath: targetConfig });
+  const targets = new TargetRegistry({
+    configPath: targetConfig,
+    execute: (async () => ({
+      stdout: [
+        "__DEVSPACE_TARGET_V1__",
+        "architecture=AMD64",
+        "home=C:\\Users\\Test",
+        "temporary=C:\\Users\\Test\\AppData\\Local\\Temp\\",
+        "git=1",
+        "",
+      ].join("\n"),
+      stderr: "",
+    })) as never,
+  });
   const contexts = new ContextRegistry({
     storePath: join(root, "v2-state", "contexts.json"),
     targets,
     serverConfig,
   });
   const driveRoot = join(root, "drive-c");
-  await mkdir(join(driveRoot, "Users", "Test"), { recursive: true });
+  await mkdir(join(driveRoot, "Users", "Test", "AppData", "Local", "Temp"), { recursive: true });
   let executionCalls = 0;
   const execution = {
     async execute(input: { command: string }): Promise<UniversalProcessSnapshot> {
       executionCalls += 1;
       const started = Date.now();
+      const cleanupPath = input.command.match(/Remove-Item\s+-LiteralPath\s+'((?:''|[^'])+)'/u)?.[1]
+        ?.replaceAll("''", "'");
+      if (cleanupPath) {
+        await rm(mapWindowsFixturePath(cleanupPath, driveRoot), { force: true });
+        return processSnapshot("", 0, started);
+      }
       let response: Record<string, unknown>;
       try {
-        const request = decodeWindowsRequest(input.command);
+        const remoteScript = input.command.match(/-File\s+'((?:''|[^'])+)'/u)?.[1]
+          ?.replaceAll("''", "'");
+        if (!remoteScript) throw new Error("Windows filesystem command is missing its staged script.");
+        const source = await readFile(mapWindowsFixturePath(remoteScript, driveRoot), "utf8");
+        const request = decodeWindowsScript(source);
         response = {
           ok: true,
           data: await executeFakeWindowsFilesystemRequest(request, driveRoot),
@@ -652,10 +675,7 @@ async function createWindowsRemoteFixture(
   };
 }
 
-function decodeWindowsRequest(command: string): Record<string, unknown> {
-  const encodedCommand = command.match(/-EncodedCommand\s+([A-Za-z0-9+/]+={0,2})/u)?.[1];
-  if (!encodedCommand) throw new Error("Windows filesystem command is missing its encoded script.");
-  const source = Buffer.from(encodedCommand, "base64").toString("utf16le");
+function decodeWindowsScript(source: string): Record<string, unknown> {
   const requestBase64 = source.match(/\$RequestBase64\s*=\s*'([A-Za-z0-9+/]+={0,2})'/u)?.[1];
   if (!requestBase64) throw new Error("Windows filesystem command is missing its framed request.");
   return JSON.parse(Buffer.from(requestBase64, "base64").toString("utf8")) as Record<string, unknown>;

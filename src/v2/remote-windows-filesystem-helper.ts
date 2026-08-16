@@ -2,8 +2,8 @@ import { UniversalBrokerError } from "./errors.js";
 
 export const REMOTE_WINDOWS_FILESYSTEM_RESULT_MARKER = "__DEVSPACE_V2_FS_JSON__";
 
-/** Build a self-contained PowerShell command for one framed Windows filesystem request. */
-export function windowsFilesystemCommand(request: Record<string, unknown>): string {
+/** Build a self-contained PowerShell script for one framed Windows filesystem request. */
+export function windowsFilesystemScript(request: Record<string, unknown>): string {
   const requestBase64 = Buffer.from(JSON.stringify(request), "utf8").toString("base64");
   const source = String.raw`
 $ErrorActionPreference = 'Stop'
@@ -252,7 +252,12 @@ try {
   Reply $false $null $code $message
 }
 `;
-  const encoded = Buffer.from(source, "utf16le").toString("base64");
+  return source;
+}
+
+/** Build an encoded command for small callers and contract tests. */
+export function windowsFilesystemCommand(request: Record<string, unknown>): string {
+  const encoded = Buffer.from(windowsFilesystemScript(request), "utf16le").toString("base64");
   if (encoded.length > 90_000) {
     throw new UniversalBrokerError(
       "RESOURCE_QUOTA_EXCEEDED",
