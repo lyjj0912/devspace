@@ -197,9 +197,31 @@ function verifyOAuthCompatibilitySources() {
 
 function verifyLiveVerifierSources() {
   const live = text("scripts/verify-universal-broker-v2-live.mjs");
-  const expected = 'createHash("sha256").update(token).digest("base64url")';
-  if (!live.includes(expected)) {
-    fail("The live verifier temporary OAuth token hash must match the provider base64url contract.");
+  const deploy = text("scripts/deploy-universal-broker-v2-production.sh");
+  for (const marker of [
+    'baseUrl: "http://127.0.0.1:7677"',
+    'mcpPath: "/mcp-next"',
+    'healthPath: "/healthz-next"',
+    "/.local/share/devspace/universal-broker-v2/devspace.sqlite",
+    'createHash("sha256").update(token).digest("base64url")',
+    "discoverTokenResource(mcpUrl, options.tokenResource)",
+    "metadata?.resource",
+    "JSON.stringify(userScopes)",
+    "fileMustExist: true",
+  ]) {
+    if (!live.includes(marker)) fail(`The live verifier user-only parallel contract is missing: ${marker}`);
+  }
+  for (const forbidden of [
+    "templateDatabasePath",
+    "--template-database",
+    "production OAuth database",
+    'JSON.stringify(["devspace"',
+    '  "devspace",',
+  ]) {
+    if (live.includes(forbidden)) fail(`The live verifier retains a legacy OAuth dependency: ${forbidden}`);
+  }
+  if (deploy.includes("--template-database")) {
+    fail("The production live-verifier invocation retains a removed template-database option.");
   }
 }
 

@@ -299,7 +299,6 @@ node scripts/verify-universal-broker-v2-live.mjs \
   --artifact-fetch-base-url "$LOCAL_V2_BASE" \
   --token-resource "$PUBLIC_MCP" \
   --database "$DATABASE" \
-  --template-database "$DATABASE" \
   --sessions 5 \
   --company-target "$COMPANY_TARGET" \
   --windows-target "$WINDOWS_TARGET" \
@@ -320,7 +319,6 @@ node scripts/verify-universal-broker-v2-live.mjs \
   --mcp-url "$PUBLIC_MCP" \
   --health-url "$PUBLIC_HEALTH" \
   --database "$DATABASE" \
-  --template-database "$DATABASE" \
   --sessions 5 \
   --company-target "$COMPANY_TARGET" \
   --windows-target "$WINDOWS_TARGET" \

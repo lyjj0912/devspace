@@ -18,6 +18,14 @@ const expectedTools = [
   "artifact",
   "gui",
 ];
+const userScopes = [
+  "devspace.read",
+  "devspace.write",
+  "devspace.exec",
+  "devspace.mcp",
+  "devspace.artifact",
+  "devspace.gui",
+];
 
 const options = parseArgs(process.argv.slice(2));
 const baseUrl = new URL(options.baseUrl);
@@ -41,14 +49,13 @@ assert(health.status === 200, `health status is ${health.status}`);
 audit.health = await health.json();
 assert(audit.health?.ok === true, "health payload is not ok");
 
-const credential = createTemporaryAccessToken(
-  options.databasePath,
-  options.templateDatabasePath,
-  options.tokenResource ?? mcpUrl.href,
-);
+const tokenResource = await discoverTokenResource(mcpUrl, options.tokenResource);
+audit.tokenResource = tokenResource;
 const root = await mkdtemp(join(tmpdir(), "devspace-v2-live-"));
+let credential;
 let primary;
 try {
+  credential = createTemporaryAccessToken(options.databasePath, tokenResource);
   for (let index = 0; index < options.sessions; index += 1) {
     const session = await connectClient(mcpUrl, credential.token, index);
     try {
@@ -67,7 +74,7 @@ try {
   primary = undefined;
 } finally {
   if (primary) await primary.client.close().catch(() => undefined);
-  credential.cleanup();
+  credential?.cleanup();
   await rm(root, { recursive: true, force: true });
 }
 
@@ -506,53 +513,77 @@ function data(result) {
   return value;
 }
 
-function createTemporaryAccessToken(databasePath, templateDatabasePath, resource) {
-  const templateDb = new Database(templateDatabasePath, { readonly: true });
-  const sourceToken = templateDb.prepare("SELECT client_id, expires_at, resource FROM oauth_access_tokens LIMIT 1").get();
-  const sourceClient = templateDb.prepare("SELECT client_json, issued_at FROM oauth_clients LIMIT 1").get();
-  templateDb.close();
-  assert(sourceToken && sourceClient, "production OAuth database has no reusable client/token template");
-  const db = new Database(databasePath);
+async function discoverTokenResource(mcpUrl, configuredResource) {
+  if (configuredResource) return new URL(configuredResource).href;
+  const unauthorized = await fetch(mcpUrl);
+  assert(unauthorized.status === 401, `unauthenticated MCP discovery status is ${unauthorized.status}`);
+  const challenge = unauthorized.headers.get("www-authenticate") ?? "";
+  const metadataMatch = /\bresource_metadata="([^"]+)"/u.exec(challenge);
+  assert(metadataMatch, "MCP authentication challenge has no resource_metadata URL");
+  const advertisedMetadataUrl = new URL(metadataMatch[1]);
+  const localMetadataUrl = new URL(
+    `${advertisedMetadataUrl.pathname}${advertisedMetadataUrl.search}`,
+    mcpUrl.origin,
+  );
+  const response = await fetch(localMetadataUrl);
+  assert(response.status === 200, `OAuth protected-resource metadata status is ${response.status}`);
+  const metadata = await response.json();
+  assert(typeof metadata?.resource === "string", "OAuth protected-resource metadata has no resource URL");
+  return new URL(metadata.resource).href;
+}
+
+function createTemporaryAccessToken(databasePath, resource) {
+  const db = new Database(databasePath, { fileMustExist: true });
   const token = `dsv2_${randomBytes(36).toString("base64url")}`;
   const tokenHash = createHash("sha256").update(token).digest("base64url");
   const clientId = `devspace-v2-live-${randomUUID()}`;
-  const clientJson = JSON.parse(sourceClient.client_json);
-  clientJson.client_id = clientId;
-  clientJson.client_name = "DevSpace Universal Broker v2 live gate";
-  db.prepare("INSERT INTO oauth_clients (client_id, client_json, issued_at) VALUES (?, ?, ?)")
-    .run(clientId, JSON.stringify(clientJson), sourceClient.issued_at);
-  db.prepare("INSERT INTO oauth_access_tokens (token_hash, client_id, scopes_json, expires_at, resource) VALUES (?, ?, ?, ?, ?)")
-    .run(
-      tokenHash,
-      clientId,
-      JSON.stringify(["devspace", "devspace.read", "devspace.write", "devspace.exec", "devspace.mcp", "devspace.artifact", "devspace.gui"]),
-      Math.max(Number(sourceToken.expires_at) || 0, Math.floor(Date.now() / 1_000) + 3_600),
-      resource,
-    );
-  db.close();
+  const issuedAt = Math.floor(Date.now() / 1_000);
+  const clientJson = {
+    client_id: clientId,
+    client_id_issued_at: issuedAt,
+    client_name: "DevSpace Universal Broker v2 live gate",
+    redirect_uris: ["http://127.0.0.1/callback"],
+    token_endpoint_auth_method: "none",
+    grant_types: ["authorization_code", "refresh_token"],
+    response_types: ["code"],
+  };
+  try {
+    db.transaction(() => {
+      db.prepare("INSERT INTO oauth_clients (client_id, client_json, issued_at) VALUES (?, ?, ?)")
+        .run(clientId, JSON.stringify(clientJson), issuedAt);
+      db.prepare("INSERT INTO oauth_access_tokens (token_hash, client_id, scopes_json, expires_at, resource) VALUES (?, ?, ?, ?, ?)")
+        .run(tokenHash, clientId, JSON.stringify(userScopes), issuedAt + 3_600, resource);
+    })();
+  } finally {
+    db.close();
+  }
   return {
     token,
     cleanup() {
-      const cleanupDb = new Database(databasePath);
-      cleanupDb.prepare("DELETE FROM oauth_access_tokens WHERE token_hash = ?").run(tokenHash);
-      cleanupDb.prepare("DELETE FROM oauth_refresh_tokens WHERE client_id = ?").run(clientId);
-      cleanupDb.prepare("DELETE FROM oauth_clients WHERE client_id = ?").run(clientId);
-      cleanupDb.close();
+      const cleanupDb = new Database(databasePath, { fileMustExist: true });
+      try {
+        cleanupDb.transaction(() => {
+          cleanupDb.prepare("DELETE FROM oauth_access_tokens WHERE token_hash = ?").run(tokenHash);
+          cleanupDb.prepare("DELETE FROM oauth_refresh_tokens WHERE client_id = ?").run(clientId);
+          cleanupDb.prepare("DELETE FROM oauth_clients WHERE client_id = ?").run(clientId);
+        })();
+      } finally {
+        cleanupDb.close();
+      }
     },
   };
 }
 
 function parseArgs(args) {
   const result = {
-    baseUrl: "http://127.0.0.1:7676",
+    baseUrl: "http://127.0.0.1:7677",
     mcpUrl: undefined,
     healthUrl: undefined,
-    mcpPath: "/mcp",
-    healthPath: "/healthz",
+    mcpPath: "/mcp-next",
+    healthPath: "/healthz-next",
     artifactFetchBaseUrl: undefined,
     tokenResource: undefined,
-    databasePath: `${process.env.HOME}/.local/share/devspace/devspace.sqlite`,
-    templateDatabasePath: `${process.env.HOME}/.local/share/devspace/devspace.sqlite`,
+    databasePath: `${process.env.HOME}/.local/share/devspace/universal-broker-v2/devspace.sqlite`,
     sessions: 5,
     output: undefined,
     companyTarget: "company",
@@ -574,7 +605,6 @@ function parseArgs(args) {
     else if (argument === "--artifact-fetch-base-url") result.artifactFetchBaseUrl = requiredValue(argument, value), index += 1;
     else if (argument === "--token-resource") result.tokenResource = requiredValue(argument, value), index += 1;
     else if (argument === "--database") result.databasePath = requiredValue(argument, value), index += 1;
-    else if (argument === "--template-database") result.templateDatabasePath = requiredValue(argument, value), index += 1;
     else if (argument === "--sessions") result.sessions = Number(requiredValue(argument, value)), index += 1;
     else if (argument === "--output") result.output = requiredValue(argument, value), index += 1;
     else if (argument === "--company-target") result.companyTarget = requiredValue(argument, value), index += 1;
