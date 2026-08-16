@@ -104,6 +104,42 @@ test("target registry validates SSH prerequisites and offline probes are cached"
   assert.equal(calls, 1);
 });
 
+test("Windows SSH probes report the target temporary directory", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-v2-targets-windows-test-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const configPath = join(root, "targets.json");
+  await writeFile(configPath, JSON.stringify({
+    version: 1,
+    targets: {
+      windows: {
+        displayName: "Windows",
+        transport: "ssh",
+        sshHost: "windows",
+        platform: "windows",
+        shell: "powershell",
+      },
+    },
+  }));
+  const registry = new TargetRegistry({
+    configPath,
+    execute: (async () => ({
+      stdout: [
+        "__DEVSPACE_TARGET_V1__",
+        "architecture=AMD64",
+        "home=C:\\Users\\test",
+        "temporary=C:\\Users\\test\\AppData\\Local\\Temp\\",
+        "git=1",
+        "",
+      ].join("\n"),
+      stderr: "",
+    })) as never,
+  });
+
+  const observation = await registry.probe("windows");
+  assert.equal(observation.status, "ONLINE");
+  assert.equal(observation.temporaryDirectory, "C:\\Users\\test\\AppData\\Local\\Temp\\");
+});
+
 function sshTarget(displayName: string, aliases: string[]) {
   return {
     displayName,

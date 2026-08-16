@@ -316,7 +316,7 @@ export class TargetRegistry {
         sshArguments(
           target.sshHost!,
           this.probeTimeoutMs,
-          "powershell -NoProfile -NonInteractive -Command \"Write-Output '__DEVSPACE_TARGET_V1__'; Write-Output ('architecture=' + $env:PROCESSOR_ARCHITECTURE); Write-Output ('home=' + $HOME); if (Get-Command git -ErrorAction SilentlyContinue) { Write-Output 'git=1' } else { Write-Output 'git=0' }\"",
+          "powershell -NoProfile -NonInteractive -Command \"Write-Output '__DEVSPACE_TARGET_V1__'; Write-Output ('architecture=' + $env:PROCESSOR_ARCHITECTURE); Write-Output ('home=' + $HOME); Write-Output ('temporary=' + [IO.Path]::GetTempPath()); if (Get-Command git -ErrorAction SilentlyContinue) { Write-Output 'git=1' } else { Write-Output 'git=0' }\"",
         ),
         {
           timeout: this.probeTimeoutMs + 1_000,
@@ -336,7 +336,7 @@ export class TargetRegistry {
         platform: "windows",
         architecture: fields.architecture,
         homeDirectory: fields.home,
-        temporaryDirectory: undefined,
+        temporaryDirectory: fields.temporary,
         capabilities: {
           fs: true,
           exec: true,

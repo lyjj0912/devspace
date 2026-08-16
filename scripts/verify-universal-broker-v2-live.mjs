@@ -136,17 +136,19 @@ async function runCanaries(client, root, canaries) {
     yieldMs: 0,
   }));
   assert(typeof background.processId === "string", "background process ID is missing");
-  await call(client, "process", {
+  const backgroundWritten = data(await call(client, "process", {
     operation: "write",
     processId: background.processId,
     chars: "live-input\n",
     waitMs: 1_000,
-  });
-  const backgroundDone = data(await call(client, "process", {
-    operation: "wait",
-    processId: background.processId,
-    waitMs: 30_000,
   }));
+  const backgroundDone = backgroundWritten.state === "EXITED"
+    ? backgroundWritten
+    : data(await call(client, "process", {
+        operation: "wait",
+        processId: background.processId,
+        waitMs: 30_000,
+      }));
   assert(backgroundDone.state === "EXITED" && String(backgroundDone.output).includes("input=live-input"), "background stdin lifecycle failed");
 
   const pty = data(await call(client, "exec", {
@@ -163,17 +165,19 @@ async function runCanaries(client, root, canaries) {
     columns: 132,
     rows: 41,
   });
-  await call(client, "process", {
+  const ptyWritten = data(await call(client, "process", {
     operation: "write",
     processId: pty.processId,
     chars: "live-pty\n",
     waitMs: 1_000,
-  });
-  const ptyDone = data(await call(client, "process", {
-    operation: "wait",
-    processId: pty.processId,
-    waitMs: 30_000,
   }));
+  const ptyDone = ptyWritten.state === "EXITED"
+    ? ptyWritten
+    : data(await call(client, "process", {
+        operation: "wait",
+        processId: pty.processId,
+        waitMs: 30_000,
+      }));
   assert(ptyDone.state === "EXITED" && /41\s+132/.test(String(ptyDone.output)) && String(ptyDone.output).includes("pty=live-pty"), "PTY resize/input lifecycle failed");
   canaries.processLifecycle = { background: true, pty: true };
 
@@ -470,6 +474,14 @@ function fetchArtifact(resourceUri) {
   const value = new URL(resourceUri);
   if (options.artifactFetchBaseUrl) {
     const replacement = new URL(options.artifactFetchBaseUrl);
+    const resource = new URL(options.tokenResource ?? mcpUrl.href);
+    const resourcePrefix = resource.pathname.slice(0, resource.pathname.lastIndexOf("/")) || "/";
+    if (
+      resourcePrefix !== "/"
+      && (value.pathname === resourcePrefix || value.pathname.startsWith(`${resourcePrefix}/`))
+    ) {
+      value.pathname = value.pathname.slice(resourcePrefix.length) || "/";
+    }
     value.protocol = replacement.protocol;
     value.username = replacement.username;
     value.password = replacement.password;
