@@ -857,7 +857,7 @@ async function executeFakeWindowsFilesystemRequest(
 }
 
 function mapWindowsFixturePath(remotePath: string, driveRoot: string): string {
-  const normalized = remotePath.replaceAll("\\", "/");
+  const normalized = remotePath.replaceAll("\\", "/").replace(/^\/(?=[a-zA-Z]:\/)/u, "");
   const expanded = normalized === "~"
     ? "C:/Users/Test"
     : normalized.startsWith("~/")

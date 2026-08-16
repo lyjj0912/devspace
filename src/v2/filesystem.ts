@@ -1441,7 +1441,8 @@ function sftpQuote(value: string): string {
 function sftpRemotePath(target: TargetDefinition, value: string): string {
   if (target.platform !== "windows") return value;
   const normalized = value.replaceAll("\\", "/");
-  return normalized.startsWith("//") ? normalized : normalized;
+  if (/^[a-zA-Z]:\//u.test(normalized)) return `/${normalized}`;
+  return normalized;
 }
 
 function validateSftpPath(value: string, field: string): void {
