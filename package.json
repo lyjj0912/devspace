@@ -1,9 +1,9 @@
 {
   "name": "@waishnav/devspace",
   "version": "1.0.6",
-  "description": "Expose a secure local coding workspace through an MCP server.",
+  "description": "Universal MCP broker for local and remote development capabilities.",
   "type": "module",
-  "main": "dist/server.js",
+  "main": "dist/v2/server.js",
   "engines": {
     "node": ">=22.19 <27"
   },
@@ -16,23 +16,43 @@
     "examples",
     "scripts",
     "skills",
-    "README.md"
+    "README.md",
+    "scripts/deploy-universal-broker-v2-production.sh",
+    "scripts/cutover-universal-broker-v2-production.sh",
+    "scripts/rollback-universal-broker-v2-production.sh",
+    "scripts/finalize-universal-broker-v2-production.sh",
+    "scripts/verify-universal-broker-v2-live.mjs",
+    "scripts/verify-universal-broker-v2-load.mjs",
+    "scripts/configure-devspace-log-rotation.sh",
+    "scripts/verify-universal-broker-v2-release.mjs"
   ],
   "publishConfig": {
     "access": "public"
   },
   "scripts": {
     "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
-    "build": "npm run clean && npm run build:app && tsc -p tsconfig.build.json",
-    "build:app": "vite build",
+    "build": "npm run clean && tsc -p tsconfig.build.json",
     "dev": "node scripts/dev-server.mjs",
     "postinstall": "node scripts/fix-node-pty-permissions.mjs",
     "start": "node dist/cli.js serve",
+    "start:next": "node dist/cli.js serve-next",
     "deploy:pm2": "bash scripts/deploy-personal-pm2.sh",
-    "release:verify": "node scripts/personal-release-gate.mjs",
+    "deploy:v2": "bash scripts/deploy-universal-broker-v2-pm2.sh",
+    "undeploy:v2": "bash scripts/undeploy-universal-broker-v2-pm2.sh",
+    "cutover:v2": "bash scripts/cutover-universal-broker-v2-production.sh",
+    "rollback:v2": "bash scripts/rollback-universal-broker-v2-production.sh",
+    "finalize:v2": "bash scripts/finalize-universal-broker-v2-production.sh",
+    "ops:logrotate": "bash scripts/configure-devspace-log-rotation.sh",
+    "release:verify": "node scripts/verify-universal-broker-v2-release.mjs",
     "release:live": "node scripts/personal-release-gate.mjs --live-only --require-clean",
-    "test": "tsx src/config.test.ts && tsx src/shortcuts/config.test.ts && tsx src/shortcuts/browser-read.test.ts && tsx src/shortcuts/remote-mcp-read.test.ts && tsx src/shortcuts/jira-lookup.test.ts && tsx src/shortcuts/runtime.test.ts && tsx src/request-meta.test.ts && tsx src/incoming-artifacts.test.ts && tsx src/artifact-download.test.ts && tsx src/ui/card-types.test.ts && tsx src/ui/patch-display.test.ts && tsx src/ui/tool-display.test.ts && tsx src/apply-patch.test.ts && tsx src/process-platform.test.ts && tsx src/process-sessions.test.ts && tsx src/mcp-sessions.test.ts && tsx src/server-shutdown.test.ts && tsx src/local-agent-runtime.test.ts && tsx src/local-agent-adapters.test.ts && tsx src/local-agent-availability.test.ts && tsx src/local-agent-profiles.test.ts && tsx src/local-agent-targets.test.ts && tsx src/local-agent-store.test.ts && tsx src/roots.test.ts && tsx src/skills.test.ts && tsx src/workspaces.test.ts && tsx src/workspace-conversation.test.ts && tsx src/maintenance.test.ts && tsx src/review-checkpoints.test.ts && tsx src/server.test.ts && tsx src/oauth-store.test.ts && tsx src/cli.test.ts",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "v2:test": "tsx src/v2/contracts.test.ts && tsx src/v2/config.test.ts && tsx src/v2/errors.test.ts && tsx src/v2/targets.test.ts && tsx src/v2/env-profiles.test.ts && tsx src/v2/env-profiles-integration.test.ts && tsx src/v2/ssh-control.test.ts && tsx src/v2/text-resource-store.test.ts && tsx src/v2/metrics.test.ts && tsx src/v2/doctor.test.ts && tsx src/v2/contexts.test.ts && tsx src/v2/execution.test.ts && tsx src/v2/filesystem.test.ts && tsx src/v2/mcp-routes.test.ts && tsx src/v2/mcp-result-store.test.ts && tsx src/v2/mcp-proxy.test.ts && tsx src/v2/artifact-service.test.ts && tsx src/v2/gui.test.ts && tsx src/v2/server.test.ts && tsx src/v2/http-server.test.ts && tsx src/v2/remote-windows-filesystem-helper.test.ts",
+    "v2:budget": "node scripts/check-universal-broker-v2-budgets.mjs",
+    "v2:load": "node --expose-gc scripts/verify-universal-broker-v2-load.mjs",
+    "v2:load:quick": "node --expose-gc scripts/verify-universal-broker-v2-load.mjs --quick",
+    "v2:live": "node scripts/verify-universal-broker-v2-live.mjs",
+    "test": "tsx src/config.test.ts && tsx src/incoming-artifacts.test.ts && tsx src/apply-patch.test.ts && tsx src/process-platform.test.ts && tsx src/mcp-sessions.test.ts && tsx src/server-shutdown.test.ts && tsx src/local-agent-runtime.test.ts && tsx src/local-agent-adapters.test.ts && tsx src/local-agent-availability.test.ts && tsx src/local-agent-profiles.test.ts && tsx src/local-agent-targets.test.ts && tsx src/local-agent-store.test.ts && tsx src/roots.test.ts && tsx src/skills.test.ts && tsx src/maintenance.test.ts && tsx src/oauth-store.test.ts && tsx src/cli.test.ts && npm run v2:test",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "v2:deploy": "bash scripts/deploy-universal-broker-v2-production.sh"
   },
   "keywords": [],
   "author": "",
@@ -46,14 +66,10 @@
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@openai/codex-sdk": "^0.142.5",
     "@opencode-ai/sdk": "^1.17.13",
-    "@pierre/diffs": "^1.2.5",
     "better-sqlite3": "^12.10.0",
     "diff": "^8.0.3",
     "drizzle-orm": "^0.45.2",
     "express": "^5.2.1",
-    "lucide": "^1.24.0",
-    "react": "^19.2.6",
-    "react-dom": "^19.2.6",
     "semver": "^7.8.4",
     "yaml": "^2.9.0",
     "zod": "^4.4.3"
@@ -62,13 +78,9 @@
     "@types/better-sqlite3": "^7.6.13",
     "@types/express": "^5.0.6",
     "@types/node": "^25.9.1",
-    "@types/react": "^19.2.15",
-    "@types/react-dom": "^19.2.3",
     "@types/semver": "^7.7.1",
-    "@vitejs/plugin-react": "^6.0.2",
     "tsx": "^4.22.3",
-    "typescript": "^6.0.3",
-    "vite": "^8.0.14"
+    "typescript": "^6.0.3"
   },
   "overrides": {
     "protobufjs": "7.6.4",

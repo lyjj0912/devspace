@@ -19,7 +19,6 @@ import {
 } from "./local-agent-profiles.js";
 import {
   assertLocalAgentProviderAvailable,
-  formatLocalAgentProviderAvailabilitySummary,
 } from "./local-agent-availability.js";
 import {
   formatAvailableLocalAgentTargets,
@@ -41,9 +40,9 @@ import { expandHomePath } from "./roots.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
 import { runMaintenance } from "./maintenance.js";
 
-type Command = "serve" | "init" | "doctor" | "maintenance" | "config" | "agents" | "help" | "version";
+type Command = "serve" | "serve-next" | "init" | "doctor" | "maintenance" | "config" | "agents" | "help" | "version";
 const require = createRequire(import.meta.url);
-const SUPPORTED_NODE_RANGE = ">=20.12 <27";
+const SUPPORTED_NODE_RANGE = ">=22.19 <27";
 
 async function main(argv: string[]): Promise<void> {
   assertSupportedNode();
@@ -56,11 +55,15 @@ async function main(argv: string[]): Promise<void> {
       await ensureConfigured();
       await serve();
       return;
+    case "serve-next":
+      await ensureConfigured();
+      await serveNext();
+      return;
     case "init":
       await runInit({ force: args.includes("--force") });
       return;
     case "doctor":
-      await runDoctor();
+      await runDoctor(args);
       return;
     case "maintenance":
       await runMaintenanceCommand(args);
@@ -84,6 +87,7 @@ function normalizeCommand(command: string | undefined): Command {
   if (!command || command === "serve" || command === "start") return "serve";
   if (
     command === "init"
+    || command === "serve-next"
     || command === "doctor"
     || command === "maintenance"
     || command === "config"
@@ -209,6 +213,17 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
 }
 
 async function serve(): Promise<void> {
+  await serveUniversalBroker({
+    ...process.env,
+    DEVSPACE_V2_DEPLOYMENT_MODE: "production",
+  });
+}
+
+async function serveNext(): Promise<void> {
+  await serveUniversalBroker(process.env);
+}
+
+async function serveUniversalBroker(env: NodeJS.ProcessEnv): Promise<void> {
   const sqliteStatus = checkSqliteNative();
   if (sqliteStatus !== "ok") {
     throw new Error(
@@ -222,34 +237,37 @@ async function serve(): Promise<void> {
     );
   }
 
-  const { createServer } = await import("./server.js");
-  const config = loadConfig();
-  if (config.maintenance.enabled) {
+  const [{ createUniversalBrokerNextServer }, { loadUniversalBrokerNextConfig }] = await Promise.all([
+    import("./v2/http-server.js"),
+    import("./v2/config.js"),
+  ]);
+  const baseConfig = loadConfig(env);
+  const config = loadUniversalBrokerNextConfig(baseConfig, env);
+  if (config.deploymentMode === "production" && baseConfig.maintenance.enabled) {
     try {
-      const maintenance = await runMaintenance(config, { scheduled: true });
+      const maintenance = await runMaintenance(baseConfig, { scheduled: true });
       console.log(`maintenance: ${JSON.stringify(maintenance)}`);
     } catch (error) {
       console.warn(
-        `maintenance failed; starting DevSpace without cleanup: ${
+        `maintenance failed; starting Universal Broker without cleanup: ${
           error instanceof Error ? error.message : String(error)
         }`,
       );
     }
   }
-  const { app, close, localAgentProviders } = createServer(config);
+  const { app, close, targets } = createUniversalBrokerNextServer(config);
+  const targetSnapshot = await targets.inspect();
   const httpServer = app.listen(config.port, config.host, () => {
-    console.log(`devspace listening on http://${config.host}:${config.port}/mcp`);
+    console.log(
+      `devspace universal broker v2 listening on http://${config.host}:${config.port}${config.endpointPath}`,
+    );
     console.log(`public base url: ${config.publicBaseUrl}`);
-    console.log(`allowed roots: ${config.allowedRoots.join(", ")}`);
-    console.log(`allowed hosts: ${config.allowedHosts.join(", ")}`);
-    if (config.allowedHosts.includes("*")) {
-      console.warn("warning: Host header allowlist is disabled because DEVSPACE_ALLOWED_HOSTS=*");
-    }
+    console.log(`state dir: ${config.stateDir}`);
+    console.log(`deployment mode: ${config.deploymentMode}`);
+    console.log("contract: universal-broker-v2");
+    console.log(`target registry: ${config.targetConfigPath}`);
+    console.log(`targets: ${targetSnapshot.targets.length} (${targetSnapshot.generation})`);
     console.log("auth: Owner password approval required");
-    console.log(`logging: ${config.logging.level} ${config.logging.format}`);
-    if (config.subagents) {
-      console.log(`subagent providers: ${formatLocalAgentProviderAvailabilitySummary(localAgentProviders)}`);
-    }
   });
 
   let shuttingDown = false;
@@ -261,7 +279,7 @@ async function serve(): Promise<void> {
   };
   const handleShutdown = () => {
     void shutdown().catch((error) => {
-      console.error("devspace shutdown failed", error);
+      console.error("devspace universal broker shutdown failed", error);
       process.exit(1);
     });
   };
@@ -269,8 +287,26 @@ async function serve(): Promise<void> {
   process.once("SIGTERM", handleShutdown);
 }
 
-async function runDoctor(): Promise<void> {
+async function runDoctor(args: string[] = []): Promise<void> {
+  const unknown = args.filter((argument) => argument !== "--json");
+  if (unknown.length > 0) throw new Error(`Unknown doctor option: ${unknown.join(" ")}`);
   const files = loadDevspaceFiles();
+  if (args.includes("--json")) {
+    const config = loadConfig();
+    const { collectUniversalBrokerDoctor } = await import("./v2/doctor.js");
+    console.log(JSON.stringify({
+      legacy: {
+        configDir: files.dir,
+        configFile: files.configExists ? files.configPath : undefined,
+        authFile: files.authExists ? files.authPath : undefined,
+        node: process.version,
+        platform: process.platform,
+        architecture: process.arch,
+      },
+      universalBroker: await collectUniversalBrokerDoctor(config),
+    }, null, 2));
+    return;
+  }
   console.log(`Config dir: ${files.dir}`);
   console.log(`Config file: ${files.configExists ? files.configPath : "missing"}`);
   console.log(`Auth file: ${files.authExists ? files.authPath : "missing"}`);
@@ -288,6 +324,15 @@ async function runDoctor(): Promise<void> {
     console.log(`Allowed roots: ${config.allowedRoots.join(", ")}`);
     console.log(`Allowed hosts: ${config.allowedHosts.join(", ")}`);
     console.log(`Maintenance: ${config.maintenance.enabled ? "enabled" : "disabled"}`);
+    const { loadUniversalBrokerNextConfig } = await import("./v2/config.js");
+    const next = loadUniversalBrokerNextConfig(config);
+    console.log(`Universal Broker v2 local URL: http://${next.host}:${next.port}${next.endpointPath}`);
+    console.log(`Universal Broker v2 public URL: ${next.publicMcpUrl}`);
+    console.log(`Universal Broker v2 state dir: ${next.stateDir}`);
+    const { TargetRegistry } = await import("./v2/targets.js");
+    const targets = await new TargetRegistry({ configPath: next.targetConfigPath }).inspect();
+    console.log(`Universal Broker v2 target registry: ${next.targetConfigPath}`);
+    console.log(`Universal Broker v2 targets: ${targets.targets.length} (${targets.generation})`);
   } catch (error) {
     console.log(`Config status: ${error instanceof Error ? error.message : String(error)}`);
   }
@@ -338,9 +383,11 @@ function printHelp(): void {
       "",
       "Usage:",
       "  devspace                 Run first-time setup if needed, then start the server",
-      "  devspace serve           Start the server",
+      "  devspace serve           Start Universal Broker v2 in production mode at /mcp",
+      "  devspace serve-next      Start the isolated parallel v2 service at /mcp-next",
       "  devspace init            Create or update ~/.devspace/config.json and auth.json",
       "  devspace doctor          Show config, runtime, and native dependency status",
+      "  devspace doctor --json   Print machine-readable Universal Broker diagnostics",
       "  devspace maintenance     Prune stale DevSpace sessions, clean managed worktrees, and review refs",
       "  devspace maintenance --dry-run",
       "  devspace config get      Print persisted config",

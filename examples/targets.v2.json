@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "targets": {
+    "local": {
+      "displayName": "Local machine",
+      "aliases": [
+        "local",
+        "localhost"
+      ],
+      "transport": "local",
+      "platform": "macos",
+      "shell": "zsh",
+      "durableProcess": {
+        "mode": "none"
+      },
+      "gui": {
+        "mode": "local-ipc"
+      }
+    },
+    "company": {
+      "displayName": "Company Mac",
+      "aliases": [
+        "company",
+        "company-mac"
+      ],
+      "transport": "ssh",
+      "sshHost": "company",
+      "platform": "macos",
+      "shell": "zsh",
+      "durableProcess": {
+        "mode": "none"
+      },
+      "gui": {
+        "mode": "ssh-stdio"
+      }
+    },
+    "linux-build": {
+      "displayName": "Linux build server",
+      "aliases": [
+        "build"
+      ],
+      "transport": "ssh",
+      "sshHost": "linux-build",
+      "platform": "linux",
+      "shell": "bash",
+      "durableProcess": {
+        "mode": "none"
+      },
+      "gui": {
+        "mode": "none"
+      }
+    }
+  }
+}

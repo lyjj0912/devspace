@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://devspace.local/contracts/errors.schema.json",
+  "title": "DevSpace Universal Broker v2 Error",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["code", "message", "retryable", "operationId"],
+  "properties": {
+    "code": {
+      "enum": [
+        "CAPABILITY_UNAVAILABLE",
+        "TARGET_NOT_FOUND",
+        "TARGET_AMBIGUOUS",
+        "TARGET_OFFLINE",
+        "PATH_NOT_FOUND",
+        "PATH_TYPE_MISMATCH",
+        "PERMISSION_DENIED",
+        "PRECONDITION_FAILED",
+        "TRANSPORT_UNAVAILABLE",
+        "TRANSPORT_INTERRUPTED",
+        "EXECUTION_STATE_UNKNOWN",
+        "PROCESS_NOT_FOUND",
+        "MCP_ROUTE_NOT_FOUND",
+        "MCP_TOOL_NOT_FOUND",
+        "MCP_PROVIDER_ERROR",
+        "MCP_RESULT_UNKNOWN",
+        "HOST_ACTION_BLOCKED",
+        "HOST_ARTIFACT_CAPABILITY_UNAVAILABLE",
+        "GUI_STATE_CHANGED",
+        "OUTPUT_TRUNCATED",
+        "RESOURCE_QUOTA_EXCEEDED"
+      ]
+    },
+    "message": { "type": "string", "minLength": 1 },
+    "retryable": { "type": "boolean" },
+    "operationId": { "type": "string", "pattern": "^op_[A-Za-z0-9_-]+$" },
+    "evidence": { "type": "object" },
+    "suggestions": {
+      "type": "array",
+      "items": { "type": "object" }
+    }
+  }
+}

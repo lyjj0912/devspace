@@ -1,11 +1,6 @@
 #!/usr/bin/env node
-import { createHash } from "node:crypto";
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { relative, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
 
-const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const argumentsSet = new Set(process.argv.slice(2));
 const liveOnly = argumentsSet.has("--live-only");
 const live = liveOnly || argumentsSet.has("--live");
@@ -15,106 +10,50 @@ const unknown = [...argumentsSet].filter((argument) => !supported.has(argument))
 if (unknown.length > 0) fail(`Unknown release-gate option: ${unknown.join(" ")}`);
 
 if (!liveOnly) {
-  run("npm", ["run", "typecheck"]);
-  run("npm", ["test"]);
-  run("npm", ["run", "build"]);
-  run("git", ["diff", "--check"]);
+  const args = ["scripts/verify-universal-broker-v2-release.mjs"];
+  if (requireClean) args.push("--require-clean");
+  run(process.execPath, args);
 }
-
-if (requireClean) {
-  const status = capture("git", ["status", "--porcelain=v1", "--untracked-files=all"]);
-  if (status.trim()) fail(`Tracked release tree is not clean:\n${status}`);
-}
-
-for (const path of [
-  "dist/cli.js",
-  "dist/server.js",
-  "dist/maintenance.js",
-  "scripts/deploy-personal-pm2.sh",
-]) {
-  if (!existsSync(resolve(root, path))) fail(`Missing build output: ${path}`);
-}
-const serverOutput = readFileSync(resolve(root, "dist/server.js"), "utf8");
-if (!serverOutput.includes('localShell: "local_shell"')) {
-  fail("Build output does not contain the required local_shell tool.");
-}
-const cliOutput = readFileSync(resolve(root, "dist/cli.js"), "utf8");
-if (!cliOutput.includes('case "maintenance"')) {
-  fail("Build output does not contain the maintenance command.");
-}
-const deployOutput = readFileSync(
-  resolve(root, "scripts/deploy-personal-pm2.sh"),
-  "utf8",
-);
-if (!deployOutput.includes("credential_key=DEVSPACE_OAUTH_OWNER_TOKEN")) {
-  fail("PM2 deployment does not define the owner credential environment key.");
-}
-if (!deployOutput.includes('unset "$credential_key"')) {
-  fail("PM2 deployment does not scrub the owner credential environment key.");
-}
-if (!deployOutput.includes("credential environment residue")) {
-  fail("PM2 deployment does not detect credential environment residue.");
-}
-
-const distFiles = walkFiles(resolve(root, "dist"));
-const digest = createHash("sha256");
-for (const file of distFiles) {
-  digest.update(relative(resolve(root, "dist"), file));
-  digest.update("\0");
-  digest.update(readFileSync(file));
-  digest.update("\0");
-}
-console.log(`dist files: ${distFiles.length}`);
-console.log(`dist tree sha256: ${digest.digest("hex")}`);
-
 if (live) await verifyLiveEndpoints();
 console.log("personal release gate: PASS");
 
-function run(command, args) {
-  const result = spawnSync(command, args, {
-    cwd: root,
-    stdio: "inherit",
-    env: process.env,
-  });
-  if (result.error) fail(`${command} failed to start: ${result.error.message}`);
-  if (result.status !== 0) fail(`${command} ${args.join(" ")} exited with ${result.status}`);
-}
-
-function capture(command, args) {
-  const result = spawnSync(command, args, {
-    cwd: root,
-    encoding: "utf8",
-    env: process.env,
-  });
-  if (result.error) fail(`${command} failed to start: ${result.error.message}`);
-  if (result.status !== 0) {
-    fail(`${command} ${args.join(" ")} exited with ${result.status}: ${result.stderr}`);
-  }
-  return result.stdout;
-}
-
-function walkFiles(directory) {
-  const files = [];
-  for (const entry of readdirSync(directory, { withFileTypes: true })) {
-    const path = resolve(directory, entry.name);
-    if (entry.isDirectory()) files.push(...walkFiles(path));
-    else if (entry.isFile() && statSync(path).isFile()) files.push(path);
-  }
-  return files.sort();
-}
-
 async function verifyLiveEndpoints() {
-  const health = await fetch("http://127.0.0.1:7676/healthz");
+  const base = new URL(process.env.DEVSPACE_V2_LIVE_BASE_URL ?? "http://127.0.0.1:7676");
+  const healthPath = process.env.DEVSPACE_V2_LIVE_HEALTH_PATH ?? "/healthz";
+  const mcpPath = process.env.DEVSPACE_V2_LIVE_MCP_PATH ?? "/mcp";
+  const health = await fetch(new URL(healthPath, base));
   const healthBody = await health.text();
   if (health.status !== 200 || !healthBody.includes('"ok":true')) {
-    fail(`Live health check failed: ${health.status} ${healthBody}`);
+    fail(`Live health check failed: ${health.status} ${healthBody.slice(0, 1_000)}`);
   }
-  const unauthenticated = await fetch("http://127.0.0.1:7676/mcp");
+  const unauthenticated = await fetch(new URL(mcpPath, base), {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: {
+        protocolVersion: "2025-06-18",
+        capabilities: {},
+        clientInfo: { name: "release-live-boundary", version: "1" },
+      },
+    }),
+  });
   if (unauthenticated.status !== 401) {
     fail(`Unauthenticated MCP boundary returned ${unauthenticated.status}, expected 401.`);
   }
-  console.log("live health: 200");
-  console.log("live unauthenticated MCP: 401");
+}
+
+function run(command, args) {
+  const result = spawnSync(command, args, {
+    cwd: process.cwd(),
+    stdio: "inherit",
+    env: process.env,
+    timeout: 20 * 60_000,
+  });
+  if (result.error) fail(`${command} failed to start: ${result.error.message}`);
+  if (result.status !== 0) process.exit(result.status ?? 1);
 }
 
 function fail(message) {

@@ -102,3 +102,44 @@ finishDelayedClose?.();
 await delayedClose;
 assert.equal(delayedCloseResolved, true);
 assert.equal(registry.size, 0);
+
+{
+  let quotaNow = 0;
+  const quota = new McpSessionRegistry<FakeTransport>({
+    now: () => quotaNow,
+    maximumSessions: 2,
+  });
+  const firstQuota = createTransport();
+  const secondQuota = createTransport();
+  quota.register("first", firstQuota);
+  quotaNow = 1;
+  quota.register("second", secondQuota);
+  assert.throws(() => quota.register("third", createTransport()), /quota is full/);
+  const closed = await quota.closeLeastRecentlyUsed(1);
+  assert.deepEqual(closed, [{ sessionId: "first" }]);
+  assert.equal(firstQuota.closeCalls, 1);
+  assert.equal(secondQuota.closeCalls, 0);
+  quota.register("third", createTransport());
+  assert.equal(quota.size, 2);
+}
+
+{
+  let activeNow = 0;
+  const activeRegistry = new McpSessionRegistry<FakeTransport>({
+    now: () => activeNow,
+    maximumSessions: 2,
+  });
+  const activeRequest = createTransport();
+  const idle = createTransport();
+  activeRegistry.register("active-request", activeRequest);
+  activeNow = 1;
+  activeRegistry.register("idle", idle);
+  activeRegistry.acquire("active-request");
+  activeNow = 10_000;
+  const closed = await activeRegistry.closeIdle(1);
+  assert.deepEqual(closed, [{ sessionId: "idle" }]);
+  assert.equal(activeRequest.closeCalls, 0);
+  assert.equal((await activeRegistry.closeLeastRecentlyUsed(1)).length, 0);
+  activeRegistry.release("active-request");
+  assert.deepEqual(await activeRegistry.closeLeastRecentlyUsed(1), [{ sessionId: "active-request" }]);
+}

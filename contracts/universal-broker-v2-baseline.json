@@ -1,0 +1,23 @@
+{
+  "capturedAt": "2026-08-15T12:53:22+09:00",
+  "sourceCommit": "ea32ae5bb3518734309f4b95f222df997c045b61",
+  "sourceTag": "universal-broker-v2-baseline-20260815",
+  "productionEndpoint": "/mcp",
+  "productionPort": 7676,
+  "productionMutationPolicy": "frozen-until-cutover",
+  "developmentBranch": "feat/universal-broker-v2-phase0-1-20260815",
+  "developmentEndpoint": "/mcp-next",
+  "developmentDefaultPort": 7677,
+  "legacyToolNames": [
+    "open_workspace",
+    "read",
+    "local_shell",
+    "apply_patch",
+    "show_changes",
+    "exec_command",
+    "write_stdin",
+    "browser_read_shortcut",
+    "remote_mcp_read_shortcut",
+    "jira_lookup_shortcut"
+  ]
+}
