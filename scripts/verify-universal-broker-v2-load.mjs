@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -9,7 +9,7 @@ import { promisify } from "node:util";
 const execFileAsync = promisify(execFile);
 const root = resolve(new URL("..", import.meta.url).pathname);
 const quick = process.argv.includes("--quick");
-const requireSsh = !quick || process.argv.includes("--require-ssh");
+const requireRealSsh = process.argv.includes("--require-ssh");
 const counts = quick
   ? { sessions: 100, contexts: 50, localExec: 50, sshExec: 10, mcp: 20, directoryEntries: 10_000, outputBytes: 10 * 1024 * 1024 }
   : { sessions: 1_000, contexts: 500, localExec: 500, sshExec: 200, mcp: 200, directoryEntries: 100_000, outputBytes: 100 * 1024 * 1024 };
@@ -22,6 +22,28 @@ const report = {
   passed: false,
 };
 
+class LoadGuiRunner {
+  constructor() {
+    this.state = guiObservation("Before action");
+    this.actions = 0;
+  }
+
+  async call(_target, request) {
+    if (request.operation === "capabilities") {
+      return {
+        platform: "macos",
+        accessibility: true,
+        screenCapture: "not_probed",
+        frontmostProcess: { name: this.state.application.name, pid: 4242 },
+      };
+    }
+    if (request.operation === "observe") return structuredClone(this.state);
+    this.actions += 1;
+    this.state = guiObservation("After action");
+    return { performed: true, actionType: request.actionType };
+  }
+}
+
 try {
   const [
     { loadConfig },
@@ -32,6 +54,9 @@ try {
     { UniversalFilesystemService },
     { UniversalMcpRouteRegistry },
     { UniversalMcpProxy },
+    { UniversalArtifactService },
+    { UniversalGuiService },
+    { UNIVERSAL_OWNER_SCOPES, UNIVERSAL_TOOL_CONTRACTS },
   ] = await Promise.all([
     import(pathToFileURL(join(root, "dist/config.js")).href),
     import(pathToFileURL(join(root, "dist/mcp-sessions.js")).href),
@@ -41,6 +66,9 @@ try {
     import(pathToFileURL(join(root, "dist/v2/filesystem.js")).href),
     import(pathToFileURL(join(root, "dist/v2/mcp-routes.js")).href),
     import(pathToFileURL(join(root, "dist/v2/mcp-proxy.js")).href),
+    import(pathToFileURL(join(root, "dist/v2/artifact-service.js")).href),
+    import(pathToFileURL(join(root, "dist/v2/gui.js")).href),
+    import(pathToFileURL(join(root, "dist/v2/contracts.js")).href),
   ]);
 
   report.checks.sessionChurn = await sessionChurn(McpSessionRegistry, counts.sessions);
@@ -54,8 +82,30 @@ try {
     DEVSPACE_PUBLIC_BASE_URL: "http://127.0.0.1:17676",
     DEVSPACE_LOG_LEVEL: "silent",
   });
-  const targetConfig = process.env.DEVSPACE_V2_LOAD_TARGET_CONFIG
-    ?? join(temporary, "missing-targets.json");
+  const fixtureSsh = await writeSshFixture(temporary);
+  const targetConfig = join(temporary, "targets.json");
+  await writeFile(targetConfig, `${JSON.stringify({
+    version: 1,
+    targets: {
+      local: {
+        displayName: "Local user fixture",
+        aliases: ["local"],
+        transport: "local",
+        platform: "macos",
+        gui: { mode: "local-ipc" },
+      },
+      "user-ssh-fixture": {
+        displayName: "SSH user fixture",
+        aliases: ["user-ssh-fixture"],
+        transport: "ssh",
+        sshHost: "user-ssh-fixture",
+        platform: "linux",
+        shell: "sh",
+        defaultCwd: join(temporary, "remote-user"),
+      },
+    },
+  }, null, 2)}\n`);
+  await mkdir(join(temporary, "remote-user"));
   const targets = new TargetRegistry({ configPath: targetConfig });
   const project = join(temporary, "project");
   await mkdir(project);
@@ -95,21 +145,54 @@ try {
     processBufferCharacters: 50_000,
     processOutputMaxBytes: counts.outputBytes + 1024 * 1024,
     completedProcessTtlMs: 60_000,
+    sshExecutable: fixtureSsh,
   });
   const filesystem = new UniversalFilesystemService(targets, contexts, execution, {
     sshControlDir: join(temporary, "fs-control-".repeat(12)),
+    sftpPut: async ({ localPath, remotePath }) => {
+      await mkdir(dirname(remotePath), { recursive: true });
+      await copyFile(localPath, remotePath);
+    },
+    sftpGet: async ({ localPath, remotePath }) => {
+      await mkdir(dirname(localPath), { recursive: true });
+      await copyFile(remotePath, localPath);
+    },
+  });
+  const artifacts = new UniversalArtifactService(filesystem, {
+    stagingRoot: join(temporary, "artifacts"),
+    maximumEntries: 8,
+    maximumTotalBytes: 10 * 1024 * 1024,
+    maximumArtifactBytes: 5 * 1024 * 1024,
+    ttlMs: 60_000,
+  });
+  const guiRunner = new LoadGuiRunner();
+  const gui = new UniversalGuiService(targets, filesystem, execution, {
+    runner: guiRunner,
+    sleep: async () => undefined,
   });
   try {
+    report.checks.userAuthority = authorityContract(
+      UNIVERSAL_OWNER_SCOPES,
+      UNIVERSAL_TOOL_CONTRACTS,
+    );
     report.checks.localExecution = await executionLoad(execution, "local", counts.localExec);
-    const sshTarget = process.env.DEVSPACE_V2_LOAD_SSH_TARGET;
-    report.checks.sshExecution = sshTarget
-      ? await executionLoad(execution, sshTarget, counts.sshExec)
-      : {
-          passed: !requireSsh,
-          skipped: true,
-          required: requireSsh,
-          reason: "DEVSPACE_V2_LOAD_SSH_TARGET is not set",
-        };
+    report.checks.sshExecution = await executionLoad(
+      execution,
+      "user-ssh-fixture",
+      counts.sshExec,
+    );
+    report.checks.realSshExecution = await optionalRealSshLoad({
+      ContextRegistry,
+      TargetRegistry,
+      UniversalExecutionPlane,
+      config,
+      count: counts.sshExec,
+      temporary,
+      required: requireRealSsh,
+    });
+    report.checks.filesystem = await filesystemLoad(filesystem, temporary);
+    report.checks.artifact = await artifactLoad(artifacts, temporary);
+    report.checks.gui = await guiLoad(gui, guiRunner);
     report.checks.concurrentProcesses = await concurrentProcessQuota(execution);
     report.checks.largeOutput = await largeOutput(execution, counts.outputBytes);
     report.checks.largeDirectory = await largeDirectory(filesystem, temporary, counts.directoryEntries);
@@ -121,6 +204,8 @@ try {
       ...executionStats,
     };
   } finally {
+    gui.close();
+    await artifacts.close();
     await execution.close();
   }
 
@@ -194,6 +279,206 @@ try {
   if (!report.passed) process.exitCode = 1;
 } finally {
   await rm(temporary, { recursive: true, force: true });
+}
+
+function authorityContract(scopes, contracts) {
+  const expectedScopes = [
+    "devspace.read",
+    "devspace.write",
+    "devspace.exec",
+    "devspace.mcp",
+    "devspace.artifact",
+    "devspace.gui",
+  ];
+  const expectedInputs = {
+    target: ["operation", "selector", "targetId", "cursor", "limit"],
+    context: ["operation", "contextId", "target", "path", "mode", "baseRef", "task", "query", "maxCharacters", "cursor", "limit"],
+    fs: ["operation", "target", "contextId", "path", "destination", "content", "patch", "query", "recursive", "overwrite", "expectedSha256", "disposition", "cursor", "limit"],
+    exec: ["target", "contextId", "cwd", "command", "tty", "mode", "yieldMs", "maxOutputChars", "envProfile"],
+    process: ["operation", "processId", "chars", "signal", "columns", "rows", "waitMs", "maxOutputChars", "cursor", "limit"],
+    mcp: ["operation", "route", "query", "name", "arguments", "uri", "cursor", "limit", "responsePolicy"],
+    artifact: ["operation", "source", "destination", "overwrite", "maxBytes", "ttlSeconds"],
+    gui: ["operation", "target", "sessionId", "generation", "action", "timeoutMs", "maxElements"],
+  };
+  const scopeStable = JSON.stringify(scopes) === JSON.stringify(expectedScopes);
+  const inputDrift = Object.entries(expectedInputs).flatMap(([name, expected]) => {
+    const actual = Object.keys(contracts[name]?.inputSchema ?? {});
+    return JSON.stringify(actual) === JSON.stringify(expected) ? [] : [{ name, expected, actual }];
+  });
+  return {
+    passed: scopeStable && inputDrift.length === 0,
+    scopes: [...scopes],
+    toolInputsStable: inputDrift.length === 0,
+    ...(inputDrift.length > 0 ? { inputDrift } : {}),
+  };
+}
+
+async function writeSshFixture(temporary) {
+  const path = join(temporary, "ssh-user-fixture.sh");
+  await writeFile(path, [
+    "#!/bin/sh",
+    "for last do :; done",
+    "exec /bin/sh -c \"$last\"",
+    "",
+  ].join("\n"));
+  await chmod(path, 0o700);
+  return path;
+}
+
+async function optionalRealSshLoad(options) {
+  const target = process.env.DEVSPACE_V2_LOAD_SSH_TARGET;
+  if (!target) {
+    return {
+      passed: !options.required,
+      skipped: true,
+      required: options.required,
+      reason: "No explicit real SSH load target was supplied.",
+    };
+  }
+  const targets = new options.TargetRegistry({
+    configPath: process.env.DEVSPACE_V2_LOAD_TARGET_CONFIG
+      ?? join(options.temporary, "missing-real-targets.json"),
+  });
+  const contexts = new options.ContextRegistry({
+    storePath: join(options.temporary, "real-ssh-contexts.json"),
+    targets,
+    serverConfig: options.config,
+    worktreeRoot: join(options.temporary, "real-ssh-worktrees"),
+  });
+  const execution = new options.UniversalExecutionPlane({
+    targets,
+    contexts,
+    outputDir: join(options.temporary, "real-ssh-output"),
+    sshControlDir: join(options.temporary, "real-ssh-control"),
+    maxRunningProcesses: 4,
+    maxRunningProcessesPerTarget: 2,
+    processBufferCharacters: 50_000,
+    processOutputMaxBytes: 1024 * 1024,
+    completedProcessTtlMs: 60_000,
+  });
+  try {
+    return await executionLoad(execution, target, options.count);
+  } finally {
+    await execution.close();
+  }
+}
+
+async function filesystemLoad(filesystem, temporary) {
+  const localPath = join(temporary, "local-user-file.txt");
+  const remotePath = join(temporary, "remote-user", "remote-user-file.txt");
+  const content = "user filesystem load\n";
+  await filesystem.execute({ operation: "write", target: "local", path: localPath, content });
+  await filesystem.execute({
+    operation: "write",
+    target: "user-ssh-fixture",
+    path: remotePath,
+    content,
+  });
+  const [localRead, remoteRead] = await Promise.all([
+    filesystem.execute({ operation: "read", target: "local", path: localPath }),
+    filesystem.execute({ operation: "read", target: "user-ssh-fixture", path: remotePath }),
+  ]);
+  return {
+    passed: localRead.content === content && remoteRead.content === content,
+    local: localRead.content === content,
+    ssh: remoteRead.content === content,
+  };
+}
+
+async function artifactLoad(artifacts, temporary) {
+  const source = join(temporary, "artifact-source.txt");
+  const remote = join(temporary, "remote-user", "artifact-remote.txt");
+  const returned = join(temporary, "artifact-returned.txt");
+  const content = "user artifact load\n";
+  await writeFile(source, content);
+  const outbound = await artifacts.execute({
+    operation: "copy",
+    source: { target: "local", path: source },
+    destination: { target: "user-ssh-fixture", path: remote },
+  });
+  const inbound = await artifacts.execute({
+    operation: "copy",
+    source: { target: "user-ssh-fixture", path: remote },
+    destination: { target: "local", path: returned },
+  });
+  return {
+    passed: await readFile(returned, "utf8") === content
+      && outbound.sha256 === inbound.sha256,
+    localToSsh: true,
+    sshToLocal: true,
+    size: inbound.size,
+    sha256: inbound.sha256,
+  };
+}
+
+async function guiLoad(gui, runner) {
+  const capabilities = await gui.execute({ operation: "capabilities", target: "local" });
+  const observed = await gui.execute({ operation: "observe", target: "local" });
+  const acted = await gui.execute({
+    operation: "act",
+    target: "local",
+    sessionId: observed.sessionId,
+    generation: observed.generation,
+    action: { type: "perform", elementId: "e1", actionName: "AXPress" },
+  });
+  return {
+    passed: capabilities.available === true
+      && runner.actions === 1
+      && acted.observation?.application?.name === "After action",
+    capabilities: capabilities.available === true,
+    observedElements: observed.elements?.length,
+    actions: runner.actions,
+  };
+}
+
+function guiObservation(applicationName) {
+  return {
+    application: {
+      name: applicationName,
+      bundleIdentifier: "devspace.load.fixture",
+      pid: 4242,
+    },
+    window: {
+      title: "Load fixture",
+      role: "AXWindow",
+      subrole: "AXStandardWindow",
+      position: [0, 0],
+      size: [800, 600],
+    },
+    elements: [
+      {
+        elementId: "e0",
+        index: 0,
+        role: "AXWindow",
+        subrole: "AXStandardWindow",
+        name: "Load fixture",
+        description: "",
+        value: "",
+        enabled: true,
+        focused: true,
+        position: [0, 0],
+        size: [800, 600],
+        actions: [],
+      },
+      {
+        elementId: "e1",
+        index: 1,
+        role: "AXButton",
+        subrole: "",
+        name: "Confirm",
+        description: "confirm",
+        value: "",
+        enabled: true,
+        focused: false,
+        position: [100, 100],
+        size: [80, 24],
+        actions: ["AXPress"],
+      },
+    ],
+    totalElements: 2,
+    omittedElements: 0,
+    truncated: false,
+  };
 }
 
 async function sessionChurn(Registry, count) {

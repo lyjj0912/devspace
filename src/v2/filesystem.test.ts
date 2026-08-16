@@ -269,6 +269,7 @@ test("remote POSIX fs uses framed helper execution and SFTP atomic publication",
     disposition: "permanent",
   });
   assert.ok(fixture.executionCalls >= 7);
+  assert.equal(fixture.forgottenProcesses, fixture.executionCalls);
 });
 
 test("remote file patch rechecks the original hash before atomic publication", async (t) => {
@@ -415,6 +416,7 @@ test("remote Windows fs uses PowerShell framing and SFTP atomic publication", as
     recursive: true,
   });
   assert.ok(fixture.executionCalls >= 10);
+  assert.equal(fixture.forgottenProcesses, fixture.executionCalls);
 
   const command = windowsFilesystemCommand(
     { op: "stat", path },
@@ -433,6 +435,7 @@ interface Fixture {
 
 interface RemoteFixture extends Fixture {
   executionCalls: number;
+  forgottenProcesses: number;
   sftpPuts: number;
   sftpGets: number;
 }
@@ -503,6 +506,7 @@ async function createRemoteFixture(
     serverConfig,
   });
   let executionCalls = 0;
+  let forgottenProcesses = 0;
   const execution = {
     async execute(input: { command: string }): Promise<UniversalProcessSnapshot> {
       executionCalls += 1;
@@ -521,8 +525,10 @@ async function createRemoteFixture(
         );
       }
     },
-    async operate(): Promise<Record<string, unknown>> {
-      throw new Error("The fixture helper completes synchronously.");
+    async operate(input: { operation: string }): Promise<Record<string, unknown>> {
+      assert.equal(input.operation, "forget");
+      forgottenProcesses += 1;
+      return { forgotten: true };
     },
   } as unknown as UniversalExecutionPlane;
   let sftpPuts = 0;
@@ -549,6 +555,7 @@ async function createRemoteFixture(
     contexts,
     filesystem,
     get executionCalls() { return executionCalls; },
+    get forgottenProcesses() { return forgottenProcesses; },
     get sftpPuts() { return sftpPuts; },
     get sftpGets() { return sftpGets; },
   };
@@ -606,6 +613,7 @@ async function createWindowsRemoteFixture(
   const driveRoot = join(root, "drive-c");
   await mkdir(join(driveRoot, "Users", "Test", "AppData", "Local", "Temp"), { recursive: true });
   let executionCalls = 0;
+  let forgottenProcesses = 0;
   const execution = {
     async execute(input: { command: string }): Promise<UniversalProcessSnapshot> {
       executionCalls += 1;
@@ -640,8 +648,10 @@ async function createWindowsRemoteFixture(
         started,
       );
     },
-    async operate(): Promise<Record<string, unknown>> {
-      throw new Error("The Windows fixture helper completes synchronously.");
+    async operate(input: { operation: string }): Promise<Record<string, unknown>> {
+      assert.equal(input.operation, "forget");
+      forgottenProcesses += 1;
+      return { forgotten: true };
     },
   } as unknown as UniversalExecutionPlane;
   let sftpPuts = 0;
@@ -670,6 +680,7 @@ async function createWindowsRemoteFixture(
     contexts,
     filesystem,
     get executionCalls() { return executionCalls; },
+    get forgottenProcesses() { return forgottenProcesses; },
     get sftpPuts() { return sftpPuts; },
     get sftpGets() { return sftpGets; },
   };
@@ -935,7 +946,6 @@ function processSnapshot(
     targetId: "remote",
     transport: "ssh",
     cwd: "/",
-    privilege: "user",
     tty: false,
     state: "EXITED",
     startedAt: new Date(startedAt).toISOString(),

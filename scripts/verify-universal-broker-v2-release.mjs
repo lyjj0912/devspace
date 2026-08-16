@@ -60,8 +60,11 @@ function verifyNoPrivilegeElevationSources() {
   const forbiddenPaths = [
     "privileged",
     "src/v2/privileged-client.ts",
+    "src/v2/privileged-client.test.ts",
     "src/v2/remote-privileged-client.ts",
+    "src/v2/remote-privileged-client.test.ts",
     "src/v2/peer-gate.test.ts",
+    "src/v2/fixtures/privileged-helper.ts",
     "scripts/install-universal-broker-v2-privileged-helper.sh",
     "scripts/uninstall-universal-broker-v2-privileged-helper.sh",
     "scripts/install-universal-broker-v2-remote-helper.sh",
@@ -72,35 +75,82 @@ function verifyNoPrivilegeElevationSources() {
       fail(`Privilege-elevation component must not ship: ${path}`);
     }
   }
+  const forbiddenPathPatterns = [
+    /(^|\/)privileged(?:\/|[-.])/iu,
+    /(^|\/)peer-gate(?:\.|\/|$)/iu,
+    /(^|\/)(?:install|uninstall)[^/]*(?:privileged|remote)[^/]*helper/iu,
+    /(^|\/)remote-privileged-client(?:\.|$)/iu,
+  ];
+  for (const path of ["src", "scripts", "contracts", "examples"]
+    .flatMap((entry) => walkFiles(resolve(root, entry)))) {
+    const relativePath = relative(root, path).replaceAll("\\", "/");
+    if (forbiddenPathPatterns.some((pattern) => pattern.test(relativePath))) {
+      fail(`Privilege-elevation file name must not ship: ${relativePath}`);
+    }
+  }
   const productionPaths = [
-    "src/v2",
+    "src",
     "contracts",
     "examples",
     "scripts",
     "package.json",
+    "package-lock.json",
   ];
-  const forbiddenMarkers = [
-    "devspace.admin",
-    "ADMIN_UNAVAILABLE",
-    "sudo -n",
-    "sudo-n",
-    "privileged-client",
-    "privileged helper",
-    "devspace-v2-peer-gate",
-    "LaunchDaemon",
+  const forbiddenPatterns = [
+    { name: "administrator OAuth scope", pattern: /devspace\.admin/u },
+    { name: "administrator error contract", pattern: /ADMIN_UNAVAILABLE/u },
+    { name: "administrator schema value", pattern: /["']admin["']/iu },
+    { name: "privilege field or input", pattern: /["']?privilege["']?\s*(?:=|:)/iu },
+    { name: "sudo execution path", pattern: /\bsudo(?:\s|$|-n\b)/iu },
+    { name: "privileged client", pattern: /privileged-client/iu },
+    { name: "privileged helper", pattern: /privileged\s+helper/iu },
+    { name: "peer-gate helper", pattern: /devspace-v2-peer-gate/iu },
+    { name: "LaunchDaemon helper", pattern: /LaunchDaemon/iu },
+    { name: "macOS authorization command", pattern: /with\s+administrator\s+privileges/iu },
+    { name: "macOS privileged helper path", pattern: /\/Library\/PrivilegedHelperTools/iu },
+    { name: "passwordless sudo configuration", pattern: /(?:\/etc\/sudoers|\bNOPASSWD\b)/iu },
+    {
+      name: "helper or elevation target mode",
+      pattern: /\bmode\b[^\n]{0,100}(?:sudo-n|privileged|admin|elevation-helper)/iu,
+    },
+    {
+      name: "system service privileged-helper instruction",
+      pattern: /(?:systemd|launchd)[^\n]{0,120}(?:privileged|elevation|root)[^\n]{0,40}helper|(?:privileged|elevation|root)[^\n]{0,120}helper[^\n]{0,40}(?:systemd|launchd)/iu,
+    },
   ];
+  const allowedAbsenceTests = new Set([
+    "src/v2/contracts.test.ts",
+    "src/v2/targets.test.ts",
+  ]);
   for (const path of productionPaths) {
     const absolute = resolve(root, path);
     const files = statSync(absolute).isDirectory() ? walkFiles(absolute) : [absolute];
     for (const file of files) {
-      if (relative(root, file) === "scripts/verify-universal-broker-v2-release.mjs") continue;
-      if (/\.test\.[cm]?[jt]sx?$/u.test(file)) continue;
+      const relativePath = relative(root, file).replaceAll("\\", "/");
+      if (relativePath === "scripts/verify-universal-broker-v2-release.mjs") continue;
+      if (/\.test\.[cm]?[jt]sx?$/u.test(file) && allowedAbsenceTests.has(relativePath)) continue;
       if (statSync(file).size > 8 * 1024 * 1024) continue;
       const source = readFileSync(file, "utf8");
-      for (const marker of forbiddenMarkers) {
-        if (source.includes(marker)) {
-          fail(`Privilege-elevation marker remains in ${relative(root, file)}: ${marker}`);
+      for (const forbidden of forbiddenPatterns) {
+        if (forbidden.pattern.test(source)) {
+          fail(`Privilege-elevation marker remains in ${relative(root, file)}: ${forbidden.name}`);
         }
+      }
+    }
+  }
+  const forbiddenInstructionPatterns = [
+    /\/Library\/(?:PrivilegedHelperTools|LaunchDaemons)/iu,
+    /\blaunchctl\b[^\n]{0,160}(?:helper|daemon)/iu,
+    /\bsystemctl\b[^\n]{0,160}(?:privileged|root|elevation)[^\n]{0,40}helper/iu,
+    /(?:\/etc\/sudoers|\bNOPASSWD\b|\bsudo\s+-n\b)/iu,
+    /\bosascript\b[^\n]{0,160}administrator/iu,
+  ];
+  for (const file of walkFiles(resolve(root, "docs"))) {
+    if (statSync(file).size > 8 * 1024 * 1024) continue;
+    const source = readFileSync(file, "utf8");
+    for (const pattern of forbiddenInstructionPatterns) {
+      if (pattern.test(source)) {
+        fail(`Usable administrator-helper instruction remains in ${relative(root, file)}`);
       }
     }
   }
@@ -220,7 +270,8 @@ function verifyDist() {
     if (!existsSync(resolve(root, path))) fail(`Missing build output: ${path}`);
   }
   const forbidden = walkFiles(resolve(root, "dist")).filter((path) =>
-    /(^|\/)(fixtures?|test|tests)(\/|$)|\.test\.|canary/i.test(relative(root, path))
+    /(^|\/)(fixtures?|test|tests|privileged)(\/|$)|\.test\.|canary|peer-gate|privileged-client|(?:install|uninstall)[^/]*(?:privileged|remote)[^/]*helper/i
+      .test(relative(root, path).replaceAll("\\", "/"))
   );
   if (forbidden.length) fail(`Production dist contains test-only files: ${forbidden.join(", ")}`);
 }
@@ -236,7 +287,7 @@ function verifyPackage() {
   const item = JSON.parse(result.stdout)[0];
   const files = item.files.map((entry) => entry.path).sort();
   const forbidden = files.filter((path) =>
-    /(^|\/)(src|fixtures?|test|tests|preservation|tmp|temp|scratch|canary|backup)(\/|$)|\.test\.|\.orig$|\.rej$|\.bak$|\.patch$|\.log$/i.test(path)
+    /(^|\/)(src|fixtures?|test|tests|privileged|preservation|tmp|temp|scratch|canary|backup)(\/|$)|\.test\.|peer-gate|privileged-client|(?:install|uninstall)[^/]*(?:privileged|remote)[^/]*helper|\.orig$|\.rej$|\.bak$|\.patch$|\.log$/i.test(path)
   );
   const required = [
     "scripts/deploy-universal-broker-v2-production.sh",

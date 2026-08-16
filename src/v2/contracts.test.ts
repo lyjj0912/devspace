@@ -5,6 +5,7 @@ import {
   UNIVERSAL_BROKER_BUDGETS,
   UNIVERSAL_BROKER_VERSION,
   UNIVERSAL_ERROR_CODES,
+  UNIVERSAL_OWNER_SCOPES,
   UNIVERSAL_TOOL_CONTRACTS,
   UNIVERSAL_TOOL_NAMES,
   UNIVERSAL_TOOL_OPERATIONS,
@@ -61,6 +62,38 @@ test("every fixed tool contract has operations and no service-specific top-level
     assert.doesNotMatch(name, forbidden);
     const input = UNIVERSAL_TOOL_CONTRACTS[name].inputSchema as Record<string, unknown>;
     if (name !== "exec") assert.ok("operation" in input, name);
+  }
+});
+
+test("contracts expose only user-account authority", async () => {
+  assert.deepEqual(UNIVERSAL_OWNER_SCOPES, [
+    "devspace.read",
+    "devspace.write",
+    "devspace.exec",
+    "devspace.mcp",
+    "devspace.artifact",
+    "devspace.gui",
+  ]);
+  for (const contract of Object.values(UNIVERSAL_TOOL_CONTRACTS)) {
+    assert.ok(!("privilege" in contract.inputSchema));
+  }
+  assert.deepEqual(Object.keys(UNIVERSAL_TOOL_CONTRACTS.gui.inputSchema), [
+    "operation",
+    "target",
+    "sessionId",
+    "generation",
+    "action",
+    "timeoutMs",
+    "maxElements",
+  ]);
+  for (const path of [
+    "../../contracts/tools-v2.schema.json",
+    "../../contracts/targets.schema.json",
+    "../../contracts/capabilities.schema.json",
+    "../../contracts/errors.schema.json",
+  ]) {
+    const source = await readFile(new URL(path, import.meta.url), "utf8");
+    assert.doesNotMatch(source, /devspace\.admin|ADMIN_UNAVAILABLE|["']privilege["']/u, path);
   }
 });
 

@@ -306,8 +306,8 @@ const guiContract = {
     sessionId: z.string().min(1).optional(),
     generation: z.string().min(1).optional(),
     action: genericRecordSchema.optional(),
-    waitMs: z.number().int().min(0).max(30_000).optional(),
-    maxCharacters: z.number().int().min(1).max(100_000).optional(),
+    timeoutMs: z.number().int().min(0).max(120_000).optional(),
+    maxElements: z.number().int().min(1).max(1_000).optional(),
   },
   annotations: {
     readOnlyHint: false,

@@ -30,7 +30,10 @@ import { pipeline } from "node:stream/promises";
 import { applyPatch, parsePatch } from "../apply-patch.js";
 import { expandHomePath } from "../roots.js";
 import type { ContextRegistry } from "./contexts.js";
-import type { UniversalExecutionPlane } from "./execution.js";
+import type {
+  UniversalExecutionPlane,
+  UniversalProcessSnapshot,
+} from "./execution.js";
 import { UniversalBrokerError } from "./errors.js";
 import { prepareSshControlPath } from "./ssh-control.js";
 import {
@@ -501,8 +504,9 @@ export class UniversalFilesystemService {
     target: TargetDefinition,
     remoteScript: string,
   ): Promise<void> {
+    let result: UniversalProcessSnapshot | undefined;
     try {
-      let result = await this.execution.execute({
+      result = await this.execution.execute({
         target: target.id,
         cwd: target.defaultCwd ?? "~",
         command: `Remove-Item -LiteralPath ${powershellLiteral(remoteScript)} -Force -ErrorAction SilentlyContinue`,
@@ -521,6 +525,8 @@ export class UniversalFilesystemService {
     } catch {
       // The staged script is random, owner-level, and short-lived. The caller's
       // original filesystem error remains authoritative if cleanup also fails.
+    } finally {
+      if (result) await this.forgetRemoteFilesystemProcess(result).catch(() => undefined);
     }
   }
 
@@ -537,57 +543,79 @@ export class UniversalFilesystemService {
       yieldMs: 30_000,
       maxOutputChars: 1_000_000,
     });
+    try {
+      if (result.state === "RUNNING" || result.state === "STARTING") {
+        result = await this.execution.operate({
+          operation: "wait",
+          processId: result.processId,
+          waitMs: 60_000,
+          maxOutputChars: 1_000_000,
+        }) as typeof result;
+      }
+      if (result.state !== "EXITED" || result.exitCode !== 0) {
+        throw new UniversalBrokerError(
+          result.state === "UNKNOWN" ? "EXECUTION_STATE_UNKNOWN" : "TRANSPORT_INTERRUPTED",
+          `Remote filesystem helper did not complete on target ${target.id}.`,
+          {
+            evidence: {
+              targetId: target.id,
+              processId: result.processId,
+              state: result.state,
+              exitCode: result.exitCode,
+              outputPreview: result.output.slice(0, 500),
+            },
+          },
+        );
+      }
+      const marker = result.output.lastIndexOf(responseMarker);
+      if (marker < 0) {
+        throw new UniversalBrokerError(
+          "TRANSPORT_INTERRUPTED",
+          `Remote filesystem helper returned no framed result on target ${target.id}.`,
+          { evidence: { targetId: target.id, outputPreview: result.output.slice(0, 500) } },
+        );
+      }
+      const framed = result.output
+        .slice(marker + responseMarker.length)
+        .trim()
+        .split(/\r?\n/, 1)[0] ?? "";
+      let response: RemoteResponse;
+      try {
+        response = JSON.parse(framed) as RemoteResponse;
+      } catch (error) {
+        throw new UniversalBrokerError(
+          "TRANSPORT_INTERRUPTED",
+          `Remote filesystem helper returned malformed JSON on target ${target.id}.`,
+          { evidence: { targetId: target.id, error: errorMessage(error) } },
+        );
+      }
+      if (response.ok === true) return response.data;
+      throw new UniversalBrokerError(
+        remoteErrorCode(response.code),
+        response.message ?? `Remote filesystem operation failed on target ${target.id}.`,
+        { evidence: { targetId: target.id, remoteCode: response.code } },
+      );
+    } finally {
+      await this.forgetRemoteFilesystemProcess(result);
+    }
+  }
+
+  private async forgetRemoteFilesystemProcess(
+    result: UniversalProcessSnapshot,
+  ): Promise<void> {
     if (result.state === "RUNNING" || result.state === "STARTING") {
       result = await this.execution.operate({
-        operation: "wait",
+        operation: "signal",
         processId: result.processId,
-        waitMs: 60_000,
-        maxOutputChars: 1_000_000,
-      }) as typeof result;
+        signal: "SIGTERM",
+        waitMs: 2_000,
+        maxOutputChars: 1_000,
+      }) as UniversalProcessSnapshot;
     }
-    if (result.state !== "EXITED" || result.exitCode !== 0) {
-      throw new UniversalBrokerError(
-        result.state === "UNKNOWN" ? "EXECUTION_STATE_UNKNOWN" : "TRANSPORT_INTERRUPTED",
-        `Remote filesystem helper did not complete on target ${target.id}.`,
-        {
-          evidence: {
-            targetId: target.id,
-            processId: result.processId,
-            state: result.state,
-            exitCode: result.exitCode,
-            outputPreview: result.output.slice(0, 500),
-          },
-        },
-      );
-    }
-    const marker = result.output.lastIndexOf(responseMarker);
-    if (marker < 0) {
-      throw new UniversalBrokerError(
-        "TRANSPORT_INTERRUPTED",
-        `Remote filesystem helper returned no framed result on target ${target.id}.`,
-        { evidence: { targetId: target.id, outputPreview: result.output.slice(0, 500) } },
-      );
-    }
-    const framed = result.output
-      .slice(marker + responseMarker.length)
-      .trim()
-      .split(/\r?\n/, 1)[0] ?? "";
-    let response: RemoteResponse;
-    try {
-      response = JSON.parse(framed) as RemoteResponse;
-    } catch (error) {
-      throw new UniversalBrokerError(
-        "TRANSPORT_INTERRUPTED",
-        `Remote filesystem helper returned malformed JSON on target ${target.id}.`,
-        { evidence: { targetId: target.id, error: errorMessage(error) } },
-      );
-    }
-    if (response.ok === true) return response.data;
-    throw new UniversalBrokerError(
-      remoteErrorCode(response.code),
-      response.message ?? `Remote filesystem operation failed on target ${target.id}.`,
-      { evidence: { targetId: target.id, remoteCode: response.code } },
-    );
+    await this.execution.operate({
+      operation: "forget",
+      processId: result.processId,
+    });
   }
 
   private async publishRemoteFile(

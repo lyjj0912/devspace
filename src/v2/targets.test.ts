@@ -104,6 +104,29 @@ test("target registry validates SSH prerequisites and offline probes are cached"
   assert.equal(calls, 1);
 });
 
+test("target registry rejects legacy elevation fields and modes", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-v2-targets-authority-test-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const configPath = join(root, "targets.json");
+  const target = {
+    displayName: "Remote",
+    transport: "ssh",
+    sshHost: "remote",
+    platform: "linux",
+  };
+
+  for (const forbidden of [
+    { ...target, privilege: "admin" },
+    { ...target, helper: { mode: "sudo-n" } },
+  ]) {
+    await writeFile(configPath, JSON.stringify({ version: 1, targets: { remote: forbidden } }));
+    await assert.rejects(
+      new TargetRegistry({ configPath }).inspect(),
+      /Invalid target registry/,
+    );
+  }
+});
+
 test("Windows SSH probes report the target temporary directory", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "devspace-v2-targets-windows-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));

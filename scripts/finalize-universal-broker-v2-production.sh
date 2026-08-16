@@ -60,7 +60,7 @@ import datetime, json, sys
 path, source_commit, phase = sys.argv[1:]
 value=json.load(open(path))
 expected_tools=["target","context","fs","exec","process","mcp","artifact","gui"]
-required={"local","external-storage","ssh","admin","mcp-mutation","artifact","gui"}
+required={"local","external-storage","ssh","mcp-mutation","artifact","gui"}
 if value.get('status') != 'PASS': raise SystemExit('Connector evidence status is not PASS')
 if value.get('phase') != phase: raise SystemExit(f'Connector evidence phase must be {phase}')
 if value.get('sourceCommit') != source_commit: raise SystemExit('Connector evidence is for a different source commit')

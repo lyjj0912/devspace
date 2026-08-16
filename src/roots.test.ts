@@ -27,7 +27,7 @@ assert.equal(
 
 if (process.platform === "win32") {
   assert.throws(
-    () => assertAllowedPath("C:\\Users\\Administrator", ["G:\\Projects\\Dev\\Github\\devspace"]),
+    () => assertAllowedPath("C:\\Users\\StandardUser", ["G:\\Projects\\Dev\\Github\\devspace"]),
     /Path is outside allowed roots/,
   );
 }

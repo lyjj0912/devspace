@@ -153,8 +153,8 @@ assert.equal(loadConfig(baseEnv).oauth.accessTokenTtlSeconds, 3600);
 assert.equal(loadConfig(baseEnv).oauth.refreshTokenTtlSeconds, 2592000);
 
 assert.deepEqual(
-  loadConfig({ ...baseEnv, DEVSPACE_OAUTH_SCOPES: "devspace,admin" }).oauth.scopes,
-  ["devspace", "admin"],
+  loadConfig({ ...baseEnv, DEVSPACE_OAUTH_SCOPES: "devspace,custom" }).oauth.scopes,
+  ["devspace", "custom"],
 );
 assert.deepEqual(
   loadConfig({ ...baseEnv, DEVSPACE_OAUTH_ALLOWED_REDIRECT_HOSTS: "chatgpt.com,example.com" }).oauth
