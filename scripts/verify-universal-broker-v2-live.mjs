@@ -438,6 +438,7 @@ async function runCanaries(client, root, canaries) {
   assert(response.status === 200 && (await response.text()).includes("user-file"), "artifact HTTP publication failed");
   canaries.artifact = true;
 
+  await prepareLocalGuiApplication();
   const gui = data(await call(client, "gui", { operation: "capabilities", target: "local" }));
   assert(
     gui.targetId === "local" && gui.configured === true && gui.available === true,
@@ -488,6 +489,15 @@ async function runCanaries(client, root, canaries) {
 
   await call(client, "fs", { operation: "remove", path: artifactDestination, disposition: "permanent" });
   await call(client, "fs", { operation: "remove", path: file, disposition: "permanent" });
+}
+
+async function prepareLocalGuiApplication() {
+  const argumentsForOpen = ["-a", options.guiApplication];
+  if (options.guiApplication === "Finder") {
+    argumentsForOpen.push(process.env.HOME ?? "/");
+  }
+  await execFileAsync("open", argumentsForOpen, { timeout: 10_000 });
+  await new Promise((resolvePromise) => setTimeout(resolvePromise, 1_000));
 }
 
 async function connectClient(url, token, index) {

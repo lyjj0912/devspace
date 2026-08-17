@@ -81,7 +81,7 @@ on observationResult(maximumElements)
       set frontWindow to front window of frontProcess
       set windowJson to my windowJson(frontWindow)
       set maximumScan to maximumElements * 2
-      if maximumScan < 20 then set maximumScan to 20
+      if maximumScan < 2 then set maximumScan to 2
       if maximumScan > 1000 then set maximumScan to 1000
       set traversalResult to my boundedElements(frontWindow, maximumScan)
       set flattenedElements to item 1 of traversalResult

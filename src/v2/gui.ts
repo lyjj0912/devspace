@@ -12,7 +12,7 @@ import type { TargetDefinition, TargetRegistry } from "./targets.js";
 
 const DEFAULT_MAXIMUM_SESSIONS = 32;
 const DEFAULT_SESSION_TTL_MS = 5 * 60_000;
-const DEFAULT_MAXIMUM_ELEMENTS = 100;
+const DEFAULT_MAXIMUM_ELEMENTS = 50;
 const MAXIMUM_ELEMENTS = 1_000;
 const DEFAULT_WAIT_MS = 5_000;
 const MAXIMUM_WAIT_MS = 120_000;

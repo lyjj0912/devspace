@@ -17,6 +17,7 @@ import { TargetRegistry, type TargetDefinition } from "./targets.js";
 test("GUI node uses bounded traversal instead of materializing entire accessibility trees", () => {
   assert.doesNotMatch(GUI_NODE_APPLESCRIPT_SOURCE, /entire contents/u);
   assert.match(GUI_NODE_APPLESCRIPT_SOURCE, /boundedElements\(frontWindow, maximumScan\)/u);
+  assert.match(GUI_NODE_APPLESCRIPT_SOURCE, /maximumScan < 2/u);
   assert.match(GUI_NODE_APPLESCRIPT_SOURCE, /maximumScan > 1000/u);
 });
 

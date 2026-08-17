@@ -117,5 +117,7 @@ test("live verifier defaults to parallel v2 and creates only a temporary user to
   assert.match(source, /universal-broker-v2\/devspace\.sqlite/u);
   assert.match(source, /code !== "GUI_STATE_CHANGED"/u);
   assert.match(source, /for \(let attempt = 0; attempt < 2; attempt \+= 1\)/u);
+  assert.match(source, /await prepareLocalGuiApplication\(\)/u);
+  assert.match(source, /execFileAsync\("open", argumentsForOpen/u);
   assert.doesNotMatch(source, /templateDatabasePath|--template-database|JSON\.stringify\(\["devspace"/u);
 });
