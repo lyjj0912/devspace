@@ -446,7 +446,7 @@ async function runCanaries(client, root, canaries) {
   let guiObservation = data(await call(client, "gui", {
     operation: "observe",
     target: "local",
-    maxElements: 100,
+    maxElements: 1,
   }));
   assert(guiObservation.sessionId && guiObservation.generation, "local generic GUI observation failed");
   let guiAction;
@@ -475,7 +475,7 @@ async function runCanaries(client, root, canaries) {
     guiObservation = data(await call(client, "gui", {
       operation: "observe",
       target: "local",
-      maxElements: 100,
+      maxElements: 1,
     }));
   }
   assert(guiAction.performed, "local generic GUI action failed");
