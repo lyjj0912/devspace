@@ -234,12 +234,21 @@ export class UniversalGuiService {
       }
       throw error;
     }
+    const available = node.accessibility === true;
+    const nodeReason = typeof node.reason === "string" && node.reason.trim()
+      ? node.reason.trim()
+      : typeof node.probeError === "string" && node.probeError.trim()
+        ? node.probeError.trim()
+        : undefined;
     return {
       targetId: target.id,
       configured: true,
-      available: node.accessibility === true,
+      available,
       guiMode: target.gui.mode,
       ...node,
+      ...(!available
+        ? { reason: nodeReason ?? `macOS Accessibility UI scripting is disabled for target ${target.id}.` }
+        : {}),
     };
   }
 

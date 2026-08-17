@@ -164,10 +164,23 @@ test("gui capabilities report configured remote TCC denial as unavailable withou
   assert.match(String(capabilities.reason), /Accessibility|TCC/i);
 });
 
+test("gui capabilities include a reason when the node reports accessibility=false", async (t) => {
+  const fixture = await createFixture(t);
+  fixture.runner.disabledTargets.add("company");
+  const capabilities = await fixture.gui.execute({
+    operation: "capabilities",
+    target: "company",
+  });
+  assert.equal(capabilities.configured, true);
+  assert.equal(capabilities.available, false);
+  assert.match(String(capabilities.reason), /Accessibility/i);
+});
+
 class FixtureGuiRunner implements GuiNodeRunner {
   state = observation("Initial", "AXPress");
   readonly actions: GuiNodeRequest[] = [];
   readonly unavailableTargets = new Set<string>();
+  readonly disabledTargets = new Set<string>();
 
   async call(target: TargetDefinition, request: GuiNodeRequest): Promise<Record<string, unknown>> {
     if (request.operation === "capabilities") {
@@ -179,7 +192,7 @@ class FixtureGuiRunner implements GuiNodeRunner {
       }
       return {
         platform: "macos",
-        accessibility: true,
+        accessibility: !this.disabledTargets.has(target.id),
         screenCapture: "not_probed",
         frontmostProcess: { name: this.state.application.name, pid: this.state.application.pid },
       };
