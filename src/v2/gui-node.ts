@@ -80,7 +80,12 @@ on observationResult(maximumElements)
     if (count of windows of frontProcess) > 0 then
       set frontWindow to front window of frontProcess
       set windowJson to my windowJson(frontWindow)
-      set flattenedElements to entire contents of frontWindow
+      set maximumScan to maximumElements * 8
+      if maximumScan < 200 then set maximumScan to 200
+      if maximumScan > 4000 then set maximumScan to 4000
+      set traversalResult to my boundedElements(frontWindow, maximumScan)
+      set flattenedElements to item 1 of traversalResult
+      set traversalTruncated to item 2 of traversalResult
       set totalElements to (count of flattenedElements) + 1
       set windowElement to my elementJson(frontWindow, 0)
       if my elementMeaningful(frontWindow) then set end of elementJsonItems to windowElement
@@ -95,6 +100,10 @@ on observationResult(maximumElements)
           end if
         end if
       end repeat
+      if traversalTruncated then
+        set omittedElements to omittedElements + 1
+        set wasTruncated to true
+      end if
     end if
     set payload to "{\"application\":{" & ¬
       "\"name\":" & my jsonString(processName) & "," & ¬
@@ -141,9 +150,8 @@ on actResult(argv)
     if elementIndex is 0 then
       set currentElement to frontWindow
     else if elementIndex > 0 then
-      set flattenedElements to entire contents of frontWindow
-      if elementIndex > (count of flattenedElements) then error "__GUI_STATE_CHANGED__element index disappeared"
-      set currentElement to item elementIndex of flattenedElements
+      set currentElement to my elementAtBoundedIndex(frontWindow, elementIndex)
+      if currentElement is missing value then error "__GUI_STATE_CHANGED__element index disappeared"
     end if
 
     if elementIndex ≥ 0 then
@@ -181,6 +189,49 @@ on actResult(argv)
   end tell
   return my emitSuccess("{\"performed\":true,\"actionType\":" & my jsonString(actionType) & "}")
 end actResult
+
+on boundedElements(guiRoot, maximumScan)
+  if maximumScan < 1 then return {{}, false}
+  set pendingElements to {}
+  tell application "System Events"
+    try
+      set rootChildren to UI elements of guiRoot
+      repeat with childElement in rootChildren
+        set end of pendingElements to contents of childElement
+      end repeat
+    end try
+  end tell
+  set flattenedElements to {}
+  set pendingIndex to 1
+  set traversalTruncated to false
+  repeat while pendingIndex ≤ (count of pendingElements)
+    if (count of flattenedElements) ≥ maximumScan then
+      set traversalTruncated to true
+      exit repeat
+    end if
+    set currentElement to item pendingIndex of pendingElements
+    set end of flattenedElements to currentElement
+    tell application "System Events"
+      try
+        set childElements to UI elements of currentElement
+        repeat with childElement in childElements
+          set end of pendingElements to contents of childElement
+        end repeat
+      end try
+    end tell
+    set pendingIndex to pendingIndex + 1
+  end repeat
+  if pendingIndex ≤ (count of pendingElements) then set traversalTruncated to true
+  return {flattenedElements, traversalTruncated}
+end boundedElements
+
+on elementAtBoundedIndex(guiRoot, elementIndex)
+  if elementIndex < 1 then return missing value
+  set traversalResult to my boundedElements(guiRoot, elementIndex)
+  set flattenedElements to item 1 of traversalResult
+  if elementIndex > (count of flattenedElements) then return missing value
+  return item elementIndex of flattenedElements
+end elementAtBoundedIndex
 
 on elementMeaningful(guiElement)
   set roleText to my safeRole(guiElement)

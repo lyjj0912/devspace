@@ -11,7 +11,14 @@ import {
   UniversalGuiService,
 } from "./gui.js";
 import { UniversalBrokerError } from "./errors.js";
+import { GUI_NODE_APPLESCRIPT_SOURCE } from "./gui-node.js";
 import { TargetRegistry, type TargetDefinition } from "./targets.js";
+
+test("GUI node uses bounded traversal instead of materializing entire accessibility trees", () => {
+  assert.doesNotMatch(GUI_NODE_APPLESCRIPT_SOURCE, /entire contents/u);
+  assert.match(GUI_NODE_APPLESCRIPT_SOURCE, /boundedElements\(frontWindow, maximumScan\)/u);
+  assert.match(GUI_NODE_APPLESCRIPT_SOURCE, /maximumScan > 4000/u);
+});
 
 test("gui capabilities and observe create a bounded generation session", async (t) => {
   const fixture = await createFixture(t);
