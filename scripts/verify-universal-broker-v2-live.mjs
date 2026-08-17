@@ -496,7 +496,7 @@ async function prepareLocalGuiApplication() {
   if (options.guiApplication === "Finder") {
     argumentsForOpen.push(process.env.HOME ?? "/");
   }
-  await execFileAsync("open", argumentsForOpen, { timeout: 10_000 });
+  execFileSync("open", argumentsForOpen, { timeout: 10_000, stdio: "ignore" });
   await new Promise((resolvePromise) => setTimeout(resolvePromise, 1_000));
 }
 
