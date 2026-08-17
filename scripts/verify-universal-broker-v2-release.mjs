@@ -275,6 +275,7 @@ function verifyDeploymentSources() {
     "DELETE FROM oauth_clients",
     "legacyConnectorRemoved",
     "legacyRuntimeRemoved",
+    'PARALLEL_PATH" != "$PUBLIC_PATH',
     "FINAL_PASS",
   ]) {
     if (!finalize.includes(marker)) fail(`Production finalizer source is missing: ${marker}`);

@@ -280,7 +280,7 @@ import json,sys
 v=json.load(open(sys.argv[1])); print(v.get('parallelFunnelPath','/'))
 PY
 )"
-if [[ -n "$PARALLEL_PORT" && "$PARALLEL_PORT" != "$PUBLIC_HTTPS_PORT" ]]; then
+if [[ -n "$PARALLEL_PORT" && ( "$PARALLEL_PORT" != "$PUBLIC_HTTPS_PORT" || "$PARALLEL_PATH" != "$PUBLIC_PATH" ) ]]; then
   command=(tailscale funnel --https="$PARALLEL_PORT")
   [[ "$PARALLEL_PATH" == "/" ]] || command+=(--set-path="$PARALLEL_PATH")
   command+=(--yes off)
