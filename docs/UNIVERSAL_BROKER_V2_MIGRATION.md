@@ -53,7 +53,7 @@ limits. Run deterministic churn and large-output tests.
 
 ### Phase 8 — ChatGPT connector validation
 
-Register `myDevSpace-next` and validate the same eight tools in at least five
+Register `myDevSpace-next-user` and validate the same eight tools in at least five
 fresh ChatGPT sessions. Verify local files, external storage, SSH targets,
 generic MCP mutation, artifact exchange, and GUI behavior.
 

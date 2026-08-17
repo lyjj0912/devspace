@@ -62,7 +62,7 @@ value = json.load(open(path))
 expected_tools = ["target", "context", "fs", "exec", "process", "mcp", "artifact", "gui"]
 if value.get("status") != "PASS": raise SystemExit("Phase 9 evidence status is not PASS")
 if value.get("sourceCommit") != expected_commit: raise SystemExit("Phase 9 evidence is for a different source commit")
-if value.get("connectorName") != "myDevSpace-next": raise SystemExit("Phase 9 connector identity is invalid")
+if value.get("connectorName") != "myDevSpace-next-user": raise SystemExit("Phase 9 connector identity is invalid")
 if int(value.get("freshChatGptSessions", 0)) < 5: raise SystemExit("Phase 9 has fewer than five fresh ChatGPT sessions")
 if value.get("toolNames") != expected_tools: raise SystemExit("Phase 9 tool surface is not the fixed eight-tool contract")
 required = {"local", "external-storage", "ssh", "mcp-mutation", "artifact", "gui"}

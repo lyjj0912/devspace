@@ -45,7 +45,7 @@ target context fs exec process mcp artifact gui
 
 ## Connector gate
 
-- A separate `myDevSpace-next` connector is authorized.
+- A separate `myDevSpace-next-user` connector is authorized.
 - At least five fresh ChatGPT sessions expose the identical eight-tool surface.
 - The required functional scenarios pass without route or path guessing loops.
 
