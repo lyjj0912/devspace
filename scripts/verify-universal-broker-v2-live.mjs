@@ -443,19 +443,41 @@ async function runCanaries(client, root, canaries) {
     gui.targetId === "local" && gui.configured === true && gui.available === true,
     "local generic GUI capability is not available in the production execution context",
   );
-  const guiObservation = data(await call(client, "gui", {
+  let guiObservation = data(await call(client, "gui", {
     operation: "observe",
     target: "local",
     maxElements: 100,
   }));
   assert(guiObservation.sessionId && guiObservation.generation, "local generic GUI observation failed");
-  const guiAction = data(await call(client, "gui", {
-    operation: "act",
-    target: "local",
-    sessionId: guiObservation.sessionId,
-    generation: guiObservation.generation,
-    action: { type: "key_code", keyCode: 53 },
-  }));
+  let guiAction;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const result = await client.callTool({
+      name: "gui",
+      arguments: {
+        operation: "act",
+        target: "local",
+        sessionId: guiObservation.sessionId,
+        generation: guiObservation.generation,
+        action: { type: "key_code", keyCode: 53 },
+      },
+    });
+    if (result.isError !== true && result.structuredContent?.ok !== false) {
+      guiAction = data(result);
+      break;
+    }
+    const code = result.structuredContent?.error?.code;
+    if (code !== "GUI_STATE_CHANGED" || attempt > 0) {
+      throw new Error(`gui failed: ${JSON.stringify(result.structuredContent ?? result.content).slice(0, 4_000)}`);
+    }
+    // A stale-generation rejection proves that no GUI action was dispatched.
+    // Re-observe once, then issue the harmless Escape action against the new
+    // generation. Never replay an action after an ambiguous dispatch.
+    guiObservation = data(await call(client, "gui", {
+      operation: "observe",
+      target: "local",
+      maxElements: 100,
+    }));
+  }
   assert(guiAction.performed, "local generic GUI action failed");
   canaries.gui = {
     configured: true,
