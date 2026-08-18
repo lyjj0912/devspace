@@ -38,6 +38,14 @@ DEVSPACE_NEXT_OAUTH_STATE_DIR
 The removed legacy-scope compatibility flag must be absent or false. Setting it
 true is a startup error.
 
+## GUI execution boundary
+
+Local and SSH GUI observations use only the broker-installed GUI node. Before
+execution, DevSpace validates the exact `osascript` path, canonical owner-only
+script path, source SHA-256, and bounded operation arguments. GUI internal calls
+cannot load an environment profile. Ordinary `exec` and every stdio MCP child
+remain under the platform no-elevation wrapper.
+
 ## Runtime environment isolation
 
 `~/.devspace/universal-broker-v2-production.env` is authoritative. Startup,

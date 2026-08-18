@@ -312,6 +312,10 @@ function verifyRuntimeNoElevationSources() {
     "file-mode #o2000",
     "setpriv --no-new-privs",
     "S-1-16-(12288|16384)",
+    "internalExecutionSpec",
+    "verifyLocalGuiScript",
+    "scriptSha256",
+    "GUI node source hash changed",
   ]) {
     if (!boundary.includes(marker)) fail(`Runtime no-elevation boundary is missing: ${marker}`);
   }
@@ -323,20 +327,28 @@ function verifyRuntimeNoElevationSources() {
     if (!policy.includes(marker)) fail(`No-elevation command policy is missing: ${marker}`);
   }
   for (const marker of [
+    "assertInternalExecutionCommand",
+    "internalExecutionSpec",
     "wrapLocalUserOnlyExecution",
     "posixRemoteUserOnlyRunner",
     "windowsNonElevatedPrelude",
+    "Internal execution policies cannot load an environment profile",
   ]) {
     if (!execution.includes(marker)) fail(`Execution plane no-elevation wiring is missing: ${marker}`);
   }
   for (const marker of [
     "wrapLocalUserOnlyExecution",
     "posixRemoteUserOnlyRunner",
+    '"mcp"',
   ]) {
     if (!mcpProxy.includes(marker)) fail(`Downstream MCP no-elevation wiring is missing: ${marker}`);
   }
   if (!mcpTests.includes("local stdio MCP routes inherit the runtime no-elevation boundary")) {
     fail("Downstream MCP no-elevation regression test is missing.");
+  }
+  if (mcpProxy.includes('wrapLocalUserOnlyExecution(localTarget.platform, direct, "gui")')
+      || mcpProxy.includes('posixRemoteUserOnlyRunner(\n      target.platform,\n      "sh",\n      shellQuote(remoteCommand),\n      "gui"')) {
+    fail("Downstream MCP incorrectly reuses the exact GUI execution policy.");
   }
   for (const marker of [
     "probeLocalUserAccountBoundary",
@@ -355,6 +367,9 @@ function verifyRuntimeNoElevationSources() {
   }
   for (const marker of [
     "ordinary AppleScript remains usable while administrator AppleScript fails closed",
+    "exact GUI internal execution accepts only the bound owner script and argument grammar",
+    "exact GUI internal execution fails closed on path, hash, mode, symlink, shell, and argument drift",
+    "MCP provider children remain in the generic no-elevation wrapper",
     'executable: "/usr/bin/osascript"',
     "with administrator privileges",
   ]) {
@@ -362,6 +377,18 @@ function verifyRuntimeNoElevationSources() {
   }
   if (!packageJson.scripts?.["v2:test"]?.includes("src/v2/no-elevation.test.ts")) {
     fail("The canonical v2 test gate omits no-elevation tests.");
+  }
+  if (!text("src/v2/execution.test.ts").includes("internal GUI execution cannot combine its exact contract with an environment profile")) {
+    fail("The internal GUI environment-profile denial regression test is missing.");
+  }
+  const guiSource = text("src/v2/gui.ts");
+  for (const marker of [
+    'internalPolicy: { kind: "gui", scriptPath, scriptSha256: this.sourceSha256 }',
+    "sourceSha256",
+    "expectedSha256",
+    "ensureInstalled",
+  ]) {
+    if (!guiSource.includes(marker)) fail(`The built-in GUI node integrity wiring is missing: ${marker}`);
   }
 }
 

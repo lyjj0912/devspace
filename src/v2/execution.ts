@@ -34,6 +34,8 @@ import {
 import { prepareSshControlPath } from "./ssh-control.js";
 import { assertNoElevationCommand } from "./authority-policy.js";
 import {
+  assertInternalExecutionCommand,
+  internalExecutionSpec,
   posixRemoteUserOnlyRunner,
   type InternalExecutionPolicy,
   windowsNonElevatedPrelude,
@@ -200,7 +202,15 @@ export class UniversalExecutionPlane {
   async execute(input: ExecuteCommandInput): Promise<UniversalProcessSnapshot> {
     this.assertOpen();
     validateCommand(input.command);
-    if (!input.internalPolicy) assertNoElevationCommand(input.command);
+    assertNoElevationCommand(input.command);
+    assertInternalExecutionCommand(input.internalPolicy, input.command);
+    if (input.internalPolicy && input.envProfile) {
+      throw new UniversalBrokerError(
+        "ELEVATION_BLOCKED",
+        "Internal execution policies cannot load an environment profile.",
+        { evidence: { policy: typeof input.internalPolicy === "string" ? input.internalPolicy : input.internalPolicy.kind } },
+      );
+    }
     const resolved = await this.resolveExecution(input);
     await assertCachedExecutionCapability(
       this.options.targets,
@@ -899,14 +909,13 @@ async function localCommandSpec(
   command: string,
   internalPolicy?: InternalExecutionPolicy,
 ): Promise<CommandSpec> {
-  const shell = wrapLocalUserOnlyExecution(
-    resolved.target.platform,
-    localShellCommand(
-      resolved.target,
-      commandWithSourceFile(command, resolved.sourceFile),
-    ),
-    internalPolicy,
-  );
+  const effectiveCommand = commandWithSourceFile(command, resolved.sourceFile);
+  const shell = internalExecutionSpec(internalPolicy, effectiveCommand, { verifyLocalScript: true })
+    ?? wrapLocalUserOnlyExecution(
+      resolved.target.platform,
+      localShellCommand(resolved.target, effectiveCommand),
+      internalPolicy,
+    );
   const environment = {
     ...executionEnvironment(),
     ...resolved.environment,
@@ -980,7 +989,7 @@ function posixRemoteCommand(
   const runner = posixRemoteUserOnlyRunner(
     target.platform,
     shell,
-    shellQuote(command),
+    command,
     internalPolicy,
   );
   const script = [

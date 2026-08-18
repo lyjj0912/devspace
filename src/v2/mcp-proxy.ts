@@ -511,7 +511,7 @@ export class UniversalMcpProxy {
             ],
           }
         : { executable: route.command!, args: route.args };
-      const wrapped = wrapLocalUserOnlyExecution(localTarget.platform, direct, "gui");
+      const wrapped = wrapLocalUserOnlyExecution(localTarget.platform, direct, "mcp");
       return new StdioClientTransport({
         command: wrapped.executable,
         args: wrapped.args,
@@ -547,8 +547,8 @@ export class UniversalMcpProxy {
     const userOnlyCommand = posixRemoteUserOnlyRunner(
       target.platform,
       "sh",
-      shellQuote(remoteCommand),
-      "gui",
+      remoteCommand,
+      "mcp",
     );
     return new StdioClientTransport({
       command: "/usr/bin/ssh",

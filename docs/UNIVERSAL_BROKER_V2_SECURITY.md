@@ -55,12 +55,20 @@ identity signature.
 
 ## Ordinary-user macOS automation
 
-The macOS boundary permits ordinary `/usr/bin/osascript` execution because it is
-a standard user-account automation primitive. Two independent controls prevent
-that capability from becoming an elevation route: command policy rejects
-administrator-privilege AppleScript syntax before dispatch, and the sandbox
-profile denies `authorization-right-obtain` at runtime. Regression tests execute
-both an ordinary AppleScript and a rejected administrator attempt.
+The generic macOS command plane permits ordinary `/usr/bin/osascript` under the
+same sandbox used by other commands. Command policy rejects administrator
+AppleScript syntax before dispatch and the sandbox denies
+`authorization-right-obtain` at runtime.
+
+System Events Accessibility Apple Events cannot function inside that sandbox, so
+the built-in GUI node uses a narrower non-shell contract instead of a broad
+exception. DevSpace accepts only `/usr/bin/osascript`, the exact installed
+owner-only regular-file path, its built-in source SHA-256, and a bounded
+capabilities/observe/act argument grammar. Local execution rechecks canonical
+path, owner, mode, and hash immediately before spawn; SSH execution verifies the
+remote SHA-256 before `exec`. Arbitrary scripts, `osascript -e`, shell operators,
+environment profiles, and malformed GUI arguments fail closed. GUI mutation
+still requires a fresh generation and one-shot R3 authority.
 
 ## Operating-system account enforcement
 
@@ -68,9 +76,10 @@ Local actions execute as the DevSpace service account. Remote actions execute as
 the configured SSH account.
 
 - macOS uses `sandbox-exec`, denies Authorization Services acquisition, and
-  blocks known identity-changing executables and every setuid/setgid executable.
-  Ordinary AppleScript is available under that same boundary for `exec`, MCP,
-  and GUI paths; it does not receive a privilege or identity-changing exception.
+  blocks known identity-changing executables and every setuid/setgid executable
+  for ordinary commands and stdio MCP providers. The built-in GUI node uses only
+  the exact path/hash/argument contract described above; it is not a generic
+  shell or arbitrary AppleScript bypass.
 - Linux requires zero effective/permitted/ambient capabilities and wraps execution with `setpriv --no-new-privs`.
 - Windows refuses a high-integrity or system token before executing a request.
 - the service itself refuses root, mismatched real/effective identities, or an

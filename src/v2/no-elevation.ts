@@ -1,9 +1,16 @@
+import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
 import type { TargetPlatform } from "./targets.js";
 import { UniversalBrokerError } from "./errors.js";
 
-export type InternalExecutionPolicy = "filesystem" | "gui" | "artifact" | "system";
+export interface GuiInternalExecutionPolicy {
+  kind: "gui";
+  scriptPath: string;
+  scriptSha256: string;
+}
+
+export type InternalExecutionPolicy = "filesystem" | "artifact" | "mcp" | "system" | GuiInternalExecutionPolicy;
 
 export interface ExecutableSpec {
   executable: string;
@@ -82,12 +89,63 @@ export function assertServiceAccountBoundary(): void {
   }
 }
 
+export function assertInternalExecutionCommand(
+  policy: InternalExecutionPolicy | undefined,
+  command: string,
+): void {
+  if (!policy || typeof policy === "string") return;
+  internalExecutionSpec(policy, command);
+}
+
+export function internalExecutionSpec(
+  policy: InternalExecutionPolicy | undefined,
+  command: string,
+  options: { verifyLocalScript?: boolean } = {},
+): ExecutableSpec | undefined {
+  if (!policy || typeof policy === "string") return undefined;
+  if (policy.kind !== "gui") {
+    throw internalExecutionViolation("unsupported internal execution policy");
+  }
+  if (!policy.scriptPath.startsWith("/") || /[\0\r\n]/u.test(policy.scriptPath)) {
+    throw internalExecutionViolation("GUI node path is not an absolute single-line path");
+  }
+  if (!/^[a-f0-9]{64}$/u.test(policy.scriptSha256)) {
+    throw internalExecutionViolation("GUI node source hash is invalid");
+  }
+  if (options.verifyLocalScript) verifyLocalGuiScript(policy);
+  const words = restrictedPosixWords(command);
+  if (words[0] !== "/usr/bin/osascript") {
+    throw internalExecutionViolation("GUI execution must invoke /usr/bin/osascript exactly");
+  }
+  if (words[1] !== policy.scriptPath) {
+    throw internalExecutionViolation("GUI execution does not match the installed GUI node path");
+  }
+  const operation = words[2];
+  if (operation === "capabilities") {
+    if (words.length !== 3) throw internalExecutionViolation("GUI capabilities argument shape is invalid");
+  } else if (operation === "observe") {
+    if (words.length !== 4 || !boundedDecimal(words[3], 1, 1_000)) {
+      throw internalExecutionViolation("GUI observe argument shape is invalid");
+    }
+  } else if (operation === "act") {
+    validateGuiActWords(words);
+  } else {
+    throw internalExecutionViolation("GUI node operation is unsupported");
+  }
+  return { executable: words[0], args: words.slice(1) };
+}
+
 export function wrapLocalUserOnlyExecution(
   platform: TargetPlatform,
   spec: ExecutableSpec,
   internalPolicy?: InternalExecutionPolicy,
 ): ExecutableSpec {
   if (platform === "macos") {
+    if (typeof internalPolicy === "object" && internalPolicy.kind === "gui") {
+      throw internalExecutionViolation(
+        "exact GUI execution must use internalExecutionSpec instead of the generic wrapper",
+      );
+    }
     if (!existsSync("/usr/bin/sandbox-exec")) {
       throw new UniversalBrokerError(
         "ELEVATION_BLOCKED",
@@ -127,9 +185,27 @@ export function wrapLocalUserOnlyExecution(
 export function posixRemoteUserOnlyRunner(
   platform: TargetPlatform,
   shell: string,
-  quotedCommand: string,
+  command: string,
   internalPolicy?: InternalExecutionPolicy,
 ): string {
+  const exact = internalExecutionSpec(internalPolicy, command);
+  if (exact) {
+    const policy = internalPolicy as GuiInternalExecutionPolicy;
+    const quotedPath = shellQuote(policy.scriptPath);
+    const quotedHash = shellQuote(policy.scriptSha256);
+    const exactCommand = [exact.executable, ...exact.args].map(shellQuote).join(" ");
+    return [
+      `[ -f ${quotedPath} ] && [ ! -L ${quotedPath} ] || exit 78`,
+      `[ "$(/bin/realpath -- ${quotedPath})" = ${quotedPath} ] || exit 78`,
+      `[ "$(/usr/bin/stat -f '%u' -- ${quotedPath})" = "$(/usr/bin/id -u)" ] || exit 78`,
+      `mode=$(/usr/bin/stat -f '%OLp' -- ${quotedPath})`,
+      `[ "$((8#$mode & 8#22))" -eq 0 ] || exit 78`,
+      `actual=$(/usr/bin/shasum -a 256 -- ${quotedPath} | /usr/bin/awk '{print $1}')`,
+      `[ "$actual" = ${quotedHash} ] || exit 78`,
+      `exec ${exactCommand}`,
+    ].join("; ");
+  }
+  const quotedCommand = shellQuote(command);
   if (platform === "macos") {
     const profile = shellQuote(macosUserOnlyProfile(internalPolicy));
     return `/usr/bin/sandbox-exec -p ${profile} ${shell} -lc ${quotedCommand}`;
@@ -140,6 +216,127 @@ export function posixRemoteUserOnlyRunner(
   throw new UniversalBrokerError(
     "ELEVATION_BLOCKED",
     `Strict POSIX user-account enforcement is unavailable for platform ${platform}.`,
+  );
+}
+
+function verifyLocalGuiScript(policy: GuiInternalExecutionPolicy): void {
+  let metadata: ReturnType<typeof lstatSync>;
+  try {
+    metadata = lstatSync(policy.scriptPath);
+  } catch {
+    throw internalExecutionViolation("GUI node source is unavailable");
+  }
+  if (!metadata.isFile() || metadata.isSymbolicLink()) {
+    throw internalExecutionViolation("GUI node source is not a regular file");
+  }
+  if (realpathSync(policy.scriptPath) !== policy.scriptPath) {
+    throw internalExecutionViolation("GUI node source path is not canonical");
+  }
+  const uid = process.getuid?.();
+  if (uid !== undefined && metadata.uid !== uid) {
+    throw internalExecutionViolation("GUI node source is not owned by the service account");
+  }
+  if ((metadata.mode & 0o022) !== 0) {
+    throw internalExecutionViolation("GUI node source is group- or world-writable");
+  }
+  const actualSha256 = createHash("sha256").update(readFileSync(policy.scriptPath)).digest("hex");
+  if (actualSha256 !== policy.scriptSha256) {
+    throw internalExecutionViolation("GUI node source hash changed");
+  }
+}
+
+function validateGuiActWords(words: string[]): void {
+  if (words.length !== 15) throw internalExecutionViolation("GUI act argument count is invalid");
+  if (!boundedDecimal(words[3], -1, 1_000)) {
+    throw internalExecutionViolation("GUI element index is invalid");
+  }
+  if (!new Set(["perform", "press", "click", "set_value", "focus", "keystroke", "key_code"]).has(words[4]!)) {
+    throw internalExecutionViolation("GUI action type is invalid");
+  }
+  for (const index of [5, 6, 10, 11, 12, 13, 14]) {
+    if (!boundedBase64(words[index])) throw internalExecutionViolation("GUI encoded argument is invalid");
+  }
+  if (!/^(?:(?:command|option|control|shift)(?:,(?:command|option|control|shift))*)?$/u.test(words[7]!)) {
+    throw internalExecutionViolation("GUI modifier list is invalid");
+  }
+  if (!boundedDecimal(words[8], -1, 255)) {
+    throw internalExecutionViolation("GUI key code is invalid");
+  }
+  if (!boundedDecimal(words[9], 0, 2_147_483_647)) {
+    throw internalExecutionViolation("GUI process identifier is invalid");
+  }
+}
+
+function restrictedPosixWords(command: string): string[] {
+  const words: string[] = [];
+  let value = "";
+  let active = false;
+  let state: "plain" | "single" | "double" = "plain";
+  for (let index = 0; index < command.length; index += 1) {
+    const character = command[index]!;
+    if (state === "single") {
+      if (character === "'") state = "plain";
+      else value += character;
+      active = true;
+      continue;
+    }
+    if (state === "double") {
+      if (character === '"') state = "plain";
+      else {
+        if (character === "$" || character === "`" || character === "\\" || character === "\n" || character === "\r") {
+          throw internalExecutionViolation("GUI command contains shell expansion");
+        }
+        value += character;
+      }
+      active = true;
+      continue;
+    }
+    if (/\s/u.test(character)) {
+      if (active) {
+        words.push(value);
+        value = "";
+        active = false;
+      }
+      continue;
+    }
+    if (character === "'") {
+      state = "single";
+      active = true;
+      continue;
+    }
+    if (character === '"') {
+      state = "double";
+      active = true;
+      continue;
+    }
+    if (/[;&|<>$`(){}\\]/u.test(character)) {
+      throw internalExecutionViolation("GUI command contains a shell operator or expansion");
+    }
+    value += character;
+    active = true;
+  }
+  if (state !== "plain") throw internalExecutionViolation("GUI command contains an unterminated quote");
+  if (active) words.push(value);
+  return words;
+}
+
+function boundedBase64(value: string | undefined): boolean {
+  return value !== undefined
+    && value.length <= 16_384
+    && /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u.test(value);
+}
+
+function boundedDecimal(value: string | undefined, minimum: number, maximum: number): boolean {
+  if (value === undefined || !/^-?\d+$/u.test(value)) return false;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed >= minimum && parsed <= maximum;
+}
+
+function internalExecutionViolation(reason: string): UniversalBrokerError {
+  return new UniversalBrokerError(
+    "ELEVATION_BLOCKED",
+    "DevSpace blocked an invalid internal GUI execution request.",
+    { evidence: { policy: "gui-node-exact", reason } },
   );
 }
 

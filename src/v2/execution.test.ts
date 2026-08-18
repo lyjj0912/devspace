@@ -198,6 +198,26 @@ test("environment-profile requests fail explicitly when unavailable", async (t) 
   );
 });
 
+test("internal GUI execution cannot combine its exact contract with an environment profile", async (t) => {
+  const fixture = await createFixture(t);
+  const scriptPath = join(fixture.root, "gui-node.applescript");
+  await assert.rejects(
+    fixture.execution.execute({
+      target: "local",
+      cwd: fixture.root,
+      command: `/usr/bin/osascript ${shellQuoteForTest(scriptPath)} capabilities`,
+      internalPolicy: {
+        kind: "gui",
+        scriptPath,
+        scriptSha256: "0".repeat(64),
+      },
+      envProfile: "must-not-load",
+    }),
+    (error: unknown) => brokerCode(error) === "ELEVATION_BLOCKED",
+  );
+  assert.equal(fixture.execution.stats().processes, 0);
+});
+
 test("exec does not inherit service credentials into child processes", async (t) => {
   const fixture = await createFixture(t);
   const previousOwner = process.env.DEVSPACE_OAUTH_OWNER_TOKEN;

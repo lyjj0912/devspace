@@ -34,8 +34,13 @@ for a higher identity.
 
 The boundary is enforced at runtime, not only documented:
 
-- macOS commands run under a sandbox profile that denies Authorization Services
-  acquisition and known elevation executables and all setuid/setgid executables;
+- ordinary macOS commands and stdio MCP providers run under a sandbox profile
+  that denies Authorization Services acquisition, known elevation executables,
+  and every setuid/setgid executable;
+- the built-in GUI node is the sole direct Apple Event exception: the broker
+  validates an exact `/usr/bin/osascript <owner-file> <bounded-args>` grammar and
+  binds execution to the installed source SHA-256, owner, mode, path, observed
+  GUI generation, and one-shot R3 authority;
 - Linux commands run with `no_new_privs` through `setpriv`;
 - Windows execution rejects high-integrity and system tokens;
 - target probes report a degraded target when the required enforcement
@@ -151,8 +156,11 @@ quotas, and uses expiring one-time publication links.
 ### GUI plane
 
 `gui` is an optional generic operating-system UI node. Protocol-native control,
-such as Chrome DevTools MCP, is preferred. GUI actions are R3 and require both an
-exact one-shot authority record and a fresh observed generation.
+such as Chrome DevTools MCP, is preferred. The macOS node is installed from one
+built-in source and invoked only through an exact path/hash/argument contract;
+arbitrary AppleScript, shell syntax, environment profiles, and another script
+path cannot enter that internal execution path. GUI actions are R3 and require
+both an exact one-shot authority record and a fresh observed generation.
 
 ### Management plane
 

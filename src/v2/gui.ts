@@ -573,7 +573,7 @@ export class MacOsGuiNodeRunner implements GuiNodeRunner {
     const scriptPath = await this.ensureInstalled(target);
     const args = guiNodeArguments(request);
     let process = await this.execution.execute({
-        internalPolicy: "gui",
+      internalPolicy: { kind: "gui", scriptPath, scriptSha256: this.sourceSha256 },
       target: target.id,
       cwd: target.defaultCwd,
       command: ["/usr/bin/osascript", shellQuote(scriptPath), ...args.map(shellQuote)].join(" "),

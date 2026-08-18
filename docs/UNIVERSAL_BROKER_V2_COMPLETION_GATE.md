@@ -77,6 +77,12 @@ target context fs exec process mcp artifact gui
   `mcp`.
 - Artifact inbound, outbound, and target-to-target transfer pass.
 - Local GUI and truthful remote GUI capability reporting pass.
+- The GUI node executes only when its canonical owner-only file, built-in
+  SHA-256, and bounded argument grammar match. Alternate paths, symlinks,
+  writable/tampered files, shell syntax, `osascript -e`, and environment-profile
+  combination fail closed.
+- Local/SSH stdio MCP children remain under the generic no-elevation wrapper and
+  cannot select the GUI exact-execution contract.
 - Authority canaries cover R0, R1, R2, R3, mismatch, consumption, correction,
   and dispatch uncertainty.
 
