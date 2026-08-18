@@ -147,5 +147,10 @@ test("live verifier defaults to parallel v2 and creates only a temporary user to
   assert.match(source, /MCP_PROVIDER_ERROR.*MCP_TRANSPORT_ERROR/u);
   assert.match(source, /unexpectedly requires mutation authority/u);
   assert.match(source, /authority preview unexpectedly created its remote fixture path/u);
+  assert.match(source, /skipCompanyGates: false/u);
+  assert.match(source, /argument === "--skip-company-gates"/u);
+  assert.match(source, /Explicit --skip-company-gates deployment option\./u);
+  assert.match(source, /companyGateSkipped: options\.skipCompanyGates/u);
+  assert.match(source, /if \(!options\.skipCompanyGates\)/u);
   assert.doesNotMatch(source, /templateDatabasePath|--template-database|JSON\.stringify\(\["devspace"/u);
 });

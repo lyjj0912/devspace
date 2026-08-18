@@ -8,6 +8,7 @@ PROCESS_NAME="devspace-v2-production"
 PRODUCTION_PORT=7678
 CANDIDATE_PORT=7679
 SSH_LOAD_TARGET="company"
+SKIP_COMPANY_GATES=0
 WINDOWS_LIVE_TARGET=""
 RELEASE_ROOT="${HOME}/.devspace/releases/universal-broker-v2"
 DEPLOYMENT_ROOT="${HOME}/.devspace/deployments/universal-broker-v2"
@@ -25,6 +26,7 @@ Options:
   --port PORT                Production port (default: 7678)
   --candidate-port PORT      Isolated candidate port (default: 7679)
   --ssh-load-target ID       Required real POSIX SSH load/live target (default: company)
+  --skip-company-gates       Skip every company target/route gate for this transaction only
   --windows-live-target ID   Optional Windows target; when supplied its live canary is mandatory
   --release-root PATH        Immutable release root
   --deployment-root PATH     Upgrade audit root
@@ -40,6 +42,7 @@ while [[ $# -gt 0 ]]; do
     --port) PRODUCTION_PORT="$2"; shift 2 ;;
     --candidate-port) CANDIDATE_PORT="$2"; shift 2 ;;
     --ssh-load-target) SSH_LOAD_TARGET="$2"; shift 2 ;;
+    --skip-company-gates) SKIP_COMPANY_GATES=1; shift ;;
     --windows-live-target) WINDOWS_LIVE_TARGET="$2"; shift 2 ;;
     --release-root) RELEASE_ROOT="$2"; shift 2 ;;
     --deployment-root) DEPLOYMENT_ROOT="$2"; CURRENT_AUDIT_LINK="$2/current"; shift 2 ;;
@@ -60,6 +63,44 @@ CURRENT_AUDIT_LINK="${DEPLOYMENT_ROOT}/current"
 for command in git node npm pm2 curl python3; do
   command -v "$command" >/dev/null 2>&1 || { echo "Required command is missing: $command" >&2; exit 1; }
 done
+ACTIVE_TRANSACTION_STATUS="$(
+  find "$DEPLOYMENT_ROOT" -maxdepth 2 -type f -name status.json -path '*/upgrade-*/*' -print0 2>/dev/null \
+    | while IFS= read -r -d '' path; do
+        python3 - "$path" <<'PYACTIVE'
+import json,sys
+try:
+  value=json.load(open(sys.argv[1],encoding="utf-8"))
+except Exception:
+  raise SystemExit
+if value.get("state") in {"PREPARED","ACCEPTED","SWITCHING","VERIFYING","ROLLING_BACK"}:
+  print(sys.argv[1])
+PYACTIVE
+      done \
+    | head -n1
+)"
+if [[ -n "$ACTIVE_TRANSACTION_STATUS" ]]; then
+  echo "Existing nonterminal production upgrade must be inspected before a new submission: $ACTIVE_TRANSACTION_STATUS" >&2
+  python3 -m json.tool "$ACTIVE_TRANSACTION_STATUS" >&2 || true
+  exit 1
+fi
+ACTIVE_CANDIDATE="$(
+  pm2 jlist | python3 -c 'import json,sys
+items=json.load(sys.stdin)
+for item in items:
+  name=str(item.get("name") or "")
+  status=str((item.get("pm2_env") or {}).get("status") or "")
+  if name.startswith("devspace-v2-candidate-") and status not in {"stopped","errored"}:
+    print(name)
+    break'
+)"
+[[ -z "$ACTIVE_CANDIDATE" ]] || {
+  echo "Existing candidate PM2 process must be inspected before a new submission: $ACTIVE_CANDIDATE" >&2
+  exit 1
+}
+if command -v lsof >/dev/null 2>&1 && lsof -nP -iTCP:"$CANDIDATE_PORT" -sTCP:LISTEN -t 2>/dev/null | grep -q .; then
+  echo "Candidate port already has a listener: $CANDIDATE_PORT" >&2
+  exit 1
+fi
 GIT_EXECUTABLE="$(command -v git)"
 [[ -f "$PRODUCTION_ENV" ]] || { echo "Production environment is missing: $PRODUCTION_ENV" >&2; exit 1; }
 [[ "$PRODUCTION_PORT" =~ ^[0-9]+$ && "$CANDIDATE_PORT" =~ ^[0-9]+$ ]] || { echo "Ports must be integers." >&2; exit 1; }
@@ -250,7 +291,11 @@ START_BACKUP="$AUDIT_DIR/start.sh.before"
 LIVE_EVIDENCE="$AUDIT_DIR/candidate-live.json"
 NPM_CI_LOG="$AUDIT_DIR/npm-ci.log"
 RELEASE_VERIFY_LOG="$AUDIT_DIR/release-verify.log"
-FULL_LOAD_LOG="$AUDIT_DIR/full-load-real-${SSH_LOAD_TARGET}.log"
+if [[ "$SKIP_COMPANY_GATES" == 1 ]]; then
+  FULL_LOAD_LOG="$AUDIT_DIR/full-load-company-skipped.json"
+else
+  FULL_LOAD_LOG="$AUDIT_DIR/full-load-real-${SSH_LOAD_TARGET}.log"
+fi
 RELEASE_CREATED=0
 UPGRADE_SCHEDULED=0
 
@@ -280,10 +325,15 @@ fi
   cd "$RELEASE"
   npm ci 2>&1 | tee "$NPM_CI_LOG"
   npm run release:verify -- --require-clean 2>&1 | tee "$RELEASE_VERIFY_LOG"
-  DEVSPACE_V2_LOAD_TARGET_CONFIG="$TARGETS_FILE" \
-  DEVSPACE_V2_LOAD_SSH_TARGET="$SSH_LOAD_TARGET" \
-  DEVSPACE_V2_LOAD_REQUIRE_REAL_SSH=1 \
-    npm run v2:load 2>&1 | tee "$FULL_LOAD_LOG"
+  if [[ "$SKIP_COMPANY_GATES" == 1 ]]; then
+    printf '%s\n' '{"ok":true,"skipped":true,"scope":"all-company-gates","reason":"explicit --skip-company-gates"}' \
+      | tee "$FULL_LOAD_LOG"
+  else
+    DEVSPACE_V2_LOAD_TARGET_CONFIG="$TARGETS_FILE" \
+    DEVSPACE_V2_LOAD_SSH_TARGET="$SSH_LOAD_TARGET" \
+    DEVSPACE_V2_LOAD_REQUIRE_REAL_SSH=1 \
+      npm run v2:load 2>&1 | tee "$FULL_LOAD_LOG"
+  fi
 )
 DIST_EVIDENCE="$(
   cd "$RELEASE"
@@ -337,9 +387,13 @@ LIVE_ARGUMENTS=(
   --token-resource "${PUBLIC_BASE_URL}/mcp"
   --database "$CANDIDATE_OAUTH_DATABASE"
   --sessions 3
-  --company-target "$SSH_LOAD_TARGET"
   --output "$LIVE_EVIDENCE"
 )
+if [[ "$SKIP_COMPANY_GATES" == 1 ]]; then
+  LIVE_ARGUMENTS+=(--skip-company-gates)
+else
+  LIVE_ARGUMENTS+=(--company-target "$SSH_LOAD_TARGET")
+fi
 if [[ -n "$WINDOWS_LIVE_TARGET" ]]; then
   LIVE_ARGUMENTS+=(--windows-target "$WINDOWS_LIVE_TARGET")
 fi

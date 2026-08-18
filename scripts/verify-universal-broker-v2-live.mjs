@@ -41,6 +41,9 @@ const audit = {
   baseUrl: baseUrl.href,
   mcpUrl: mcpUrl.href,
   healthUrl: healthUrl.href,
+  companyGates: options.skipCompanyGates
+    ? { skipped: true, reason: "Explicit --skip-company-gates deployment option." }
+    : { skipped: false },
   health: undefined,
   protocolSessions: [],
   canaries: {},
@@ -156,10 +159,13 @@ async function runCanaries(client, sameClientTransport, foreignClient, root, can
   if (options.windowsTarget) {
     assert(targetIds.includes(options.windowsTarget), `Windows target is missing: ${options.windowsTarget}`);
   }
-  assert(targetIds.includes(options.companyTarget), `company target is missing: ${options.companyTarget}`);
+  if (!options.skipCompanyGates) {
+    assert(targetIds.includes(options.companyTarget), `company target is missing: ${options.companyTarget}`);
+  }
   canaries.targets = targetIds;
 
   const previewOnlyPath = join(root, "authority-preview-only.txt");
+  const previewR2Path = join(root, "authority-preview-r2.txt");
   const previewRemotePath = `/tmp/devspace-preview-only-${randomUUID()}.txt`;
   const authorityPreview = data(await client.callTool({
     name: "context",
@@ -176,11 +182,17 @@ async function runCanaries(client, sameClientTransport, foreignClient, root, can
           tool: "fs",
           arguments: { operation: "write", path: previewOnlyPath, content: "preview-only\n" },
         },
-        {
-          id: "r2-remote-write",
-          tool: "fs",
-          arguments: { operation: "write", target: options.companyTarget, path: previewRemotePath, content: "preview-only\n" },
-        },
+        options.skipCompanyGates
+          ? {
+              id: "r2-local-remove",
+              tool: "fs",
+              arguments: { operation: "remove", target: "local", path: previewR2Path, disposition: "permanent" },
+            }
+          : {
+              id: "r2-remote-write",
+              tool: "fs",
+              arguments: { operation: "write", target: options.companyTarget, path: previewRemotePath, content: "preview-only\n" },
+            },
         {
           id: "r3-push",
           tool: "exec",
@@ -197,23 +209,28 @@ async function runCanaries(client, sameClientTransport, foreignClient, root, can
     "authority preview risk classification is incorrect",
   );
   await assertPathMissing(previewOnlyPath);
-  const remotePreviewStat = await client.callTool({
-    name: "fs",
-    arguments: {
-      operation: "stat",
-      target: options.companyTarget,
-      path: previewRemotePath,
-    },
-  });
-  assert(
-    errorCode(remotePreviewStat) === "PATH_NOT_FOUND",
-    "authority preview unexpectedly created its remote fixture path",
-  );
+  if (options.skipCompanyGates) {
+    await assertPathMissing(previewR2Path);
+  } else {
+    const remotePreviewStat = await client.callTool({
+      name: "fs",
+      arguments: {
+        operation: "stat",
+        target: options.companyTarget,
+        path: previewRemotePath,
+      },
+    });
+    assert(
+      errorCode(remotePreviewStat) === "PATH_NOT_FOUND",
+      "authority preview unexpectedly created its remote fixture path",
+    );
+  }
   canaries.authorityPreview = {
     planFingerprint: authorityPreview.planFingerprint,
     risks: authorityPreview.actions.map((action) => action.minimumRisk),
     localDispatched: false,
     remoteDispatched: false,
+    companyGateSkipped: options.skipCompanyGates,
   };
 
   const file = join(root, "plain.txt");
@@ -419,6 +436,12 @@ async function runCanaries(client, sameClientTransport, foreignClient, root, can
   assert(ptyDone.state === "EXITED" && /41\s+132/.test(String(ptyDone.output)) && String(ptyDone.output).includes("pty=live-pty"), "PTY resize/input lifecycle failed");
   canaries.processLifecycle = { background: true, pty: true };
 
+  if (options.skipCompanyGates) {
+    canaries.company = {
+      skipped: true,
+      reason: "Explicit --skip-company-gates deployment option.",
+    };
+  } else {
   const companyProbe = data(await call(client, "target", {
     operation: "probe",
     targetId: options.companyTarget,
@@ -476,6 +499,7 @@ async function runCanaries(client, sameClientTransport, foreignClient, root, can
     disposition: "permanent",
   });
   canaries.company = { exec: true, pty: true, sftp: true, filesystem: true, artifact: true };
+  }
 
   if (options.windowsTarget) {
     const windowsProbe = data(await call(client, "target", {
@@ -585,6 +609,16 @@ async function runCanaries(client, sameClientTransport, foreignClient, root, can
   assert(closed.worktree?.removed === true, "managed worktree was not removed after cleanup");
   canaries.contextWorktree = true;
 
+  if (options.skipCompanyGates) {
+    canaries.companyRoutes = {
+      skipped: true,
+      reason: "Explicit --skip-company-gates deployment option.",
+    };
+    canaries.remoteGui = {
+      skipped: true,
+      reason: "Explicit --skip-company-gates deployment option.",
+    };
+  } else {
   const routes = data(await call(client, "mcp", { operation: "routes" }));
   const routeIds = (routes.routes ?? []).map((route) => route.routeId);
   assert(routeIds.includes(options.chromeRoute), `Chrome MCP route is missing: ${options.chromeRoute}`);
@@ -680,6 +714,7 @@ async function runCanaries(client, sameClientTransport, foreignClient, root, can
       observation: false,
       action: false,
     };
+  }
   }
 
   const artifactDestination = join(root, "artifact-copy.txt");
@@ -987,6 +1022,7 @@ function parseArgs(args) {
     databasePath: `${process.env.HOME}/.local/share/devspace/universal-broker-v2/devspace.sqlite`,
     sessions: 5,
     output: undefined,
+    skipCompanyGates: false,
     companyTarget: "company",
     chromeRoute: "company-chrome",
     jiraRoute: "company-jira",
@@ -1008,6 +1044,7 @@ function parseArgs(args) {
     else if (argument === "--database") result.databasePath = requiredValue(argument, value), index += 1;
     else if (argument === "--sessions") result.sessions = Number(requiredValue(argument, value)), index += 1;
     else if (argument === "--output") result.output = requiredValue(argument, value), index += 1;
+    else if (argument === "--skip-company-gates") result.skipCompanyGates = true;
     else if (argument === "--company-target") result.companyTarget = requiredValue(argument, value), index += 1;
     else if (argument === "--chrome-route") result.chromeRoute = requiredValue(argument, value), index += 1;
     else if (argument === "--jira-route") result.jiraRoute = requiredValue(argument, value), index += 1;

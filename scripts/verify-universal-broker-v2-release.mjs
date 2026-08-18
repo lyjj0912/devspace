@@ -564,6 +564,10 @@ function verifySelfManagementSources() {
   for (const marker of [
     "npm run release:verify -- --require-clean",
     "DEVSPACE_V2_LOAD_SSH_TARGET",
+    "SKIP_COMPANY_GATES=0",
+    "--skip-company-gates",
+    "full-load-company-skipped.json",
+    "LIVE_ARGUMENTS+=(--skip-company-gates)",
     "candidate-live.json",
     "full-load-real-",
     "DEVSPACE_V2_LOAD_REQUIRE_REAL_SSH=1",
@@ -769,6 +773,10 @@ function verifyLiveVerifierSources() {
     "sameClientTransport",
     "foreignClient",
     "sessions must be 2..20",
+    "skipCompanyGates: false",
+    'argument === "--skip-company-gates"',
+    "Explicit --skip-company-gates deployment option.",
+    "companyGateSkipped: options.skipCompanyGates",
     "ELEVATION_BLOCKED",
     "runtimeElevationBlocked",
   ]) {
