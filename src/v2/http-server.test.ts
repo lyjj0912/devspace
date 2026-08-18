@@ -576,19 +576,35 @@ test("parallel v2 HTTP skeleton has an independent health endpoint and protected
       risk: "R2",
     });
     assert.notEqual(mcpWrite.isError, true);
-    const mcpRead = await callAuthorized(client, {
-      taskId: "http-mcp-read-invocation",
-      authorityText: "Invoke this exact downstream MCP tool and read this exact fixture key.",
-      tool: "mcp",
+    const mcpRead = await client.callTool({
+      name: "mcp",
       arguments: {
         operation: "invoke",
         route: "fixture",
         name: "read_value",
         arguments: { key: "http" },
       },
-      risk: "R2",
     });
     assert.match(JSON.stringify(mcpRead.structuredContent), /proxied/);
+    const unnecessaryReadAuthority = await client.callTool({
+      name: "context",
+      arguments: {
+        operation: "authorize",
+        taskId: "unnecessary-read-only-mcp-authority",
+        authorityText: "This read-only provider call must not require mutation authority.",
+        actions: [{
+          tool: "mcp",
+          arguments: {
+            operation: "invoke",
+            route: "fixture",
+            name: "read_value",
+            arguments: { key: "http" },
+          },
+        }],
+      },
+    });
+    assert.equal(unnecessaryReadAuthority.isError, true);
+    assert.match(JSON.stringify(unnecessaryReadAuthority.structuredContent), /must run without task authority/u);
 
     const routeArgs = {
       operation: "invoke",
@@ -671,10 +687,8 @@ test("parallel v2 HTTP skeleton has an independent health endpoint and protected
     });
     assert.match(JSON.stringify(mcpPrompt.structuredContent), /Inspect HTTP proxy/);
 
-    const mcpLarge = await callAuthorized(client, {
-      taskId: "http-mcp-large-result",
-      authorityText: "Invoke this exact downstream MCP large-result canary.",
-      tool: "mcp",
+    const mcpLarge = await client.callTool({
+      name: "mcp",
       arguments: {
         operation: "invoke",
         route: "fixture",
@@ -682,7 +696,6 @@ test("parallel v2 HTTP skeleton has an independent health endpoint and protected
         arguments: { characters: 20_000 },
         responsePolicy: { maxCharacters: 500, preserveFullResult: true },
       },
-      risk: "R2",
     });
     const largeData = (mcpLarge.structuredContent as {
       data?: { result?: { resourceUri?: string; truncated?: boolean } };

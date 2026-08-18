@@ -203,8 +203,12 @@ test("R0 actions cannot be wrapped in authority and elevation commands fail clos
   assert.equal(commandRisk("env sh -c touch /tmp/x", "local"), "R3");
   assert.equal(commandRisk("find /tmp -fprint /tmp/index", "local"), "R3");
   assert.equal(commandRisk("printf x | xargs touch", "local"), "R2");
-  assert.equal(mcpRisk("invoke", { readOnly: true }), "R2");
+  assert.equal(mcpRisk("invoke", { readOnly: true }), "R0");
+  assert.equal(mcpRisk("invoke", {}), "R2");
   assert.equal(mcpRisk("invoke", { destructive: true }), "R3");
+  assert.equal(commandRisk("git branch --delete obsolete", "local"), "R3");
+  assert.equal(commandRisk("git tag --delete obsolete", "local"), "R3");
+  assert.equal(commandRisk("git stash clear", "local"), "R3");
 });
 
 function code(error: unknown): string | undefined {

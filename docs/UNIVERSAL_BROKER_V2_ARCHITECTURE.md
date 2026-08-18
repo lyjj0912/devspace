@@ -131,11 +131,12 @@ transaction fails closed rather than blocking all future restarts forever.
 
 `mcp` proxies configured local-stdio, SSH-stdio, and Streamable HTTP routes. It
 supports tools, resources, and prompts without service-specific DevSpace code.
-Before an invocation, downstream tool annotations are inspected. An invocation
-is never lower than R2 because provider annotations are hints rather than an
-authorization boundary; a destructive annotation raises it to R3. Exact MCP
-invocation authorities include the canonical route ID and route fingerprint, so
-route hot reload invalidates stale authority before provider dispatch. Local and
+Before an invocation, downstream tool annotations are inspected. An explicitly
+read-only invocation is R0, an explicitly destructive invocation is R3, and a
+missing, contradictory, or mutating annotation fails conservatively at R2.
+Exact MCP invocation authorities include the canonical route ID, provider risk
+annotation, and route fingerprint, so provider or route drift invalidates stale
+authority before dispatch. Local and
 SSH stdio providers inherit the same runtime no-elevation wrapper as ordinary
 commands. Large results are retained behind bounded resource handles.
 

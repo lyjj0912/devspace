@@ -271,15 +271,9 @@ function registerMcpTool(
     async (input, extra) => executeUniversalTool(async () => {
       requireScope(extra.authInfo?.scopes, "devspace.mcp");
       const typed = input as UniversalMcpInput;
-      let risk = mcpRisk(typed.operation);
-      let routeBinding: { routeId: string; routeFingerprint: string } | undefined;
+      let routeBinding: RouteAuthorityBinding | undefined;
       if (typed.operation === "invoke") {
-        const inspected = await proxy.inspectInvocation(typed);
-        routeBinding = inspected;
-        risk = mcpRisk(typed.operation, {
-          readOnly: inspected.annotations?.readOnlyHint === true,
-          destructive: inspected.annotations?.destructiveHint === true,
-        });
+        routeBinding = await proxy.inspectInvocation(typed);
       } else if (typed.operation === "close") {
         routeBinding = await proxy.inspectRoute(typed.route);
       }
@@ -287,6 +281,7 @@ function registerMcpTool(
         mcpAction(typed, routeBinding?.routeId),
         routeBinding,
       );
+      const risk = minimumAuthorityRisk(action);
       const data = await withOperationAuthority(
         authority,
         typed.authorityId,
@@ -857,17 +852,27 @@ function bindTargetAuthority(
   };
 }
 
+interface RouteAuthorityBinding {
+  routeId: string;
+  routeFingerprint: string;
+  annotations?: Record<string, unknown>;
+}
+
 function bindRouteAuthority(
   action: AuthorityActionDescriptor,
-  binding: { routeId: string; routeFingerprint: string } | undefined,
+  binding: RouteAuthorityBinding | undefined,
 ): AuthorityActionDescriptor {
   if (!binding) return action;
+  const readOnly = binding.annotations?.readOnlyHint === true;
+  const destructive = binding.annotations?.destructiveHint === true;
   return {
     ...action,
     resource: binding.routeId,
     parameters: {
       ...(action.parameters ?? {}),
       routeFingerprint: binding.routeFingerprint,
+      ...(readOnly ? { readOnly: true } : {}),
+      ...(destructive ? { destructive: true } : {}),
     },
   };
 }

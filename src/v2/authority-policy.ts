@@ -20,7 +20,7 @@ const HIGH_RISK_COMMAND_PATTERNS = [
   /(?:^|[;&|()\s])(?:rmdir|unlink|shred|truncate|mkfs(?:\.[A-Za-z0-9_-]+)?)(?:\s|$)/u,
   /\bfind\b[^\n]*(?:-delete|-exec(?:dir)?|-ok(?:dir)?|-fprint(?:f)?|-fls)\b/iu,
   /\b(?:dd|diskutil)\b[^\n]*(?:of=|erase|partition|zeroDisk|secureErase)/iu,
-  /\bgit\s+(?:push|reset\s+--hard|clean\s+-|branch\s+-D|tag\s+-d|rebase|filter-(?:branch|repo)|checkout\s+(?:-f|--)|restore\s+(?:--staged\s+)?(?:--worktree\s+)?)/iu,
+  /\bgit\s+(?:push|reset\s+--hard|clean\s+-|branch\s+(?:-d|-D|--delete|--force)|tag\s+(?:-d|--delete|--force)|stash\s+(?:drop|clear)|reflog\s+expire|gc\b[^\n]*--prune|rebase|filter-(?:branch|repo)|checkout\s+(?:-f|--)|restore\s+(?:--staged\s+)?(?:--worktree\s+)?)/iu,
   /\bpm2\s+(?:start|restart|reload|stop|delete|kill|save|startup|unstartup)\b/iu,
   /\b(?:launchctl|systemctl|service)\s+(?:boot|bootstrap|bootout|enable|disable|start|stop|restart|reload|daemon-reload)\b/iu,
   /\b(?:shutdown|reboot|halt|poweroff)\b/iu,
@@ -290,8 +290,8 @@ export function mcpRisk(
   if (operation === "close") return "R1";
   if (operation === "invoke") {
     if (parameters?.destructive === true) return "R3";
-    // Downstream annotations are discovery hints, not an authorization boundary.
-    // A configured provider may raise risk to R3 but cannot lower invocation below R2.
+    if (parameters?.readOnly === true) return "R0";
+    // Missing, contradictory, or mutation annotations fail conservatively.
     return "R2";
   }
   return "R2";
