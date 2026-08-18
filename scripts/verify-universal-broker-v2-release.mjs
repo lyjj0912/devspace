@@ -479,8 +479,22 @@ function verifySelfManagementSources() {
   if (!upgradeWorker.includes("productionPm2Environment")) {
     fail("Production upgrade worker does not sanitize inherited DevSpace environment variables.");
   }
+  for (const marker of [
+    "pm2CommandEnvironment",
+    "pm2ExecutablePath",
+    "dirname(resolve(nodeExecutable))",
+    "env: env ?? pm2CommandEnvironment(process.env)",
+  ]) {
+    if (!upgradeWorker.includes(marker)) fail(`Detached PM2 Node-path continuity is missing: ${marker}`);
+  }
   if (!upgradeTests.includes("drop inherited DevSpace runtime state")) {
     fail("Production upgrade environment isolation regression test is missing.");
+  }
+  if (!upgradeTests.includes("every detached PM2 command can resolve the worker Node executable")) {
+    fail("Detached PM2 Node-path continuity regression test is missing.");
+  }
+  if (!upgradeTests.includes("runs an env-node shebang under a minimal launchd PATH")) {
+    fail("Detached PM2 env-node shebang regression test is missing.");
   }
   if (!packageJson.scripts?.["v2:test"]?.includes("src/v2/startup-environment.test.ts")) {
     fail("The canonical v2 test gate omits startup environment isolation tests.");

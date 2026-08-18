@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import assert from "node:assert/strict";
 import { createServer, type Server } from "node:http";
 import {
@@ -15,6 +16,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
 import {
+  pm2CommandEnvironment,
   productionPm2Environment,
   runProductionUpgradeWorker,
   type ProductionUpgradeRequest,
@@ -39,12 +41,54 @@ test("production PM2 launches retain ordinary process variables but drop inherit
     DEVSPACE_NEXT_STALE_VALUE: "must-not-survive",
     DEVSPACE_OAUTH_OWNER_TOKEN: "must-not-survive",
     DEVSPACE_PRODUCTION_ENV_FILE: "/old.env",
-  }, "/new.env");
+  }, "/new.env", "/Users/example/.nvm/versions/node/v22/bin/node");
   assert.deepEqual(sanitized, {
     HOME: "/Users/example",
-    PATH: "/usr/bin:/bin",
+    PATH: "/Users/example/.nvm/versions/node/v22/bin:/usr/bin:/bin",
     DEVSPACE_PRODUCTION_ENV_FILE: "/new.env",
   });
+});
+
+test("every detached PM2 command can resolve the worker Node executable without duplicating PATH entries", () => {
+  assert.deepEqual(
+    pm2CommandEnvironment({
+      HOME: "/Users/example",
+      PATH: "/usr/bin:/Users/example/.nvm/versions/node/v22/bin:/bin",
+      DEVSPACE_NEXT_PORT: "7678",
+    }, "/Users/example/.nvm/versions/node/v22/bin/node"),
+    {
+      HOME: "/Users/example",
+      PATH: "/Users/example/.nvm/versions/node/v22/bin:/usr/bin:/bin",
+      DEVSPACE_NEXT_PORT: "7678",
+    },
+  );
+  assert.throws(
+    () => pm2CommandEnvironment({ PATH: "/usr/bin:/bin" }, "node"),
+    /Node executable must be absolute/u,
+  );
+});
+
+test("detached PM2 environment runs an env-node shebang under a minimal launchd PATH", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-pm2-node-path-test-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const executable = join(root, "pm2-like.mjs");
+  await writeFile(executable, [
+    "#!/usr/bin/env node",
+    "process.stdout.write(JSON.stringify({execPath:process.execPath,args:process.argv.slice(2)}));",
+    "",
+  ].join("\n"), { mode: 0o700 });
+  await chmod(executable, 0o700);
+  const result = spawnSync(executable, ["jlist"], {
+    encoding: "utf8",
+    env: pm2CommandEnvironment({
+      HOME: root,
+      PATH: "/usr/bin:/bin",
+    }, process.execPath),
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const value = JSON.parse(result.stdout) as { execPath: string; args: string[] };
+  assert.equal(value.execPath, process.execPath);
+  assert.deepEqual(value.args, ["jlist"]);
 });
 
 test("production upgrade worker switches one PM2 process and commits canonical pointers only after verification", async (t) => {

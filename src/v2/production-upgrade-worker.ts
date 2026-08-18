@@ -11,7 +11,7 @@ import {
   symlink,
   writeFile,
 } from "node:fs/promises";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
 
@@ -258,13 +258,39 @@ function replacePm2Process(
 export function productionPm2Environment(
   inherited: NodeJS.ProcessEnv,
   productionEnvPath: string,
+  nodeExecutable = process.execPath,
 ): NodeJS.ProcessEnv {
   const sanitized: NodeJS.ProcessEnv = {};
   for (const [key, value] of Object.entries(inherited)) {
     if (!key.startsWith("DEVSPACE_")) sanitized[key] = value;
   }
+  sanitized.PATH = pm2ExecutablePath(inherited.PATH, nodeExecutable);
   sanitized.DEVSPACE_PRODUCTION_ENV_FILE = productionEnvPath;
   return sanitized;
+}
+
+export function pm2CommandEnvironment(
+  inherited: NodeJS.ProcessEnv,
+  nodeExecutable = process.execPath,
+): NodeJS.ProcessEnv {
+  return {
+    ...inherited,
+    PATH: pm2ExecutablePath(inherited.PATH, nodeExecutable),
+  };
+}
+
+function pm2ExecutablePath(
+  inheritedPath: string | undefined,
+  nodeExecutable: string,
+): string {
+  if (!isAbsolute(nodeExecutable)) {
+    throw new Error(`Node executable must be absolute for detached PM2 control: ${nodeExecutable}`);
+  }
+  const entries = [
+    dirname(resolve(nodeExecutable)),
+    ...(inheritedPath ?? "").split(delimiter),
+  ].filter((entry) => entry.length > 0);
+  return [...new Set(entries)].join(delimiter);
 }
 
 async function rollbackRuntime(request: ProductionUpgradeRequest): Promise<Record<string, unknown>> {
@@ -333,12 +359,12 @@ function runPm2(
   args: string[],
   timeout: number,
   allowFailure = false,
-  env: NodeJS.ProcessEnv = process.env,
+  env?: NodeJS.ProcessEnv,
 ): { stdout: string; stderr: string; status: number | null } {
   const result = spawnSync(request.pm2Executable, args, {
     encoding: "utf8",
     timeout,
-    env,
+    env: env ?? pm2CommandEnvironment(process.env),
     cwd: request.auditDirectory,
   });
   if (result.error) throw result.error;

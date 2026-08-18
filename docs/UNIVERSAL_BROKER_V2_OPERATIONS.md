@@ -52,6 +52,10 @@ remain under the platform no-elevation wrapper.
 candidate verification, production switch, and rollback discard inherited
 `DEVSPACE_*` values before sourcing that file. An absent managed key therefore
 stays absent; it cannot be resurrected from an older PM2 or broker environment.
+The detached upgrade worker also prepends the directory of its exact
+`process.execPath` to every PM2 command PATH, so the absolute PM2 executable's
+`/usr/bin/env node` shebang remains resolvable under launchd's minimal
+environment.
 
 ## Verification commands
 

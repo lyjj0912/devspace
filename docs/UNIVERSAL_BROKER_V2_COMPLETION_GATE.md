@@ -46,6 +46,9 @@ target context fs exec process mcp artifact gui
 
 - Startup removes inherited `DEVSPACE_*` variables before sourcing the exact
   owner-only runtime environment file.
+- Every detached worker PM2 command resolves `node` from the directory of the
+  exact worker `process.execPath`, including switch, verification, save, and
+  rollback under a minimal launchd environment.
 - Candidate, final switch, rollback, and ordinary restart apply the same rule.
 - A removed compatibility flag cannot survive through PM2 metadata or the parent
   broker environment.
