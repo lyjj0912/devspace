@@ -38,6 +38,13 @@ DEVSPACE_NEXT_OAUTH_STATE_DIR
 The removed legacy-scope compatibility flag must be absent or false. Setting it
 true is a startup error.
 
+## Runtime environment isolation
+
+`~/.devspace/universal-broker-v2-production.env` is authoritative. Startup,
+candidate verification, production switch, and rollback discard inherited
+`DEVSPACE_*` values before sourcing that file. An absent managed key therefore
+stays absent; it cannot be resurrected from an older PM2 or broker environment.
+
 ## Verification commands
 
 ```bash

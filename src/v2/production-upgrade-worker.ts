@@ -248,11 +248,23 @@ function replacePm2Process(
     "--cwd",
     cwd,
     "--time",
-  ], 60_000, false, {
-    ...process.env,
-    DEVSPACE_PRODUCTION_ENV_FILE: request.productionEnvPath,
-  });
+  ], 60_000, false, productionPm2Environment(
+    process.env,
+    request.productionEnvPath,
+  ));
   runPm2(request, ["save"], 30_000);
+}
+
+export function productionPm2Environment(
+  inherited: NodeJS.ProcessEnv,
+  productionEnvPath: string,
+): NodeJS.ProcessEnv {
+  const sanitized: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(inherited)) {
+    if (!key.startsWith("DEVSPACE_")) sanitized[key] = value;
+  }
+  sanitized.DEVSPACE_PRODUCTION_ENV_FILE = productionEnvPath;
+  return sanitized;
 }
 
 async function rollbackRuntime(request: ProductionUpgradeRequest): Promise<Record<string, unknown>> {

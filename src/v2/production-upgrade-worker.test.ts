@@ -15,6 +15,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
 import {
+  productionPm2Environment,
   runProductionUpgradeWorker,
   type ProductionUpgradeRequest,
 } from "./production-upgrade-worker.js";
@@ -28,6 +29,23 @@ const expectedScopes = [
   "devspace.gui",
   "offline_access",
 ];
+
+test("production PM2 launches retain ordinary process variables but drop inherited DevSpace runtime state", () => {
+  const sanitized = productionPm2Environment({
+    HOME: "/Users/example",
+    PATH: "/usr/bin:/bin",
+    DEVSPACE_V2_LEGACY_SCOPE_COMPATIBILITY: "true",
+    DEVSPACE_NEXT_PORT: "9999",
+    DEVSPACE_NEXT_STALE_VALUE: "must-not-survive",
+    DEVSPACE_OAUTH_OWNER_TOKEN: "must-not-survive",
+    DEVSPACE_PRODUCTION_ENV_FILE: "/old.env",
+  }, "/new.env");
+  assert.deepEqual(sanitized, {
+    HOME: "/Users/example",
+    PATH: "/usr/bin:/bin",
+    DEVSPACE_PRODUCTION_ENV_FILE: "/new.env",
+  });
+});
 
 test("production upgrade worker switches one PM2 process and commits canonical pointers only after verification", async (t) => {
   const fixture = await createFixture(t, { publicMetricsStatus: 403 });

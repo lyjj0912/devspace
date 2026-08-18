@@ -137,6 +137,18 @@ PYENV
   chmod 600 "$temporary"
   mv -f "$temporary" "$path"
 }
+run_pm2_with_environment_file() {
+  local environment_file="$1"
+  shift
+  (
+    while IFS= read -r variable; do
+      unset "$variable"
+    done < <(compgen -A variable DEVSPACE_)
+    export DEVSPACE_PRODUCTION_ENV_FILE="$environment_file"
+    exec pm2 "$@"
+  )
+}
+
 wait_http() {
   local url="$1" expected="$2" attempts="${3:-120}"
   local code="000"
@@ -273,12 +285,12 @@ chmod 600 "$NPM_CI_LOG" "$RELEASE_VERIFY_LOG" "$FULL_LOAD_LOG"
 
 write_env "$CANDIDATE_ENV" "$CANDIDATE_PORT" "$CANDIDATE_STATE" "$CANDIDATE_OAUTH_STATE" "$CANDIDATE_NAME" "$NEW_SCRIPT"
 pm2 delete "$CANDIDATE_NAME" >/dev/null 2>&1 || true
-DEVSPACE_PRODUCTION_ENV_FILE="$CANDIDATE_ENV" \
-  pm2 start "$NEW_SCRIPT" \
-    --name "$CANDIDATE_NAME" \
-    --interpreter /bin/bash \
-    --cwd "$RELEASE" \
-    --time
+run_pm2_with_environment_file "$CANDIDATE_ENV" \
+  start "$NEW_SCRIPT" \
+  --name "$CANDIDATE_NAME" \
+  --interpreter /bin/bash \
+  --cwd "$RELEASE" \
+  --time
 wait_http "http://127.0.0.1:${CANDIDATE_PORT}/healthz" 200
 LOCAL_METRICS="$(curl -sS --max-time 10 -H "Host: 127.0.0.1:${CANDIDATE_PORT}" -o /dev/null -w '%{http_code}' "http://127.0.0.1:${CANDIDATE_PORT}/metrics" || true)"
 PUBLIC_HOST_METRICS="$(curl -sS --max-time 10 -H "Host: $PUBLIC_HOST" -o /dev/null -w '%{http_code}' "http://127.0.0.1:${CANDIDATE_PORT}/metrics" || true)"

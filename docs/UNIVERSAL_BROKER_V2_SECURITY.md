@@ -81,6 +81,15 @@ Command validation is defense in depth. The OS enforcement wrapper is the
 runtime boundary. The wrapper also applies to configured local-stdio and
 SSH-stdio MCP providers, not only to the direct `exec` plane.
 
+## Authoritative runtime environment
+
+Every broker start, candidate, final switch, and rollback first removes inherited
+`DEVSPACE_*` variables and then sources exactly one owner-only runtime environment
+file. This prevents a removed compatibility flag, stale route, old port, or
+credential from leaking through the serving broker or PM2 process environment.
+The production wrapper may supply only the expected-script fallback; an explicit
+value in the runtime file wins.
+
 ## Secrets
 
 Secrets are referenced through owner-only environment profiles. Model-visible

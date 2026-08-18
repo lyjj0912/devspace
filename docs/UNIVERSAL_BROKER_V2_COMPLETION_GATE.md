@@ -42,6 +42,14 @@ target context fs exec process mcp artifact gui
   execution/filesystem/MCP capability.
 - Higher-authority work remains outside MCP.
 
+## Runtime-environment gate
+
+- Startup removes inherited `DEVSPACE_*` variables before sourcing the exact
+  owner-only runtime environment file.
+- Candidate, final switch, rollback, and ordinary restart apply the same rule.
+- A removed compatibility flag cannot survive through PM2 metadata or the parent
+  broker environment.
+
 ## OAuth gate
 
 - Tool scopes are the six granular `devspace.*` scopes.

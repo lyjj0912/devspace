@@ -374,6 +374,7 @@ function verifySelfManagementSources() {
   const upgradeStatus = text("scripts/status-universal-broker-v2-upgrade.sh");
   const server = text("src/v2/server.ts");
   const start = text("scripts/start-universal-broker-v2-production.sh");
+  const startup = text("scripts/start-universal-broker-v2.sh");
   const deploy = text("scripts/deploy-universal-broker-v2-production.sh");
   const tests = text("src/v2/self-management.test.ts");
   const upgradeTests = text("src/v2/production-upgrade-worker.test.ts");
@@ -412,11 +413,21 @@ function verifySelfManagementSources() {
     fail("Production start script does not bind the expected PM2 script for restart verification.");
   }
   for (const marker of [
+    "compgen -A variable DEVSPACE_",
+    'unset "$variable"',
+    "expected_script_fallback",
+  ]) {
+    if (!startup.includes(marker)) fail(`Authoritative startup environment isolation is missing: ${marker}`);
+  }
+  for (const marker of [
     "DEVSPACE_NEXT_SELF_MANAGEMENT_DIR",
     "DEVSPACE_NEXT_PM2_PROCESS_NAME",
     "DEVSPACE_NEXT_SELF_RESTART_TIMEOUT_MS",
   ]) {
     if (!deploy.includes(marker)) fail(`Production deploy source is missing self-management config: ${marker}`);
+  }
+  if (!upgrade.includes("run_pm2_with_environment_file")) {
+    fail("Production upgrade candidate launch does not sanitize inherited DevSpace environment variables.");
   }
   for (const marker of [
     "stale transactions fail closed",
@@ -426,6 +437,15 @@ function verifySelfManagementSources() {
   }
   if (!packageJson.scripts?.["v2:test"]?.includes("src/v2/self-management.test.ts")) {
     fail("The canonical v2 test gate omits self-management tests.");
+  }
+  if (!upgradeWorker.includes("productionPm2Environment")) {
+    fail("Production upgrade worker does not sanitize inherited DevSpace environment variables.");
+  }
+  if (!upgradeTests.includes("drop inherited DevSpace runtime state")) {
+    fail("Production upgrade environment isolation regression test is missing.");
+  }
+  if (!packageJson.scripts?.["v2:test"]?.includes("src/v2/startup-environment.test.ts")) {
+    fail("The canonical v2 test gate omits startup environment isolation tests.");
   }
   for (const marker of [
     "PRODUCTION_UPGRADE_STATES",
