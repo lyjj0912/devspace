@@ -48,6 +48,8 @@ const authorityAudit = {
   prepared: 0,
   byRisk: { R1: 0, R2: 0, R3: 0 },
   mismatchRejected: false,
+  crossTransportAccepted: false,
+  crossClientRejected: false,
   consumedRejected: false,
   correctionInvalidated: false,
   staticElevationBlocked: false,
@@ -63,9 +65,13 @@ const tokenResource = await discoverTokenResource(mcpUrl, options.tokenResource)
 audit.tokenResource = tokenResource;
 const root = await mkdtemp(join(tmpdir(), "devspace-v2-live-"));
 let credential;
+let foreignCredential;
 let primary;
+let secondary;
+let foreign;
 try {
   credential = createTemporaryAccessToken(options.databasePath, tokenResource);
+  foreignCredential = createTemporaryAccessToken(options.databasePath, tokenResource);
   for (let index = 0; index < options.sessions; index += 1) {
     const session = await connectClient(mcpUrl, credential.token, index);
     try {
@@ -74,17 +80,37 @@ try {
       assert(JSON.stringify(names) === JSON.stringify(expectedTools), `tool surface mismatch: ${names.join(",")}`);
       audit.protocolSessions.push({ index: index + 1, tools: names, sessionId: session.transport.sessionId });
       if (index === 0) primary = session;
+      else if (index === 1) secondary = session;
     } finally {
-      if (index !== 0) await session.client.close();
+      if (index > 1) await session.client.close();
     }
   }
   assert(primary, "primary MCP session was not created");
-  await runCanaries(primary.client, root, audit.canaries);
+  assert(secondary, "secondary MCP transport for the same OAuth client was not created");
+  foreign = await connectClient(mcpUrl, foreignCredential.token, options.sessions);
+  const foreignTools = await foreign.client.listTools();
+  assert(
+    JSON.stringify(foreignTools.tools.map((tool) => tool.name)) === JSON.stringify(expectedTools),
+    "foreign OAuth client tool surface mismatch",
+  );
+  audit.protocolSessions.push({
+    index: "foreign-client",
+    tools: foreignTools.tools.map((tool) => tool.name),
+    sessionId: foreign.transport.sessionId,
+  });
+  await runCanaries(primary.client, secondary.client, foreign.client, root, audit.canaries);
   await primary.client.close();
+  await secondary.client.close();
+  await foreign.client.close();
   primary = undefined;
+  secondary = undefined;
+  foreign = undefined;
 } finally {
   if (primary) await primary.client.close().catch(() => undefined);
+  if (secondary) await secondary.client.close().catch(() => undefined);
+  if (foreign) await foreign.client.close().catch(() => undefined);
   credential?.cleanup();
+  foreignCredential?.cleanup();
   await rm(root, { recursive: true, force: true });
 }
 
@@ -92,7 +118,7 @@ const serialized = JSON.stringify(audit, null, 2);
 if (options.output) await writeFile(options.output, `${serialized}\n`, { mode: 0o600 });
 console.log(serialized);
 
-async function runCanaries(client, root, canaries) {
+async function runCanaries(client, sameClientTransport, foreignClient, root, canaries) {
   const targets = data(await call(client, "target", { operation: "list", limit: 100 }));
   const targetIds = (targets.targets ?? []).map((target) => target.targetId);
   assert(targetIds.includes("local"), "local target is missing");
@@ -182,7 +208,7 @@ async function runCanaries(client, root, canaries) {
     "R1",
     "Verify exact local mutation authority and one-use consumption.",
   );
-  const mismatchResult = await client.callTool({
+  const mismatchResult = await sameClientTransport.callTool({
     name: "fs",
     arguments: {
       ...exactAuthorityArgs,
@@ -192,11 +218,21 @@ async function runCanaries(client, root, canaries) {
   });
   assert(errorCode(mismatchResult) === "AUTHORITY_MISMATCH", "authority mismatch was not rejected");
   authorityAudit.mismatchRejected = true;
-  const exactResult = await client.callTool({
+  const crossClientResult = await foreignClient.callTool({
+    name: "fs",
+    arguments: { ...exactAuthorityArgs, authorityId: exactAuthorityId },
+  });
+  assert(
+    errorCode(crossClientResult) === "AUTHORITY_MISMATCH",
+    "a different OAuth client reused another client's authority",
+  );
+  authorityAudit.crossClientRejected = true;
+  const exactResult = await sameClientTransport.callTool({
     name: "fs",
     arguments: { ...exactAuthorityArgs, authorityId: exactAuthorityId },
   });
   assert(exactResult.isError !== true && exactResult.structuredContent?.ok !== false, "exact authority action failed");
+  authorityAudit.crossTransportAccepted = true;
   const consumedResult = await client.callTool({
     name: "fs",
     arguments: { ...exactAuthorityArgs, authorityId: exactAuthorityId },
@@ -935,7 +971,7 @@ function parseArgs(args) {
     else if (argument === "--external-storage-root") result.externalStorageRoot = requiredValue(argument, value), index += 1;
     else throw new Error(`Unknown option: ${argument}`);
   }
-  assert(Number.isInteger(result.sessions) && result.sessions >= 1 && result.sessions <= 20, "sessions must be 1..20");
+  assert(Number.isInteger(result.sessions) && result.sessions >= 2 && result.sessions <= 20, "sessions must be 2..20");
   return result;
 }
 

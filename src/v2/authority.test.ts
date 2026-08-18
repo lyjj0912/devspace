@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
+import Database from "better-sqlite3";
 import {
   OperationAuthorityRegistry,
   actionFingerprint,
@@ -13,10 +17,16 @@ import {
 } from "./authority-policy.js";
 import { UniversalBrokerError } from "./errors.js";
 
-function registry(now: { value: number } = { value: Date.now() }) {
+function registry(
+  now: { value: number } = { value: Date.now() },
+  storePath?: string,
+  instanceId?: string,
+) {
   return new OperationAuthorityRegistry({
     now: () => now.value,
     minimumRisk: minimumAuthorityRisk,
+    ...(storePath ? { storePath } : {}),
+    ...(instanceId ? { instanceId } : {}),
   });
 }
 
@@ -104,6 +114,347 @@ test("filesystem authority binds context identity and payload hashes", () => {
   });
   assert.notEqual(actionFingerprint(a), actionFingerprint(b));
   assert.notEqual(actionFingerprint(a), actionFingerprint(c));
+});
+
+test("exact action fingerprints bind every mutation dispatch dimension", () => {
+  const fsBase = authorityActionFromToolCall("fs", {
+    operation: "write",
+    target: "local",
+    path: "/tmp/exact-a.txt",
+    content: "alpha\n",
+  });
+  for (const changed of [
+    authorityActionFromToolCall("fs", {
+      operation: "write",
+      target: "company",
+      path: "/tmp/exact-a.txt",
+      content: "alpha\n",
+    }),
+    authorityActionFromToolCall("fs", {
+      operation: "write",
+      target: "local",
+      path: "/tmp/exact-b.txt",
+      content: "alpha\n",
+    }),
+    authorityActionFromToolCall("fs", {
+      operation: "write",
+      target: "local",
+      path: "/tmp/exact-a.txt",
+      content: "beta\n",
+    }),
+  ]) {
+    assert.notEqual(actionFingerprint(fsBase), actionFingerprint(changed));
+  }
+
+  const execBase = authorityActionFromToolCall("exec", {
+    target: "local",
+    cwd: "/tmp",
+    command: "git push origin main",
+    mode: "foreground",
+  });
+  const execChanged = authorityActionFromToolCall("exec", {
+    target: "local",
+    cwd: "/tmp",
+    command: "git push origin release",
+    mode: "foreground",
+  });
+  assert.notEqual(actionFingerprint(execBase), actionFingerprint(execChanged));
+
+  const mcpBase = authorityActionFromToolCall("mcp", {
+    operation: "invoke",
+    route: "jira",
+    name: "create_issue",
+    arguments: { project: "A", summary: "one" },
+  });
+  for (const changed of [
+    authorityActionFromToolCall("mcp", {
+      operation: "invoke",
+      route: "computer-use",
+      name: "create_issue",
+      arguments: { project: "A", summary: "one" },
+    }),
+    authorityActionFromToolCall("mcp", {
+      operation: "invoke",
+      route: "jira",
+      name: "update_issue",
+      arguments: { project: "A", summary: "one" },
+    }),
+    authorityActionFromToolCall("mcp", {
+      operation: "invoke",
+      route: "jira",
+      name: "create_issue",
+      arguments: { project: "A", summary: "two" },
+    }),
+  ]) {
+    assert.notEqual(actionFingerprint(mcpBase), actionFingerprint(changed));
+  }
+
+  const guiBase = authorityActionFromToolCall("gui", {
+    operation: "act",
+    target: "local",
+    sessionId: "gui-1",
+    generation: "generation-1",
+    action: { type: "press", elementId: "confirm" },
+  });
+  for (const changed of [
+    authorityActionFromToolCall("gui", {
+      operation: "act",
+      target: "local",
+      sessionId: "gui-1",
+      generation: "generation-2",
+      action: { type: "press", elementId: "confirm" },
+    }),
+    authorityActionFromToolCall("gui", {
+      operation: "act",
+      target: "local",
+      sessionId: "gui-1",
+      generation: "generation-1",
+      action: { type: "press", elementId: "cancel" },
+    }),
+  ]) {
+    assert.notEqual(actionFingerprint(guiBase), actionFingerprint(changed));
+  }
+  assert.notEqual(actionFingerprint(fsBase), actionFingerprint(mcpBase));
+});
+
+test("PENDING reservation recovers as UNCERTAIN and consumed without persisting raw payload", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-authority-recovery-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const storePath = join(root, "authority.sqlite");
+  const now = { value: 1_787_050_000_000 };
+  const rawSecret = "RAW_AUTHORITY_SECRET_9f6b7b8e";
+  const scopeId = `oauth-client:${rawSecret}`;
+  const descriptor = authorityActionFromToolCall("exec", {
+    target: "local",
+    cwd: `/tmp/${rawSecret}`,
+    command: `git push origin ${rawSecret}`,
+    mode: "foreground",
+  });
+  const fileDescriptor = authorityActionFromToolCall("fs", {
+    operation: "write",
+    target: "local",
+    path: `/tmp/${rawSecret}.txt`,
+    content: `file-content-${rawSecret}\n`,
+    overwrite: false,
+  });
+  const patchDescriptor = authorityActionFromToolCall("fs", {
+    operation: "patch",
+    target: "local",
+    path: `/tmp/${rawSecret}.txt`,
+    patch: `*** Begin Patch\n*** Update File: fixture.txt\n@@\n-old\n+${rawSecret}\n*** End Patch`,
+  });
+  const credentialDescriptor = authorityActionFromToolCall("mcp", {
+    operation: "invoke",
+    route: "jira",
+    name: "read_only_fixture",
+    arguments: { credential: rawSecret, query: `payload-${rawSecret}` },
+  });
+  const first = registry(now, storePath, "process-generation-a");
+  const created = first.create({
+    taskId: `task-${rawSecret}`,
+    authorityText: `Dispatch exactly once using ${rawSecret}.`,
+    actions: [
+      { id: rawSecret, descriptor, risk: "R3", uses: 1 },
+      { id: `file-${rawSecret}`, descriptor: fileDescriptor },
+      { id: `patch-${rawSecret}`, descriptor: patchDescriptor },
+      { id: `credential-${rawSecret}`, descriptor: credentialDescriptor },
+    ],
+  }, scopeId);
+  const authorityId = String(created.authorityId);
+  const grant = first.require(authorityId, scopeId, descriptor, "R3");
+  assert.ok(grant);
+  assert.equal(
+    ((first.status(authorityId, scopeId).receipts as Array<{ result: string }>)[0]?.result),
+    "PENDING",
+  );
+  first.close();
+
+  now.value += 1_000;
+  const recovered = registry(now, storePath, "process-generation-b");
+  const status = recovered.status(authorityId, scopeId) as {
+    actions: Array<{ consumedUses: number }>;
+    receipts: Array<{ result: string; evidence?: { errorCode?: string; reasonCode?: string } }>;
+  };
+  assert.equal(status.actions[0]?.consumedUses, 1);
+  assert.equal(status.receipts[0]?.result, "UNCERTAIN");
+  assert.equal(status.receipts[0]?.evidence?.errorCode, "PROCESS_RESTARTED");
+  assert.equal(status.receipts[0]?.evidence?.reasonCode, "PENDING_RESERVATION_RECOVERED");
+  const stats = recovered.stats() as {
+    pendingReservations: number;
+    recoveredPendingUses: number;
+  };
+  assert.equal(stats.pendingReservations, 0);
+  assert.equal(stats.recoveredPendingUses, 1);
+  assert.throws(
+    () => recovered.require(authorityId, scopeId, descriptor, "R3"),
+    (error: unknown) => code(error) === "AUTHORITY_CONSUMED",
+  );
+  recovered.close();
+
+  for (const path of [storePath, `${storePath}-wal`, `${storePath}-shm`]) {
+    const bytes = await readFile(path).catch(() => undefined);
+    if (!bytes) continue;
+    assert.equal(bytes.includes(Buffer.from(rawSecret)), false, path);
+    assert.equal(bytes.includes(Buffer.from(scopeId)), false, path);
+  }
+});
+
+test("restart after authority expiry still preserves UNCERTAIN consumed evidence without replay", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-authority-expired-recovery-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const storePath = join(root, "authority.sqlite");
+  const now = { value: 1_787_055_000_000 };
+  const scopeId = "oauth-client:expired-recovery-client";
+  const descriptor = authorityActionFromToolCall("exec", {
+    target: "local",
+    cwd: "/tmp",
+    command: "git push origin expired-recovery-test",
+    mode: "foreground",
+  });
+  const first = registry(now, storePath, "expired-process-a");
+  const created = first.create({
+    taskId: "expired-recovery",
+    authorityText: "Dispatch this exact action once before expiry.",
+    expiresInSeconds: 60,
+    actions: [{ id: "one-shot", descriptor, risk: "R3", uses: 1 }],
+  }, scopeId);
+  const authorityId = String(created.authorityId);
+  assert.ok(first.require(authorityId, scopeId, descriptor, "R3"));
+  first.close();
+
+  now.value += 61_000;
+  const recovered = registry(now, storePath, "expired-process-b");
+  const status = recovered.status(authorityId, scopeId) as {
+    expired: boolean;
+    actions: Array<{ consumedUses: number }>;
+    receipts: Array<{ result: string }>;
+  };
+  assert.equal(status.expired, true);
+  assert.equal(status.actions[0]?.consumedUses, 1);
+  assert.deepEqual(status.receipts.map((receipt) => receipt.result), ["UNCERTAIN"]);
+  assert.throws(
+    () => recovered.require(authorityId, scopeId, descriptor, "R3"),
+    (error: unknown) => code(error) === "AUTHORITY_EXPIRED",
+  );
+  recovered.close();
+});
+
+test("stale overlapping workers cannot reserve the same R3 action twice", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-authority-overlap-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const storePath = join(root, "authority.sqlite");
+  const now = { value: 1_787_060_000_000 };
+  const scopeId = "oauth-client:overlap-client";
+  const descriptor = authorityActionFromToolCall("exec", {
+    target: "local",
+    cwd: "/tmp",
+    command: "git push origin overlap-test",
+    mode: "foreground",
+  });
+  const workerA = registry(now, storePath, "overlap-worker-a");
+  const created = workerA.create({
+    taskId: "overlap-one-shot",
+    authorityText: "Dispatch the exact overlap test once.",
+    actions: [{ id: "one-shot", descriptor, risk: "R3", uses: 1 }],
+  }, scopeId);
+  const authorityId = String(created.authorityId);
+  const workerB = registry(now, storePath, "overlap-worker-b");
+
+  const grant = workerA.require(authorityId, scopeId, descriptor, "R3");
+  assert.ok(grant);
+  assert.throws(
+    () => workerB.require(authorityId, scopeId, descriptor, "R3"),
+    (error: unknown) => code(error) === "AUTHORITY_CONSUMED",
+  );
+  assert.throws(
+    () => workerB.release(authorityId, scopeId),
+    (error: unknown) => code(error) === "PRECONDITION_FAILED",
+  );
+  workerA.record(grant, "PASS");
+  workerA.close();
+  workerB.close();
+
+  const readback = registry(now, storePath, "overlap-worker-readback");
+  const status = readback.status(authorityId, scopeId) as {
+    actions: Array<{ consumedUses: number }>;
+    receipts: Array<{ result: string }>;
+  };
+  assert.equal(status.actions[0]?.consumedUses, 1);
+  assert.deepEqual(status.receipts.map((receipt) => receipt.result), ["PASS"]);
+  readback.close();
+});
+
+test("correction preserves an in-flight receipt and epochs remain monotonic across workers", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-authority-correction-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const storePath = join(root, "authority.sqlite");
+  const now = { value: 1_787_070_000_000 };
+  const scopeId = "oauth-client:correction-client";
+  const descriptor = authorityActionFromToolCall("exec", {
+    target: "local",
+    cwd: "/tmp",
+    command: "git push origin correction-test",
+    mode: "foreground",
+  });
+  const workerA = registry(now, storePath, "correction-worker-a");
+  const created = workerA.create({
+    taskId: "correction-one-shot",
+    authorityText: "Dispatch this exact action before correction.",
+    actions: [{ id: "one-shot", descriptor, risk: "R3", uses: 1 }],
+  }, scopeId);
+  const authorityId = String(created.authorityId);
+  const workerB = registry(now, storePath, "correction-worker-b");
+  const grant = workerA.require(authorityId, scopeId, descriptor, "R3");
+  assert.ok(grant);
+
+  const firstCorrection = workerA.invalidate(scopeId, "Stop authorizing the old action.");
+  assert.equal(firstCorrection.correctionEpoch, 1);
+  assert.deepEqual(firstCorrection.invalidatedAuthorityIds, [authorityId]);
+  workerA.record(grant, "PASS", { reasonCode: "ACTION_COMPLETED_AFTER_CORRECTION" });
+  assert.throws(
+    () => workerB.status(authorityId, scopeId),
+    (error: unknown) => code(error) === "AUTHORITY_EXPIRED",
+  );
+  const replacementFromStaleWorker = workerB.create({
+    taskId: "correction-one-shot",
+    authorityText: "Dispatch this exact action before correction.",
+    actions: [{ id: "one-shot", descriptor, risk: "R3", uses: 1 }],
+  }, scopeId);
+  assert.equal(replacementFromStaleWorker.correctionEpoch, 1);
+  assert.notEqual(replacementFromStaleWorker.authorityId, authorityId);
+  const secondCorrection = workerB.invalidate(scopeId, "Apply a second correction from a stale worker.");
+  assert.equal(secondCorrection.correctionEpoch, 2);
+  assert.deepEqual(secondCorrection.invalidatedAuthorityIds, [replacementFromStaleWorker.authorityId]);
+  workerA.close();
+  workerB.close();
+
+  const sqlite = new Database(storePath, { readonly: true, fileMustExist: true });
+  const receipt = sqlite.prepare(
+    "select result, reason_code from operation_authority_receipts where authority_id = ?",
+  ).get(authorityId) as { result: string; reason_code: string | null } | undefined;
+  const scope = sqlite.prepare(
+    "select correction_epoch from operation_authority_scopes",
+  ).get() as { correction_epoch: number } | undefined;
+  sqlite.close();
+  assert.deepEqual(receipt, {
+    result: "PASS",
+    reason_code: "ACTION_COMPLETED_AFTER_CORRECTION",
+  });
+  assert.equal(scope?.correction_epoch, 2);
+
+  const readback = registry(now, storePath, "correction-worker-readback");
+  assert.equal((readback.stats() as { authorities: number }).authorities, 0);
+  assert.throws(
+    () => readback.require(authorityId, scopeId, descriptor, "R3"),
+    (error: unknown) => code(error) === "AUTHORITY_EXPIRED",
+  );
+  const replacement = readback.create({
+    taskId: "correction-replacement",
+    authorityText: "Create a replacement authority after both corrections.",
+    actions: [{ id: "replacement", descriptor, risk: "R3", uses: 1 }],
+  }, scopeId);
+  assert.equal(replacement.correctionEpoch, 2);
+  readback.close();
 });
 
 test("R3 authority is one-shot and cannot authorize a different exact action", () => {
@@ -203,7 +554,13 @@ test("authority preview classifies exact actions without creating or consuming a
       { id: "push", minimumRisk: "R3", maximumUses: 1 },
     ],
   );
-  assert.deepEqual(authority.stats(), { authorities: 0, scopes: 0, previews: 2 });
+  assert.deepEqual(authority.stats(), {
+    authorities: 0,
+    scopes: 0,
+    pendingReservations: 0,
+    recoveredPendingUses: 0,
+    previews: 2,
+  });
   assert.throws(
     () => authority.preview([{ descriptor: read, risk: "R1" }]),
     /is R0; omit risk and uses/u,

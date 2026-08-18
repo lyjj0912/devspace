@@ -60,6 +60,7 @@ CURRENT_AUDIT_LINK="${DEPLOYMENT_ROOT}/current"
 for command in git node npm pm2 curl python3; do
   command -v "$command" >/dev/null 2>&1 || { echo "Required command is missing: $command" >&2; exit 1; }
 done
+GIT_EXECUTABLE="$(command -v git)"
 [[ -f "$PRODUCTION_ENV" ]] || { echo "Production environment is missing: $PRODUCTION_ENV" >&2; exit 1; }
 [[ "$PRODUCTION_PORT" =~ ^[0-9]+$ && "$CANDIDATE_PORT" =~ ^[0-9]+$ ]] || { echo "Ports must be integers." >&2; exit 1; }
 [[ "$PRODUCTION_PORT" != "$CANDIDATE_PORT" ]] || { echo "Candidate port must differ from production port." >&2; exit 1; }
@@ -69,6 +70,7 @@ BRANCH="$(git branch --show-current)"
 [[ -n "$BRANCH" ]] || { echo "Source must be on a branch." >&2; exit 1; }
 [[ -z "$(git status --porcelain=v1 --untracked-files=all)" ]] || { echo "Source worktree is not clean." >&2; git status --short >&2; exit 1; }
 HEAD="$(git rev-parse HEAD)"
+SOURCE_TREE="$(git rev-parse 'HEAD^{tree}')"
 UPSTREAM="$(git rev-parse '@{upstream}' 2>/dev/null || true)"
 [[ -n "$UPSTREAM" && "$HEAD" == "$UPSTREAM" ]] || { echo "HEAD must equal its upstream before production upgrade." >&2; exit 1; }
 [[ "$(git rev-parse "origin/$BRANCH" 2>/dev/null || true)" == "$HEAD" ]] || { echo "origin/$BRANCH does not equal HEAD." >&2; exit 1; }
@@ -283,6 +285,22 @@ fi
   DEVSPACE_V2_LOAD_REQUIRE_REAL_SSH=1 \
     npm run v2:load 2>&1 | tee "$FULL_LOAD_LOG"
 )
+DIST_EVIDENCE="$(
+  cd "$RELEASE"
+  node --input-type=module -e \
+    'import { directoryEvidence } from "./dist/v2/production-upgrade-worker.js"; console.log(JSON.stringify(await directoryEvidence("./dist")));'
+)"
+read -r DIST_FILES DIST_SHA256 < <(
+  python3 - "$DIST_EVIDENCE" <<'PYDIST'
+import json,sys
+value=json.loads(sys.argv[1])
+print(int(value["files"]),value["sha256"])
+PYDIST
+)
+[[ "$DIST_FILES" =~ ^[1-9][0-9]*$ && "$DIST_SHA256" =~ ^[0-9a-f]{64}$ ]] || {
+  echo "Unable to establish release dist fingerprint: $DIST_EVIDENCE" >&2
+  exit 1
+}
 chmod 600 "$NPM_CI_LOG" "$RELEASE_VERIFY_LOG" "$FULL_LOAD_LOG"
 [[ -x "$NEW_SCRIPT" ]] || chmod 700 "$NEW_SCRIPT"
 
@@ -365,8 +383,8 @@ chmod 600 "$AUDIT_DIR/oauth-before.sqlite"
 
 python3 - \
   "$REQUEST_PATH" "$STATUS_PATH" "$TRANSACTION_ID" "$REQUESTED_AT" \
-  "$PROCESS_NAME" "$PM2_EXECUTABLE" "$PREVIOUS_PID" "$PREVIOUS_CWD" "$PREVIOUS_SCRIPT" "$PREVIOUS_AUDIT_TARGET" \
-  "$HEAD" "$RELEASE" "$NEW_SCRIPT" "$PRODUCTION_ENV" "$ENV_BACKUP" "$NEXT_ENV" \
+  "$PROCESS_NAME" "$PM2_EXECUTABLE" "$GIT_EXECUTABLE" "$PREVIOUS_PID" "$PREVIOUS_CWD" "$PREVIOUS_SCRIPT" "$PREVIOUS_AUDIT_TARGET" \
+  "$HEAD" "$SOURCE_TREE" "$DIST_FILES" "$DIST_SHA256" "$RELEASE" "$NEW_SCRIPT" "$PRODUCTION_ENV" "$ENV_BACKUP" "$NEXT_ENV" \
   "$CANONICAL_START" "$START_BACKUP" "$AUDIT_DIR" "$CURRENT_AUDIT_LINK" "$WORKER_LOG" \
   "http://127.0.0.1:${PRODUCTION_PORT}/healthz" "${PUBLIC_BASE_URL}/healthz" \
   "${PUBLIC_BASE_URL}/metrics" "${PUBLIC_BASE_URL}/mcp" \
@@ -374,8 +392,8 @@ python3 - \
 import json,os,sys,tempfile
 (
   request_path,status_path,transaction_id,requested_at,
-  process_name,pm2_executable,previous_pid,previous_cwd,previous_script,previous_audit_target,
-  head,release,new_script,production_env,env_backup,next_env,
+  process_name,pm2_executable,git_executable,previous_pid,previous_cwd,previous_script,previous_audit_target,
+  head,source_tree,dist_files,dist_sha256,release,new_script,production_env,env_backup,next_env,
   canonical_start,start_backup,audit_dir,current_audit_link,worker_log,
   local_health,public_health,public_metrics,public_mcp,oauth_metadata,live_evidence,
 )=sys.argv[1:]
@@ -387,13 +405,20 @@ request={
   "timeoutMs":180000,
   "pm2ProcessName":process_name,
   "pm2Executable":pm2_executable,
+  "gitExecutable":git_executable,
   "previous":{
     "pid":int(previous_pid),
     "cwd":previous_cwd,
     "script":previous_script,
     **({"auditTarget":previous_audit_target} if previous_audit_target else {}),
   },
-  "next":{"commit":head,"release":release,"script":new_script},
+  "next":{
+    "commit":head,
+    "sourceTree":source_tree,
+    "release":release,
+    "script":new_script,
+    "dist":{"files":int(dist_files),"sha256":dist_sha256},
+  },
   "productionEnvPath":production_env,
   "productionEnvBackupPath":env_backup,
   "nextEnvPath":next_env,
@@ -421,6 +446,7 @@ status={
   "previous":request["previous"],
   "next":request["next"],
   "candidateEvidence":live_evidence,
+  "history":[{"state":"PREPARED","at":requested_at}],
 }
 def write(path,value,mode=0o600):
   os.makedirs(os.path.dirname(path),exist_ok=True)

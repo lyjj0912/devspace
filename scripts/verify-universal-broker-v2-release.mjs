@@ -231,8 +231,11 @@ function verifyGranularOAuthSources() {
 function verifyOperationAuthoritySources() {
   const contracts = text("src/v2/contracts.ts");
   const authority = text("src/v2/authority.ts");
+  const store = text("src/v2/authority-store.ts");
   const policy = text("src/v2/authority-policy.ts");
   const server = text("src/v2/server.ts");
+  const config = text("src/v2/config.ts");
+  const http = text("src/v2/http-server.ts");
   const tests = text("src/v2/authority.test.ts");
   const packageJson = JSON.parse(text("package.json"));
   for (const marker of [
@@ -257,10 +260,48 @@ function verifyOperationAuthoritySources() {
     "maximumUses",
     "consumedUses",
     "authorityScope",
+    "scopeKeyFor",
+    "persistentActionKey",
+    "this.store.reserveUse",
+    "this.store.finalizeUse",
   ]) {
     if (!authority.includes(marker) && !server.includes(marker)) {
       fail(`Operation-authority implementation is missing: ${marker}`);
     }
+  }
+  for (const marker of [
+    "task_id_sha256",
+    "authority_text_sha256",
+    "scope_key",
+    "owner_instance_id",
+    "PENDING",
+    "UNCERTAIN",
+    "PROCESS_RESTARTED",
+    "PENDING_RESERVATION_RECOVERED",
+    "synchronous = FULL",
+    "reserveUse(input",
+    "finalizeUse(input",
+    "incrementCorrectionEpoch",
+    "releaseAuthority",
+  ]) {
+    if (!store.includes(marker)) fail(`Durable operation-authority store is missing: ${marker}`);
+  }
+  for (const forbidden of [
+    /\btask_id\s+text\b/iu,
+    /\bauthority_text\s+text\b/iu,
+    /\bscope_id\s+text\b/iu,
+    /\bclient_id\s+text\b/iu,
+    /\bcommand\s+text\b/iu,
+    /\bpath\s+text\b/iu,
+    /\barguments_json\b/iu,
+    /\bcontent\s+text\b/iu,
+    /\bpatch\s+text\b/iu,
+    /\bcredential\s+text\b/iu,
+  ]) {
+    if (forbidden.test(store)) fail(`Durable authority schema stores a forbidden raw field: ${forbidden}`);
+  }
+  if (!config.includes("authorityStorePath") || !http.includes("storePath: config.authorityStorePath")) {
+    fail("Production HTTP runtime is not wired to the dedicated durable authority store.");
   }
   for (const marker of [
     "minimumAuthorityRisk",
@@ -287,6 +328,10 @@ function verifyOperationAuthoritySources() {
     "R3 authority is one-shot",
     "correction invalidates every authority",
     "R0 actions cannot be wrapped",
+    "PENDING reservation recovers as UNCERTAIN and consumed without persisting raw payload",
+    "restart after authority expiry still preserves UNCERTAIN consumed evidence without replay",
+    "stale overlapping workers cannot reserve the same R3 action twice",
+    "correction preserves an in-flight receipt and epochs remain monotonic across workers",
   ]) {
     if (!tests.includes(marker)) fail(`Operation-authority regression test is missing: ${marker}`);
   }
@@ -501,9 +546,15 @@ function verifySelfManagementSources() {
   }
   for (const marker of [
     "PRODUCTION_UPGRADE_STATES",
+    '"ACCEPTED"',
     "ROLLING_BACK",
+    '"UNKNOWN"',
     "replacePm2Process",
     "verifyNextRuntime",
+    "directoryEvidence",
+    "runtimeCommit",
+    "runtimeSourceTree",
+    "runtimeDist",
     "publicMetricsStatus",
     "unauthenticatedMcpStatus",
     "rollbackRuntime",
@@ -531,6 +582,10 @@ function verifySelfManagementSources() {
     "oauth-before.sqlite",
     "launchctl submit",
     "production-upgrade-worker.js",
+    "SOURCE_TREE",
+    "DIST_EVIDENCE",
+    '"gitExecutable":git_executable',
+    '"history":[{"state":"PREPARED"',
   ]) {
     if (!upgrade.includes(marker)) fail(`Production upgrade transaction is missing: ${marker}`);
   }
@@ -540,6 +595,8 @@ function verifySelfManagementSources() {
   for (const marker of [
     "commits canonical pointers only after verification",
     "rolls back env, process, start path, and audit link",
+    "records UNKNOWN when rollback cannot establish the previous runtime",
+    "acceptedAt",
   ]) {
     if (!upgradeTests.includes(marker)) fail(`Production upgrade regression test is missing: ${marker}`);
   }
@@ -707,6 +764,11 @@ function verifyLiveVerifierSources() {
     "AUTHORITY_MISMATCH",
     "AUTHORITY_CONSUMED",
     "AUTHORITY_EXPIRED",
+    "crossTransportAccepted",
+    "crossClientRejected",
+    "sameClientTransport",
+    "foreignClient",
+    "sessions must be 2..20",
     "ELEVATION_BLOCKED",
     "runtimeElevationBlocked",
   ]) {
@@ -790,6 +852,7 @@ function verifyDist() {
     "dist/v2/http-server.js",
     "dist/v2/remote-windows-filesystem-helper.js",
     "dist/v2/authority.js",
+    "dist/v2/authority-store.js",
     "dist/v2/no-elevation.js",
     "dist/v2/self-management.js",
     "dist/v2/self-management-worker.js",

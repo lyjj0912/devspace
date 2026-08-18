@@ -1,9 +1,11 @@
 import { spawnSync } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
 import {
   chmod,
   copyFile,
   lstat,
   mkdir,
+  readdir,
   readFile,
   readlink,
   rename,
@@ -11,18 +13,18 @@ import {
   symlink,
   writeFile,
 } from "node:fs/promises";
-import { basename, delimiter, dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { randomUUID } from "node:crypto";
 
 export const PRODUCTION_UPGRADE_STATES = [
   "PREPARED",
-  "WAITING_FOR_RESPONSE",
+  "ACCEPTED",
   "SWITCHING",
   "VERIFYING",
   "PASS",
   "ROLLING_BACK",
   "FAIL",
+  "UNKNOWN",
 ] as const;
 
 export type ProductionUpgradeState = (typeof PRODUCTION_UPGRADE_STATES)[number];
@@ -35,6 +37,7 @@ export interface ProductionUpgradeRequest {
   timeoutMs: number;
   pm2ProcessName: string;
   pm2Executable: string;
+  gitExecutable: string;
   previous: {
     pid: number;
     cwd: string;
@@ -43,8 +46,13 @@ export interface ProductionUpgradeRequest {
   };
   next: {
     commit: string;
+    sourceTree: string;
     release: string;
     script: string;
+    dist: {
+      files: number;
+      sha256: string;
+    };
   };
   productionEnvPath: string;
   productionEnvBackupPath: string;
@@ -74,6 +82,8 @@ export interface ProductionUpgradeStatus extends Record<string, unknown> {
   previous: ProductionUpgradeRequest["previous"];
   next: ProductionUpgradeRequest["next"];
   workerPid?: number;
+  acceptedAt?: string;
+  history?: Array<{ state: ProductionUpgradeState; at: string }>;
   pidAfter?: number;
   pm2Status?: string;
   cwd?: string;
@@ -83,6 +93,9 @@ export interface ProductionUpgradeStatus extends Record<string, unknown> {
   publicMetricsStatus?: number;
   unauthenticatedMcpStatus?: number;
   oauthScopes?: string[];
+  runtimeCommit?: string;
+  runtimeSourceTree?: string;
+  runtimeDist?: { files: number; sha256: string };
   rollback?: Record<string, unknown>;
   error?: string;
 }
@@ -101,16 +114,22 @@ const TRANSACTION_PATTERN = /^upgrade_[0-9a-f-]{36}$/u;
 
 export async function runProductionUpgradeWorker(requestPath: string): Promise<void> {
   const request = await readRequest(requestPath);
+  const acceptedAt = new Date().toISOString();
   let status: ProductionUpgradeStatus = {
     version: 1,
     transactionId: request.transactionId,
-    state: "WAITING_FOR_RESPONSE",
+    state: "ACCEPTED",
     requestedAt: request.requestedAt,
-    updatedAt: new Date().toISOString(),
+    updatedAt: acceptedAt,
     expectedDisconnect: true,
     previous: request.previous,
     next: request.next,
     workerPid: process.pid,
+    acceptedAt,
+    history: [
+      { state: "PREPARED", at: request.requestedAt },
+      { state: "ACCEPTED", at: acceptedAt },
+    ],
   };
   await writeStatus(request.statusPath, status);
   try {
@@ -123,10 +142,12 @@ export async function runProductionUpgradeWorker(requestPath: string): Promise<v
 
     await installStartScript(request);
     await replaceSymlink(request.currentAuditLink, request.auditDirectory);
+    const passedAt = new Date().toISOString();
     status = {
       ...status,
       state: "PASS",
-      updatedAt: new Date().toISOString(),
+      updatedAt: passedAt,
+      history: [...(status.history ?? []), { state: "PASS", at: passedAt }],
       ...evidence,
     };
     await writeStatus(request.statusPath, status);
@@ -134,12 +155,15 @@ export async function runProductionUpgradeWorker(requestPath: string): Promise<v
     const failure = error instanceof Error ? error.message : String(error);
     status = await transition(request, { ...status, error: failure }, "ROLLING_BACK");
     const rollback = await rollbackRuntime(request);
+    const terminalAt = new Date().toISOString();
+    const terminalState: ProductionUpgradeState = rollback.restored === true ? "FAIL" : "UNKNOWN";
     status = {
       ...status,
-      state: "FAIL",
-      updatedAt: new Date().toISOString(),
+      state: terminalState,
+      updatedAt: terminalAt,
       error: failure,
       rollback,
+      history: [...(status.history ?? []), { state: terminalState, at: terminalAt }],
     };
     await writeStatus(request.statusPath, status);
     throw error;
@@ -160,7 +184,27 @@ async function verifyNextRuntime(
   | "publicMetricsStatus"
   | "unauthenticatedMcpStatus"
   | "oauthScopes"
+  | "runtimeCommit"
+  | "runtimeSourceTree"
+  | "runtimeDist"
 >> {
+  const runtimeCommit = gitValue(request, ["-C", request.next.release, "rev-parse", "HEAD"]);
+  const runtimeSourceTree = gitValue(request, ["-C", request.next.release, "rev-parse", "HEAD^{tree}"]);
+  const runtimeDist = await directoryEvidence(join(request.next.release, "dist"));
+  if (runtimeCommit !== request.next.commit) {
+    throw new Error(`Runtime commit mismatch: expected ${request.next.commit}, actual ${runtimeCommit}.`);
+  }
+  if (runtimeSourceTree !== request.next.sourceTree) {
+    throw new Error(`Runtime source tree mismatch: expected ${request.next.sourceTree}, actual ${runtimeSourceTree}.`);
+  }
+  if (
+    runtimeDist.files !== request.next.dist.files
+    || runtimeDist.sha256 !== request.next.dist.sha256
+  ) {
+    throw new Error(
+      `Runtime dist fingerprint mismatch: expected ${JSON.stringify(request.next.dist)}, actual ${JSON.stringify(runtimeDist)}.`,
+    );
+  }
   const deadline = Date.now() + request.timeoutMs;
   let lastError = "Production upgrade verification did not run.";
   while (Date.now() < deadline) {
@@ -223,6 +267,9 @@ async function verifyNextRuntime(
         publicMetricsStatus,
         unauthenticatedMcpStatus,
         oauthScopes,
+        runtimeCommit,
+        runtimeSourceTree,
+        runtimeDist,
       };
     } catch (error) {
       lastError = error instanceof Error ? error.message : String(error);
@@ -381,15 +428,22 @@ async function readRequest(path: string): Promise<ProductionUpgradeRequest> {
     || !TRANSACTION_PATTERN.test(request.transactionId)
     || !request.pm2ProcessName
     || !request.pm2Executable
+    || !request.gitExecutable
     || !request.previous?.cwd
     || !request.previous?.script
     || !request.next?.release
     || !request.next?.script
+    || !/^[0-9a-f]{40,64}$/u.test(request.next?.commit ?? "")
+    || !/^[0-9a-f]{40,64}$/u.test(request.next?.sourceTree ?? "")
+    || !Number.isInteger(request.next?.dist?.files)
+    || request.next.dist.files < 1
+    || !/^[0-9a-f]{64}$/u.test(request.next?.dist?.sha256 ?? "")
   ) {
     throw new Error(`Malformed production upgrade request: ${path}`);
   }
   for (const absolutePath of [
     request.pm2Executable,
+    request.gitExecutable,
     request.previous.cwd,
     request.previous.script,
     request.next.release,
@@ -413,9 +467,55 @@ async function transition(
   status: ProductionUpgradeStatus,
   state: ProductionUpgradeState,
 ): Promise<ProductionUpgradeStatus> {
-  const next = { ...status, state, updatedAt: new Date().toISOString() };
+  const at = new Date().toISOString();
+  const next = {
+    ...status,
+    state,
+    updatedAt: at,
+    history: [...(status.history ?? []), { state, at }],
+  };
   await writeStatus(request.statusPath, next);
   return next;
+}
+
+function gitValue(request: ProductionUpgradeRequest, args: string[]): string {
+  const result = spawnSync(request.gitExecutable, args, {
+    encoding: "utf8",
+    timeout: 30_000,
+    cwd: request.auditDirectory,
+    env: pm2CommandEnvironment(process.env),
+  });
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    throw new Error(`git ${args.join(" ")} failed: ${bounded(result.stderr || result.stdout)}`);
+  }
+  return (result.stdout ?? "").trim();
+}
+
+export async function directoryEvidence(directory: string): Promise<{ files: number; sha256: string }> {
+  const root = resolve(directory);
+  const files: string[] = [];
+  const visit = async (current: string): Promise<void> => {
+    const entries = (await readdir(current, { withFileTypes: true }))
+      .sort((left, right) => left.name.localeCompare(right.name));
+    for (const entry of entries) {
+      const path = join(current, entry.name);
+      if (entry.isDirectory()) await visit(path);
+      else if (entry.isFile()) files.push(path);
+    }
+  };
+  await visit(root);
+  files.sort((left, right) => relative(root, left).localeCompare(relative(root, right)));
+  const digest = createHash("sha256");
+  for (const path of files) {
+    const rel = relative(root, path).replaceAll("\\", "/");
+    const content = await readFile(path);
+    digest.update(rel);
+    digest.update("\0");
+    digest.update(createHash("sha256").update(content).digest("hex"));
+    digest.update("\n");
+  }
+  return { files: files.length, sha256: digest.digest("hex") };
 }
 
 async function writeStatus(path: string, value: ProductionUpgradeStatus): Promise<void> {

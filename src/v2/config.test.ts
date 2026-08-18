@@ -24,6 +24,7 @@ test("next config uses an isolated port, endpoint, state directory, and full own
   assert.equal(next.publicBaseUrl, `http://127.0.0.1:${base.port + 1}`);
   assert.equal(next.publicMcpUrl, `http://127.0.0.1:${base.port + 1}/mcp-next`);
   assert.equal(next.stateDir, join(base.stateDir, "universal-broker-v2"));
+  assert.equal(next.authorityStorePath, join(next.stateDir, "authority.sqlite"));
   assert.equal(next.oauthStateDir, next.stateDir);
   assert.equal(next.targetConfigPath, join(root, ".config", "targets.v2.json"));
   assert.equal(next.mcpRouteConfigPath, join(root, ".config", "mcp-routes.v2.json"));
@@ -83,6 +84,7 @@ test("production v2 uses canonical production routes and may reuse the legacy OA
   assert.equal(production.artifactPathPrefix, "/artifacts");
   assert.equal(production.oauthStateDir, base.stateDir);
   assert.equal(production.stateDir, join(root, "v2-production-state"));
+  assert.equal(production.authorityStorePath, join(production.stateDir, "authority.sqlite"));
   assert.equal(production.publicBaseUrl, new URL(base.publicBaseUrl).origin);
   assert.equal(production.selfRestartPm2ProcessName, "devspace-v2-production");
 
@@ -127,6 +129,21 @@ test("production v2 uses canonical production routes and may reuse the legacy OA
       DEVSPACE_NEXT_MCP_SESSION_CLEANUP_INTERVAL_MS: String(60 * 60_000 + 1),
     }),
     /DEVSPACE_NEXT_MCP_SESSION_CLEANUP_INTERVAL_MS/,
+  );
+  assert.throws(
+    () => loadUniversalBrokerNextConfig(base, {
+      DEVSPACE_NEXT_STATE_DIR: join(root, "authority-state"),
+      DEVSPACE_NEXT_AUTHORITY_STORE: join(root, "outside-authority.sqlite"),
+    }),
+    /must stay inside DEVSPACE_NEXT_STATE_DIR/,
+  );
+  assert.throws(
+    () => loadUniversalBrokerNextConfig(base, {
+      DEVSPACE_NEXT_STATE_DIR: join(root, "shared-authority-state"),
+      DEVSPACE_NEXT_OAUTH_STATE_DIR: join(root, "shared-authority-state"),
+      DEVSPACE_NEXT_AUTHORITY_STORE: join(root, "shared-authority-state", "devspace.sqlite"),
+    }),
+    /must not reuse the OAuth database/,
   );
 });
 

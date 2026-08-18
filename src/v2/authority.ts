@@ -1,5 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
+  DurableAuthorityStore,
+  type DurableAuthorityRecord,
+} from "./authority-store.js";
+import {
   UNIVERSAL_AUTHORITY_RISKS,
   UNIVERSAL_TOOL_OPERATIONS,
   type AuthorityRiskClass,
@@ -52,9 +56,10 @@ interface StoredAuthorityAction {
 
 interface StoredOperationAuthority {
   authorityId: string;
-  taskId: string;
+  taskId?: string;
+  taskIdSha256: string;
   authorityTextSha256: string;
-  scopeId: string;
+  scopeKey: string;
   correctionEpoch: number;
   createdAtMs: number;
   expiresAtMs: number;
@@ -66,14 +71,17 @@ interface StoredOperationAuthority {
 interface AuthorityReceipt {
   useId: string;
   actionId: string;
-  recordedAt: string;
-  result: "PASS" | "FAIL" | "UNCERTAIN";
+  reservedAtMs: number;
+  completedAtMs?: number;
+  result: "PENDING" | "PASS" | "FAIL" | "UNCERTAIN";
   evidence?: Record<string, unknown>;
 }
 
 export interface OperationAuthorityRegistryOptions {
   now?: () => number;
   minimumRisk?: (action: AuthorityActionDescriptor) => AuthorityRiskClass;
+  storePath?: string;
+  instanceId?: string;
 }
 
 const DEFAULT_AUTHORITY_TTL_SECONDS = 15 * 60;
@@ -82,18 +90,38 @@ const MAXIMUM_ACTIONS = 64;
 const MAXIMUM_AUTHORITY_TEXT_CHARACTERS = 8_000;
 const MAXIMUM_ACTION_PARAMETERS_CHARACTERS = 16_000;
 const MAXIMUM_RECEIPTS = 256;
+const MAXIMUM_ACTIVE_AUTHORITIES = 4_096;
+const MAXIMUM_ACTIVE_AUTHORITIES_PER_SCOPE = 512;
+const AUTHORITY_RECEIPT_RETENTION_MS = 24 * 60 * 60_000;
 
 export class OperationAuthorityRegistry {
   private readonly now: () => number;
   private readonly minimumRisk: (action: AuthorityActionDescriptor) => AuthorityRiskClass;
+  private readonly store: DurableAuthorityStore;
   private readonly authorities = new Map<string, StoredOperationAuthority>();
   private readonly correctionEpochs = new Map<string, number>();
   private readonly authorityIdsByFingerprint = new Map<string, string>();
+  private readonly recoveredPendingUses: number;
   private previews = 0;
 
   constructor(options: OperationAuthorityRegistryOptions = {}) {
     this.now = options.now ?? Date.now;
     this.minimumRisk = options.minimumRisk ?? (() => "R1");
+    this.store = new DurableAuthorityStore(options.storePath, this.now(), options.instanceId);
+    const snapshot = this.store.load();
+    this.recoveredPendingUses = snapshot.recoveredPendingUses;
+    for (const [scopeKey, correctionEpoch] of snapshot.correctionEpochs) {
+      this.correctionEpochs.set(scopeKey, correctionEpoch);
+    }
+    for (const record of snapshot.authorities) {
+      if (record.correctionEpoch !== (snapshot.correctionEpochs.get(record.scopeKey) ?? 0)) {
+        continue;
+      }
+      const authority = this.fromDurable(record);
+      this.authorities.set(authority.authorityId, authority);
+      this.authorityIdsByFingerprint.set(authority.fingerprint, authority.authorityId);
+    }
+    this.pruneExpired();
   }
 
   create(input: CreateOperationAuthorityInput, scopeId: string): Record<string, unknown> {
@@ -110,7 +138,9 @@ export class OperationAuthorityRegistry {
         `context.authorize requires 1 through ${MAXIMUM_ACTIONS} exact actions.`,
       );
     }
-    const correctionEpoch = this.correctionEpoch(scopeId);
+    const scopeKey = scopeKeyFor(scopeId);
+    const correctionEpoch = this.correctionEpoch(scopeKey);
+    this.dropStaleScopeAuthorities(scopeKey, correctionEpoch);
     const actions = input.actions.map((action, index) => this.prepareAction(action, index, false));
     assertUniqueActionIds(actions);
     assertUniqueActionFingerprints(actions);
@@ -121,14 +151,16 @@ export class OperationAuthorityRegistry {
       MAXIMUM_AUTHORITY_TTL_SECONDS,
       "expiresInSeconds",
     );
+    const taskIdSha256 = sha256(taskId);
+    const authorityTextSha256 = sha256(authorityText);
     const fingerprint = sha256(stableJson({
-      scopeId,
+      scopeKey,
       correctionEpoch,
-      taskId,
-      authorityText,
+      taskIdSha256,
+      authorityTextSha256,
       actions: actions.map((action) => ({
         id: action.id,
-        descriptor: action.descriptor,
+        fingerprint: action.fingerprint,
         minimumRisk: action.minimumRisk,
         risk: action.risk,
         maximumUses: action.maximumUses,
@@ -146,13 +178,15 @@ export class OperationAuthorityRegistry {
       return this.present(existing, true);
     }
     if (existingId) this.authorityIdsByFingerprint.delete(fingerprint);
+    this.assertAuthorityCapacity(scopeKey);
 
     const createdAtMs = this.now();
     const authority: StoredOperationAuthority = {
       authorityId: `authority_${randomUUID()}`,
       taskId,
-      authorityTextSha256: sha256(authorityText),
-      scopeId,
+      taskIdSha256,
+      authorityTextSha256,
+      scopeKey,
       correctionEpoch,
       createdAtMs,
       expiresAtMs: createdAtMs + expiresInSeconds * 1_000,
@@ -160,6 +194,7 @@ export class OperationAuthorityRegistry {
       actions,
       receipts: [],
     };
+    this.store.saveAuthority(this.toDurable(authority));
     this.authorities.set(authority.authorityId, authority);
     this.authorityIdsByFingerprint.set(fingerprint, authority.authorityId);
     return this.present(authority, false);
@@ -229,21 +264,24 @@ export class OperationAuthorityRegistry {
         `Task authority is unknown, released, stale, or expired: ${authorityId}`,
       );
     }
-    if (authority.scopeId !== scopeId) {
+    const scopeKey = scopeKeyFor(scopeId);
+    if (authority.scopeKey !== scopeKey) {
       throw new UniversalBrokerError(
         "AUTHORITY_MISMATCH",
         "Task authority belongs to a different authenticated OAuth client.",
       );
     }
-    if (authority.correctionEpoch !== this.correctionEpoch(scopeId)) {
-      this.remove(authority);
+    if (authority.correctionEpoch !== this.correctionEpoch(scopeKey)) {
+      this.remove(authority, false);
       throw new UniversalBrokerError(
         "AUTHORITY_EXPIRED",
         `Task authority is stale after a correction: ${authorityId}`,
       );
     }
     if (authority.expiresAtMs <= this.now()) {
-      this.remove(authority);
+      if (this.authorityIdsByFingerprint.get(authority.fingerprint) === authority.authorityId) {
+        this.authorityIdsByFingerprint.delete(authority.fingerprint);
+      }
       throw new UniversalBrokerError(
         "AUTHORITY_EXPIRED",
         `Task authority expired: ${authorityId}`,
@@ -285,55 +323,181 @@ export class OperationAuthorityRegistry {
         },
       );
     }
-    selected.consumedUses += 1;
-    return {
+    const grant: AuthorityGrant = {
       authorityId,
       actionId: selected.id,
       useId: `authority_use_${randomUUID()}`,
       risk: requiredRisk,
       fingerprint,
     };
+    const reservedAtMs = this.now();
+    const receipt: AuthorityReceipt = {
+      useId: grant.useId,
+      actionId: grant.actionId,
+      reservedAtMs,
+      result: "PENDING",
+    };
+    let reservation: ReturnType<DurableAuthorityStore["reserveUse"]>;
+    try {
+      reservation = this.store.reserveUse({
+        authorityId,
+        scopeKey,
+        correctionEpoch: authority.correctionEpoch,
+        actionId: persistentActionKey(fingerprint),
+        actionFingerprint: fingerprint,
+        useId: grant.useId,
+        reservedAtMs,
+        maximumReceipts: MAXIMUM_RECEIPTS,
+      });
+    } catch (error) {
+      throw new UniversalBrokerError(
+        "EXECUTION_STATE_UNKNOWN",
+        "Task authority reservation outcome could not be confirmed; the action was not dispatched.",
+        {
+          evidence: {
+            authorityId,
+            actionId: selected.id,
+            persistenceError: error instanceof Error ? error.name : "UNKNOWN_ERROR",
+          },
+        },
+      );
+    }
+    if (!reservation.ok) {
+      switch (reservation.code) {
+        case "AUTHORITY_EXPIRED":
+          this.remove(authority, false);
+          throw new UniversalBrokerError(
+            "AUTHORITY_EXPIRED",
+            `Task authority is stale or expired: ${authorityId}`,
+          );
+        case "AUTHORITY_MISMATCH":
+          throw new UniversalBrokerError(
+            "AUTHORITY_MISMATCH",
+            "Task authority no longer matches the exact persisted action or OAuth client.",
+          );
+        case "AUTHORITY_CONSUMED":
+          selected.consumedUses = reservation.consumedUses ?? selected.maximumUses;
+          throw new UniversalBrokerError(
+            "AUTHORITY_CONSUMED",
+            `Task authority action is fully consumed: ${selected.id}`,
+            {
+              evidence: {
+                authorityId,
+                actionId: selected.id,
+                maximumUses: selected.maximumUses,
+              },
+            },
+          );
+        case "RESOURCE_QUOTA_EXCEEDED":
+          throw new UniversalBrokerError(
+            "RESOURCE_QUOTA_EXCEEDED",
+            "Task authority has too many in-flight reservations; wait for terminal receipts.",
+            {
+              evidence: {
+                authorityId,
+                maximumReceipts: MAXIMUM_RECEIPTS,
+              },
+            },
+          );
+      }
+    }
+    selected.consumedUses = reservation.consumedUses;
+    authority.receipts = trimReceipts([...authority.receipts, receipt]);
+    return grant;
   }
 
   record(
     grant: AuthorityGrant | undefined,
-    result: AuthorityReceipt["result"],
+    result: "PASS" | "FAIL" | "UNCERTAIN",
     evidence?: Record<string, unknown>,
   ): void {
     if (!grant) return;
     const authority = this.authorities.get(grant.authorityId);
-    if (!authority) return;
-    authority.receipts.push({
-      useId: grant.useId,
-      actionId: grant.actionId,
-      recordedAt: new Date(this.now()).toISOString(),
-      result,
-      ...(evidence ? { evidence: boundedRecord(evidence, 4_000) } : {}),
-    });
-    if (authority.receipts.length > MAXIMUM_RECEIPTS) {
-      authority.receipts.splice(0, authority.receipts.length - MAXIMUM_RECEIPTS);
+    const receiptIndex = authority?.receipts.findIndex(
+      (receipt) => receipt.useId === grant.useId && receipt.result === "PENDING",
+    ) ?? -1;
+    const completedAtMs = this.now();
+    const boundedEvidence = evidence ? boundedRecord(evidence, 4_000) : undefined;
+    let finalized: boolean;
+    try {
+      finalized = this.store.finalizeUse({
+        authorityId: grant.authorityId,
+        useId: grant.useId,
+        completedAtMs,
+        result,
+        ...(typeof boundedEvidence?.errorCode === "string"
+          ? { errorCode: boundedEvidence.errorCode }
+          : {}),
+        ...(typeof boundedEvidence?.reasonCode === "string"
+          ? { reasonCode: boundedEvidence.reasonCode }
+          : {}),
+        maximumReceipts: MAXIMUM_RECEIPTS,
+      });
+    } catch (error) {
+      throw new UniversalBrokerError(
+        "EXECUTION_STATE_UNKNOWN",
+        "The action completed, but its authority receipt could not be durably finalized.",
+        {
+          evidence: {
+            authorityId: grant.authorityId,
+            actionId: grant.actionId,
+            persistenceError: error instanceof Error ? error.name : "UNKNOWN_ERROR",
+          },
+        },
+      );
     }
+    if (!finalized) {
+      throw new UniversalBrokerError(
+        "EXECUTION_STATE_UNKNOWN",
+        "The authority reservation was no longer PENDING; it may already be terminal or recovered as UNCERTAIN.",
+        {
+          evidence: {
+            authorityId: grant.authorityId,
+            actionId: grant.actionId,
+          },
+        },
+      );
+    }
+    if (!authority || receiptIndex < 0) return;
+    const nextReceipt: AuthorityReceipt = {
+      ...authority.receipts[receiptIndex]!,
+      completedAtMs,
+      result,
+      ...(boundedEvidence ? { evidence: boundedEvidence } : {}),
+    };
+    authority.receipts = trimReceipts([
+      ...authority.receipts.slice(0, receiptIndex),
+      nextReceipt,
+      ...authority.receipts.slice(receiptIndex + 1),
+    ]);
   }
 
   status(authorityId: string, scopeId: string): Record<string, unknown> {
     this.pruneExpired();
     const authority = this.authorities.get(requiredText(authorityId, "authorityId is required.", 256));
-    if (!authority || authority.scopeId !== scopeId) {
+    if (!authority || authority.scopeKey !== scopeKeyFor(scopeId)) {
       throw new UniversalBrokerError("AUTHORITY_EXPIRED", `Unknown task authority: ${authorityId}`);
+    }
+    if (authority.correctionEpoch !== this.correctionEpoch(authority.scopeKey)) {
+      this.remove(authority, false);
+      throw new UniversalBrokerError("AUTHORITY_EXPIRED", "Task authority was invalidated by a user correction.");
     }
     return this.present(authority, false);
   }
 
   invalidate(scopeId: string, correctionText: string): Record<string, unknown> {
     requiredText(correctionText, "context.invalidate_authority requires correctionText.", 8_000);
-    const previousEpoch = this.correctionEpoch(scopeId);
-    const correctionEpoch = previousEpoch + 1;
-    this.correctionEpochs.set(scopeId, correctionEpoch);
+    const scopeKey = scopeKeyFor(scopeId);
+    const correctionEpoch = this.store.incrementCorrectionEpoch(scopeKey, this.now());
     const invalidated: string[] = [];
     for (const authority of [...this.authorities.values()]) {
-      if (authority.scopeId !== scopeId) continue;
+      if (authority.scopeKey !== scopeKey) continue;
       invalidated.push(authority.authorityId);
-      this.remove(authority);
+    }
+    this.correctionEpochs.set(scopeKey, correctionEpoch);
+    for (const authorityId of invalidated) {
+      const authority = this.authorities.get(authorityId);
+      if (authority) this.remove(authority, false);
     }
     return {
       correctionEpoch,
@@ -344,10 +508,49 @@ export class OperationAuthorityRegistry {
 
   release(authorityId: string, scopeId: string): Record<string, unknown> {
     const authority = this.authorities.get(requiredText(authorityId, "authorityId is required.", 256));
-    if (!authority || authority.scopeId !== scopeId) {
+    if (!authority || authority.scopeKey !== scopeKeyFor(scopeId)) {
       throw new UniversalBrokerError("AUTHORITY_EXPIRED", `Unknown task authority: ${authorityId}`);
     }
-    this.remove(authority);
+    let released: ReturnType<DurableAuthorityStore["releaseAuthority"]>;
+    try {
+      released = this.store.releaseAuthority({
+        authorityId: authority.authorityId,
+        scopeKey: authority.scopeKey,
+        correctionEpoch: authority.correctionEpoch,
+      });
+    } catch (error) {
+      throw new UniversalBrokerError(
+        "EXECUTION_STATE_UNKNOWN",
+        "Task authority release outcome could not be confirmed.",
+        {
+          evidence: {
+            authorityId,
+            persistenceError: error instanceof Error ? error.name : "UNKNOWN_ERROR",
+          },
+        },
+      );
+    }
+    if (!released.ok) {
+      if (released.code === "PRECONDITION_FAILED") {
+        throw new UniversalBrokerError(
+          "PRECONDITION_FAILED",
+          "A task authority with in-flight PENDING reservations cannot be released.",
+          { evidence: { authorityId, pendingReceipts: released.pendingReceipts ?? 1 } },
+        );
+      }
+      if (released.code === "AUTHORITY_MISMATCH") {
+        throw new UniversalBrokerError(
+          "AUTHORITY_MISMATCH",
+          "Task authority belongs to a different authenticated OAuth client.",
+        );
+      }
+      this.remove(authority, false);
+      throw new UniversalBrokerError(
+        "AUTHORITY_EXPIRED",
+        `Task authority is stale, released, or expired: ${authorityId}`,
+      );
+    }
+    this.remove(authority, false);
     return {
       authorityId,
       released: true,
@@ -360,9 +563,18 @@ export class OperationAuthorityRegistry {
     this.pruneExpired();
     return {
       authorities: this.authorities.size,
-      scopes: new Set([...this.authorities.values()].map((authority) => authority.scopeId)).size,
+      scopes: new Set([...this.authorities.values()].map((authority) => authority.scopeKey)).size,
+      pendingReservations: [...this.authorities.values()].reduce(
+        (total, authority) => total + authority.receipts.filter((receipt) => receipt.result === "PENDING").length,
+        0,
+      ),
+      recoveredPendingUses: this.recoveredPendingUses,
       previews: this.previews,
     };
+  }
+
+  close(): void {
+    this.store.close();
   }
 
   private prepareAction(
@@ -416,7 +628,9 @@ export class OperationAuthorityRegistry {
       ? 0
       : boundedInteger(action.uses, 1, 1, maximumForRisk, `actions[${index}].uses`);
     return {
-      id: action.id?.trim() || `action-${index + 1}`,
+      id: action.id === undefined
+        ? `action-${index + 1}`
+        : requiredText(action.id, `Authority action ${index} ID is invalid.`, 128),
       descriptor,
       fingerprint: actionFingerprint(descriptor),
       minimumRisk,
@@ -429,10 +643,12 @@ export class OperationAuthorityRegistry {
   private present(authority: StoredOperationAuthority, reused: boolean): Record<string, unknown> {
     return {
       authorityId: authority.authorityId,
-      taskId: authority.taskId,
+      ...(authority.taskId ? { taskId: authority.taskId } : {}),
+      taskIdSha256: authority.taskIdSha256,
       correctionEpoch: authority.correctionEpoch,
       createdAt: new Date(authority.createdAtMs).toISOString(),
       expiresAt: new Date(authority.expiresAtMs).toISOString(),
+      expired: authority.expiresAtMs <= this.now(),
       authorityTextSha256: authority.authorityTextSha256,
       reused,
       actions: authority.actions.map((action) => ({
@@ -445,26 +661,173 @@ export class OperationAuthorityRegistry {
         maximumUses: action.maximumUses,
         consumedUses: action.consumedUses,
       })),
-      receipts: authority.receipts.map((receipt) => ({ ...receipt })),
+      receipts: authority.receipts.map((receipt) => ({
+        useId: receipt.useId,
+        actionId: receipt.actionId,
+        reservedAt: new Date(receipt.reservedAtMs).toISOString(),
+        ...(receipt.completedAtMs === undefined
+          ? {}
+          : {
+              completedAt: new Date(receipt.completedAtMs).toISOString(),
+              recordedAt: new Date(receipt.completedAtMs).toISOString(),
+            }),
+        result: receipt.result,
+        ...(receipt.evidence ? { evidence: receipt.evidence } : {}),
+      })),
     };
   }
 
-  private correctionEpoch(scopeId: string): number {
-    return this.correctionEpochs.get(scopeId) ?? 0;
+  private correctionEpoch(scopeKey: string): number {
+    const correctionEpoch = this.store.currentCorrectionEpoch(scopeKey);
+    this.correctionEpochs.set(scopeKey, correctionEpoch);
+    return correctionEpoch;
+  }
+
+  private dropStaleScopeAuthorities(scopeKey: string, correctionEpoch: number): void {
+    for (const authority of [...this.authorities.values()]) {
+      if (authority.scopeKey === scopeKey && authority.correctionEpoch !== correctionEpoch) {
+        this.remove(authority, false);
+      }
+    }
   }
 
   private pruneExpired(): void {
     const now = this.now();
-    for (const authority of [...this.authorities.values()]) {
-      if (authority.expiresAtMs <= now) this.remove(authority);
+    const purgedAuthorityIds = this.store.deleteAuthoritiesExpiredBefore(
+      now - AUTHORITY_RECEIPT_RETENTION_MS,
+    );
+    for (const authorityId of purgedAuthorityIds) {
+      const authority = this.authorities.get(authorityId);
+      if (authority) this.remove(authority, false);
+    }
+    for (const authority of this.authorities.values()) {
+      if (
+        authority.expiresAtMs <= now
+        && this.authorityIdsByFingerprint.get(authority.fingerprint) === authority.authorityId
+      ) {
+        this.authorityIdsByFingerprint.delete(authority.fingerprint);
+      }
     }
   }
 
-  private remove(authority: StoredOperationAuthority): void {
+  private remove(authority: StoredOperationAuthority, persist = true): void {
+    if (persist) this.store.deleteAuthorities([authority.authorityId]);
     this.authorities.delete(authority.authorityId);
     if (this.authorityIdsByFingerprint.get(authority.fingerprint) === authority.authorityId) {
       this.authorityIdsByFingerprint.delete(authority.fingerprint);
     }
+  }
+
+  private assertAuthorityCapacity(scopeKey: string): void {
+    const now = this.now();
+    const activeAuthorities = [...this.authorities.values()].filter(
+      (authority) => authority.expiresAtMs > now,
+    );
+    const scopeAuthorities = activeAuthorities.filter(
+      (authority) => authority.scopeKey === scopeKey,
+    ).length;
+    if (
+      activeAuthorities.length >= MAXIMUM_ACTIVE_AUTHORITIES
+      || scopeAuthorities >= MAXIMUM_ACTIVE_AUTHORITIES_PER_SCOPE
+    ) {
+      throw new UniversalBrokerError(
+        "RESOURCE_QUOTA_EXCEEDED",
+        "Operation authority quota is full; release or wait for existing authorities to expire.",
+        {
+          evidence: {
+            authorities: activeAuthorities.length,
+            maximumAuthorities: MAXIMUM_ACTIVE_AUTHORITIES,
+            scopeAuthorities,
+            maximumAuthoritiesPerScope: MAXIMUM_ACTIVE_AUTHORITIES_PER_SCOPE,
+          },
+        },
+      );
+    }
+  }
+
+  private toDurable(authority: StoredOperationAuthority): DurableAuthorityRecord {
+    const persistentActionIds = new Map(
+      authority.actions.map((action) => [action.id, persistentActionKey(action.fingerprint)]),
+    );
+    return {
+      authorityId: authority.authorityId,
+      taskIdSha256: authority.taskIdSha256,
+      authorityTextSha256: authority.authorityTextSha256,
+      scopeKey: authority.scopeKey,
+      correctionEpoch: authority.correctionEpoch,
+      createdAtMs: authority.createdAtMs,
+      expiresAtMs: authority.expiresAtMs,
+      fingerprint: authority.fingerprint,
+      actions: authority.actions.map((action) => ({
+        id: persistentActionKey(action.fingerprint),
+        tool: action.descriptor.tool,
+        operation: action.descriptor.operation,
+        fingerprint: action.fingerprint,
+        minimumRisk: action.minimumRisk,
+        risk: action.risk,
+        maximumUses: action.maximumUses,
+        consumedUses: action.consumedUses,
+      })),
+      receipts: authority.receipts.map((receipt) => {
+        const actionId = persistentActionIds.get(receipt.actionId);
+        if (!actionId) {
+          throw new Error(`Authority receipt references an unknown in-memory action: ${receipt.actionId}`);
+        }
+        return {
+          useId: receipt.useId,
+          actionId,
+          reservedAtMs: receipt.reservedAtMs,
+          ...(receipt.completedAtMs === undefined ? {} : { completedAtMs: receipt.completedAtMs }),
+          result: receipt.result,
+          ...(typeof receipt.evidence?.errorCode === "string"
+            ? { errorCode: receipt.evidence.errorCode }
+            : {}),
+          ...(typeof receipt.evidence?.reasonCode === "string"
+            ? { reasonCode: receipt.evidence.reasonCode }
+            : {}),
+        };
+      }),
+    };
+  }
+
+  private fromDurable(record: DurableAuthorityRecord): StoredOperationAuthority {
+    return {
+      authorityId: record.authorityId,
+      taskIdSha256: record.taskIdSha256,
+      authorityTextSha256: record.authorityTextSha256,
+      scopeKey: record.scopeKey,
+      correctionEpoch: record.correctionEpoch,
+      createdAtMs: record.createdAtMs,
+      expiresAtMs: record.expiresAtMs,
+      fingerprint: record.fingerprint,
+      actions: record.actions.map((action) => ({
+        id: action.id,
+        descriptor: {
+          tool: persistedTool(action.tool),
+          operation: action.operation,
+        },
+        fingerprint: action.fingerprint,
+        minimumRisk: persistedRisk(action.minimumRisk),
+        risk: persistedRisk(action.risk),
+        maximumUses: action.maximumUses,
+        consumedUses: action.consumedUses,
+      })),
+      receipts: record.receipts.map((receipt) => ({
+        useId: receipt.useId,
+        actionId: receipt.actionId,
+        reservedAtMs: receipt.reservedAtMs,
+        ...(receipt.completedAtMs === undefined ? {} : { completedAtMs: receipt.completedAtMs }),
+        result: receipt.result,
+        ...(receipt.errorCode || receipt.reasonCode
+          ? {
+              evidence: {
+                ...(receipt.errorCode ? { errorCode: receipt.errorCode } : {}),
+                ...(receipt.reasonCode ? { reasonCode: receipt.reasonCode } : {}),
+              },
+            }
+          : {}),
+      })),
+    };
   }
 }
 
@@ -549,6 +912,41 @@ function assertUniqueActionFingerprints(actions: StoredAuthorityAction[]): void 
     }
     fingerprints.set(action.fingerprint, action.id);
   }
+}
+
+function trimReceipts(receipts: AuthorityReceipt[]): AuthorityReceipt[] {
+  if (receipts.length <= MAXIMUM_RECEIPTS) return receipts;
+  const pending = receipts.filter((receipt) => receipt.result === "PENDING");
+  const terminalCapacity = Math.max(0, MAXIMUM_RECEIPTS - pending.length);
+  const terminal = receipts.filter((receipt) => receipt.result !== "PENDING");
+  const retainedTerminalIds = new Set(
+    terminal.slice(Math.max(0, terminal.length - terminalCapacity)).map((receipt) => receipt.useId),
+  );
+  return receipts.filter(
+    (receipt) => receipt.result === "PENDING" || retainedTerminalIds.has(receipt.useId),
+  );
+}
+
+function scopeKeyFor(scopeId: string): string {
+  return sha256(requiredText(scopeId, "Authenticated authority scope is required.", 2_048));
+}
+
+function persistentActionKey(fingerprint: string): string {
+  return `action_${fingerprint}`;
+}
+
+function persistedTool(value: string): UniversalToolName {
+  if (!Object.prototype.hasOwnProperty.call(UNIVERSAL_TOOL_OPERATIONS, value)) {
+    throw new Error(`Invalid persisted authority tool: ${value}`);
+  }
+  return value as UniversalToolName;
+}
+
+function persistedRisk(value: string): AuthorityRiskClass {
+  if (!UNIVERSAL_AUTHORITY_RISKS.includes(value as AuthorityRiskClass)) {
+    throw new Error(`Invalid persisted authority risk: ${value}`);
+  }
+  return value as AuthorityRiskClass;
 }
 
 function riskRank(risk: AuthorityRiskClass): number {

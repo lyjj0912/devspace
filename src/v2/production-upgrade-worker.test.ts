@@ -16,6 +16,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
 import {
+  directoryEvidence,
   pm2CommandEnvironment,
   productionPm2Environment,
   runProductionUpgradeWorker,
@@ -96,16 +97,29 @@ test("production upgrade worker switches one PM2 process and commits canonical p
   await runProductionUpgradeWorker(fixture.requestPath);
   const status = JSON.parse(await readFile(fixture.statusPath, "utf8")) as {
     state: string;
+    acceptedAt?: string;
+    history?: Array<{ state: string }>;
     pidAfter?: number;
     publicMetricsStatus?: number;
     unauthenticatedMcpStatus?: number;
     oauthScopes?: string[];
+    runtimeCommit?: string;
+    runtimeSourceTree?: string;
+    runtimeDist?: { files: number; sha256: string };
   };
   assert.equal(status.state, "PASS");
+  assert.equal(typeof status.acceptedAt, "string");
+  assert.deepEqual(
+    status.history?.map((entry) => entry.state),
+    ["PREPARED", "ACCEPTED", "SWITCHING", "VERIFYING", "PASS"],
+  );
   assert.equal(status.pidAfter, 222);
   assert.equal(status.publicMetricsStatus, 403);
   assert.equal(status.unauthenticatedMcpStatus, 401);
   assert.deepEqual(status.oauthScopes, expectedScopes);
+  assert.equal(status.runtimeCommit, fixture.nextCommit);
+  assert.equal(status.runtimeSourceTree, fixture.nextSourceTree);
+  assert.deepEqual(status.runtimeDist, fixture.nextDist);
   assert.equal(await readFile(fixture.productionEnvPath, "utf8"), "NEXT_ENV=1\n");
   assert.match(await readFile(fixture.startScriptPath, "utf8"), new RegExp(escapeRegExp(fixture.nextScript), "u"));
   assert.equal(await readlink(fixture.currentAuditLink), fixture.auditDirectory);
@@ -131,9 +145,27 @@ test("production upgrade worker rolls back env, process, start path, and audit l
   assert.equal((await readFile(fixture.pm2State.script, "utf8")).trim(), fixture.previousScript);
 });
 
+test("production upgrade worker records UNKNOWN when rollback cannot establish the previous runtime", async (t) => {
+  const fixture = await createFixture(t, {
+    publicMetricsStatus: 200,
+    timeoutMs: 250,
+    rollbackFails: true,
+  });
+  await assert.rejects(runProductionUpgradeWorker(fixture.requestPath), /Public metrics returned 200/u);
+  const status = JSON.parse(await readFile(fixture.statusPath, "utf8")) as {
+    state: string;
+    history?: Array<{ state: string }>;
+    rollback?: { restored?: boolean; error?: string };
+  };
+  assert.equal(status.state, "UNKNOWN");
+  assert.equal(status.history?.at(-1)?.state, "UNKNOWN");
+  assert.equal(status.rollback?.restored, false);
+  assert.equal(typeof status.rollback?.error, "string");
+});
+
 async function createFixture(
   t: TestContext,
-  options: { publicMetricsStatus: number; timeoutMs?: number },
+  options: { publicMetricsStatus: number; timeoutMs?: number; rollbackFails?: boolean },
 ) {
   const root = await mkdtemp(join(tmpdir(), "devspace-production-upgrade-worker-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -141,6 +173,8 @@ async function createFixture(
   const previousAudit = join(root, "audit-previous");
   const previousRelease = join(root, "release-previous");
   const nextRelease = join(root, "release-next");
+  const requestPath = join(auditDirectory, "request.json");
+  const statusPath = join(auditDirectory, "status.json");
   await Promise.all([
     mkdir(auditDirectory, { recursive: true }),
     mkdir(previousAudit, { recursive: true }),
@@ -151,6 +185,22 @@ async function createFixture(
   const nextScript = join(nextRelease, "start.sh");
   await writeFile(previousScript, "#!/bin/sh\n", { mode: 0o700 });
   await writeFile(nextScript, "#!/bin/sh\n", { mode: 0o700 });
+  await mkdir(join(nextRelease, "dist"), { recursive: true });
+  await writeFile(join(nextRelease, "dist", "runtime.js"), "export const runtime = true;\n");
+  const nextDist = await directoryEvidence(join(nextRelease, "dist"));
+  const nextCommit = "a".repeat(40);
+  const nextSourceTree = "b".repeat(40);
+  const git = join(root, "git-fixture.sh");
+  await writeFile(git, [
+    "#!/bin/sh",
+    "last=",
+    "for value in \"$@\"; do last=$value; done",
+    `if [ \"$last\" = HEAD ]; then printf '%s\\n' ${shellQuote(nextCommit)}; exit 0; fi`,
+    `if [ \"$last\" = 'HEAD^{tree}' ]; then printf '%s\\n' ${shellQuote(nextSourceTree)}; exit 0; fi`,
+    "exit 64",
+    "",
+  ].join("\n"), { mode: 0o700 });
+  await chmod(git, 0o700);
 
   const productionEnvPath = join(root, "production.env");
   const productionEnvBackupPath = join(auditDirectory, "production.env.before");
@@ -179,6 +229,7 @@ async function createFixture(
     `pid_file=${shellQuote(pm2State.pid)}`,
     `cwd_file=${shellQuote(pm2State.cwd)}`,
     `script_file=${shellQuote(pm2State.script)}`,
+    `status_file=${shellQuote(statusPath)}`,
     "case \"$1\" in",
     "  jlist)",
     "    pid=$(cat \"$pid_file\")",
@@ -186,7 +237,9 @@ async function createFixture(
     "    script=$(cat \"$script_file\")",
     "    printf '[{\"name\":\"devspace-v2-production\",\"pid\":%s,\"pm2_env\":{\"status\":\"online\",\"pm_cwd\":\"%s\",\"pm_exec_path\":\"%s\"}}]\\n' \"$pid\" \"$cwd\" \"$script\"",
     "    ;;",
-    "  delete) : ;;",
+    "  delete)",
+    "    grep -q '\"state\": \"ACCEPTED\"' \"$status_file\" || exit 65",
+    "    ;;",
     "  start)",
     "    script=$2",
     "    shift 2",
@@ -194,7 +247,9 @@ async function createFixture(
     "    while [ $# -gt 0 ]; do",
     "      if [ \"$1\" = \"--cwd\" ]; then cwd=$2; shift 2; else shift; fi",
     "    done",
-    `    if [ \"$script\" = ${shellQuote(nextScript)} ]; then printf '222\\n' > \"$pid_file\"; else printf '333\\n' > \"$pid_file\"; fi`,
+    options.rollbackFails
+      ? `    if [ \"$script\" = ${shellQuote(nextScript)} ]; then printf '222\\n' > \"$pid_file\"; else exit 70; fi`
+      : `    if [ \"$script\" = ${shellQuote(nextScript)} ]; then printf '222\\n' > \"$pid_file\"; else printf '333\\n' > \"$pid_file\"; fi`,
     "    printf '%s\\n' \"$cwd\" > \"$cwd_file\"",
     "    printf '%s\\n' \"$script\" > \"$script_file\"",
     "    ;;",
@@ -233,8 +288,6 @@ async function createFixture(
   t.after(() => close(server));
   const port = (server.address() as AddressInfo).port;
   const transactionId = "upgrade_11111111-1111-4111-8111-111111111111";
-  const requestPath = join(auditDirectory, "request.json");
-  const statusPath = join(auditDirectory, "status.json");
   const request: ProductionUpgradeRequest = {
     version: 1,
     transactionId,
@@ -243,6 +296,7 @@ async function createFixture(
     timeoutMs: options.timeoutMs ?? 2_000,
     pm2ProcessName: "devspace-v2-production",
     pm2Executable: pm2,
+    gitExecutable: git,
     previous: {
       pid: 111,
       cwd: previousRelease,
@@ -250,9 +304,11 @@ async function createFixture(
       auditTarget: previousAudit,
     },
     next: {
-      commit: "a".repeat(40),
+      commit: nextCommit,
+      sourceTree: nextSourceTree,
       release: nextRelease,
       script: nextScript,
+      dist: nextDist,
     },
     productionEnvPath,
     productionEnvBackupPath,
@@ -283,6 +339,9 @@ async function createFixture(
     previousScript,
     nextRelease,
     nextScript,
+    nextCommit,
+    nextSourceTree,
+    nextDist,
     pm2State,
   };
 }

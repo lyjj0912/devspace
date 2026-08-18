@@ -89,7 +89,10 @@ export function createUniversalBrokerNextServer(
     maximumSessions: config.maximumMcpSessions,
   });
   const metrics = new UniversalBrokerMetrics();
-  const authority = new OperationAuthorityRegistry({ minimumRisk: minimumAuthorityRisk });
+  const authority = new OperationAuthorityRegistry({
+    minimumRisk: minimumAuthorityRisk,
+    storePath: config.authorityStorePath,
+  });
   const envProfiles = new UniversalEnvProfileRegistry({
     configPath: config.envProfileConfigPath,
   });
@@ -507,6 +510,7 @@ export function createUniversalBrokerNextServer(
         await artifacts.close();
         await mcpProxy.close();
         await execution.close();
+        authority.close();
         oauthProvider.close();
       })();
       return closePromise;

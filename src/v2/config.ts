@@ -1,5 +1,5 @@
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { ServerConfig } from "../config.js";
 import type { LoggingConfig } from "../logger.js";
 import type { OAuthConfig } from "../oauth-provider.js";
@@ -52,6 +52,7 @@ export interface UniversalBrokerNextConfig {
   metricsPath: string;
   artifactPathPrefix: string;
   stateDir: string;
+  authorityStorePath: string;
   oauthStateDir: string;
   targetConfigPath: string;
   mcpRouteConfigPath: string;
@@ -150,6 +151,22 @@ export function loadUniversalBrokerNextConfig(
     env.DEVSPACE_NEXT_OAUTH_STATE_DIR
       ?? (deploymentMode === "production" ? base.stateDir : stateDir),
   ));
+  const authorityStorePath = resolve(expandHomePath(
+    env.DEVSPACE_NEXT_AUTHORITY_STORE
+      ?? join(stateDir, "authority.sqlite"),
+  ));
+  const authorityRelativePath = relative(stateDir, authorityStorePath);
+  if (
+    authorityRelativePath.length === 0
+    || authorityRelativePath === ".."
+    || authorityRelativePath.startsWith(`..${sep}`)
+    || isAbsolute(authorityRelativePath)
+  ) {
+    throw new Error("DEVSPACE_NEXT_AUTHORITY_STORE must stay inside DEVSPACE_NEXT_STATE_DIR.");
+  }
+  if (authorityStorePath === resolve(join(oauthStateDir, "devspace.sqlite"))) {
+    throw new Error("DEVSPACE_NEXT_AUTHORITY_STORE must not reuse the OAuth database.");
+  }
   const legacyScopeCompatibility = env.DEVSPACE_V2_LEGACY_SCOPE_COMPATIBILITY;
   if (legacyScopeCompatibility !== undefined && parseBoolean(
     legacyScopeCompatibility,
@@ -183,6 +200,7 @@ export function loadUniversalBrokerNextConfig(
     metricsPath,
     artifactPathPrefix,
     stateDir,
+    authorityStorePath,
     oauthStateDir,
     targetConfigPath: resolve(expandHomePath(
       env.DEVSPACE_NEXT_TARGETS_FILE ?? join(configDir, "targets.v2.json"),
