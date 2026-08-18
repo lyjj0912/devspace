@@ -303,6 +303,25 @@ test("remote file patch rechecks the original hash before atomic publication", a
   assert.ok(fixture.sftpPuts > 0);
 });
 
+test("fresh cached SFTP denial fails before transfer dispatch", async (t) => {
+  const fixture = await createRemoteFixture(t, { sftpAvailable: false });
+  const path = join(fixture.root, "must-not-publish.txt");
+  await assert.rejects(
+    fixture.filesystem.execute({
+      operation: "write",
+      target: "remote",
+      path,
+      content: `${"blocked".repeat(12_000)}\n`,
+      overwrite: false,
+    }),
+    (error: unknown) => error instanceof UniversalBrokerError
+      && error.code === "CAPABILITY_UNAVAILABLE",
+  );
+  assert.equal(fixture.executionCalls, 0);
+  assert.equal(fixture.sftpPuts, 0);
+  await assert.rejects(readFile(path, "utf8"), { code: "ENOENT" });
+});
+
 test("remote Windows fs uses PowerShell framing and SFTP atomic publication", async (t) => {
   const fixture = await createWindowsRemoteFixture(t);
   const directory = "C:/Users/Test/DevSpace/storage";
@@ -472,6 +491,7 @@ async function createFixture(t: test.TestContext): Promise<Fixture> {
 
 async function createRemoteFixture(
   t: test.TestContext,
+  options: { sftpAvailable?: boolean } = {},
 ): Promise<RemoteFixture> {
   const root = await mkdtemp(join(tmpdir(), "devspace-v2-fs-remote-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -499,7 +519,32 @@ async function createRemoteFixture(
     DEVSPACE_LOG_LEVEL: "silent",
     DEVSPACE_SKILL_PATHS: join(root, "skills"),
   });
-  const targets = new TargetRegistry({ configPath: targetConfig });
+  const targets = new TargetRegistry({
+    configPath: targetConfig,
+    execute: (async (executable: string, args: string[]) => {
+      if (executable === "sftp") {
+        if (options.sftpAvailable === false) throw new Error("SFTP subsystem unavailable");
+        return { stdout: "", stderr: "" };
+      }
+      if (args.includes("-tt")) return { stdout: "__DEVSPACE_PTY_OK__\r\n", stderr: "" };
+      return {
+        stdout: [
+          "__DEVSPACE_TARGET_V1__",
+          "kernel=Linux",
+          "architecture=x86_64",
+          `home=${root}`,
+          `temporary=${root}`,
+          "git=1",
+          "rsync=0",
+          "setpriv_boundary=1",
+          "sandbox_boundary=0",
+          "",
+        ].join("\n"),
+        stderr: "",
+      };
+    }) as never,
+  });
+  await targets.probe("remote");
   const contexts = new ContextRegistry({
     storePath: join(root, "v2-state", "contexts.json"),
     targets,
@@ -593,17 +638,22 @@ async function createWindowsRemoteFixture(
   });
   const targets = new TargetRegistry({
     configPath: targetConfig,
-    execute: (async () => ({
-      stdout: [
-        "__DEVSPACE_TARGET_V1__",
-        "architecture=AMD64",
-        "home=C:\\Users\\Test",
-        "temporary=C:\\Users\\Test\\AppData\\Local\\Temp\\",
-        "git=1",
-        "",
-      ].join("\n"),
-      stderr: "",
-    })) as never,
+    execute: (async (executable: string, args: string[]) => {
+      if (executable === "sftp") return { stdout: "", stderr: "" };
+      if (args.includes("-tt")) return { stdout: "__DEVSPACE_PTY_OK__\r\n", stderr: "" };
+      return {
+        stdout: [
+          "__DEVSPACE_TARGET_V1__",
+          "architecture=AMD64",
+          "home=C:\\Users\\Test",
+          "temporary=C:\\Users\\Test\\AppData\\Local\\Temp\\",
+          "git=1",
+          "elevated=0",
+          "",
+        ].join("\n"),
+        stderr: "",
+      };
+    }) as never,
   });
   const contexts = new ContextRegistry({
     storePath: join(root, "v2-state", "contexts.json"),

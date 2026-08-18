@@ -218,6 +218,25 @@ test("exec does not inherit service credentials into child processes", async (t)
   }
 });
 
+test("fresh cached target evidence blocks impossible PTY dispatch", async (t) => {
+  const fixture = await createFixture(t);
+  const observation = await fixture.targets.probe("no-pty", { refresh: true });
+  assert.equal(observation.status, "ONLINE");
+  assert.equal(observation.capabilities.exec, true);
+  assert.equal(observation.capabilities.pty, false);
+
+  await assert.rejects(
+    fixture.execution.execute({
+      target: "no-pty",
+      command: "printf should-not-run",
+      tty: true,
+      mode: "foreground",
+    }),
+    (error: unknown) => brokerCode(error) === "CAPABILITY_UNAVAILABLE",
+  );
+  assert.equal(fixture.execution.stats().processes, 0);
+});
+
 test("SSH execution strips dispatch markers and preserves the remote exit code", async (t) => {
   const fixture = await createFixture(t);
   const result = await fixture.execution.execute({
@@ -329,6 +348,10 @@ async function createFixture(
         shell: "zsh",
       },
       fake: sshTarget("fake"),
+      "no-pty": {
+        ...sshTarget("no-pty"),
+        platform: "macos",
+      },
       offline: sshTarget("offline"),
       unknown: sshTarget("unknown"),
     },
@@ -342,7 +365,11 @@ async function createFixture(
     DEVSPACE_PUBLIC_BASE_URL: "http://127.0.0.1:17676",
     DEVSPACE_LOG_LEVEL: "silent",
   });
-  const targets = new TargetRegistry({ configPath: targetsPath });
+  const targets = new TargetRegistry({
+    configPath: targetsPath,
+    sshExecutable: fakeSsh,
+    sftpExecutable: "/usr/bin/true",
+  });
   const contexts = new ContextRegistry({
     storePath: join(root, "v2-state", "contexts.json"),
     targets,

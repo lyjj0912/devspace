@@ -160,6 +160,74 @@ test("correction invalidates every authority in the same session epoch", () => {
   );
 });
 
+test("authority preview classifies exact actions without creating or consuming authority", () => {
+  const authority = registry();
+  const read = authorityActionFromToolCall("fs", {
+    operation: "read",
+    target: "local",
+    path: "/tmp/example.txt",
+  });
+  const write = authorityActionFromToolCall("fs", {
+    operation: "write",
+    target: "local",
+    path: "/tmp/example.txt",
+    content: "value\n",
+  });
+  const push = authorityActionFromToolCall("exec", {
+    target: "local",
+    cwd: "/tmp",
+    command: "git push origin main",
+  });
+  const first = authority.preview([
+    { id: "read", descriptor: read },
+    { id: "write", descriptor: write, uses: 2 },
+    { id: "push", descriptor: push },
+  ]);
+  const second = authority.preview([
+    { id: "read", descriptor: read },
+    { id: "write", descriptor: write, uses: 2 },
+    { id: "push", descriptor: push },
+  ]);
+  assert.equal(first.authorityRequired, true);
+  assert.equal(first.actionCount, 3);
+  assert.equal(first.authorityActionCount, 2);
+  assert.equal(first.r0ActionCount, 1);
+  assert.equal(first.planFingerprint, second.planFingerprint);
+  assert.deepEqual(
+    (first.actions as Array<{ id: string; minimumRisk: string; maximumUses: number }>).map(
+      ({ id, minimumRisk, maximumUses }) => ({ id, minimumRisk, maximumUses }),
+    ),
+    [
+      { id: "read", minimumRisk: "R0", maximumUses: 0 },
+      { id: "write", minimumRisk: "R1", maximumUses: 2 },
+      { id: "push", minimumRisk: "R3", maximumUses: 1 },
+    ],
+  );
+  assert.deepEqual(authority.stats(), { authorities: 0, scopes: 0, previews: 2 });
+  assert.throws(
+    () => authority.preview([{ descriptor: read, risk: "R1" }]),
+    /is R0; omit risk and uses/u,
+  );
+  assert.throws(
+    () => authority.preview([
+      { id: "duplicate-one", descriptor: write },
+      { id: "duplicate-two", descriptor: write },
+    ]),
+    /Duplicate exact authority actions.*combine repeated identical calls/u,
+  );
+  assert.throws(
+    () => authority.create({
+      taskId: "duplicate-create",
+      authorityText: "Repeated exact actions must use one bounded action record.",
+      actions: [
+        { id: "duplicate-one", descriptor: write },
+        { id: "duplicate-two", descriptor: write },
+      ],
+    }, "client:session"),
+    /Duplicate exact authority actions.*combine repeated identical calls/u,
+  );
+});
+
 test("R0 actions cannot be wrapped in authority and elevation commands fail closed", () => {
   const authority = registry();
   const read = authorityActionFromToolCall("fs", {

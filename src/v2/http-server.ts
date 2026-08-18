@@ -332,6 +332,8 @@ export function createUniversalBrokerNextServer(
       mcpProxy.stats(),
       selfManagement.stats(),
     ]);
+    const targetProbeStats = targets.stats();
+    const authorityStats = authority.stats();
     res.type("text/plain; version=0.0.4").send(metrics.render({
       devspace_open_http_sessions: gauge("Open MCP HTTP sessions", transports.size),
       devspace_pending_mcp_initializations: gauge("Pending MCP initialize requests", pendingInitializations),
@@ -344,7 +346,18 @@ export function createUniversalBrokerNextServer(
       devspace_artifacts: gauge("Published artifacts", numeric(artifacts.stats().artifacts)),
       devspace_artifact_bytes: gauge("Published artifact bytes", numeric(artifacts.stats().totalBytes)),
       devspace_gui_sessions: gauge("Open GUI sessions", numeric(gui.stats().sessions)),
-      devspace_operation_authorities: gauge("Active operation authority records", numeric(authority.stats().authorities)),
+      devspace_operation_authorities: gauge("Active operation authority records", numeric(authorityStats.authorities)),
+      devspace_authority_previews: gauge("Operation authority previews since process start", numeric(authorityStats.previews)),
+      devspace_target_probe_cache_entries: gauge("Cached target probe observations", numeric(targetProbeStats.probeCacheEntries)),
+      devspace_target_probe_in_flight: gauge("Target probes currently in flight", numeric(targetProbeStats.probeInFlight)),
+      devspace_target_probe_cache_hits: gauge("Target probe cache hits since process start", numeric(targetProbeStats.probeCacheHits)),
+      devspace_target_probe_cache_misses: gauge("Target probe cache misses since process start", numeric(targetProbeStats.probeCacheMisses)),
+      devspace_target_probe_coalesced: gauge("Target probe calls coalesced onto in-flight work", numeric(targetProbeStats.probeCoalesced)),
+      devspace_target_probe_online: gauge("Successful online target probes since process start", numeric(targetProbeStats.probeOnline)),
+      devspace_target_probe_degraded: gauge("Degraded target probes since process start", numeric(targetProbeStats.probeDegraded)),
+      devspace_target_probe_offline: gauge("Offline target probes since process start", numeric(targetProbeStats.probeOffline)),
+      devspace_target_probe_average_duration_ms: gauge("Average uncached target probe duration in milliseconds", numeric(targetProbeStats.averageProbeDurationMs)),
+      devspace_target_probe_last_duration_ms: gauge("Most recent uncached target probe duration in milliseconds", numeric(targetProbeStats.lastProbeDurationMs)),
       devspace_restart_transactions: gauge("Retained broker restart transactions", numeric(selfManagementStats.restartTransactions)),
       devspace_active_restart_transactions: gauge("Active broker restart transactions", numeric(selfManagementStats.activeRestartTransactions)),
     }));

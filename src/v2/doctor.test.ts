@@ -26,8 +26,41 @@ test("doctor JSON reports contracts, registries, targets, and quotas without cre
   });
   assert.equal((report.contracts as { passed: boolean }).passed, true);
   assert.equal(Array.isArray(report.targets), true);
+  for (const observation of report.targets as Array<{
+    targetId?: string;
+    status?: string;
+    observedAt?: string;
+    expiresAt?: string;
+    platform?: string;
+    capabilities?: Record<string, boolean>;
+    evidence?: { transport?: string };
+  }>) {
+    assert.equal(typeof observation.targetId, "string");
+    assert.equal(typeof observation.status, "string");
+    assert.equal(typeof observation.observedAt, "string");
+    assert.equal(typeof observation.expiresAt, "string");
+    assert.equal(typeof observation.platform, "string");
+    assert.equal(typeof observation.capabilities, "object");
+    assert.equal(typeof observation.evidence?.transport, "string");
+  }
   assert.equal(JSON.stringify(report).includes("owner-token-not-for-output"), false);
   assert.equal((report.quotas as { httpMcpSessions: number }).httpMcpSessions, 128);
+  assert.deepEqual(
+    report.targetProbeStats,
+    {
+      probeCacheEntries: 1,
+      probeInFlight: 0,
+      probeCacheHits: 0,
+      probeCacheMisses: 1,
+      probeCoalesced: 0,
+      probeOnline: 1,
+      probeDegraded: 0,
+      probeOffline: 0,
+      probeDurationMsTotal: (report.targetProbeStats as { probeDurationMsTotal: number }).probeDurationMsTotal,
+      averageProbeDurationMs: (report.targetProbeStats as { averageProbeDurationMs: number }).averageProbeDurationMs,
+      lastProbeDurationMs: (report.targetProbeStats as { lastProbeDurationMs: number }).lastProbeDurationMs,
+    },
+  );
   assert.deepEqual(
     report.selfManagement,
     {

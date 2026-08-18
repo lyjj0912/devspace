@@ -202,6 +202,11 @@ export class UniversalExecutionPlane {
     validateCommand(input.command);
     if (!input.internalPolicy) assertNoElevationCommand(input.command);
     const resolved = await this.resolveExecution(input);
+    await assertCachedExecutionCapability(
+      this.options.targets,
+      resolved.target,
+      input.tty === true,
+    );
     this.assertQuota(resolved.target.id);
     await Promise.all([
       mkdir(this.options.outputDir, { recursive: true, mode: 0o700 }),
@@ -849,6 +854,43 @@ class RemoteMarkerParser {
       return "";
     });
     return result;
+  }
+}
+
+async function assertCachedExecutionCapability(
+  targets: TargetRegistry,
+  target: TargetDefinition,
+  requiresPty: boolean,
+): Promise<void> {
+  const observation = await targets.cachedObservation(target.id);
+  if (!observation) return;
+  if (!observation.capabilities.exec) {
+    throw new UniversalBrokerError(
+      observation.status === "OFFLINE" ? "TARGET_OFFLINE" : "CAPABILITY_UNAVAILABLE",
+      `A fresh target probe reports ordinary execution unavailable on ${target.id}.`,
+      {
+        evidence: {
+          targetId: target.id,
+          status: observation.status,
+          capability: "exec",
+          expiresAt: observation.expiresAt,
+        },
+      },
+    );
+  }
+  if (requiresPty && !observation.capabilities.pty) {
+    throw new UniversalBrokerError(
+      "CAPABILITY_UNAVAILABLE",
+      `A fresh target probe reports PTY unavailable on ${target.id}. Refresh the target probe after external SSH configuration changes.`,
+      {
+        evidence: {
+          targetId: target.id,
+          status: observation.status,
+          capability: "pty",
+          expiresAt: observation.expiresAt,
+        },
+      },
+    );
   }
 }
 

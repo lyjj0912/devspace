@@ -4,20 +4,38 @@
   "title": "DevSpace Universal Broker v2 Observed Target Capability",
   "type": "object",
   "additionalProperties": false,
-  "required": ["targetId", "status", "observedAt", "capabilities"],
+  "required": [
+    "targetId",
+    "status",
+    "observedAt",
+    "expiresAt",
+    "platform",
+    "capabilities",
+    "evidence"
+  ],
   "properties": {
-    "targetId": { "type": "string", "minLength": 1 },
+    "targetId": { "type": "string", "minLength": 1, "maxLength": 64 },
     "status": { "enum": ["ONLINE", "OFFLINE", "DEGRADED", "UNKNOWN"] },
     "observedAt": { "type": "string", "format": "date-time" },
     "expiresAt": { "type": "string", "format": "date-time" },
     "platform": { "enum": ["macos", "linux", "windows", "unknown"] },
-    "architecture": { "type": "string" },
-    "homeDirectory": { "type": "string" },
-    "temporaryDirectory": { "type": "string" },
+    "architecture": { "type": "string", "maxLength": 128 },
+    "homeDirectory": { "type": "string", "maxLength": 4096 },
+    "temporaryDirectory": { "type": "string", "maxLength": 4096 },
     "capabilities": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["fs", "exec", "pty", "sftp", "gui", "mcp"],
+      "required": [
+        "fs",
+        "exec",
+        "pty",
+        "sftp",
+        "rsync",
+        "git",
+        "gui",
+        "mcp",
+        "durableProcess"
+      ],
       "properties": {
         "fs": { "type": "boolean" },
         "exec": { "type": "boolean" },
@@ -30,6 +48,39 @@
         "durableProcess": { "type": "boolean" }
       }
     },
-    "reason": { "type": "string" }
+    "reason": { "type": "string", "minLength": 1, "maxLength": 1000 },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["transport"],
+      "properties": {
+        "transport": { "enum": ["local", "ssh"] },
+        "sshHost": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "userAccountBoundary": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "probeDurationMs": { "type": "number", "minimum": 0, "maximum": 600000 },
+        "targetGeneration": { "type": "string", "pattern": "^[a-f0-9]{16}$" },
+        "cache": { "enum": ["hit", "miss", "shared"] },
+        "capabilityProbes": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "pty": { "$ref": "#/$defs/capabilityProbe" },
+            "sftp": { "$ref": "#/$defs/capabilityProbe" }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "capabilityProbe": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["available", "mechanism"],
+      "properties": {
+        "available": { "type": "boolean" },
+        "mechanism": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "reason": { "type": "string", "minLength": 1, "maxLength": 500 }
+      }
+    }
   }
 }

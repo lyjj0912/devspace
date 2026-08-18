@@ -307,7 +307,7 @@ export function artifactRisk(
 }
 
 function contextRisk(operation: string, parameters?: Record<string, unknown>): AuthorityRiskClass {
-  if (["authorize", "authority_status", "invalidate_authority", "release_authority", "search", "diff"].includes(operation)) return "R0";
+  if (["authority_preview", "authorize", "authority_status", "invalidate_authority", "release_authority", "search", "diff"].includes(operation)) return "R0";
   if (operation === "open" && parameters?.mode !== "worktree") return "R0";
   return "R1";
 }

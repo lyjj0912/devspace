@@ -35,6 +35,15 @@ package scans, granular OAuth, public metrics denial, R0–R3 canaries,
 no-elevation canaries, durable restart readback, exact PM2/release state, and
 canonical connector reconnect all PASS from the same source revision.
 
+## P1 operability follow-up
+
+Package `1.0.8` / broker contract `2.1.1` adds exact authority preview, real
+PTY/SFTP capability probes, ordinary AppleScript recovery under the no-elevation
+boundary, explicit probe refresh, and bounded probe telemetry. These reduce failed-call and discovery
+loops while preserving every P0 authorization and no-elevation boundary. The
+authoritative scope and gates are recorded in
+`UNIVERSAL_BROKER_V2_1_P1_PLAN.md`.
+
 ## Dependency boundary
 
 The production dependency graph is audited during every release. v2.1 updates

@@ -554,7 +554,7 @@ function registerTargetTool(server: McpServer, targets: TargetRegistry): void {
       annotations: contract.annotations,
       _meta: {},
     },
-    async ({ operation, selector, targetId, cursor, limit }, extra) => executeUniversalTool(async () => {
+    async ({ operation, selector, targetId, refresh, cursor, limit }, extra) => executeUniversalTool(async () => {
       requireScope(extra.authInfo?.scopes, "devspace.read");
       switch (operation) {
         case "list": {
@@ -572,7 +572,7 @@ function registerTargetTool(server: McpServer, targets: TargetRegistry): void {
           return successfulToolResult(data, undefined, `Resolved target: ${resolved.id}`);
         }
         case "probe": {
-          const observation = await targets.probe(targetId ?? selector);
+          const observation = await targets.probe(targetId ?? selector, { refresh });
           return successfulToolResult(
             { observation },
             undefined,
@@ -628,20 +628,33 @@ function registerContextTool(
         requireScope(extra.authInfo?.scopes, "devspace.write");
       }
       switch (operation) {
+        case "authority_preview": {
+          requireAuthorityPlanningInputScopes(extra.authInfo?.scopes, actions);
+          const normalizedActions = await normalizeRequestedAuthorityActions(
+            actions,
+            targets,
+            contexts,
+            mcpProxy,
+            gui,
+          );
+          requireAuthorityPlanningScopes(extra.authInfo?.scopes, normalizedActions);
+          const data = authority.preview(normalizedActions);
+          return successfulToolResult(
+            data,
+            undefined,
+            `Authority preview: ${String(data.authorityActionCount)} of ${String(data.actionCount)} action(s) require authority.`,
+          );
+        }
         case "authorize": {
-          const normalizedActions = await Promise.all((actions ?? []).map(async (action) => ({
-            ...(action.id ? { id: action.id } : {}),
-            descriptor: await normalizeAuthorityAction(
-              action.tool,
-              action.arguments as Record<string, unknown>,
-              targets,
-              contexts,
-              mcpProxy,
-              gui,
-            ),
-            ...(action.risk ? { risk: action.risk } : {}),
-            ...(action.uses ? { uses: action.uses } : {}),
-          }))) satisfies RequestedAuthorityAction[];
+          requireAuthorityPlanningInputScopes(extra.authInfo?.scopes, actions);
+          const normalizedActions = await normalizeRequestedAuthorityActions(
+            actions,
+            targets,
+            contexts,
+            mcpProxy,
+            gui,
+          );
+          requireAuthorityPlanningScopes(extra.authInfo?.scopes, normalizedActions);
           const data = authority.create({
             taskId: taskId ?? "",
             authorityText: authorityText ?? "",
@@ -877,6 +890,84 @@ function bindRouteAuthority(
   };
 }
 
+async function normalizeRequestedAuthorityActions(
+  actions: Array<{
+    id?: string;
+    tool: UniversalToolName;
+    arguments: Record<string, unknown>;
+    risk?: AuthorityRiskClass;
+    uses?: number;
+  }> | undefined,
+  targets: TargetRegistry,
+  contexts: ContextRegistry,
+  mcpProxy: UniversalMcpProxy | undefined,
+  gui: UniversalGuiService | undefined,
+): Promise<RequestedAuthorityAction[]> {
+  return Promise.all((actions ?? []).map(async (action) => ({
+    ...(action.id ? { id: action.id } : {}),
+    descriptor: await normalizeAuthorityAction(
+      action.tool,
+      action.arguments,
+      targets,
+      contexts,
+      mcpProxy,
+      gui,
+    ),
+    ...(action.risk ? { risk: action.risk } : {}),
+    ...(action.uses ? { uses: action.uses } : {}),
+  })));
+}
+
+function requireAuthorityPlanningInputScopes(
+  scopes: string[] | undefined,
+  actions: Array<{
+    tool: UniversalToolName;
+    arguments: Record<string, unknown>;
+  }> | undefined,
+): void {
+  requireAuthorityPlanningScopes(
+    scopes,
+    (actions ?? []).map((action) => ({
+      descriptor: authorityActionFromToolCall(action.tool, action.arguments),
+    })),
+  );
+}
+
+function requireAuthorityPlanningScopes(
+  scopes: string[] | undefined,
+  actions: RequestedAuthorityAction[],
+): void {
+  const required = new Set<string>();
+  for (const action of actions) {
+    const descriptor = action.descriptor;
+    const risk = minimumAuthorityRisk(descriptor);
+    switch (descriptor.tool) {
+      case "target":
+        required.add("devspace.read");
+        break;
+      case "context":
+      case "fs":
+        required.add(risk === "R0" ? "devspace.read" : "devspace.write");
+        break;
+      case "exec":
+      case "process":
+        required.add("devspace.exec");
+        break;
+      case "mcp":
+        required.add("devspace.mcp");
+        break;
+      case "artifact":
+        required.add("devspace.artifact");
+        required.add(descriptor.operation === "publish" ? "devspace.read" : "devspace.write");
+        break;
+      case "gui":
+        required.add("devspace.gui");
+        break;
+    }
+  }
+  for (const scope of [...required].sort()) requireScope(scopes, scope);
+}
+
 async function normalizeAuthorityAction(
   tool: UniversalToolName,
   argumentsValue: Record<string, unknown>,
@@ -886,13 +977,12 @@ async function normalizeAuthorityAction(
   gui: UniversalGuiService | undefined,
 ): Promise<AuthorityActionDescriptor> {
   const action = authorityActionFromToolCall(tool, argumentsValue);
-  if (minimumAuthorityRisk(action) === "R0") return action;
   switch (tool) {
     case "target":
     case "process":
       return action;
     case "context": {
-      if (action.operation !== "open" || action.parameters?.mode !== "worktree") return action;
+      if (action.operation !== "open") return action;
       return bindTargetAuthority(
         action,
         await targets.resolveWithGeneration(
@@ -931,6 +1021,7 @@ async function normalizeAuthorityAction(
         );
       }
       const input = argumentsValue as unknown as UniversalMcpInput;
+      if (input.operation === "routes") return action;
       const binding = input.operation === "invoke"
         ? await mcpProxy.inspectInvocation(input)
         : await mcpProxy.inspectRoute(input.route);

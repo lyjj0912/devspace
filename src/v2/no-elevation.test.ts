@@ -71,3 +71,28 @@ test("Windows remote prelude detects high and system integrity tokens", () => {
 test("macOS profile denies Authorization Services acquisition", () => {
   assert.match(macosUserOnlyProfile(), /deny authorization-right-obtain/u);
 });
+
+test("macOS ordinary AppleScript remains usable while administrator AppleScript fails closed", { skip: process.platform !== "darwin" }, () => {
+  const ordinary = wrapLocalUserOnlyExecution("macos", {
+    executable: "/usr/bin/osascript",
+    args: ["-e", "return 2 + 2"],
+  });
+  const ordinaryResult = spawnSync(ordinary.executable, ordinary.args, {
+    encoding: "utf8",
+    timeout: 5_000,
+  });
+  assert.equal(ordinaryResult.status, 0, ordinaryResult.stderr);
+  assert.equal(ordinaryResult.stdout.trim(), "4");
+
+  const elevated = wrapLocalUserOnlyExecution("macos", {
+    executable: "/usr/bin/osascript",
+    args: ["-e", 'do shell script "/usr/bin/id" with administrator privileges'],
+  });
+  const elevatedResult = spawnSync(elevated.executable, elevated.args, {
+    encoding: "utf8",
+    timeout: 5_000,
+  });
+  assert.notEqual(elevatedResult.status, 0);
+  assert.equal(elevatedResult.signal, null);
+  assert.doesNotMatch(elevatedResult.stdout, /uid=0/u);
+});

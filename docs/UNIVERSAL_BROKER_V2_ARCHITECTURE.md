@@ -56,8 +56,10 @@ R2  remote, shared, published, or externally visible mutation
 R3  irreversible, destructive, deployment, delivery, or GUI action
 ```
 
-`context.authorize` creates a short-lived authority record containing exact tool
-calls, normalized argument fingerprints, risk, and use limits. R3 actions are
+`context.authority_preview` first classifies a batch with the exact canonical
+normalization used at dispatch, without creating or consuming authority.
+`context.authorize` then creates a short-lived authority record containing exact
+tool calls, normalized argument fingerprints, risk, and use limits. R3 actions are
 one-shot. Records are bound to the OAuth client and MCP session. A correction
 increments the session correction epoch and invalidates all earlier records.
 PASS, FAIL, and UNCERTAIN receipts are retained without storing the controlling

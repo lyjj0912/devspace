@@ -5,7 +5,7 @@ import { homedir, platform as nodePlatform, arch, tmpdir } from "node:os";
 import { promisify } from "node:util";
 import * as z from "zod/v4";
 import { UniversalBrokerError } from "./errors.js";
-import { macosUserOnlyProfile, windowsIntegrityIsElevated } from "./no-elevation.js";
+import { macosUserOnlyProfile, windowsIntegrityIsElevated, windowsNonElevatedPrelude } from "./no-elevation.js";
 
 const execFileAsync = promisify(execFile);
 const TARGET_ID_PATTERN = /^[a-z][a-z0-9._-]{0,63}$/;
@@ -70,6 +70,8 @@ export interface TargetRegistryOptions {
   configPath: string;
   now?: () => number;
   probeTimeoutMs?: number;
+  sshExecutable?: string;
+  sftpExecutable?: string;
   execute?: typeof execFileAsync;
 }
 
@@ -116,13 +118,26 @@ export class TargetRegistry {
   private snapshot?: TargetRegistrySnapshot;
   private snapshotContentHash?: string;
   private readonly probeCache = new Map<string, TargetObservation>();
+  private readonly probeInFlight = new Map<string, Promise<TargetObservation>>();
   private readonly now: () => number;
   private readonly probeTimeoutMs: number;
+  private readonly sshExecutable: string;
+  private readonly sftpExecutable: string;
   private readonly execute: typeof execFileAsync;
+  private probeCacheHits = 0;
+  private probeCacheMisses = 0;
+  private probeCoalesced = 0;
+  private probeOnline = 0;
+  private probeDegraded = 0;
+  private probeOffline = 0;
+  private probeDurationMsTotal = 0;
+  private lastProbeDurationMs = 0;
 
   constructor(private readonly options: TargetRegistryOptions) {
     this.now = options.now ?? Date.now;
     this.probeTimeoutMs = options.probeTimeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS;
+    this.sshExecutable = options.sshExecutable ?? "ssh";
+    this.sftpExecutable = options.sftpExecutable ?? "sftp";
     this.execute = options.execute ?? execFileAsync;
   }
 
@@ -179,17 +194,85 @@ export class TargetRegistry {
     };
   }
 
-  async probe(selector: string | undefined): Promise<TargetObservation> {
+  async probe(
+    selector: string | undefined,
+    options: { refresh?: boolean } = {},
+  ): Promise<TargetObservation> {
     const { generation, target } = await this.resolveWithGeneration(selector);
     const key = `${generation}:${target.id}`;
     const cached = this.probeCache.get(key);
-    if (cached && Date.parse(cached.expiresAt) > this.now()) return cached;
+    if (!options.refresh && cached && Date.parse(cached.expiresAt) > this.now()) {
+      this.probeCacheHits += 1;
+      return observationWithProbeMetadata(cached, generation, "hit");
+    }
 
+    const inFlight = this.probeInFlight.get(key);
+    if (inFlight) {
+      this.probeCoalesced += 1;
+      return observationWithProbeMetadata(await inFlight, generation, "shared");
+    }
+
+    this.probeCacheMisses += 1;
+    const pending = this.performProbe(target, key);
+    this.probeInFlight.set(key, pending);
+    try {
+      return observationWithProbeMetadata(await pending, generation, "miss");
+    } finally {
+      if (this.probeInFlight.get(key) === pending) this.probeInFlight.delete(key);
+    }
+  }
+
+  async cachedObservation(selector: string | undefined): Promise<TargetObservation | undefined> {
+    const { generation, target } = await this.resolveWithGeneration(selector);
+    const cached = this.probeCache.get(`${generation}:${target.id}`);
+    if (!cached || Date.parse(cached.expiresAt) <= this.now()) return undefined;
+    return observationWithProbeMetadata(cached, generation, "hit");
+  }
+
+  stats(): Record<string, number> {
+    return {
+      probeCacheEntries: this.probeCache.size,
+      probeInFlight: this.probeInFlight.size,
+      probeCacheHits: this.probeCacheHits,
+      probeCacheMisses: this.probeCacheMisses,
+      probeCoalesced: this.probeCoalesced,
+      probeOnline: this.probeOnline,
+      probeDegraded: this.probeDegraded,
+      probeOffline: this.probeOffline,
+      probeDurationMsTotal: roundedMilliseconds(this.probeDurationMsTotal),
+      averageProbeDurationMs: roundedMilliseconds(
+        this.probeCacheMisses > 0 ? this.probeDurationMsTotal / this.probeCacheMisses : 0,
+      ),
+      lastProbeDurationMs: roundedMilliseconds(this.lastProbeDurationMs),
+    };
+  }
+
+  private async performProbe(
+    target: TargetDefinition,
+    key: string,
+  ): Promise<TargetObservation> {
+    const started = performance.now();
     const observed = target.transport === "local"
       ? await this.probeLocal(target)
       : await this.probeSsh(target);
-    this.probeCache.set(key, observed);
-    return observed;
+    const durationMs = Math.max(0, performance.now() - started);
+    this.lastProbeDurationMs = durationMs;
+    this.probeDurationMsTotal += durationMs;
+    if (observed.status === "ONLINE") this.probeOnline += 1;
+    else if (observed.status === "DEGRADED") this.probeDegraded += 1;
+    else if (observed.status === "OFFLINE") this.probeOffline += 1;
+    const retained = {
+      ...observed,
+      evidence: {
+        ...(observed.evidence ?? {}),
+        probeDurationMs: roundedMilliseconds(durationMs),
+      },
+    };
+    const currentKey = this.snapshot
+      ? `${this.snapshot.generation}:${target.id}`
+      : undefined;
+    if (currentKey === key) this.probeCache.set(key, retained);
+    return retained;
   }
 
   private async readConfig(): Promise<string | undefined> {
@@ -266,7 +349,7 @@ export class TargetRegistry {
 
     try {
       const result = await this.execute(
-        "ssh",
+        this.sshExecutable,
         sshArguments(target.sshHost, this.probeTimeoutMs, `sh -lc ${shellQuote(script)}`),
         {
           timeout: this.probeTimeoutMs + 1_000,
@@ -286,6 +369,26 @@ export class TargetRegistry {
         : platform === "macos"
           ? { available: fields.sandbox_boundary === "1", mechanism: "verified sandbox-exec + authorization/set-id deny" }
           : { available: false, mechanism: "unsupported" };
+      const [pty, sftp] = boundary.available
+        ? await Promise.all([
+            probePosixSshPty(
+              target,
+              platform,
+              this.sshExecutable,
+              this.probeTimeoutMs,
+              this.execute,
+            ),
+            probeSftp(
+              target,
+              this.sftpExecutable,
+              this.probeTimeoutMs,
+              this.execute,
+            ),
+          ])
+        : [
+            unavailableCapabilityProbe("not-probed-without-user-account-boundary"),
+            unavailableCapabilityProbe("not-probed-without-user-account-boundary"),
+          ];
       return {
         targetId: target.id,
         status: boundary.available ? "ONLINE" : "DEGRADED",
@@ -298,8 +401,8 @@ export class TargetRegistry {
         capabilities: {
           fs: boundary.available,
           exec: boundary.available,
-          pty: false,
-          sftp: false,
+          pty: boundary.available && pty.available,
+          sftp: boundary.available && sftp.available,
           rsync: fields.rsync === "1",
           git: fields.git === "1",
           gui: boundary.available && target.gui.mode !== "none",
@@ -313,8 +416,7 @@ export class TargetRegistry {
           transport: "ssh",
           sshHost: target.sshHost,
           userAccountBoundary: boundary.mechanism,
-          ptyProbe: "not_run_phase_2",
-          sftpProbe: "not_run_phase_2",
+          capabilityProbes: { pty, sftp },
         },
       };
     } catch (error) {
@@ -329,7 +431,7 @@ export class TargetRegistry {
   ): Promise<TargetObservation> {
     try {
       const result = await this.execute(
-        "ssh",
+        this.sshExecutable,
         sshArguments(
           target.sshHost!,
           this.probeTimeoutMs,
@@ -346,6 +448,25 @@ export class TargetRegistry {
         throw new Error("Remote probe marker missing");
       }
       const elevated = fields.elevated !== "0";
+      const [pty, sftp] = elevated
+        ? [
+            unavailableCapabilityProbe("not-probed-for-elevated-token"),
+            unavailableCapabilityProbe("not-probed-for-elevated-token"),
+          ]
+        : await Promise.all([
+            probeWindowsSshPty(
+              target,
+              this.sshExecutable,
+              this.probeTimeoutMs,
+              this.execute,
+            ),
+            probeSftp(
+              target,
+              this.sftpExecutable,
+              this.probeTimeoutMs,
+              this.execute,
+            ),
+          ]);
       return {
         targetId: target.id,
         status: elevated ? "DEGRADED" : "ONLINE",
@@ -356,10 +477,10 @@ export class TargetRegistry {
         homeDirectory: fields.home,
         temporaryDirectory: fields.temporary,
         capabilities: {
-          fs: !elevated,
+          fs: !elevated && sftp.available,
           exec: !elevated,
-          pty: false,
-          sftp: false,
+          pty: !elevated && pty.available,
+          sftp: !elevated && sftp.available,
           rsync: false,
           git: fields.git === "1",
           gui: !elevated && target.gui.mode !== "none",
@@ -373,8 +494,7 @@ export class TargetRegistry {
           transport: "ssh",
           sshHost: target.sshHost,
           userAccountBoundary: elevated ? "blocked-elevated-token" : "medium-or-lower-integrity-token",
-          ptyProbe: "not_run_phase_2",
-          sftpProbe: "not_run_phase_2",
+          capabilityProbes: { pty, sftp },
         },
       };
     } catch (error) {
@@ -549,6 +669,155 @@ function platformFromKernel(kernel: string | undefined): TargetPlatform {
     default:
       return "unknown";
   }
+}
+
+interface CapabilityProbeResult {
+  available: boolean;
+  mechanism: string;
+  reason?: string;
+}
+
+async function probePosixSshPty(
+  target: TargetDefinition,
+  platform: TargetPlatform,
+  sshExecutable: string,
+  timeoutMs: number,
+  execute: typeof execFileAsync,
+): Promise<CapabilityProbeResult> {
+  if (!target.sshHost) return unavailableCapabilityProbe("missing-ssh-host");
+  const ttyTest = "if [ -t 0 ] && [ -t 1 ]; then printf '__DEVSPACE_PTY_OK__\n'; else exit 73; fi";
+  const linuxTest = [
+    "grep -Eq '^NoNewPrivs:[[:space:]]*1' /proc/self/status",
+    "grep -Eq '^CapPrm:[[:space:]]*0+$' /proc/self/status",
+    "grep -Eq '^CapEff:[[:space:]]*0+$' /proc/self/status",
+    "grep -Eq '^CapAmb:[[:space:]]*0+$' /proc/self/status",
+    ttyTest,
+  ].join(" && ");
+  const remote = platform === "macos"
+    ? `/usr/bin/sandbox-exec -p ${shellQuote(macosUserOnlyProfile())} /bin/sh -c ${shellQuote(ttyTest)}`
+    : `setpriv --no-new-privs -- sh -c ${shellQuote(linuxTest)}`;
+  try {
+    const result = await execute(sshExecutable, [
+      "-tt",
+      "-o", "BatchMode=yes",
+      "-o", `ConnectTimeout=${Math.max(1, Math.ceil(timeoutMs / 1_000))}`,
+      "-o", "ConnectionAttempts=1",
+      "-o", "LogLevel=ERROR",
+      target.sshHost,
+      remote,
+    ], {
+      timeout: timeoutMs + 1_000,
+      encoding: "utf8",
+      maxBuffer: 64 * 1024,
+    });
+    if (!result.stdout.includes("__DEVSPACE_PTY_OK__")) {
+      return unavailableCapabilityProbe("ssh-tty-marker-missing");
+    }
+    return {
+      available: true,
+      mechanism: platform === "linux"
+        ? "verified-ssh-tty-with-no-new-privileges-and-zero-capabilities"
+        : "verified-ssh-tty-inside-macos-user-only-sandbox",
+    };
+  } catch (error) {
+    return unavailableCapabilityProbe("ssh-tty-unavailable", error);
+  }
+}
+
+async function probeWindowsSshPty(
+  target: TargetDefinition,
+  sshExecutable: string,
+  timeoutMs: number,
+  execute: typeof execFileAsync,
+): Promise<CapabilityProbeResult> {
+  if (!target.sshHost) return unavailableCapabilityProbe("missing-ssh-host");
+  const source = [
+    "$ErrorActionPreference='Stop'",
+    ...windowsNonElevatedPrelude("__DEVSPACE_PTY_ELEVATED_TOKEN_BLOCKED__"),
+    "if((-not [Console]::IsInputRedirected)-and(-not [Console]::IsOutputRedirected)){Write-Output '__DEVSPACE_PTY_OK__';exit 0}",
+    "exit 73",
+  ].join("; ");
+  const encoded = Buffer.from(source, "utf16le").toString("base64");
+  const remote = `powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ${encoded}`;
+  try {
+    const result = await execute(sshExecutable, [
+      "-tt",
+      "-o", "BatchMode=yes",
+      "-o", `ConnectTimeout=${Math.max(1, Math.ceil(timeoutMs / 1_000))}`,
+      "-o", "ConnectionAttempts=1",
+      "-o", "LogLevel=ERROR",
+      target.sshHost,
+      remote,
+    ], {
+      timeout: timeoutMs + 1_000,
+      encoding: "utf8",
+      maxBuffer: 64 * 1024,
+    });
+    if (!result.stdout.includes("__DEVSPACE_PTY_OK__")) {
+      return unavailableCapabilityProbe("windows-ssh-tty-marker-missing");
+    }
+    return { available: true, mechanism: "verified-windows-openssh-pty-with-non-elevated-token" };
+  } catch (error) {
+    return unavailableCapabilityProbe("windows-ssh-tty-unavailable", error);
+  }
+}
+
+async function probeSftp(
+  target: TargetDefinition,
+  sftpExecutable: string,
+  timeoutMs: number,
+  execute: typeof execFileAsync,
+): Promise<CapabilityProbeResult> {
+  if (!target.sshHost) return unavailableCapabilityProbe("missing-ssh-host");
+  try {
+    await execute(sftpExecutable, [
+      "-q",
+      "-b", nodePlatform() === "win32" ? "NUL" : "/dev/null",
+      "-o", "BatchMode=yes",
+      "-o", `ConnectTimeout=${Math.max(1, Math.ceil(timeoutMs / 1_000))}`,
+      "-o", "ConnectionAttempts=1",
+      "-o", "LogLevel=ERROR",
+      target.sshHost,
+    ], {
+      timeout: timeoutMs + 1_000,
+      encoding: "utf8",
+      maxBuffer: 64 * 1024,
+    });
+    return { available: true, mechanism: "verified-sftp-subsystem-handshake" };
+  } catch (error) {
+    return unavailableCapabilityProbe("sftp-subsystem-unavailable", error);
+  }
+}
+
+function unavailableCapabilityProbe(
+  mechanism: string,
+  error?: unknown,
+): CapabilityProbeResult {
+  return {
+    available: false,
+    mechanism,
+    ...(error ? { reason: boundedError(error) } : {}),
+  };
+}
+
+function observationWithProbeMetadata(
+  observation: TargetObservation,
+  generation: string,
+  cache: "hit" | "miss" | "shared",
+): TargetObservation {
+  return {
+    ...observation,
+    capabilities: { ...observation.capabilities },
+    evidence: {
+      ...(observation.evidence ?? {}),
+      targetGeneration: generation,
+      cache,
+    },
+  };
+}
+
+function roundedMilliseconds(value: number): number {
+  return Math.round(value * 1_000) / 1_000;
 }
 
 function sshArguments(host: string, timeoutMs: number, command: string): string[] {

@@ -176,6 +176,7 @@ export class UniversalFilesystemService {
         },
       );
     }
+    await assertCachedSftpCapability(this.targets, resolved.target);
     return this.publishRemoteFile(
       resolved.target,
       requirePath(resolved.path, "artifact destination"),
@@ -208,6 +209,7 @@ export class UniversalFilesystemService {
       await copyFile(sourcePath, input.localPath, fsConstants.COPYFILE_EXCL);
     } else {
       const remotePath = requirePath(resolved.path, "artifact source");
+      await assertCachedSftpCapability(this.targets, resolved.target);
       const metadata = await this.remoteRequest(
         resolved.target,
         { op: "stat", path: remotePath },
@@ -369,6 +371,7 @@ export class UniversalFilesystemService {
             options,
           }));
         }
+        await assertCachedSftpCapability(this.targets, target);
         const directory = await mkdtemp(join(tmpdir(), "devspace-v2-fs-write-"));
         const staged = join(directory, "payload");
         try {
@@ -379,6 +382,7 @@ export class UniversalFilesystemService {
         }
       }
       case "patch":
+        await assertCachedSftpCapability(this.targets, target);
         return this.remotePatch(
           target,
           requirePath(path, "fs.patch"),
@@ -473,6 +477,7 @@ export class UniversalFilesystemService {
     target: TargetDefinition,
     request: Record<string, unknown>,
   ): Promise<unknown> {
+    await assertCachedSftpCapability(this.targets, target);
     const observation = await this.targets.probe(target.id);
     const temporaryDirectory = observation.temporaryDirectory;
     if (!temporaryDirectory) {
@@ -635,6 +640,7 @@ export class UniversalFilesystemService {
       createParents?: boolean;
     },
   ): Promise<Record<string, unknown>> {
+    await assertCachedSftpCapability(this.targets, target);
     const prepared = asRecord(await this.remoteRequest(target, {
       op: "prepare_write",
       path,
@@ -666,6 +672,7 @@ export class UniversalFilesystemService {
     patch: string,
     expectedSha256: string | undefined,
   ): Promise<Record<string, unknown>> {
+    await assertCachedSftpCapability(this.targets, target);
     const metadata = asRecord(await this.remoteRequest(target, {
       op: "stat",
       path,
@@ -718,14 +725,16 @@ export class UniversalFilesystemService {
     }
   }
 
-  private sftpPut(input: SftpTransferInput): Promise<void> {
-    return this.options.sftpPut?.(input)
-      ?? runSftpTransfer("put", input, this.options);
+  private async sftpPut(input: SftpTransferInput): Promise<void> {
+    await assertCachedSftpCapability(this.targets, input.target);
+    await (this.options.sftpPut?.(input)
+      ?? runSftpTransfer("put", input, this.options));
   }
 
-  private sftpGet(input: SftpTransferInput): Promise<void> {
-    return this.options.sftpGet?.(input)
-      ?? runSftpTransfer("get", input, this.options);
+  private async sftpGet(input: SftpTransferInput): Promise<void> {
+    await assertCachedSftpCapability(this.targets, input.target);
+    await (this.options.sftpGet?.(input)
+      ?? runSftpTransfer("get", input, this.options));
   }
 }
 
@@ -1124,6 +1133,26 @@ function validateSingleFilePatch(patch: string, expectedName: string): void {
       `A file-targeted patch must update exactly ${expectedName} without moving it.`,
     );
   }
+}
+
+async function assertCachedSftpCapability(
+  targets: TargetRegistry,
+  target: TargetDefinition,
+): Promise<void> {
+  const observation = await targets.cachedObservation(target.id);
+  if (!observation || observation.capabilities.sftp) return;
+  throw new UniversalBrokerError(
+    observation.status === "OFFLINE" ? "TARGET_OFFLINE" : "CAPABILITY_UNAVAILABLE",
+    `A fresh target probe reports SFTP unavailable on ${target.id}. Refresh the target probe after external SSH configuration changes.`,
+    {
+      evidence: {
+        targetId: target.id,
+        status: observation.status,
+        capability: "sftp",
+        expiresAt: observation.expiresAt,
+      },
+    },
+  );
 }
 
 async function runSftpTransfer(

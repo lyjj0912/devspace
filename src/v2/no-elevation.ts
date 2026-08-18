@@ -23,10 +23,6 @@ const MACOS_ALWAYS_DENIED_EXECUTABLES = [
   "/usr/libexec/security_authtrampoline",
 ];
 
-const MACOS_USER_COMMAND_DENIED_EXECUTABLES = [
-  "/usr/bin/osascript",
-];
-
 export function assertServiceAccountBoundary(): void {
   const uid = process.getuid?.();
   const euid = process.geteuid?.();
@@ -169,10 +165,7 @@ export function windowsNonElevatedPrelude(marker = "__DEVSPACE_ELEVATED_TOKEN_BL
 }
 
 export function macosUserOnlyProfile(internalPolicy?: InternalExecutionPolicy): string {
-  const denied = [
-    ...MACOS_ALWAYS_DENIED_EXECUTABLES,
-    ...(internalPolicy === "gui" ? [] : MACOS_USER_COMMAND_DENIED_EXECUTABLES),
-  ];
+  const denied = [...MACOS_ALWAYS_DENIED_EXECUTABLES];
   return [
     "(version 1)",
     "(allow default)",

@@ -44,6 +44,7 @@ interface StoredAuthorityAction {
   id: string;
   descriptor: AuthorityActionDescriptor;
   fingerprint: string;
+  minimumRisk: AuthorityRiskClass;
   risk: AuthorityRiskClass;
   maximumUses: number;
   consumedUses: number;
@@ -88,6 +89,7 @@ export class OperationAuthorityRegistry {
   private readonly authorities = new Map<string, StoredOperationAuthority>();
   private readonly correctionEpochs = new Map<string, number>();
   private readonly authorityIdsByFingerprint = new Map<string, string>();
+  private previews = 0;
 
   constructor(options: OperationAuthorityRegistryOptions = {}) {
     this.now = options.now ?? Date.now;
@@ -109,8 +111,9 @@ export class OperationAuthorityRegistry {
       );
     }
     const correctionEpoch = this.correctionEpoch(scopeId);
-    const actions = input.actions.map((action, index) => this.prepareAction(action, index));
+    const actions = input.actions.map((action, index) => this.prepareAction(action, index, false));
     assertUniqueActionIds(actions);
+    assertUniqueActionFingerprints(actions);
     const expiresInSeconds = boundedInteger(
       input.expiresInSeconds,
       DEFAULT_AUTHORITY_TTL_SECONDS,
@@ -126,6 +129,7 @@ export class OperationAuthorityRegistry {
       actions: actions.map((action) => ({
         id: action.id,
         descriptor: action.descriptor,
+        minimumRisk: action.minimumRisk,
         risk: action.risk,
         maximumUses: action.maximumUses,
       })),
@@ -159,6 +163,48 @@ export class OperationAuthorityRegistry {
     this.authorities.set(authority.authorityId, authority);
     this.authorityIdsByFingerprint.set(fingerprint, authority.authorityId);
     return this.present(authority, false);
+  }
+
+  preview(actionsInput: RequestedAuthorityAction[]): Record<string, unknown> {
+    this.pruneExpired();
+    if (!Array.isArray(actionsInput) || actionsInput.length < 1 || actionsInput.length > MAXIMUM_ACTIONS) {
+      throw new UniversalBrokerError(
+        "PRECONDITION_FAILED",
+        `context.authority_preview requires 1 through ${MAXIMUM_ACTIONS} exact actions.`,
+      );
+    }
+    const actions = actionsInput.map((action, index) => this.prepareAction(action, index, true));
+    assertUniqueActionIds(actions);
+    assertUniqueActionFingerprints(actions);
+    this.previews += 1;
+    const planFingerprint = sha256(stableJson(actions.map((action) => ({
+      id: action.id,
+      descriptor: action.descriptor,
+      minimumRisk: action.minimumRisk,
+      risk: action.risk,
+      maximumUses: action.maximumUses,
+    }))));
+    const authorityActions = actions.filter((action) => action.minimumRisk !== "R0");
+    return {
+      planFingerprint,
+      actionCount: actions.length,
+      authorityActionCount: authorityActions.length,
+      r0ActionCount: actions.length - authorityActions.length,
+      authorityRequired: authorityActions.length > 0,
+      actions: actions.map((action) => ({
+        id: action.id,
+        tool: action.descriptor.tool,
+        operation: action.descriptor.operation,
+        target: action.descriptor.target,
+        resource: action.descriptor.resource,
+        fingerprint: action.fingerprint,
+        minimumRisk: action.minimumRisk,
+        effectiveRisk: action.risk,
+        authorityRequired: action.minimumRisk !== "R0",
+        maximumUses: action.maximumUses,
+        parameterKeys: Object.keys(action.descriptor.parameters ?? {}).sort(),
+      })),
+    };
   }
 
   require(
@@ -315,10 +361,15 @@ export class OperationAuthorityRegistry {
     return {
       authorities: this.authorities.size,
       scopes: new Set([...this.authorities.values()].map((authority) => authority.scopeId)).size,
+      previews: this.previews,
     };
   }
 
-  private prepareAction(action: RequestedAuthorityAction, index: number): StoredAuthorityAction {
+  private prepareAction(
+    action: RequestedAuthorityAction,
+    index: number,
+    allowR0: boolean,
+  ): StoredAuthorityAction {
     if (!action || typeof action !== "object") {
       throw new UniversalBrokerError("PRECONDITION_FAILED", `Invalid authority action at index ${index}.`);
     }
@@ -338,7 +389,7 @@ export class OperationAuthorityRegistry {
       );
     }
     const minimumRisk = this.minimumRisk(descriptor);
-    if (minimumRisk === "R0") {
+    if (minimumRisk === "R0" && !allowR0) {
       throw new UniversalBrokerError(
         "PRECONDITION_FAILED",
         `Authority action ${index} is R0 and must run without task authority: ${descriptor.tool}.${descriptor.operation}.`,
@@ -348,6 +399,12 @@ export class OperationAuthorityRegistry {
     if (!UNIVERSAL_AUTHORITY_RISKS.includes(requestedRisk)) {
       throw new UniversalBrokerError("PRECONDITION_FAILED", `Invalid authority risk at index ${index}.`);
     }
+    if (minimumRisk === "R0" && (action.risk !== undefined || action.uses !== undefined)) {
+      throw new UniversalBrokerError(
+        "PRECONDITION_FAILED",
+        `Authority preview action ${index} is R0; omit risk and uses because no authority is required.`,
+      );
+    }
     if (riskRank(requestedRisk) < riskRank(minimumRisk)) {
       throw new UniversalBrokerError(
         "PRECONDITION_FAILED",
@@ -355,11 +412,14 @@ export class OperationAuthorityRegistry {
       );
     }
     const maximumForRisk = requestedRisk === "R3" ? 1 : requestedRisk === "R2" ? 10 : 50;
-    const maximumUses = boundedInteger(action.uses, 1, 1, maximumForRisk, `actions[${index}].uses`);
+    const maximumUses = minimumRisk === "R0"
+      ? 0
+      : boundedInteger(action.uses, 1, 1, maximumForRisk, `actions[${index}].uses`);
     return {
       id: action.id?.trim() || `action-${index + 1}`,
       descriptor,
       fingerprint: actionFingerprint(descriptor),
+      minimumRisk,
       risk: requestedRisk,
       maximumUses,
       consumedUses: 0,
@@ -474,6 +534,20 @@ function assertUniqueActionIds(actions: StoredAuthorityAction[]): void {
       throw new UniversalBrokerError("PRECONDITION_FAILED", `Duplicate authority action ID: ${action.id}`);
     }
     ids.add(action.id);
+  }
+}
+
+function assertUniqueActionFingerprints(actions: StoredAuthorityAction[]): void {
+  const fingerprints = new Map<string, string>();
+  for (const action of actions) {
+    const previous = fingerprints.get(action.fingerprint);
+    if (previous) {
+      throw new UniversalBrokerError(
+        "PRECONDITION_FAILED",
+        `Duplicate exact authority actions ${previous} and ${action.id}; combine repeated identical calls with one action and uses.`,
+      );
+    }
+    fingerprints.set(action.fingerprint, action.id);
   }
 }
 

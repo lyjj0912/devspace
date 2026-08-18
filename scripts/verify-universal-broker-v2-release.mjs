@@ -42,6 +42,7 @@ verifyRuntimeNoElevationSources();
 verifyOperationAuthoritySources();
 verifySelfManagementSources();
 verifyMetricsIsolationSources();
+verifyP1OperabilitySources();
 verifyDeploymentSources();
 verifyGranularOAuthSources();
 verifyLiveVerifierSources();
@@ -235,7 +236,8 @@ function verifyOperationAuthoritySources() {
   const tests = text("src/v2/authority.test.ts");
   const packageJson = JSON.parse(text("package.json"));
   for (const marker of [
-    'UNIVERSAL_BROKER_VERSION = "2.1.0"',
+    'UNIVERSAL_BROKER_VERSION = "2.1.1"',
+    '"authority_preview"',
     '"authorize"',
     '"authority_status"',
     '"invalidate_authority"',
@@ -248,6 +250,9 @@ function verifyOperationAuthoritySources() {
   }
   for (const marker of [
     "OperationAuthorityRegistry",
+    "preview(actionsInput",
+    "planFingerprint",
+    "assertUniqueActionFingerprints",
     "correctionEpoch",
     "maximumUses",
     "consumedUses",
@@ -268,6 +273,8 @@ function verifyOperationAuthoritySources() {
   }
   for (const marker of [
     "withOperationAuthority",
+    'case "authority_preview"',
+    "authority.preview",
     'case "authorize"',
     "authority.create",
     "authority.require",
@@ -276,6 +283,7 @@ function verifyOperationAuthoritySources() {
     if (!server.includes(marker)) fail(`Operation-authority server gate is missing: ${marker}`);
   }
   for (const marker of [
+    "authority preview classifies exact actions",
     "R3 authority is one-shot",
     "correction invalidates every authority",
     "R0 actions cannot be wrapped",
@@ -344,6 +352,13 @@ function verifyRuntimeNoElevationSources() {
     "denies Authorization Services acquisition",
   ]) {
     if (!tests.includes(marker)) fail(`Runtime no-elevation regression test is missing: ${marker}`);
+  }
+  for (const marker of [
+    "ordinary AppleScript remains usable while administrator AppleScript fails closed",
+    'executable: "/usr/bin/osascript"',
+    "with administrator privileges",
+  ]) {
+    if (!tests.includes(marker)) fail(`macOS AppleScript boundary regression test is missing: ${marker}`);
   }
   if (!packageJson.scripts?.["v2:test"]?.includes("src/v2/no-elevation.test.ts")) {
     fail("The canonical v2 test gate omits no-elevation tests.");
@@ -480,6 +495,113 @@ function verifyMetricsIsolationSources() {
   }
 }
 
+function verifyP1OperabilitySources() {
+  const contracts = text("src/v2/contracts.ts");
+  const authority = text("src/v2/authority.ts");
+  const server = text("src/v2/server.ts");
+  const targets = text("src/v2/targets.ts");
+  const execution = text("src/v2/execution.ts");
+  const filesystem = text("src/v2/filesystem.ts");
+  const doctor = text("src/v2/doctor.ts");
+  const http = text("src/v2/http-server.ts");
+  const authorityTests = text("src/v2/authority.test.ts");
+  const targetTests = text("src/v2/targets.test.ts");
+  const executionTests = text("src/v2/execution.test.ts");
+  const filesystemTests = text("src/v2/filesystem.test.ts");
+  const httpTests = text("src/v2/http-server.test.ts");
+  const live = text("scripts/verify-universal-broker-v2-live.mjs");
+  const load = text("scripts/verify-universal-broker-v2-load.mjs");
+  const planPath = resolve(root, "docs/UNIVERSAL_BROKER_V2_1_P1_PLAN.md");
+  if (!existsSync(planPath)) fail("The authoritative v2.1 P1 plan is missing.");
+
+  for (const marker of [
+    '"authority_preview"',
+    "refresh: z.boolean().optional()",
+    "Use context.authority_preview",
+  ]) {
+    if (!contracts.includes(marker)) fail(`P1 contract marker is missing: ${marker}`);
+  }
+  for (const marker of [
+    "preview(actionsInput",
+    "planFingerprint",
+    "authorityActionCount",
+    "r0ActionCount",
+  ]) {
+    if (!authority.includes(marker)) fail(`P1 authority preview implementation is missing: ${marker}`);
+  }
+  for (const marker of [
+    'case "authority_preview"',
+    "authority.preview",
+    "normalizeRequestedAuthorityActions",
+    "requireAuthorityPlanningInputScopes",
+    "requireAuthorityPlanningScopes",
+    "targets.probe(targetId ?? selector, { refresh })",
+  ]) {
+    if (!server.includes(marker)) fail(`P1 server wiring is missing: ${marker}`);
+  }
+  for (const marker of [
+    "probePosixSshPty",
+    "probeWindowsSshPty",
+    "probeSftp",
+    "cachedObservation",
+    "probeInFlight",
+    "probeCoalesced",
+    "probeCacheHits",
+    "capabilityProbes",
+    'cache: "hit" | "miss" | "shared"',
+  ]) {
+    if (!targets.includes(marker)) fail(`P1 target capability implementation is missing: ${marker}`);
+  }
+  if (targets.includes("not_run_phase_2")) {
+    fail("A stale phase placeholder remains in target capability evidence.");
+  }
+  if (!execution.includes("assertCachedExecutionCapability")) {
+    fail("Execution does not use fresh cached capability evidence before impossible dispatch.");
+  }
+  if (!filesystem.includes("assertCachedSftpCapability")) {
+    fail("Filesystem transfer does not use fresh cached SFTP evidence before dispatch.");
+  }
+  for (const marker of [
+    "targetProbeStats",
+    "mapWithConcurrency",
+    "devspace_authority_previews",
+    "devspace_target_probe_cache_hits",
+    "devspace_target_probe_coalesced",
+    "devspace_target_probe_average_duration_ms",
+  ]) {
+    if (!doctor.includes(marker) && !http.includes(marker)) {
+      fail(`P1 operability telemetry is missing: ${marker}`);
+    }
+  }
+  for (const [source, markers, label] of [
+    [authorityTests, ["authority preview classifies exact actions", "Duplicate exact authority actions"], "authority"],
+    [targetTests, ["POSIX SSH probes verify PTY and SFTP", "concurrent probes for one generation share", "Linux SSH PTY probe rechecks no-new-privileges", "SSH capability probes fail independently"], "target"],
+    [executionTests, ["fresh cached target evidence blocks impossible PTY dispatch"], "execution"],
+    [filesystemTests, ["fresh cached SFTP denial fails before transfer dispatch"], "filesystem"],
+    [httpTests, ["authority-preview-scope-test", "devspace_authority_previews 0", "devspace_target_probe_cache_hits 0", "devspace_target_probe_coalesced 0"], "HTTP metrics and scope"],
+  ]) {
+    for (const marker of markers) {
+      if (!source.includes(marker)) fail(`P1 ${label} regression test is missing: ${marker}`);
+    }
+  }
+  for (const marker of [
+    'operation: "authority_preview"',
+    "refresh: true",
+    "company-pty-ok",
+    "authority preview unexpectedly created its remote fixture path",
+  ]) {
+    if (!live.includes(marker)) fail(`P1 live verifier marker is missing: ${marker}`);
+  }
+  for (const marker of [
+    "DEVSPACE_V2_LOAD_REQUIRE_REAL_SSH",
+    "capabilityProbe",
+    "executionPtyCanary",
+    "missingCapabilities",
+  ]) {
+    if (!load.includes(marker)) fail(`P1 load gate marker is missing: ${marker}`);
+  }
+}
+
 function verifyLiveVerifierSources() {
   const live = text("scripts/verify-universal-broker-v2-live.mjs");
   const deploy = text("scripts/deploy-universal-broker-v2-production.sh");
@@ -495,6 +617,12 @@ function verifyLiveVerifierSources() {
     '"offline_access"',
     "fileMustExist: true",
     "prepareExactAuthority",
+    'operation: "authority_preview"',
+    "authorityPreview.authorityActionCount",
+    "refresh: true",
+    "capabilities?.pty === true",
+    "capabilities?.sftp === true",
+    "company-pty-ok",
     "AUTHORITY_MISMATCH",
     "AUTHORITY_CONSUMED",
     "AUTHORITY_EXPIRED",
@@ -610,6 +738,7 @@ function verifyPackage() {
     /(^|\/)(src|fixtures?|test|tests|privileged|preservation|tmp|temp|scratch|canary|backup)(\/|$)|\.test\.|peer-gate|privileged-client|(?:install|uninstall)[^/]*(?:privileged|remote)[^/]*helper|\.orig$|\.rej$|\.bak$|\.patch$|\.log$/i.test(path)
   );
   const required = [
+    "docs/UNIVERSAL_BROKER_V2_1_P1_PLAN.md",
     "scripts/deploy-universal-broker-v2-production.sh",
     "scripts/cutover-universal-broker-v2-production.sh",
     "scripts/rollback-universal-broker-v2-production.sh",
@@ -701,13 +830,17 @@ function collectSecretValues(value, output, key = "") {
 }
 
 function verifyContract() {
+  const packageJson = JSON.parse(text("package.json"));
+  if (packageJson.version !== "1.0.8") {
+    fail(`Unexpected package version: ${packageJson.version}`);
+  }
   const output = capture(process.execPath, ["--input-type=module", "-e", [
     "import { UNIVERSAL_BROKER_VERSION, UNIVERSAL_TOOL_NAMES } from './dist/v2/contracts.js';",
     "console.log(JSON.stringify({version:UNIVERSAL_BROKER_VERSION,tools:UNIVERSAL_TOOL_NAMES}));",
   ].join("")]);
   const value = JSON.parse(output.trim());
   const expected = ["target", "context", "fs", "exec", "process", "mcp", "artifact", "gui"];
-  if (value.version !== "2.1.0" || JSON.stringify(value.tools) !== JSON.stringify(expected)) {
+  if (value.version !== "2.1.1" || JSON.stringify(value.tools) !== JSON.stringify(expected)) {
     fail(`Unexpected broker contract: ${output}`);
   }
   return value;

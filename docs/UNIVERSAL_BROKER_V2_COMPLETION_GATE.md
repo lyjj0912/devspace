@@ -11,6 +11,10 @@ target context fs exec process mcp artifact gui
 - Context is a workflow default, not an access boundary.
 - Missing context paths are never created.
 - Tool descriptors and model-visible results remain within budgets.
+- `context.authority_preview` is planning-only and cannot create, consume, or
+  grant authority.
+- SSH PTY and SFTP capabilities are verified rather than hard-coded or left as
+  phase placeholders.
 
 ## Operation-authority gate
 

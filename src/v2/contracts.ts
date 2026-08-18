@@ -1,6 +1,6 @@
 import * as z from "zod/v4";
 
-export const UNIVERSAL_BROKER_VERSION = "2.1.0";
+export const UNIVERSAL_BROKER_VERSION = "2.1.1";
 
 export const UNIVERSAL_TOOL_NAMES = [
   "target",
@@ -20,7 +20,7 @@ export type AuthorityRiskClass = (typeof UNIVERSAL_AUTHORITY_RISKS)[number];
 
 export const UNIVERSAL_TOOL_OPERATIONS = {
   target: ["list", "resolve", "probe"],
-  context: ["open", "search", "diff", "close", "authorize", "authority_status", "invalidate_authority", "release_authority"],
+  context: ["open", "search", "diff", "close", "authority_preview", "authorize", "authority_status", "invalidate_authority", "release_authority"],
   fs: [
     "stat",
     "list",
@@ -107,7 +107,7 @@ export const UNIVERSAL_BROKER_INSTRUCTIONS = [
   "Use context only for project instructions, Git state, and a default target/path; it is not an authority boundary.",
   "Use fs for local or remote files, exec plus process for commands, mcp for arbitrary configured MCP servers, artifact for file exchange, and gui only for operating-system UI that has no better protocol.",
   "DevSpace never installs, injects, or reuses privilege-elevation credentials. Commands and file operations run only as the configured target user; any operating-system authorization must be approved directly by the user outside DevSpace.",
-  "R0 inspection needs no authority. Before R1 through R3 operations, prepare exact task authority with context.authorize and pass authorityId; R3 actions are one-shot.",
+  "Use context.authority_preview to classify and batch exact planned actions before the first mutation. R0 needs no authority; prepare R1 through R3 with context.authorize and pass authorityId; R3 is one-shot.",
   "DevSpace blocks privilege-elevation commands at validation and execution boundaries. Higher-authority work is manual and outside DevSpace.",
   "Do not retry an identical failed operation. Provider mutations and commands whose dispatch state is unknown must not be replayed automatically.",
   "Large results are returned through resource handles rather than repeated in tool text.",
@@ -152,6 +152,7 @@ const targetContract = {
     operation: z.enum(UNIVERSAL_TOOL_OPERATIONS.target),
     selector: z.string().min(1).optional(),
     targetId: z.string().min(1).optional(),
+    refresh: z.boolean().optional(),
     cursor: cursorSchema,
     limit: limitSchema,
   },
@@ -166,7 +167,7 @@ const targetContract = {
 const contextContract = {
   title: "Manage context",
   description:
-    "Open, search, diff, or close a project context. Context supplies instructions and defaults; paths must already exist and context is not an access boundary.",
+    "Open, search, diff, or close a project context, or preview and prepare exact operation authority. Context supplies workflow defaults and is not an access boundary.",
   inputSchema: {
     operation: z.enum(UNIVERSAL_TOOL_OPERATIONS.context),
     contextId: z.string().min(1).optional(),

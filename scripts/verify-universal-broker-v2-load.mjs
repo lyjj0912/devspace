@@ -9,7 +9,10 @@ import { promisify } from "node:util";
 const execFileAsync = promisify(execFile);
 const root = resolve(new URL("..", import.meta.url).pathname);
 const quick = process.argv.includes("--quick");
-const requireRealSsh = process.argv.includes("--require-ssh");
+const requireRealSsh = process.argv.includes("--require-ssh")
+  || ["1", "true", "yes", "on"].includes(
+    String(process.env.DEVSPACE_V2_LOAD_REQUIRE_REAL_SSH ?? "").trim().toLowerCase(),
+  );
 const counts = quick
   ? { sessions: 100, contexts: 50, localExec: 50, sshExec: 10, mcp: 20, directoryEntries: 10_000, outputBytes: 10 * 1024 * 1024 }
   : { sessions: 1_000, contexts: 500, localExec: 500, sshExec: 200, mcp: 200, directoryEntries: 100_000, outputBytes: 100 * 1024 * 1024 };
@@ -291,7 +294,7 @@ function authorityContract(scopes, contracts) {
     "devspace.gui",
   ];
   const expectedInputs = {
-    target: ["operation", "selector", "targetId", "cursor", "limit"],
+    target: ["operation", "selector", "targetId", "refresh", "cursor", "limit"],
     context: ["operation", "contextId", "target", "path", "mode", "baseRef", "task", "query", "maxCharacters", "authorityId", "taskId", "authorityText", "actions", "correctionText", "expiresInSeconds", "cursor", "limit"],
     fs: ["operation", "target", "contextId", "path", "destination", "content", "patch", "query", "recursive", "overwrite", "expectedSha256", "disposition", "authorityId", "cursor", "limit"],
     exec: ["target", "contextId", "cwd", "command", "tty", "mode", "yieldMs", "maxOutputChars", "envProfile", "authorityId"],
@@ -377,9 +380,88 @@ async function optionalRealSshLoad(options) {
     completedProcessTtlMs: 60_000,
   });
   try {
-    return await executionLoad(execution, target, options.count);
+    const observation = await targets.probe(target, { refresh: true });
+    const requiredCapabilities = {
+      online: observation.status === "ONLINE",
+      exec: observation.capabilities.exec === true,
+      pty: observation.capabilities.pty === true,
+      sftp: observation.capabilities.sftp === true,
+      fs: observation.capabilities.fs === true,
+    };
+    if (!Object.values(requiredCapabilities).every(Boolean)) {
+      return {
+        passed: false,
+        target,
+        required: options.required,
+        capabilityProbe: {
+          status: observation.status,
+          platform: observation.platform,
+          capabilities: observation.capabilities,
+          evidence: observation.evidence,
+        },
+        missingCapabilities: Object.entries(requiredCapabilities)
+          .filter(([, available]) => !available)
+          .map(([name]) => name),
+      };
+    }
+    const executionResult = await executionLoad(execution, target, options.count);
+    const ptyResult = await executionPtyCanary(execution, target, observation.platform);
+    return {
+      ...executionResult,
+      passed: executionResult.passed && ptyResult.passed,
+      required: options.required,
+      capabilityProbe: {
+        status: observation.status,
+        platform: observation.platform,
+        capabilities: observation.capabilities,
+        evidence: observation.evidence,
+      },
+      ptyCanary: ptyResult,
+    };
   } finally {
     await execution.close();
+  }
+}
+
+async function executionPtyCanary(execution, target, platform) {
+  const command = platform === "windows"
+    ? "if((-not [Console]::IsInputRedirected)-and(-not [Console]::IsOutputRedirected)){Write-Output '__DEVSPACE_REAL_PTY_OK__';exit 0};exit 73"
+    : "test -t 0 && test -t 1 && printf '__DEVSPACE_REAL_PTY_OK__\n'";
+  let result = await execution.execute({
+    target,
+    command,
+    tty: true,
+    mode: "foreground",
+    yieldMs: 30_000,
+    maxOutputChars: 1_000,
+  });
+  try {
+    if (result.state === "RUNNING" || result.state === "STARTING") {
+      result = await execution.operate({
+        operation: "wait",
+        processId: result.processId,
+        waitMs: 30_000,
+        maxOutputChars: 1_000,
+      });
+    }
+    if (result.state === "RUNNING" || result.state === "STARTING") {
+      result = await execution.operate({
+        operation: "signal",
+        processId: result.processId,
+        signal: "SIGTERM",
+        waitMs: 5_000,
+        maxOutputChars: 1_000,
+      });
+    }
+    return {
+      passed: result.state === "EXITED"
+        && result.exitCode === 0
+        && String(result.output ?? "").includes("__DEVSPACE_REAL_PTY_OK__"),
+      state: result.state,
+      exitCode: result.exitCode,
+    };
+  } finally {
+    await execution.operate({ operation: "forget", processId: result.processId }).catch(() => undefined);
   }
 }
 

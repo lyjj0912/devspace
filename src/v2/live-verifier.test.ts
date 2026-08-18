@@ -120,5 +120,10 @@ test("live verifier defaults to parallel v2 and creates only a temporary user to
   assert.match(source, /for \(let attempt = 0; attempt < 2; attempt \+= 1\)/u);
   assert.match(source, /await prepareLocalGuiApplication\(\)/u);
   assert.match(source, /execFileSync\("open", argumentsForOpen/u);
+  assert.match(source, /operation: "authority_preview"/u);
+  assert.match(source, /refresh: true/u);
+  assert.match(source, /capabilities\?\.pty === true/u);
+  assert.match(source, /capabilities\?\.sftp === true/u);
+  assert.match(source, /authority preview unexpectedly created its remote fixture path/u);
   assert.doesNotMatch(source, /templateDatabasePath|--template-database|JSON\.stringify\(\["devspace"/u);
 });

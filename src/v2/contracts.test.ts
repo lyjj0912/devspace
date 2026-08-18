@@ -98,6 +98,44 @@ test("contracts expose only user-account authority", async () => {
   }
 });
 
+test("target capability contract is closed and requires complete observed capability evidence", async () => {
+  const schema = await readJson("../../contracts/capabilities.schema.json") as {
+    required?: string[];
+    properties?: {
+      capabilities?: { required?: string[]; additionalProperties?: boolean };
+      evidence?: {
+        required?: string[];
+        additionalProperties?: boolean;
+        properties?: { cache?: { enum?: string[] } };
+      };
+    };
+  };
+  assert.deepEqual(schema.required, [
+    "targetId",
+    "status",
+    "observedAt",
+    "expiresAt",
+    "platform",
+    "capabilities",
+    "evidence",
+  ]);
+  assert.deepEqual(schema.properties?.capabilities?.required, [
+    "fs",
+    "exec",
+    "pty",
+    "sftp",
+    "rsync",
+    "git",
+    "gui",
+    "mcp",
+    "durableProcess",
+  ]);
+  assert.equal(schema.properties?.capabilities?.additionalProperties, false);
+  assert.deepEqual(schema.properties?.evidence?.required, ["transport"]);
+  assert.equal(schema.properties?.evidence?.additionalProperties, false);
+  assert.deepEqual(schema.properties?.evidence?.properties?.cache?.enum, ["hit", "miss", "shared"]);
+});
+
 test("all JSON contract files parse", async () => {
   for (const path of [
     "../../contracts/tools-v2.schema.json",

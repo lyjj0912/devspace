@@ -19,6 +19,11 @@ mode `0600`:
 ~/.devspace/universal-broker-v2-production.env
 ```
 
+SSH PTY and SFTP support are verified with bounded read-only probes and cached by
+target-registry generation and TTL. Use `target.probe(refresh=true)` after an
+external target configuration or availability change; normal execution does not
+implicitly repeat the probe.
+
 Important production values include:
 
 ```text
@@ -41,6 +46,9 @@ npm test
 npm run build
 npm run v2:budget
 npm run v2:load
+DEVSPACE_V2_LOAD_TARGET_CONFIG="$HOME/.devspace/targets.v2.json" \
+DEVSPACE_V2_LOAD_SSH_TARGET=company \
+DEVSPACE_V2_LOAD_REQUIRE_REAL_SSH=1 npm run v2:load
 npm run release:verify -- --require-clean
 ```
 
@@ -48,13 +56,18 @@ npm run release:verify -- --require-clean
 audit with low-or-higher findings blocked, build, budget, quick load,
 source/package boundary scans, granular OAuth checks, operation-authority checks,
 runtime no-elevation checks, restart-worker checks, and metrics isolation checks.
-Production deployment additionally runs full and real-target load/live canaries.
+The second load command is the final P1 source gate: real SSH, PTY, SFTP, and
+transfer-capable remote-filesystem evidence are mandatory rather than an optional
+load add-on. Production deployment additionally runs full real-target and live
+canaries.
 
 ## Operation authority workflow
 
-R0 reads need no lease. Before an R1–R3 action, prepare the exact action through
-`context.authorize` using the current controlling instruction, then pass the
-returned `authorityId` to that exact call.
+Use `context.authority_preview` before the first mutation to classify and batch
+the exact planned calls without dispatching or creating authority. R0 reads need
+no lease. Prepare only the returned R1–R3 actions through `context.authorize`
+using the current controlling instruction, then pass the returned `authorityId`
+to those exact calls.
 
 An authority record does not wildcard another path, command, target, route, GUI
 generation, or argument set. Target and MCP authorities also bind the current

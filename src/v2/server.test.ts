@@ -20,7 +20,7 @@ test("Universal Broker v2 exposes exactly the fixed eight-tool surface within bu
 
 test("tools without an injected implementation fail explicitly without changing the registered schema", async () => {
   const server = createUniversalBrokerMcpServer();
-  const client = new Client({ name: "v2-skeleton-test", version: "1.0.0" });
+  const client = new Client({ name: "v2-service-test", version: "1.0.0" });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await Promise.all([
     client.connect(clientTransport),

@@ -1,6 +1,6 @@
 {
   "name": "@waishnav/devspace",
-  "version": "1.0.7",
+  "version": "1.0.8",
   "description": "Universal MCP broker for local and remote development capabilities.",
   "type": "module",
   "main": "dist/v2/server.js",

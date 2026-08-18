@@ -27,18 +27,36 @@ export async function collectUniversalBrokerDoctor(
     inspectUniversalBrokerBudgets(),
     gitCommit(),
   ]);
-  const observations = [];
-  for (const target of targetSnapshot.targets) {
+  const observations = await mapWithConcurrency(targetSnapshot.targets, 4, async (target) => {
     try {
-      observations.push(await targets.probe(target.id));
+      return await targets.probe(target.id);
     } catch (error) {
-      observations.push({
+      const observedAt = new Date().toISOString();
+      return {
         targetId: target.id,
-        status: "UNKNOWN",
+        status: "UNKNOWN" as const,
+        observedAt,
+        expiresAt: observedAt,
+        platform: target.platform,
+        capabilities: {
+          fs: false,
+          exec: false,
+          pty: false,
+          sftp: false,
+          rsync: false,
+          git: false,
+          gui: false,
+          mcp: false,
+          durableProcess: false,
+        },
         reason: errorMessage(error),
-      });
+        evidence: {
+          transport: target.transport,
+          ...(target.sshHost ? { sshHost: target.sshHost } : {}),
+        },
+      };
     }
-  }
+  });
   const [targetFile, routeFile, envProfileFile] = await Promise.all([
     safePathMetadata(config.targetConfigPath),
     safePathMetadata(config.mcpRouteConfigPath),
@@ -94,6 +112,7 @@ export async function collectUniversalBrokerDoctor(
       },
     },
     targets: observations,
+    targetProbeStats: targets.stats(),
     quotas: {
       httpMcpSessions: config.maximumMcpSessions,
       httpMcpIdleTtlMs: config.mcpSessionIdleTimeoutMs,
@@ -122,6 +141,27 @@ export async function collectUniversalBrokerDoctor(
       guiSessionTtlMs: config.guiSessionTtlMs,
     },
   };
+}
+
+async function mapWithConcurrency<T, R>(
+  values: readonly T[],
+  maximumConcurrency: number,
+  mapper: (value: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const output = new Array<R>(values.length);
+  let nextIndex = 0;
+  const workers = Array.from(
+    { length: Math.min(Math.max(maximumConcurrency, 1), values.length) },
+    async () => {
+      while (nextIndex < values.length) {
+        const index = nextIndex;
+        nextIndex += 1;
+        output[index] = await mapper(values[index]!, index);
+      }
+    },
+  );
+  await Promise.all(workers);
+  return output;
 }
 
 async function safePathMetadata(path: string): Promise<Record<string, unknown>> {

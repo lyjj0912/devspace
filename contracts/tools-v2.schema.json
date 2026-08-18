@@ -11,7 +11,7 @@
   ],
   "properties": {
     "version": {
-      "const": "2.1.0"
+      "const": "2.1.1"
     },
     "tools": {
       "type": "object",
@@ -136,6 +136,7 @@
                 "search",
                 "diff",
                 "close",
+                "authority_preview",
                 "authorize",
                 "authority_status",
                 "invalidate_authority",

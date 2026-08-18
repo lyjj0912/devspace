@@ -100,6 +100,63 @@ async function runCanaries(client, root, canaries) {
   assert(targetIds.includes(options.companyTarget), `company target is missing: ${options.companyTarget}`);
   canaries.targets = targetIds;
 
+  const previewOnlyPath = join(root, "authority-preview-only.txt");
+  const previewRemotePath = `/tmp/devspace-preview-only-${randomUUID()}.txt`;
+  const authorityPreview = data(await client.callTool({
+    name: "context",
+    arguments: {
+      operation: "authority_preview",
+      actions: [
+        {
+          id: "r0-inspection",
+          tool: "exec",
+          arguments: { target: "local", cwd: root, command: "git status --short", mode: "foreground" },
+        },
+        {
+          id: "r1-local-write",
+          tool: "fs",
+          arguments: { operation: "write", path: previewOnlyPath, content: "preview-only\n" },
+        },
+        {
+          id: "r2-remote-write",
+          tool: "fs",
+          arguments: { operation: "write", target: options.companyTarget, path: previewRemotePath, content: "preview-only\n" },
+        },
+        {
+          id: "r3-push",
+          tool: "exec",
+          arguments: { target: "local", cwd: root, command: "git push origin main", mode: "foreground" },
+        },
+      ],
+    },
+  }));
+  assert(authorityPreview.authorityActionCount === 3, "authority preview mutation count is incorrect");
+  assert(authorityPreview.r0ActionCount === 1, "authority preview R0 count is incorrect");
+  assert(
+    JSON.stringify((authorityPreview.actions ?? []).map((action) => action.minimumRisk))
+      === JSON.stringify(["R0", "R1", "R2", "R3"]),
+    "authority preview risk classification is incorrect",
+  );
+  await assertPathMissing(previewOnlyPath);
+  const remotePreviewStat = await client.callTool({
+    name: "fs",
+    arguments: {
+      operation: "stat",
+      target: options.companyTarget,
+      path: previewRemotePath,
+    },
+  });
+  assert(
+    errorCode(remotePreviewStat) === "PATH_NOT_FOUND",
+    "authority preview unexpectedly created its remote fixture path",
+  );
+  canaries.authorityPreview = {
+    planFingerprint: authorityPreview.planFingerprint,
+    risks: authorityPreview.actions.map((action) => action.minimumRisk),
+    localDispatched: false,
+    remoteDispatched: false,
+  };
+
   const file = join(root, "plain.txt");
   const copy = join(root, "plain-copy.txt");
   await call(client, "fs", { operation: "write", path: file, content: "user-file\n", overwrite: false });
@@ -296,8 +353,12 @@ async function runCanaries(client, root, canaries) {
   const companyProbe = data(await call(client, "target", {
     operation: "probe",
     targetId: options.companyTarget,
+    refresh: true,
   }));
   assert(companyProbe.observation?.status === "ONLINE", "company Mac target is not online");
+  assert(companyProbe.observation?.capabilities?.pty === true, "company Mac PTY probe is not verified");
+  assert(companyProbe.observation?.capabilities?.sftp === true, "company Mac SFTP probe is not verified");
+  assert(companyProbe.observation?.capabilities?.fs === true, "company Mac complete filesystem capability is unavailable");
   const companyTemporary = companyProbe.observation?.temporaryDirectory;
   assert(typeof companyTemporary === "string" && companyTemporary.startsWith("/"), "company Mac temporary directory is unavailable");
   const companyExec = data(await call(client, "exec", {
@@ -308,6 +369,17 @@ async function runCanaries(client, root, canaries) {
     yieldMs: 30_000,
   }));
   assert(companyExec.state === "EXITED" && String(companyExec.output).includes("company-exec-ok"), "company Mac user exec failed");
+  const companyPty = data(await call(client, "exec", {
+    target: options.companyTarget,
+    command: "test -t 0 && test -t 1 && stty size && printf 'company-pty-ok\n'",
+    tty: true,
+    mode: "foreground",
+    yieldMs: 30_000,
+  }));
+  assert(
+    companyPty.state === "EXITED" && String(companyPty.output).includes("company-pty-ok"),
+    "company Mac verified PTY execution failed",
+  );
   const companyPath = `${companyTemporary.replace(/\/+$/, "")}/devspace-v2-${randomUUID()}.txt`;
   await call(client, "artifact", {
     operation: "copy",
@@ -334,11 +406,12 @@ async function runCanaries(client, root, canaries) {
     path: companyPath,
     disposition: "permanent",
   });
-  canaries.company = { exec: true, filesystem: true, artifact: true };
+  canaries.company = { exec: true, pty: true, sftp: true, filesystem: true, artifact: true };
 
   const windowsProbe = data(await call(client, "target", {
     operation: "probe",
     targetId: options.windowsTarget,
+    refresh: true,
   }));
   assert(windowsProbe.observation?.status === "ONLINE", "Windows target is not online");
   const windowsTemporary = windowsProbe.observation?.temporaryDirectory;
@@ -591,6 +664,21 @@ async function runCanaries(client, root, canaries) {
 
   await call(client, "fs", { operation: "remove", path: artifactDestination, disposition: "permanent" });
   await call(client, "fs", { operation: "remove", path: file, disposition: "permanent" });
+}
+
+async function assertPathMissing(path) {
+  const result = await clientlessLocalStat(path);
+  assert(result === false, `authority preview unexpectedly created ${path}`);
+}
+
+async function clientlessLocalStat(path) {
+  try {
+    await readFile(path, "utf8");
+    return true;
+  } catch (error) {
+    if (error && typeof error === "object" && error.code === "ENOENT") return false;
+    throw error;
+  }
 }
 
 async function prepareLocalGuiApplication() {

@@ -178,6 +178,7 @@ test("production HTTP rejects legacy-scope tokens and accepts granular tokens", 
   });
   const legacyToken = `legacy-${randomUUID()}`;
   const granularToken = `granular-${randomUUID()}`;
+  const readOnlyToken = `read-only-${randomUUID()}`;
   const store = new SqliteOAuthStore(config.oauthStateDir);
   const registered = store.registerClient({
     redirect_uris: ["http://127.0.0.1/callback"],
@@ -189,6 +190,7 @@ test("production HTTP rejects legacy-scope tokens and accepts granular tokens", 
   for (const [token, scopes] of [
     [legacyToken, ["devspace"]],
     [granularToken, [...config.oauth.scopes]],
+    [readOnlyToken, ["devspace.read"]],
   ] as const) {
     store.saveAccessToken(createHash("sha256").update(token).digest("base64url"), {
       clientId: registered.client_id,
@@ -225,13 +227,50 @@ test("production HTTP rejects legacy-scope tokens and accepts granular tokens", 
     const targets = await acceptedClient.callTool({ name: "target", arguments: { operation: "list" } });
     assert.notEqual(targets.isError, true);
     await acceptedClient.close();
+
+    const readOnlyTransport = new StreamableHTTPClientTransport(endpoint, {
+      requestInit: { headers: { Authorization: `Bearer ${readOnlyToken}` } },
+    });
+    const readOnlyClient = new Client({ name: "authority-preview-scope-test", version: "1" });
+    await readOnlyClient.connect(readOnlyTransport);
+    const readPreview = await readOnlyClient.callTool({
+      name: "context",
+      arguments: {
+        operation: "authority_preview",
+        actions: [{
+          tool: "fs",
+          arguments: { operation: "read", target: "local", path: "/tmp/example.txt" },
+        }],
+      },
+    });
+    assert.notEqual(readPreview.isError, true, JSON.stringify(readPreview.structuredContent));
+    const execPreview = await readOnlyClient.callTool({
+      name: "context",
+      arguments: {
+        operation: "authority_preview",
+        actions: [{
+          tool: "exec",
+          arguments: { target: "local", cwd: "/tmp", command: "git status --short" },
+        }],
+      },
+    });
+    assert.equal(execPreview.isError, true);
+    assert.equal(
+      (execPreview.structuredContent as { error?: { code?: string; evidence?: { requiredScope?: string } } } | undefined)?.error?.code,
+      "PERMISSION_DENIED",
+    );
+    assert.equal(
+      (execPreview.structuredContent as { error?: { evidence?: { requiredScope?: string } } } | undefined)?.error?.evidence?.requiredScope,
+      "devspace.exec",
+    );
+    await readOnlyClient.close();
   } finally {
     await new Promise<void>((resolve) => http.close(() => resolve()));
     await running.close();
   }
 });
 
-test("parallel v2 HTTP skeleton has an independent health endpoint and protected MCP endpoint", async (t) => {
+test("parallel v2 HTTP service has an independent health endpoint and protected MCP endpoint", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "devspace-v2-http-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const mcpRoutes = join(root, "mcp-routes.json");
@@ -352,6 +391,15 @@ test("parallel v2 HTTP skeleton has an independent health endpoint and protected
     await requestStatus(`${origin}${config.metricsPath}`, "home-ai.example.test"),
     403,
   );
+  const localMetrics = await fetch(`${origin}${config.metricsPath}`);
+  assert.equal(localMetrics.status, 200);
+  const localMetricsText = await localMetrics.text();
+  assert.match(localMetricsText, /devspace_authority_previews 0/u);
+  assert.match(localMetricsText, /devspace_target_probe_in_flight 0/u);
+  assert.match(localMetricsText, /devspace_target_probe_cache_hits 0/u);
+  assert.match(localMetricsText, /devspace_target_probe_cache_misses 0/u);
+  assert.match(localMetricsText, /devspace_target_probe_coalesced 0/u);
+  assert.match(localMetricsText, /devspace_target_probe_average_duration_ms 0/u);
   const health = await fetch(`${origin}/healthz-next`);
   assert.equal(health.status, 200);
   const healthBody = await health.json() as {
@@ -412,6 +460,7 @@ test("parallel v2 HTTP skeleton has an independent health endpoint and protected
   );
 
   const token = `v2-test-${randomUUID()}`;
+  const readOnlyPlanningToken = `v2-read-only-${randomUUID()}`;
   const oauthStore = new SqliteOAuthStore(config.stateDir);
   const registered = oauthStore.registerClient({
     redirect_uris: ["http://127.0.0.1/callback"],
@@ -426,7 +475,64 @@ test("parallel v2 HTTP skeleton has an independent health endpoint and protected
     expiresAt: Math.floor(Date.now() / 1000) + 300,
     resource: config.publicMcpUrl,
   });
+  oauthStore.saveAccessToken(
+    createHash("sha256").update(readOnlyPlanningToken).digest("base64url"),
+    {
+      clientId: registered.client_id,
+      scopes: ["devspace.read"],
+      expiresAt: Math.floor(Date.now() / 1000) + 300,
+      resource: config.publicMcpUrl,
+    },
+  );
   oauthStore.close();
+
+  const readOnlyPlanningTransport = new StreamableHTTPClientTransport(
+    new URL(`${origin}${config.endpointPath}`),
+    {
+      requestInit: {
+        headers: { Authorization: `Bearer ${readOnlyPlanningToken}` },
+      },
+    },
+  );
+  const readOnlyPlanningClient = new Client({
+    name: "v2-authority-preview-preflight-scope-test",
+    version: "1.0.0",
+  });
+  await readOnlyPlanningClient.connect(readOnlyPlanningTransport);
+  try {
+    assert.equal((await running.mcpProxy.stats()).sessions, 0);
+    const deniedMcpPreview = await readOnlyPlanningClient.callTool({
+      name: "context",
+      arguments: {
+        operation: "authority_preview",
+        actions: [{
+          tool: "mcp",
+          arguments: {
+            operation: "invoke",
+            route: "fixture",
+            name: "read_value",
+            arguments: { key: "must-not-inspect-provider" },
+          },
+        }],
+      },
+    });
+    assert.equal(deniedMcpPreview.isError, true);
+    assert.equal(
+      (deniedMcpPreview.structuredContent as {
+        error?: { code?: string; evidence?: { requiredScope?: string } };
+      } | undefined)?.error?.code,
+      "PERMISSION_DENIED",
+    );
+    assert.equal(
+      (deniedMcpPreview.structuredContent as {
+        error?: { evidence?: { requiredScope?: string } };
+      } | undefined)?.error?.evidence?.requiredScope,
+      "devspace.mcp",
+    );
+    assert.equal((await running.mcpProxy.stats()).sessions, 0);
+  } finally {
+    await readOnlyPlanningClient.close();
+  }
 
   const transport = new StreamableHTTPClientTransport(
     new URL(`${origin}${config.endpointPath}`),
@@ -518,6 +624,104 @@ test("parallel v2 HTTP skeleton has an independent health endpoint and protected
     assert.equal(contextError?.code, "PATH_NOT_FOUND");
 
     const filePath = join(root, "http-fs-v2.txt");
+    const previewSecretContent = "preview-secret-content-must-not-echo";
+    const previewSecretMcpValue = "preview-secret-mcp-value-must-not-echo";
+    const authorityPreview = await client.callTool({
+      name: "context",
+      arguments: {
+        operation: "authority_preview",
+        actions: [
+          {
+            id: "local-write",
+            tool: "fs",
+            arguments: {
+              operation: "write",
+              path: filePath,
+              content: previewSecretContent,
+            },
+          },
+          {
+            id: "provider-read",
+            tool: "mcp",
+            arguments: {
+              operation: "invoke",
+              route: "fixture",
+              name: "read_value",
+              arguments: { key: "http" },
+            },
+          },
+          {
+            id: "provider-write",
+            tool: "mcp",
+            arguments: {
+              operation: "invoke",
+              route: "fixture",
+              name: "write_value",
+              arguments: { key: "http", value: previewSecretMcpValue },
+            },
+          },
+        ],
+      },
+    });
+    assert.notEqual(authorityPreview.isError, true, JSON.stringify(authorityPreview.structuredContent));
+    const serializedPreview = JSON.stringify(authorityPreview.structuredContent);
+    assert.doesNotMatch(serializedPreview, new RegExp(previewSecretContent, "u"));
+    assert.doesNotMatch(serializedPreview, new RegExp(previewSecretMcpValue, "u"));
+    const previewData = (authorityPreview.structuredContent as {
+      data?: {
+        planFingerprint?: string;
+        authorityActionCount?: number;
+        r0ActionCount?: number;
+        actions?: Array<{
+          id?: string;
+          minimumRisk?: string;
+          authorityRequired?: boolean;
+          target?: string;
+          resource?: string;
+          parameterKeys?: string[];
+        }>;
+      };
+    } | undefined)?.data;
+    assert.equal(typeof previewData?.planFingerprint, "string");
+    assert.equal(previewData?.authorityActionCount, 2);
+    assert.equal(previewData?.r0ActionCount, 1);
+    assert.deepEqual(
+      previewData?.actions?.map(({ id, minimumRisk, authorityRequired }) => ({ id, minimumRisk, authorityRequired })),
+      [
+        { id: "local-write", minimumRisk: "R1", authorityRequired: true },
+        { id: "provider-read", minimumRisk: "R0", authorityRequired: false },
+        { id: "provider-write", minimumRisk: "R2", authorityRequired: true },
+      ],
+    );
+    assert.equal(previewData?.actions?.[0]?.target, "local");
+    assert.deepEqual(
+      previewData?.actions?.[0]?.parameterKeys,
+      ["contentSha256", "path", "targetGeneration"],
+    );
+    assert.equal(previewData?.actions?.[1]?.resource, "fixture");
+    assert.deepEqual(
+      previewData?.actions?.[1]?.parameterKeys,
+      ["arguments", "name", "readOnly", "routeFingerprint"],
+    );
+    assert.deepEqual(
+      previewData?.actions?.[2]?.parameterKeys,
+      ["arguments", "name", "routeFingerprint"],
+    );
+    const unapprovedWrite = await client.callTool({
+      name: "fs",
+      arguments: {
+        operation: "write",
+        path: filePath,
+        content: "must-not-dispatch\n",
+      },
+    });
+    assert.equal(unapprovedWrite.isError, true);
+    assert.equal(
+      (unapprovedWrite.structuredContent as { error?: { code?: string } } | undefined)?.error?.code,
+      "AUTHORITY_REQUIRED",
+    );
+    await assert.rejects(readFile(filePath, "utf8"), { code: "ENOENT" });
+
     const fileWrite = await callAuthorized(client, {
       taskId: "http-fs-write",
       authorityText: "Write this exact local fixture file.",
