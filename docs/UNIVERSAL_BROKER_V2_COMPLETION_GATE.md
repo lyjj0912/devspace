@@ -70,6 +70,9 @@ target context fs exec process mcp artifact gui
   Windows becomes mandatory when `--windows-live-target` is supplied. An
   unselected or offline configured target is reported truthfully, not certified.
 - Generic MCP read, write, destructive invocation, resources, and prompts pass.
+- Bounded provider-readiness retry is restricted to a freshly described,
+  explicitly read-only and non-destructive MCP tool. Mutation and destructive
+  invocations are not replayed.
 - Chrome DevTools, Jira, and generic computer-use routes are exercised through
   `mcp`.
 - Artifact inbound, outbound, and target-to-target transfer pass.

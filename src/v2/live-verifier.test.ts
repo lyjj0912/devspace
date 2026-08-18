@@ -127,6 +127,11 @@ test("live verifier defaults to parallel v2 and creates only a temporary user to
   assert.match(source, /windowsTarget: undefined/u);
   assert.match(source, /No explicit Windows live target was supplied/u);
   assert.match(source, /if \(options\.windowsTarget\)/u);
+  assert.match(source, /callReadOnlyMcpWhenReady/u);
+  assert.match(source, /readOnlyHint === true/u);
+  assert.match(source, /destructiveHint !== true/u);
+  assert.match(source, /MCP_PROVIDER_ERROR.*MCP_TRANSPORT_ERROR/u);
+  assert.match(source, /unexpectedly requires mutation authority/u);
   assert.match(source, /authority preview unexpectedly created its remote fixture path/u);
   assert.doesNotMatch(source, /templateDatabasePath|--template-database|JSON\.stringify\(\["devspace"/u);
 });

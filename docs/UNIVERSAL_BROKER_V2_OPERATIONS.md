@@ -69,7 +69,10 @@ load add-on. Production upgrade always requires the selected POSIX target
 (default `company`). Add `--windows-live-target windows` only when that endpoint
 is intentionally online and must be certified in the same transaction; other
 configured offline targets remain truthful `OFFLINE` observations rather than
-blocking unrelated production cutover.
+blocking unrelated production cutover. A live provider readiness check may retry
+only an exact tool whose current descriptor is explicitly `readOnlyHint=true`
+and not destructive. Mutating or destructive downstream MCP calls are never
+replayed by the verifier.
 
 ## Operation authority workflow
 

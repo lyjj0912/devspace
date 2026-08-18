@@ -529,14 +529,21 @@ async function runCanaries(client, root, canaries) {
     query: "search issue",
     limit: 5,
   });
-  const chrome = data(await call(client, "mcp", {
+  const chromeReadiness = await callReadOnlyMcpWhenReady(client, {
     operation: "invoke",
     route: options.chromeRoute,
     name: "list_pages",
     arguments: {},
     responsePolicy: { maxCharacters: 12_000, preserveFullResult: true },
-  }));
+  });
+  const chrome = data(chromeReadiness.result);
   assert(chrome.result, "Chrome DevTools MCP invocation failed");
+  canaries.chromeReadiness = {
+    route: options.chromeRoute,
+    tool: "list_pages",
+    attempts: chromeReadiness.attempts,
+    readOnly: true,
+  };
   const chromeMutation = data(await call(client, "mcp", {
     operation: "invoke",
     route: options.chromeRoute,
@@ -729,6 +736,43 @@ function fetchArtifact(resourceUri) {
     if (replacementPrefix) value.pathname = `${replacementPrefix}${value.pathname}`;
   }
   return fetch(value);
+}
+
+async function callReadOnlyMcpWhenReady(
+  client,
+  args,
+  { maximumAttempts = 12, delayMs = 500 } = {},
+) {
+  assert(args?.operation === "invoke", "read-only MCP readiness helper requires invoke");
+  assert(typeof args.route === "string" && args.route.length > 0, "read-only MCP readiness helper requires route");
+  assert(typeof args.name === "string" && args.name.length > 0, "read-only MCP readiness helper requires tool name");
+  let lastResult;
+  for (let attempt = 1; attempt <= maximumAttempts; attempt += 1) {
+    const described = data(await call(client, "mcp", {
+      operation: "describe_tool",
+      route: args.route,
+      name: args.name,
+    }));
+    const tool = described.result?.value?.tool ?? described.result?.tool ?? described.tool;
+    assert(tool?.name === args.name, `MCP descriptor mismatch for ${args.route}.${args.name}`);
+    assert(tool.annotations?.readOnlyHint === true, `${args.route}.${args.name} is not explicitly read-only`);
+    assert(tool.annotations?.destructiveHint !== true, `${args.route}.${args.name} is marked destructive`);
+
+    const result = await client.callTool({ name: "mcp", arguments: args });
+    if (result.isError !== true && result.structuredContent?.ok !== false) {
+      return { result, attempts: attempt };
+    }
+    lastResult = result;
+    const code = errorCode(result);
+    assert(code !== "AUTHORITY_REQUIRED", `${args.route}.${args.name} unexpectedly requires mutation authority`);
+    if (!new Set(["MCP_PROVIDER_ERROR", "MCP_TRANSPORT_ERROR"]).has(code) || attempt === maximumAttempts) {
+      break;
+    }
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, delayMs));
+  }
+  throw new Error(
+    `read-only MCP readiness failed: ${JSON.stringify(lastResult?.structuredContent ?? lastResult?.content).slice(0, 4_000)}`,
+  );
 }
 
 async function call(client, name, args) {
