@@ -66,7 +66,7 @@ exception. DevSpace accepts only `/usr/bin/osascript`, the exact installed
 owner-only regular-file path, its built-in source SHA-256, and a bounded
 capabilities/observe/act argument grammar. Local execution rechecks canonical
 path, owner, mode, and hash immediately before spawn; SSH execution verifies the
-remote SHA-256 before `exec`. Arbitrary scripts, `osascript -e`, shell operators,
+remote SHA-256 before invoking the node. The verification and invocation run inside a bounded subshell that returns to the outer SSH marker shell, so both success and policy rejection retain their exact exit code and completion evidence. Arbitrary scripts, `osascript -e`, shell operators,
 environment profiles, and malformed GUI arguments fail closed. GUI mutation
 still requires a fresh generation and one-shot R3 authority.
 

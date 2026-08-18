@@ -194,7 +194,7 @@ export function posixRemoteUserOnlyRunner(
     const quotedPath = shellQuote(policy.scriptPath);
     const quotedHash = shellQuote(policy.scriptSha256);
     const exactCommand = [exact.executable, ...exact.args].map(shellQuote).join(" ");
-    return [
+    const exactScript = [
       `[ -f ${quotedPath} ] && [ ! -L ${quotedPath} ] || exit 78`,
       `[ "$(/bin/realpath -- ${quotedPath})" = ${quotedPath} ] || exit 78`,
       `[ "$(/usr/bin/stat -f '%u' -- ${quotedPath})" = "$(/usr/bin/id -u)" ] || exit 78`,
@@ -202,8 +202,9 @@ export function posixRemoteUserOnlyRunner(
       `[ "$((8#$mode & 8#22))" -eq 0 ] || exit 78`,
       `actual=$(/usr/bin/shasum -a 256 -- ${quotedPath} | /usr/bin/awk '{print $1}')`,
       `[ "$actual" = ${quotedHash} ] || exit 78`,
-      `exec ${exactCommand}`,
+      exactCommand,
     ].join("; ");
+    return `(${exactScript})`;
   }
   const quotedCommand = shellQuote(command);
   if (platform === "macos") {

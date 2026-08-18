@@ -83,6 +83,9 @@ target context fs exec process mcp artifact gui
   combination fail closed.
 - Local/SSH stdio MCP children remain under the generic no-elevation wrapper and
   cannot select the GUI exact-execution contract.
+- The exact remote GUI invocation returns to the SSH marker shell; success and
+  policy rejection both emit a deterministic completion marker with the actual
+  exit code instead of becoming an ambiguous post-dispatch `UNKNOWN` result.
 - Authority canaries cover R0, R1, R2, R3, mismatch, consumption, correction,
   and dispatch uncertainty.
 

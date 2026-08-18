@@ -144,20 +144,25 @@ test("exact GUI internal execution accepts only the bound owner script and argum
   const remote = posixRemoteUserOnlyRunner("macos", "sh", command, policy);
   assert.match(remote, /\/usr\/bin\/shasum -a 256/u);
   assert.match(remote, new RegExp(policy.scriptSha256, "u"));
+  assert.match(remote, /^\(/u);
+  assert.match(remote, /\)$/u);
   assert.match(remote, /\[ -f/u);
   assert.match(remote, /! -L/u);
   assert.match(remote, /\/bin\/realpath/u);
   assert.match(remote, /\/usr\/bin\/stat -f '%u'/u);
   assert.match(remote, /8#\$mode & 8#22/u);
-  assert.match(remote, /exec '\/usr\/bin\/osascript'/u);
+  assert.match(remote, /'\/usr\/bin\/osascript'/u);
+  assert.doesNotMatch(remote, /(?:^|;\s*)exec\s+'\/usr\/bin\/osascript'/u);
   assert.doesNotMatch(remote, /sandbox-exec/u);
   if (process.platform === "darwin") {
-    const remoteResult = spawnSync("/bin/sh", ["-lc", remote], {
+    const framed = `${remote}; rc=$?; printf '__DEVSPACE_TEST_COMPLETED__:%s\n' "$rc"; exit 0`;
+    const remoteResult = spawnSync("/bin/sh", ["-lc", framed], {
       encoding: "utf8",
       timeout: 5_000,
     });
     assert.equal(remoteResult.status, 0, remoteResult.stderr);
-    assert.equal(remoteResult.stdout.trim(), "capabilities");
+    assert.match(remoteResult.stdout, /capabilities/u);
+    assert.match(remoteResult.stdout, /__DEVSPACE_TEST_COMPLETED__:0/u);
   }
 });
 
@@ -214,11 +219,14 @@ test("exact GUI internal execution fails closed on path, hash, mode, symlink, sh
   );
   if (process.platform === "darwin") {
     const remote = posixRemoteUserOnlyRunner("macos", "sh", valid, policy);
-    const remoteResult = spawnSync("/bin/sh", ["-lc", remote], {
+    const framed = `${remote}; rc=$?; printf '__DEVSPACE_TEST_COMPLETED__:%s\n' "$rc"; exit 0`;
+    const remoteResult = spawnSync("/bin/sh", ["-lc", framed], {
       encoding: "utf8",
       timeout: 5_000,
     });
-    assert.equal(remoteResult.status, 78, remoteResult.stderr);
+    assert.equal(remoteResult.status, 0, remoteResult.stderr);
+    assert.doesNotMatch(remoteResult.stdout, /capabilities/u);
+    assert.match(remoteResult.stdout, /__DEVSPACE_TEST_COMPLETED__:78/u);
   }
 });
 

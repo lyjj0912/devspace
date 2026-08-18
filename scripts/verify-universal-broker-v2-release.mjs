@@ -370,6 +370,8 @@ function verifyRuntimeNoElevationSources() {
     "exact GUI internal execution accepts only the bound owner script and argument grammar",
     "exact GUI internal execution fails closed on path, hash, mode, symlink, shell, and argument drift",
     "MCP provider children remain in the generic no-elevation wrapper",
+    "__DEVSPACE_TEST_COMPLETED__:0",
+    "__DEVSPACE_TEST_COMPLETED__:78",
     'executable: "/usr/bin/osascript"',
     "with administrator privileges",
   ]) {
@@ -380,6 +382,15 @@ function verifyRuntimeNoElevationSources() {
   }
   if (!text("src/v2/execution.test.ts").includes("internal GUI execution cannot combine its exact contract with an environment profile")) {
     fail("The internal GUI environment-profile denial regression test is missing.");
+  }
+  if (boundary.includes("`exec ${exactCommand}`")) {
+    fail("Exact remote GUI execution replaces the SSH completion-marker shell.");
+  }
+  for (const marker of [
+    "const exactScript = [",
+    "return `(${exactScript})`",
+  ]) {
+    if (!boundary.includes(marker)) fail(`Exact remote GUI subshell framing is missing: ${marker}`);
   }
   const guiSource = text("src/v2/gui.ts");
   for (const marker of [
