@@ -63,7 +63,12 @@ target context fs exec process mcp artifact gui
 
 - Local and external-storage lifecycle passes.
 - Local PTY and managed-process lifecycle passes.
-- POSIX SSH and Windows SSH user-account execution/filesystem pass.
+- POSIX SSH and Windows SSH user-account execution/filesystem pass deterministic
+  integration tests.
+- Production live canaries are mandatory only for targets explicitly selected by
+  the upgrade transaction. `company` is the default required real target;
+  Windows becomes mandatory when `--windows-live-target` is supplied. An
+  unselected or offline configured target is reported truthfully, not certified.
 - Generic MCP read, write, destructive invocation, resources, and prompts pass.
 - Chrome DevTools, Jira, and generic computer-use routes are exercised through
   `mcp`.

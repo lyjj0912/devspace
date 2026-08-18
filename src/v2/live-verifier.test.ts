@@ -124,6 +124,9 @@ test("live verifier defaults to parallel v2 and creates only a temporary user to
   assert.match(source, /refresh: true/u);
   assert.match(source, /capabilities\?\.pty === true/u);
   assert.match(source, /capabilities\?\.sftp === true/u);
+  assert.match(source, /windowsTarget: undefined/u);
+  assert.match(source, /No explicit Windows live target was supplied/u);
+  assert.match(source, /if \(options\.windowsTarget\)/u);
   assert.match(source, /authority preview unexpectedly created its remote fixture path/u);
   assert.doesNotMatch(source, /templateDatabasePath|--template-database|JSON\.stringify\(\["devspace"/u);
 });

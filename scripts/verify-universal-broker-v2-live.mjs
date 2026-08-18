@@ -96,7 +96,9 @@ async function runCanaries(client, root, canaries) {
   const targets = data(await call(client, "target", { operation: "list", limit: 100 }));
   const targetIds = (targets.targets ?? []).map((target) => target.targetId);
   assert(targetIds.includes("local"), "local target is missing");
-  assert(targetIds.includes(options.windowsTarget), `Windows target is missing: ${options.windowsTarget}`);
+  if (options.windowsTarget) {
+    assert(targetIds.includes(options.windowsTarget), `Windows target is missing: ${options.windowsTarget}`);
+  }
   assert(targetIds.includes(options.companyTarget), `company target is missing: ${options.companyTarget}`);
   canaries.targets = targetIds;
 
@@ -408,63 +410,71 @@ async function runCanaries(client, root, canaries) {
   });
   canaries.company = { exec: true, pty: true, sftp: true, filesystem: true, artifact: true };
 
-  const windowsProbe = data(await call(client, "target", {
-    operation: "probe",
-    targetId: options.windowsTarget,
-    refresh: true,
-  }));
-  assert(windowsProbe.observation?.status === "ONLINE", "Windows target is not online");
-  const windowsTemporary = windowsProbe.observation?.temporaryDirectory;
-  assert(typeof windowsTemporary === "string" && windowsTemporary.length > 0, "Windows target temporary directory is unavailable");
-  const windowsExec = data(await call(client, "exec", {
-    target: options.windowsTarget,
-    command: "Write-Output 'windows-exec-ok'",
-    mode: "foreground",
-    yieldMs: 30_000,
-  }));
-  assert(windowsExec.state === "EXITED" && String(windowsExec.output).includes("windows-exec-ok"), "Windows user exec failed");
-  const windowsPath = `${windowsTemporary.replace(/[\\/]+$/, "")}\\devspace-v2-${randomUUID()}.txt`;
-  await call(client, "fs", {
-    operation: "write",
-    target: options.windowsTarget,
-    path: windowsPath,
-    content: "windows-filesystem\n",
-    overwrite: false,
-  });
-  const windowsRead = data(await call(client, "fs", {
-    operation: "read",
-    target: options.windowsTarget,
-    path: windowsPath,
-  }));
-  assert(String(windowsRead.content ?? windowsRead.text ?? "").includes("windows-filesystem"), "Windows filesystem round trip failed");
-  const windowsArtifactPath = `${windowsTemporary.replace(/[\\/]+$/, "")}\\devspace-v2-artifact-${randomUUID()}.txt`;
-  await call(client, "artifact", {
-    operation: "copy",
-    source: { target: "local", path: file },
-    destination: { target: options.windowsTarget, path: windowsArtifactPath },
-    overwrite: false,
-  });
-  const windowsPublished = data(await call(client, "artifact", {
-    operation: "publish",
-    source: { target: options.windowsTarget, path: windowsArtifactPath, name: "windows-artifact.txt", mimeType: "text/plain" },
-    ttlSeconds: 60,
-  }));
-  assert(typeof windowsPublished.resourceUri === "string", "Windows artifact publication URI is missing");
-  const windowsArtifactResponse = await fetchArtifact(windowsPublished.resourceUri);
-  assert(windowsArtifactResponse.status === 200 && (await windowsArtifactResponse.text()).includes("user-file"), "Windows artifact round trip failed");
-  await call(client, "fs", {
-    operation: "remove",
-    target: options.windowsTarget,
-    path: windowsArtifactPath,
-    disposition: "permanent",
-  });
-  await call(client, "fs", {
-    operation: "remove",
-    target: options.windowsTarget,
-    path: windowsPath,
-    disposition: "permanent",
-  });
-  canaries.windows = { exec: true, filesystem: true, artifact: true };
+  if (options.windowsTarget) {
+    const windowsProbe = data(await call(client, "target", {
+      operation: "probe",
+      targetId: options.windowsTarget,
+      refresh: true,
+    }));
+    assert(windowsProbe.observation?.status === "ONLINE", "Windows target is not online");
+    const windowsTemporary = windowsProbe.observation?.temporaryDirectory;
+    assert(typeof windowsTemporary === "string" && windowsTemporary.length > 0, "Windows target temporary directory is unavailable");
+    const windowsExec = data(await call(client, "exec", {
+      target: options.windowsTarget,
+      command: "Write-Output 'windows-exec-ok'",
+      mode: "foreground",
+      yieldMs: 30_000,
+    }));
+    assert(windowsExec.state === "EXITED" && String(windowsExec.output).includes("windows-exec-ok"), "Windows user exec failed");
+    const windowsPath = `${windowsTemporary.replace(/[\\/]+$/, "")}\\devspace-v2-${randomUUID()}.txt`;
+    await call(client, "fs", {
+      operation: "write",
+      target: options.windowsTarget,
+      path: windowsPath,
+      content: "windows-filesystem\n",
+      overwrite: false,
+    });
+    const windowsRead = data(await call(client, "fs", {
+      operation: "read",
+      target: options.windowsTarget,
+      path: windowsPath,
+    }));
+    assert(String(windowsRead.content ?? windowsRead.text ?? "").includes("windows-filesystem"), "Windows filesystem round trip failed");
+    const windowsArtifactPath = `${windowsTemporary.replace(/[\\/]+$/, "")}\\devspace-v2-artifact-${randomUUID()}.txt`;
+    await call(client, "artifact", {
+      operation: "copy",
+      source: { target: "local", path: file },
+      destination: { target: options.windowsTarget, path: windowsArtifactPath },
+      overwrite: false,
+    });
+    const windowsPublished = data(await call(client, "artifact", {
+      operation: "publish",
+      source: { target: options.windowsTarget, path: windowsArtifactPath, name: "windows-artifact.txt", mimeType: "text/plain" },
+      ttlSeconds: 60,
+    }));
+    assert(typeof windowsPublished.resourceUri === "string", "Windows artifact publication URI is missing");
+    const windowsArtifactResponse = await fetchArtifact(windowsPublished.resourceUri);
+    assert(windowsArtifactResponse.status === 200 && (await windowsArtifactResponse.text()).includes("user-file"), "Windows artifact round trip failed");
+    await call(client, "fs", {
+      operation: "remove",
+      target: options.windowsTarget,
+      path: windowsArtifactPath,
+      disposition: "permanent",
+    });
+    await call(client, "fs", {
+      operation: "remove",
+      target: options.windowsTarget,
+      path: windowsPath,
+      disposition: "permanent",
+    });
+    canaries.windows = { exec: true, filesystem: true, artifact: true };
+  } else {
+    canaries.windows = {
+      skipped: true,
+      required: false,
+      reason: "No explicit Windows live target was supplied.",
+    };
+  }
 
   const repository = join(root, "repository");
   await mkdir(repository);
@@ -856,7 +866,7 @@ function parseArgs(args) {
     jiraRoute: "company-jira",
     computerUseRoute: "company-computer-use",
     guiApplication: "Finder",
-    windowsTarget: "windows",
+    windowsTarget: undefined,
     externalStorageRoot: "/Volumes/Untitled",
   };
   for (let index = 0; index < args.length; index += 1) {

@@ -8,6 +8,7 @@ PROCESS_NAME="devspace-v2-production"
 PRODUCTION_PORT=7678
 CANDIDATE_PORT=7679
 SSH_LOAD_TARGET="company"
+WINDOWS_LIVE_TARGET=""
 RELEASE_ROOT="${HOME}/.devspace/releases/universal-broker-v2"
 DEPLOYMENT_ROOT="${HOME}/.devspace/deployments/universal-broker-v2"
 PRODUCTION_ENV="${HOME}/.devspace/universal-broker-v2-production.env"
@@ -23,7 +24,8 @@ Options:
   --process-name NAME        PM2 process name (default: devspace-v2-production)
   --port PORT                Production port (default: 7678)
   --candidate-port PORT      Isolated candidate port (default: 7679)
-  --ssh-load-target ID       Real SSH load target (default: company)
+  --ssh-load-target ID       Required real POSIX SSH load/live target (default: company)
+  --windows-live-target ID   Optional Windows target; when supplied its live canary is mandatory
   --release-root PATH        Immutable release root
   --deployment-root PATH     Upgrade audit root
   --production-env PATH      Active production environment file
@@ -38,6 +40,7 @@ while [[ $# -gt 0 ]]; do
     --port) PRODUCTION_PORT="$2"; shift 2 ;;
     --candidate-port) CANDIDATE_PORT="$2"; shift 2 ;;
     --ssh-load-target) SSH_LOAD_TARGET="$2"; shift 2 ;;
+    --windows-live-target) WINDOWS_LIVE_TARGET="$2"; shift 2 ;;
     --release-root) RELEASE_ROOT="$2"; shift 2 ;;
     --deployment-root) DEPLOYMENT_ROOT="$2"; CURRENT_AUDIT_LINK="$2/current"; shift 2 ;;
     --production-env) PRODUCTION_ENV="$2"; shift 2 ;;
@@ -308,16 +311,21 @@ CANDIDATE_OAUTH_DATABASE="$CANDIDATE_OAUTH_STATE/devspace.sqlite"
   echo "Candidate OAuth database is missing: $CANDIDATE_OAUTH_DATABASE" >&2
   exit 1
 }
-node "$RELEASE/scripts/verify-universal-broker-v2-live.mjs" \
-  --base-url "http://127.0.0.1:${CANDIDATE_PORT}" \
-  --mcp-url "http://127.0.0.1:${CANDIDATE_PORT}/mcp" \
-  --health-url "http://127.0.0.1:${CANDIDATE_PORT}/healthz" \
-  --artifact-fetch-base-url "http://127.0.0.1:${CANDIDATE_PORT}" \
-  --token-resource "${PUBLIC_BASE_URL}/mcp" \
-  --database "$CANDIDATE_OAUTH_DATABASE" \
-  --sessions 3 \
-  --company-target "$SSH_LOAD_TARGET" \
+LIVE_ARGUMENTS=(
+  --base-url "http://127.0.0.1:${CANDIDATE_PORT}"
+  --mcp-url "http://127.0.0.1:${CANDIDATE_PORT}/mcp"
+  --health-url "http://127.0.0.1:${CANDIDATE_PORT}/healthz"
+  --artifact-fetch-base-url "http://127.0.0.1:${CANDIDATE_PORT}"
+  --token-resource "${PUBLIC_BASE_URL}/mcp"
+  --database "$CANDIDATE_OAUTH_DATABASE"
+  --sessions 3
+  --company-target "$SSH_LOAD_TARGET"
   --output "$LIVE_EVIDENCE"
+)
+if [[ -n "$WINDOWS_LIVE_TARGET" ]]; then
+  LIVE_ARGUMENTS+=(--windows-target "$WINDOWS_LIVE_TARGET")
+fi
+node "$RELEASE/scripts/verify-universal-broker-v2-live.mjs" "${LIVE_ARGUMENTS[@]}"
 cleanup_candidate
 
 cp -p "$PRODUCTION_ENV" "$ENV_BACKUP"

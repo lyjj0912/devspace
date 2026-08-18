@@ -65,8 +65,11 @@ source/package boundary scans, granular OAuth checks, operation-authority checks
 runtime no-elevation checks, restart-worker checks, and metrics isolation checks.
 The second load command is the final P1 source gate: real SSH, PTY, SFTP, and
 transfer-capable remote-filesystem evidence are mandatory rather than an optional
-load add-on. Production deployment additionally runs full real-target and live
-canaries.
+load add-on. Production upgrade always requires the selected POSIX target
+(default `company`). Add `--windows-live-target windows` only when that endpoint
+is intentionally online and must be certified in the same transaction; other
+configured offline targets remain truthful `OFFLINE` observations rather than
+blocking unrelated production cutover.
 
 ## Operation authority workflow
 
