@@ -20,7 +20,7 @@ function registry(now: { value: number } = { value: Date.now() }) {
   });
 }
 
-test("exact R1 authority is session-bound, receipted, and bounded by uses", () => {
+test("exact R1 authority is scope-bound, receipted, and bounded by uses", () => {
   const authority = registry();
   const descriptor = authorityActionFromToolCall("fs", {
     operation: "write",
@@ -137,7 +137,7 @@ test("R3 authority is one-shot and cannot authorize a different exact action", (
   assert.notEqual(actionFingerprint(changed), actionFingerprint(descriptor));
 });
 
-test("correction invalidates every authority in the same session epoch", () => {
+test("correction invalidates every authority in the same scope epoch", () => {
   const authority = registry();
   const descriptor = authorityActionFromToolCall("gui", {
     operation: "act",

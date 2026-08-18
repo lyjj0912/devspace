@@ -179,10 +179,18 @@ test("production HTTP rejects legacy-scope tokens and accepts granular tokens", 
   const legacyToken = `legacy-${randomUUID()}`;
   const granularToken = `granular-${randomUUID()}`;
   const readOnlyToken = `read-only-${randomUUID()}`;
+  const otherClientToken = `other-client-${randomUUID()}`;
   const store = new SqliteOAuthStore(config.oauthStateDir);
   const registered = store.registerClient({
     redirect_uris: ["http://127.0.0.1/callback"],
     client_name: "Granular scope enforcement test",
+    token_endpoint_auth_method: "none",
+    grant_types: ["authorization_code", "refresh_token"],
+    response_types: ["code"],
+  }, config.oauth.allowedRedirectHosts);
+  const otherRegistered = store.registerClient({
+    redirect_uris: ["http://127.0.0.1/other-callback"],
+    client_name: "Cross-client authority rejection test",
     token_endpoint_auth_method: "none",
     grant_types: ["authorization_code", "refresh_token"],
     response_types: ["code"],
@@ -199,6 +207,12 @@ test("production HTTP rejects legacy-scope tokens and accepts granular tokens", 
       resource: config.publicMcpUrl,
     });
   }
+  store.saveAccessToken(createHash("sha256").update(otherClientToken).digest("base64url"), {
+    clientId: otherRegistered.client_id,
+    scopes: [...config.oauth.scopes],
+    expiresAt: Math.floor(Date.now() / 1000) + 300,
+    resource: config.publicMcpUrl,
+  });
   store.close();
 
   const running = createUniversalBrokerNextServer(config, { incomingArtifactAdapters: [] });
@@ -226,7 +240,50 @@ test("production HTTP rejects legacy-scope tokens and accepts granular tokens", 
     assert.deepEqual(listed.tools.map((tool) => tool.name), [...UNIVERSAL_TOOL_NAMES]);
     const targets = await acceptedClient.callTool({ name: "target", arguments: { operation: "list" } });
     assert.notEqual(targets.isError, true);
+    const crossSessionPath = join(root, "cross-session-authority.txt");
+    const crossSessionArguments = {
+      operation: "write",
+      target: "local",
+      path: crossSessionPath,
+      content: "same OAuth client, new MCP session\n",
+    };
+    const crossSessionAuthorityId = await prepareAuthority(acceptedClient, {
+      taskId: "cross-session-first-write",
+      authorityText: "Write the exact fixture once through a fresh MCP session.",
+      tool: "fs",
+      arguments: crossSessionArguments,
+      uses: 2,
+    });
     await acceptedClient.close();
+
+    const nextSessionTransport = new StreamableHTTPClientTransport(endpoint, {
+      requestInit: { headers: { Authorization: `Bearer ${granularToken}` } },
+    });
+    const nextSessionClient = new Client({ name: "same-oauth-new-session-test", version: "1" });
+    await nextSessionClient.connect(nextSessionTransport);
+    const crossSessionWrite = await nextSessionClient.callTool({
+      name: "fs",
+      arguments: { ...crossSessionArguments, authorityId: crossSessionAuthorityId },
+    });
+    assert.notEqual(crossSessionWrite.isError, true, JSON.stringify(crossSessionWrite.structuredContent));
+    assert.equal(await readFile(crossSessionPath, "utf8"), crossSessionArguments.content);
+    await nextSessionClient.close();
+
+    const otherClientTransport = new StreamableHTTPClientTransport(endpoint, {
+      requestInit: { headers: { Authorization: `Bearer ${otherClientToken}` } },
+    });
+    const otherClient = new Client({ name: "different-oauth-authority-test", version: "1" });
+    await otherClient.connect(otherClientTransport);
+    const crossClientWrite = await otherClient.callTool({
+      name: "fs",
+      arguments: { ...crossSessionArguments, authorityId: crossSessionAuthorityId },
+    });
+    assert.equal(crossClientWrite.isError, true);
+    assert.equal(
+      (crossClientWrite.structuredContent as { error?: { code?: string } } | undefined)?.error?.code,
+      "AUTHORITY_MISMATCH",
+    );
+    await otherClient.close();
 
     const readOnlyTransport = new StreamableHTTPClientTransport(endpoint, {
       requestInit: { headers: { Authorization: `Bearer ${readOnlyToken}` } },

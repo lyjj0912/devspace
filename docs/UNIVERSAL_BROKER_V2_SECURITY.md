@@ -37,7 +37,7 @@ Authorization Code with PKCE S256 and rotating refresh tokens remain required.
 R0 inspection is immediate. R1 through R3 calls require an exact authority ID.
 The server verifies:
 
-- OAuth client and MCP session binding;
+- authenticated OAuth client binding across ephemeral MCP transport sessions;
 - correction epoch;
 - expiry;
 - normalized tool/operation/target/resource/argument fingerprint;

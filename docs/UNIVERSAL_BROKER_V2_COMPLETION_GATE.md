@@ -20,7 +20,8 @@ target context fs exec process mcp artifact gui
 
 - R0 inspection executes without a task authority.
 - R1–R3 require an exact `authorityId` prepared through `context.authorize`.
-- Authority is bound to OAuth client, MCP session, correction epoch, action
+- Authority is bound to the authenticated OAuth client across MCP transport
+  sessions, plus correction epoch and exact action
   fingerprint, expiry, risk, use count, and the current target generation or MCP
   route fingerprint where applicable.
 - R3 is one-shot.

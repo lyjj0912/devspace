@@ -232,7 +232,7 @@ export class OperationAuthorityRegistry {
     if (authority.scopeId !== scopeId) {
       throw new UniversalBrokerError(
         "AUTHORITY_MISMATCH",
-        "Task authority belongs to a different MCP session or OAuth client.",
+        "Task authority belongs to a different authenticated OAuth client.",
       );
     }
     if (authority.correctionEpoch !== this.correctionEpoch(scopeId)) {

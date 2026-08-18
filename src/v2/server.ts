@@ -826,9 +826,10 @@ async function withOperationAuthority<T extends Record<string, unknown>>(
 }
 
 function authorityScope(extra: AuthorityRequestExtra): string {
-  const clientId = extra.authInfo?.clientId?.trim() || "anonymous";
+  const clientId = extra.authInfo?.clientId?.trim();
+  if (clientId) return `oauth-client:${clientId}`;
   const sessionId = extra.sessionId?.trim() || "sessionless";
-  return `${clientId}:${sessionId}`;
+  return `anonymous-session:${sessionId}`;
 }
 
 type ResolvedTargetAuthorityBinding = Awaited<ReturnType<TargetRegistry["resolveWithGeneration"]>>;

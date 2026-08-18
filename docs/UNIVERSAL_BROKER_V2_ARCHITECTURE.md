@@ -65,8 +65,10 @@ R3  irreversible, destructive, deployment, delivery, or GUI action
 normalization used at dispatch, without creating or consuming authority.
 `context.authorize` then creates a short-lived authority record containing exact
 tool calls, normalized argument fingerprints, risk, and use limits. R3 actions are
-one-shot. Records are bound to the OAuth client and MCP session. A correction
-increments the session correction epoch and invalidates all earlier records.
+one-shot. Records are bound to the authenticated OAuth client, not to an
+ephemeral Streamable HTTP MCP session, so a connector may initialize a fresh
+transport session for the next exact call without invalidating authority. A correction
+increments the OAuth-client correction epoch and invalidates all earlier records.
 PASS, FAIL, and UNCERTAIN receipts are retained without storing the controlling
 instruction text; only its SHA-256 is recorded.
 
