@@ -286,9 +286,24 @@ async function createFixture(
     await rm(root, { recursive: true, force: true });
   });
   const targetsPath = join(root, "targets.json");
+  const fakeBin = join(root, "fake-bin");
+  const fakeSetpriv = join(fakeBin, "setpriv");
+  await mkdir(fakeBin, { recursive: true });
+  await writeFile(fakeSetpriv, [
+    "#!/bin/sh",
+    "[ \"$1\" = \"--no-new-privs\" ] || exit 64",
+    "shift",
+    "[ \"$1\" = \"--\" ] || exit 64",
+    "shift",
+    "exec \"$@\"",
+    "",
+  ].join("\n"));
+  await chmod(fakeSetpriv, 0o700);
   const fakeSsh = join(root, "fake-ssh.sh");
   await writeFile(fakeSsh, [
     "#!/bin/sh",
+    `PATH=${shellQuoteForTest(fakeBin)}:$PATH`,
+    "export PATH",
     "all=\" $* \"",
     "for last do :; done",
     "case \"$all\" in",
@@ -358,6 +373,10 @@ function sshTarget(sshHost: string) {
     platform: "linux",
     shell: "sh",
   };
+}
+
+function shellQuoteForTest(value: string): string {
+  return `'${value.replaceAll("'", `'"'"'`)}'`;
 }
 
 function brokerCode(error: unknown): string | undefined {

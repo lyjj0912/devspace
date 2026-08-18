@@ -1,6 +1,6 @@
 import * as z from "zod/v4";
 
-export const UNIVERSAL_BROKER_VERSION = "2.0.0";
+export const UNIVERSAL_BROKER_VERSION = "2.1.0";
 
 export const UNIVERSAL_TOOL_NAMES = [
   "target",
@@ -15,9 +15,12 @@ export const UNIVERSAL_TOOL_NAMES = [
 
 export type UniversalToolName = (typeof UNIVERSAL_TOOL_NAMES)[number];
 
+export const UNIVERSAL_AUTHORITY_RISKS = ["R0", "R1", "R2", "R3"] as const;
+export type AuthorityRiskClass = (typeof UNIVERSAL_AUTHORITY_RISKS)[number];
+
 export const UNIVERSAL_TOOL_OPERATIONS = {
   target: ["list", "resolve", "probe"],
-  context: ["open", "search", "diff", "close"],
+  context: ["open", "search", "diff", "close", "authorize", "authority_status", "invalidate_authority", "release_authority"],
   fs: [
     "stat",
     "list",
@@ -33,7 +36,7 @@ export const UNIVERSAL_TOOL_OPERATIONS = {
     "sync",
   ],
   exec: ["run"],
-  process: ["poll", "write", "resize", "signal", "wait", "list", "forget"],
+  process: ["poll", "write", "resize", "signal", "wait", "list", "forget", "restart_broker", "restart_status"],
   mcp: [
     "routes",
     "search_tools",
@@ -80,6 +83,11 @@ export const UNIVERSAL_ERROR_CODES = [
   "GUI_STATE_CHANGED",
   "OUTPUT_TRUNCATED",
   "RESOURCE_QUOTA_EXCEEDED",
+  "AUTHORITY_REQUIRED",
+  "AUTHORITY_EXPIRED",
+  "AUTHORITY_MISMATCH",
+  "AUTHORITY_CONSUMED",
+  "ELEVATION_BLOCKED",
 ] as const;
 
 export type UniversalErrorCode = (typeof UNIVERSAL_ERROR_CODES)[number];
@@ -99,6 +107,8 @@ export const UNIVERSAL_BROKER_INSTRUCTIONS = [
   "Use context only for project instructions, Git state, and a default target/path; it is not an authority boundary.",
   "Use fs for local or remote files, exec plus process for commands, mcp for arbitrary configured MCP servers, artifact for file exchange, and gui only for operating-system UI that has no better protocol.",
   "DevSpace never installs, injects, or reuses privilege-elevation credentials. Commands and file operations run only as the configured target user; any operating-system authorization must be approved directly by the user outside DevSpace.",
+  "R0 inspection needs no authority. Before R1 through R3 operations, prepare exact task authority with context.authorize and pass authorityId; R3 actions are one-shot.",
+  "DevSpace blocks privilege-elevation commands at validation and execution boundaries. Higher-authority work is manual and outside DevSpace.",
   "Do not retry an identical failed operation. Provider mutations and commands whose dispatch state is unknown must not be replayed automatically.",
   "Large results are returned through resource handles rather than repeated in tool text.",
 ].join(" ");
@@ -167,6 +177,18 @@ const contextContract = {
     task: z.string().min(1).optional(),
     query: z.string().min(1).optional(),
     maxCharacters: z.number().int().min(100).max(100_000).optional(),
+    authorityId: z.string().min(1).optional(),
+    taskId: z.string().min(1).max(256).optional(),
+    authorityText: z.string().min(1).max(8_000).optional(),
+    actions: z.array(z.strictObject({
+      id: z.string().min(1).max(128).optional(),
+      tool: z.enum(UNIVERSAL_TOOL_NAMES),
+      arguments: genericRecordSchema,
+      risk: z.enum(UNIVERSAL_AUTHORITY_RISKS).optional(),
+      uses: z.number().int().min(1).max(50).optional(),
+    })).min(1).max(64).optional(),
+    correctionText: z.string().min(1).max(8_000).optional(),
+    expiresInSeconds: z.number().int().min(60).max(28_800).optional(),
     cursor: cursorSchema,
     limit: limitSchema,
   },
@@ -195,6 +217,7 @@ const fsContract = {
     overwrite: z.boolean().optional(),
     expectedSha256: z.string().min(1).optional(),
     disposition: z.enum(["trash", "permanent"]).optional(),
+    authorityId: z.string().min(1).optional(),
     cursor: cursorSchema,
     limit: limitSchema,
   },
@@ -220,6 +243,7 @@ const execContract = {
     yieldMs: z.number().int().min(0).max(30_000).optional(),
     maxOutputChars: z.number().int().min(1).max(1_000_000).optional(),
     envProfile: z.string().min(1).optional(),
+    authorityId: z.string().min(1).optional(),
   },
   annotations: {
     readOnlyHint: false,
@@ -240,6 +264,10 @@ const processContract = {
     signal: z.string().min(1).optional(),
     columns: z.number().int().min(1).max(1_000).optional(),
     rows: z.number().int().min(1).max(1_000).optional(),
+    authorityId: z.string().min(1).optional(),
+    transactionId: z.string().min(1).max(128).optional(),
+    reason: z.string().min(1).max(2_000).optional(),
+    delayMs: z.number().int().min(750).max(15_000).optional(),
     waitMs: z.number().int().min(0).max(110_000).optional(),
     maxOutputChars: z.number().int().min(1).max(1_000_000).optional(),
     cursor: cursorSchema,
@@ -267,6 +295,7 @@ const mcpContract = {
     cursor: cursorSchema,
     limit: limitSchema,
     responsePolicy: genericRecordSchema.optional(),
+    authorityId: z.string().min(1).optional(),
   },
   annotations: {
     readOnlyHint: false,
@@ -287,6 +316,7 @@ const artifactContract = {
     overwrite: z.boolean().optional(),
     maxBytes: z.number().int().min(1).optional(),
     ttlSeconds: z.number().int().min(1).max(86_400).optional(),
+    authorityId: z.string().min(1).optional(),
   },
   annotations: {
     readOnlyHint: false,
@@ -308,6 +338,7 @@ const guiContract = {
     action: genericRecordSchema.optional(),
     timeoutMs: z.number().int().min(0).max(120_000).optional(),
     maxElements: z.number().int().min(1).max(1_000).optional(),
+    authorityId: z.string().min(1).optional(),
   },
   annotations: {
     readOnlyHint: false,

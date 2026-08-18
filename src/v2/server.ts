@@ -9,8 +9,36 @@ import type {
   UniversalArtifactInput,
   UniversalArtifactService,
 } from "./artifact-service.js";
+import {
+  OperationAuthorityRegistry,
+  type AuthorityActionDescriptor,
+  type AuthorityGrant,
+  type CreateOperationAuthorityInput,
+  type RequestedAuthorityAction,
+} from "./authority.js";
+import {
+  artifactAction,
+  artifactRisk,
+  authorityActionFromToolCall,
+  commandRisk,
+  contextAction,
+  execAction,
+  filesystemAction,
+  filesystemRisk,
+  guiAction,
+  mcpAction,
+  mcpRisk,
+  minimumAuthorityRisk,
+  processAction,
+  processRisk,
+} from "./authority-policy.js";
 import type { ContextRegistry } from "./contexts.js";
-import type { UniversalExecutionPlane } from "./execution.js";
+import type { UniversalSelfManagementService } from "./self-management.js";
+import type {
+  ExecuteCommandInput,
+  ProcessOperationInput,
+  UniversalExecutionPlane,
+} from "./execution.js";
 import type {
   UniversalFilesystemInput,
   UniversalFilesystemService,
@@ -28,6 +56,7 @@ import {
   UNIVERSAL_BROKER_VERSION,
   UNIVERSAL_TOOL_CONTRACTS,
   UNIVERSAL_TOOL_NAMES,
+  type AuthorityRiskClass,
   type UniversalToolContract,
   type UniversalToolName,
 } from "./contracts.js";
@@ -49,6 +78,8 @@ export interface UniversalBrokerServices {
   mcpProxy?: UniversalMcpProxy;
   artifacts?: UniversalArtifactService;
   gui?: UniversalGuiService;
+  authority?: OperationAuthorityRegistry;
+  selfManagement?: UniversalSelfManagementService;
 }
 
 export function createUniversalBrokerMcpServer(
@@ -64,6 +95,9 @@ export function createUniversalBrokerMcpServer(
     },
     { instructions: UNIVERSAL_BROKER_INSTRUCTIONS },
   );
+  const authority = services.authority ?? new OperationAuthorityRegistry({
+    minimumRisk: minimumAuthorityRisk,
+  });
 
   if (services.execution) registerProcessOutputResource(server, services.execution);
   if (services.mcpProxy) registerMcpResultResource(server, services.mcpProxy);
@@ -72,20 +106,38 @@ export function createUniversalBrokerMcpServer(
   for (const name of UNIVERSAL_TOOL_NAMES) {
     if (name === "target" && services.targets) {
       registerTargetTool(server, services.targets);
-    } else if (name === "context" && services.contexts) {
-      registerContextTool(server, services.contexts);
-    } else if (name === "exec" && services.execution) {
-      registerExecTool(server, services.execution);
+    } else if (name === "context" && services.contexts && services.targets) {
+      registerContextTool(
+        server,
+        services.contexts,
+        services.targets,
+        services.mcpProxy,
+        services.gui,
+        authority,
+      );
+    } else if (name === "exec" && services.execution && services.targets && services.contexts) {
+      registerExecTool(server, services.execution, services.targets, services.contexts, authority);
     } else if (name === "process" && services.execution) {
-      registerProcessTool(server, services.execution);
-    } else if (name === "fs" && services.filesystem) {
-      registerFilesystemTool(server, services.filesystem);
+      registerProcessTool(server, services.execution, authority, services.selfManagement);
+    } else if (name === "fs" && services.filesystem && services.targets && services.contexts) {
+      registerFilesystemTool(server, services.filesystem, services.targets, services.contexts, authority);
     } else if (name === "mcp" && services.mcpProxy) {
-      registerMcpTool(server, services.mcpProxy);
-    } else if (name === "artifact" && services.artifacts) {
-      registerArtifactTool(server, services.artifacts);
-    } else if (name === "gui" && services.gui) {
-      registerGuiTool(server, services.gui);
+      registerMcpTool(server, services.mcpProxy, authority);
+    } else if (
+      name === "artifact"
+      && services.artifacts
+      && services.targets
+      && services.contexts
+    ) {
+      registerArtifactTool(
+        server,
+        services.artifacts,
+        services.targets,
+        services.contexts,
+        authority,
+      );
+    } else if (name === "gui" && services.gui && services.targets) {
+      registerGuiTool(server, services.gui, authority);
     } else {
       registerUnavailableTool(
         server,
@@ -98,7 +150,11 @@ export function createUniversalBrokerMcpServer(
   return server;
 }
 
-function registerGuiTool(server: McpServer, gui: UniversalGuiService): void {
+function registerGuiTool(
+  server: McpServer,
+  gui: UniversalGuiService,
+  authority: OperationAuthorityRegistry,
+): void {
   const contract = UNIVERSAL_TOOL_CONTRACTS.gui;
   registerAppTool(
     server,
@@ -112,8 +168,24 @@ function registerGuiTool(server: McpServer, gui: UniversalGuiService): void {
     },
     async (input, extra) => executeUniversalTool(async () => {
       requireScope(extra.authInfo?.scopes, "devspace.gui");
-      const data = await gui.execute(input as UniversalGuiInput);
-      return successfulToolResult(data, undefined, guiSummaryText(input.operation, data));
+      const typed = input as UniversalGuiInput;
+      const targetBinding = typed.operation === "act"
+        ? await gui.authorityTarget(typed)
+        : undefined;
+      const action = bindTargetAuthority(
+        guiAction(typed, targetBinding?.target.id),
+        targetBinding,
+      );
+      const risk: AuthorityRiskClass = typed.operation === "act" ? "R3" : "R0";
+      const data = await withOperationAuthority(
+        authority,
+        typed.authorityId,
+        authorityScope(extra),
+        action,
+        risk,
+        () => gui.execute(typed),
+      );
+      return successfulToolResult(data, undefined, guiSummaryText(typed.operation, data));
     }),
   );
 }
@@ -121,6 +193,9 @@ function registerGuiTool(server: McpServer, gui: UniversalGuiService): void {
 function registerArtifactTool(
   server: McpServer,
   artifacts: UniversalArtifactService,
+  targets: TargetRegistry,
+  contexts: ContextRegistry,
+  authority: OperationAuthorityRegistry,
 ): void {
   const contract = UNIVERSAL_TOOL_CONTRACTS.artifact;
   registerAppTool(
@@ -139,14 +214,27 @@ function registerArtifactTool(
         extra.authInfo?.scopes,
         input.operation === "publish" ? "devspace.read" : "devspace.write",
       );
-      const data = await artifacts.execute(input as UniversalArtifactInput);
+      const typed = input as UniversalArtifactInput;
+      const normalized = await normalizeArtifactAuthority(
+        typed,
+        targets,
+        contexts,
+      );
+      const data = await withOperationAuthority(
+        authority,
+        typed.authorityId,
+        authorityScope(extra),
+        normalized.action,
+        normalized.risk,
+        () => artifacts.execute(typed),
+      );
       const result = successfulToolResult(
         data,
         undefined,
-        artifactSummaryText(input.operation, data),
+        artifactSummaryText(typed.operation, data),
       );
       if (
-        input.operation === "publish"
+        typed.operation === "publish"
         && typeof data.resourceUri === "string"
         && typeof data.resourceName === "string"
       ) {
@@ -164,7 +252,11 @@ function registerArtifactTool(
   );
 }
 
-function registerMcpTool(server: McpServer, proxy: UniversalMcpProxy): void {
+function registerMcpTool(
+  server: McpServer,
+  proxy: UniversalMcpProxy,
+  authority: OperationAuthorityRegistry,
+): void {
   const contract = UNIVERSAL_TOOL_CONTRACTS.mcp;
   registerAppTool(
     server,
@@ -178,11 +270,35 @@ function registerMcpTool(server: McpServer, proxy: UniversalMcpProxy): void {
     },
     async (input, extra) => executeUniversalTool(async () => {
       requireScope(extra.authInfo?.scopes, "devspace.mcp");
-      const data = await proxy.execute(input as UniversalMcpInput);
+      const typed = input as UniversalMcpInput;
+      let risk = mcpRisk(typed.operation);
+      let routeBinding: { routeId: string; routeFingerprint: string } | undefined;
+      if (typed.operation === "invoke") {
+        const inspected = await proxy.inspectInvocation(typed);
+        routeBinding = inspected;
+        risk = mcpRisk(typed.operation, {
+          readOnly: inspected.annotations?.readOnlyHint === true,
+          destructive: inspected.annotations?.destructiveHint === true,
+        });
+      } else if (typed.operation === "close") {
+        routeBinding = await proxy.inspectRoute(typed.route);
+      }
+      const action = bindRouteAuthority(
+        mcpAction(typed, routeBinding?.routeId),
+        routeBinding,
+      );
+      const data = await withOperationAuthority(
+        authority,
+        typed.authorityId,
+        authorityScope(extra),
+        action,
+        risk,
+        () => proxy.execute(typed),
+      );
       return successfulToolResult(
         data,
         undefined,
-        mcpSummaryText(input.operation, data),
+        mcpSummaryText(typed.operation, data),
       );
     }),
   );
@@ -191,6 +307,9 @@ function registerMcpTool(server: McpServer, proxy: UniversalMcpProxy): void {
 function registerFilesystemTool(
   server: McpServer,
   filesystem: UniversalFilesystemService,
+  targets: TargetRegistry,
+  contexts: ContextRegistry,
+  authority: OperationAuthorityRegistry,
 ): void {
   const contract = UNIVERSAL_TOOL_CONTRACTS.fs;
   registerAppTool(
@@ -208,17 +327,46 @@ function registerFilesystemTool(
         extra.authInfo?.scopes,
         isFilesystemMutation(input.operation) ? "devspace.write" : "devspace.read",
       );
-      const data = await filesystem.execute(input as UniversalFilesystemInput);
+      const typed = input as UniversalFilesystemInput;
+      const targetBinding = await resolveSelectedTargetBinding(
+        targets,
+        contexts,
+        typed.target,
+        typed.contextId,
+      );
+      const action = bindTargetAuthority(
+        filesystemAction(typed, targetBinding.target.id),
+        targetBinding,
+      );
+      const risk = filesystemRisk(
+        typed.operation,
+        targetBinding.target.id,
+        action.parameters,
+      );
+      const data = await withOperationAuthority(
+        authority,
+        typed.authorityId,
+        authorityScope(extra),
+        action,
+        risk,
+        () => filesystem.execute(typed),
+      );
       return successfulToolResult(
         data,
         undefined,
-        filesystemSummaryText(input.operation, data),
+        filesystemSummaryText(typed.operation, data),
       );
     }),
   );
 }
 
-function registerExecTool(server: McpServer, execution: UniversalExecutionPlane): void {
+function registerExecTool(
+  server: McpServer,
+  execution: UniversalExecutionPlane,
+  targets: TargetRegistry,
+  contexts: ContextRegistry,
+  authority: OperationAuthorityRegistry,
+): void {
   const contract = UNIVERSAL_TOOL_CONTRACTS.exec;
   registerAppTool(
     server,
@@ -232,7 +380,27 @@ function registerExecTool(server: McpServer, execution: UniversalExecutionPlane)
     },
     async (input, extra) => executeUniversalTool(async () => {
       requireScope(extra.authInfo?.scopes, "devspace.exec");
-      const data = await execution.execute(input);
+      const typed = input as ExecuteCommandInput;
+      const targetBinding = await resolveSelectedTargetBinding(
+        targets,
+        contexts,
+        typed.target,
+        typed.contextId,
+      );
+      const resource = typed.cwd ?? typed.contextId ?? "default";
+      const action = bindTargetAuthority(
+        execAction(typed, targetBinding.target.id, resource),
+        targetBinding,
+      );
+      const risk = minimumAuthorityRisk(action);
+      const data = await withOperationAuthority(
+        authority,
+        typed.authorityId,
+        authorityScope(extra),
+        action,
+        risk,
+        () => execution.execute(typed),
+      );
       return successfulToolResult(
         data,
         undefined,
@@ -242,7 +410,12 @@ function registerExecTool(server: McpServer, execution: UniversalExecutionPlane)
   );
 }
 
-function registerProcessTool(server: McpServer, execution: UniversalExecutionPlane): void {
+function registerProcessTool(
+  server: McpServer,
+  execution: UniversalExecutionPlane,
+  authority: OperationAuthorityRegistry,
+  selfManagement?: UniversalSelfManagementService,
+): void {
   const contract = UNIVERSAL_TOOL_CONTRACTS.process;
   registerAppTool(
     server,
@@ -256,12 +429,50 @@ function registerProcessTool(server: McpServer, execution: UniversalExecutionPla
     },
     async (input, extra) => executeUniversalTool(async () => {
       requireScope(extra.authInfo?.scopes, "devspace.exec");
-      const data = await execution.operate(input);
-      const text = input.operation === "list"
+      const typed = input as ProcessOperationInput;
+      const data = await withOperationAuthority(
+        authority,
+        typed.authorityId,
+        authorityScope(extra),
+        processAction(typed),
+        processRisk(typed.operation),
+        async () => {
+          if (typed.operation === "restart_broker") {
+            if (!selfManagement) return unavailableSelfManagement("restart_broker");
+            return selfManagement.requestRestart({
+              reason: typed.reason,
+              delayMs: typed.delayMs,
+            });
+          }
+          if (typed.operation === "restart_status") {
+            if (!selfManagement) return unavailableSelfManagement("restart_status");
+            if (!typed.transactionId) {
+              throw new UniversalBrokerError(
+                "PRECONDITION_FAILED",
+                "process.restart_status requires transactionId.",
+              );
+            }
+            return selfManagement.status(typed.transactionId);
+          }
+          return execution.operate(typed);
+        },
+      );
+      const text = typed.operation === "list"
         ? `Managed processes: ${Array.isArray(data.processes) ? data.processes.length : 0}`
-        : processSummaryText(data);
+        : typed.operation === "restart_broker"
+          ? `Broker restart transaction requested: ${String(data.transactionId)}`
+          : typed.operation === "restart_status"
+            ? `Broker restart ${String(data.transactionId)}: ${String(data.state)}`
+            : processSummaryText(data);
       return successfulToolResult(data, undefined, text);
     }),
+  );
+}
+
+function unavailableSelfManagement(operation: string): never {
+  throw new UniversalBrokerError(
+    "CAPABILITY_UNAVAILABLE",
+    `Broker self-management is unavailable for process.${operation}.`,
   );
 }
 
@@ -378,7 +589,14 @@ function registerTargetTool(server: McpServer, targets: TargetRegistry): void {
   );
 }
 
-function registerContextTool(server: McpServer, contexts: ContextRegistry): void {
+function registerContextTool(
+  server: McpServer,
+  contexts: ContextRegistry,
+  targets: TargetRegistry,
+  mcpProxy: UniversalMcpProxy | undefined,
+  gui: UniversalGuiService | undefined,
+  authority: OperationAuthorityRegistry,
+): void {
   const contract = UNIVERSAL_TOOL_CONTRACTS.context;
   registerAppTool(
     server,
@@ -390,14 +608,99 @@ function registerContextTool(server: McpServer, contexts: ContextRegistry): void
       annotations: contract.annotations,
       _meta: {},
     },
-    async ({ operation, contextId, target, path, mode, baseRef, task, query, cursor, limit, maxCharacters }, extra) => executeUniversalTool(async () => {
+    async ({
+      operation,
+      contextId,
+      target,
+      path,
+      mode,
+      baseRef,
+      task,
+      query,
+      cursor,
+      limit,
+      maxCharacters,
+      authorityId,
+      taskId,
+      authorityText,
+      actions,
+      correctionText,
+      expiresInSeconds,
+    }, extra) => executeUniversalTool(async () => {
       requireScope(extra.authInfo?.scopes, "devspace.read");
+      const scopeId = authorityScope(extra);
       if (operation === "close" || (operation === "open" && mode === "worktree")) {
         requireScope(extra.authInfo?.scopes, "devspace.write");
       }
       switch (operation) {
+        case "authorize": {
+          const normalizedActions = await Promise.all((actions ?? []).map(async (action) => ({
+            ...(action.id ? { id: action.id } : {}),
+            descriptor: await normalizeAuthorityAction(
+              action.tool,
+              action.arguments as Record<string, unknown>,
+              targets,
+              contexts,
+              mcpProxy,
+              gui,
+            ),
+            ...(action.risk ? { risk: action.risk } : {}),
+            ...(action.uses ? { uses: action.uses } : {}),
+          }))) satisfies RequestedAuthorityAction[];
+          const data = authority.create({
+            taskId: taskId ?? "",
+            authorityText: authorityText ?? "",
+            actions: normalizedActions,
+            expiresInSeconds,
+          } satisfies CreateOperationAuthorityInput, scopeId);
+          return successfulToolResult(
+            data,
+            undefined,
+            `Prepared exact task authority ${String(data.authorityId)} for ${normalizedActions.length} action(s).`,
+          );
+        }
+        case "authority_status": {
+          if (!authorityId) {
+            throw new UniversalBrokerError(
+              "PRECONDITION_FAILED",
+              "context.authority_status requires authorityId.",
+            );
+          }
+          const data = authority.status(authorityId, scopeId);
+          return successfulToolResult(data, undefined, `Task authority status: ${authorityId}`);
+        }
+        case "invalidate_authority": {
+          const data = authority.invalidate(scopeId, correctionText ?? "");
+          return successfulToolResult(
+            data,
+            undefined,
+            `Invalidated ${String((data.invalidatedAuthorityIds as unknown[]).length)} task authority record(s).`,
+          );
+        }
+        case "release_authority": {
+          if (!authorityId) {
+            throw new UniversalBrokerError(
+              "PRECONDITION_FAILED",
+              "context.release_authority requires authorityId.",
+            );
+          }
+          const data = authority.release(authorityId, scopeId);
+          return successfulToolResult(data, undefined, `Released task authority ${authorityId}.`);
+        }
         case "open": {
-          const data = await contexts.open({ target, path, mode, baseRef, task });
+          const rawAction = contextAction(operation, { target, path, contextId, mode, baseRef });
+          const targetBinding = mode === "worktree"
+            ? await targets.resolveWithGeneration(target)
+            : undefined;
+          const action = bindTargetAuthority(rawAction, targetBinding);
+          const data = await withOperationAuthority(
+            authority,
+            authorityId,
+            scopeId,
+            action,
+            minimumAuthorityRisk(action),
+            () => contexts.open({ target, path, mode, baseRef, task }),
+          );
           return successfulToolResult(
             data,
             undefined,
@@ -418,7 +721,15 @@ function registerContextTool(server: McpServer, contexts: ContextRegistry): void
               "context.close requires contextId.",
             );
           }
-          const data = await contexts.close(contextId);
+          const action = contextAction(operation, { contextId });
+          const data = await withOperationAuthority(
+            authority,
+            authorityId,
+            scopeId,
+            action,
+            minimumAuthorityRisk(action),
+            () => contexts.close(contextId),
+          );
           return successfulToolResult(data, undefined, `Closed context ${contextId}.`);
         }
         case "diff": {
@@ -472,6 +783,244 @@ function registerContextDiffResource(
   );
 }
 
+interface AuthorityRequestExtra {
+  authInfo?: { clientId?: string };
+  sessionId?: string;
+}
+
+async function withOperationAuthority<T extends Record<string, unknown>>(
+  authority: OperationAuthorityRegistry,
+  authorityId: string | undefined,
+  scopeId: string,
+  action: AuthorityActionDescriptor,
+  risk: AuthorityRiskClass,
+  execute: () => Promise<T>,
+): Promise<T> {
+  let grant: AuthorityGrant | undefined;
+  grant = authority.require(authorityId, scopeId, action, risk);
+  try {
+    const value = await execute();
+    authority.record(grant, "PASS", {
+      tool: action.tool,
+      operation: action.operation,
+    });
+    return value;
+  } catch (error) {
+    const uncertain = error instanceof UniversalBrokerError
+      && ["MCP_RESULT_UNKNOWN", "EXECUTION_STATE_UNKNOWN", "TRANSPORT_INTERRUPTED"].includes(error.code);
+    authority.record(grant, uncertain ? "UNCERTAIN" : "FAIL", {
+      tool: action.tool,
+      operation: action.operation,
+      errorCode: error instanceof UniversalBrokerError ? error.code : "UNEXPECTED_ERROR",
+    });
+    throw error;
+  }
+}
+
+function authorityScope(extra: AuthorityRequestExtra): string {
+  const clientId = extra.authInfo?.clientId?.trim() || "anonymous";
+  const sessionId = extra.sessionId?.trim() || "sessionless";
+  return `${clientId}:${sessionId}`;
+}
+
+type ResolvedTargetAuthorityBinding = Awaited<ReturnType<TargetRegistry["resolveWithGeneration"]>>;
+
+async function resolveSelectedTargetBinding(
+  targets: TargetRegistry,
+  contexts: ContextRegistry,
+  selector: string | undefined,
+  contextId: string | undefined,
+): Promise<ResolvedTargetAuthorityBinding> {
+  const context = contextId ? await contexts.get(contextId) : undefined;
+  const binding = await targets.resolveWithGeneration(selector ?? context?.targetId);
+  if (context && context.targetId !== binding.target.id) {
+    throw new UniversalBrokerError(
+      "PRECONDITION_FAILED",
+      `Context ${context.contextId} belongs to target ${context.targetId}, not ${binding.target.id}.`,
+    );
+  }
+  return binding;
+}
+
+function bindTargetAuthority(
+  action: AuthorityActionDescriptor,
+  binding: ResolvedTargetAuthorityBinding | undefined,
+): AuthorityActionDescriptor {
+  if (!binding) return action;
+  return {
+    ...action,
+    target: binding.target.id,
+    parameters: {
+      ...(action.parameters ?? {}),
+      targetGeneration: binding.generation,
+    },
+  };
+}
+
+function bindRouteAuthority(
+  action: AuthorityActionDescriptor,
+  binding: { routeId: string; routeFingerprint: string } | undefined,
+): AuthorityActionDescriptor {
+  if (!binding) return action;
+  return {
+    ...action,
+    resource: binding.routeId,
+    parameters: {
+      ...(action.parameters ?? {}),
+      routeFingerprint: binding.routeFingerprint,
+    },
+  };
+}
+
+async function normalizeAuthorityAction(
+  tool: UniversalToolName,
+  argumentsValue: Record<string, unknown>,
+  targets: TargetRegistry,
+  contexts: ContextRegistry,
+  mcpProxy: UniversalMcpProxy | undefined,
+  gui: UniversalGuiService | undefined,
+): Promise<AuthorityActionDescriptor> {
+  const action = authorityActionFromToolCall(tool, argumentsValue);
+  if (minimumAuthorityRisk(action) === "R0") return action;
+  switch (tool) {
+    case "target":
+    case "process":
+      return action;
+    case "context": {
+      if (action.operation !== "open" || action.parameters?.mode !== "worktree") return action;
+      return bindTargetAuthority(
+        action,
+        await targets.resolveWithGeneration(
+          typeof argumentsValue.target === "string" ? argumentsValue.target : undefined,
+        ),
+      );
+    }
+    case "fs": {
+      const input = argumentsValue as unknown as UniversalFilesystemInput;
+      const binding = await resolveSelectedTargetBinding(
+        targets,
+        contexts,
+        input.target,
+        input.contextId,
+      );
+      return bindTargetAuthority(filesystemAction(input, binding.target.id), binding);
+    }
+    case "exec": {
+      const input = argumentsValue as unknown as ExecuteCommandInput;
+      const binding = await resolveSelectedTargetBinding(
+        targets,
+        contexts,
+        input.target,
+        input.contextId,
+      );
+      return bindTargetAuthority(
+        execAction(input, binding.target.id, input.cwd ?? input.contextId ?? "default"),
+        binding,
+      );
+    }
+    case "mcp": {
+      if (!mcpProxy) {
+        throw new UniversalBrokerError(
+          "CAPABILITY_UNAVAILABLE",
+          "MCP authority cannot be prepared because the generic MCP proxy is unavailable.",
+        );
+      }
+      const input = argumentsValue as unknown as UniversalMcpInput;
+      const binding = input.operation === "invoke"
+        ? await mcpProxy.inspectInvocation(input)
+        : await mcpProxy.inspectRoute(input.route);
+      return bindRouteAuthority(mcpAction(input, binding.routeId), binding);
+    }
+    case "artifact": {
+      const normalized = await normalizeArtifactAuthority(
+        argumentsValue as unknown as UniversalArtifactInput,
+        targets,
+        contexts,
+      );
+      return normalized.action;
+    }
+    case "gui": {
+      if (!gui) {
+        throw new UniversalBrokerError(
+          "CAPABILITY_UNAVAILABLE",
+          "GUI authority cannot be prepared because the GUI service is unavailable.",
+        );
+      }
+      const input = argumentsValue as unknown as UniversalGuiInput;
+      const binding = await gui.authorityTarget(input);
+      return bindTargetAuthority(guiAction(input, binding.target.id), binding);
+    }
+  }
+}
+
+async function normalizeArtifactAuthority(
+  input: UniversalArtifactInput,
+  targets: TargetRegistry,
+  contexts: ContextRegistry,
+): Promise<{ action: AuthorityActionDescriptor; risk: AuthorityRiskClass }> {
+  const source = await normalizeArtifactEndpoint(input.source, targets, contexts);
+  const destination = await normalizeArtifactEndpoint(input.destination, targets, contexts);
+  const normalizedInput: UniversalArtifactInput = {
+    ...input,
+    source: source.endpoint ?? input.source,
+    ...(input.destination
+      ? { destination: destination.endpoint ?? input.destination }
+      : {}),
+  };
+  const bindings = [source.binding, destination.binding]
+    .filter((value): value is ResolvedTargetAuthorityBinding => Boolean(value));
+  const action = bindMultipleTargetAuthority(artifactAction(normalizedInput), bindings);
+  return {
+    action,
+    risk: artifactRisk(input.operation, {
+      remote: bindings.some((binding) => binding.target.id !== "local"),
+    }),
+  };
+}
+
+async function normalizeArtifactEndpoint(
+  endpoint: Record<string, unknown> | undefined,
+  targets: TargetRegistry,
+  contexts: ContextRegistry,
+): Promise<{
+  endpoint?: Record<string, unknown>;
+  binding?: ResolvedTargetAuthorityBinding;
+}> {
+  if (!endpoint) return {};
+  const target = typeof endpoint.target === "string" ? endpoint.target : undefined;
+  const contextId = typeof endpoint.contextId === "string" ? endpoint.contextId : undefined;
+  const path = typeof endpoint.path === "string" ? endpoint.path : undefined;
+  if (!target && !contextId && !path) return { endpoint };
+  const binding = await resolveSelectedTargetBinding(targets, contexts, target, contextId);
+  return {
+    endpoint: { ...endpoint, target: binding.target.id },
+    binding,
+  };
+}
+
+function bindMultipleTargetAuthority(
+  action: AuthorityActionDescriptor,
+  bindings: ResolvedTargetAuthorityBinding[],
+): AuthorityActionDescriptor {
+  if (bindings.length === 0) return action;
+  const unique = [...new Map(bindings.map((binding) => [
+    `${binding.generation}:${binding.target.id}`,
+    binding,
+  ])).values()]
+    .map((binding) => ({
+      targetId: binding.target.id,
+      targetGeneration: binding.generation,
+    }))
+    .sort((left, right) => left.targetId.localeCompare(right.targetId));
+  return {
+    ...action,
+    parameters: {
+      ...(action.parameters ?? {}),
+      targetBindings: unique,
+    },
+  };
+}
+
 function registerUnavailableTool(
   server: McpServer,
   name: UniversalToolName,
@@ -494,12 +1043,12 @@ function registerUnavailableTool(
 function unavailableResult(
   name: UniversalToolName,
   evidence: Record<string, unknown> = {
-    phase: "phase-1-skeleton",
+    phase: "service-not-configured",
     tool: name,
   },
 ): CallToolResult {
   const operationId = `op_${randomUUID()}`;
-  const message = `${name} is registered in the Universal Broker v2 contract but is not implemented in the Phase 1 skeleton.`;
+  const message = `${name} is registered in the Universal Broker contract but its backing service is not configured.`;
   const structuredContent = {
     ok: false,
     operationId,

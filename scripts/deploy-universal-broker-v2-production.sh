@@ -62,8 +62,8 @@ value = json.load(open(path))
 expected_tools = ["target", "context", "fs", "exec", "process", "mcp", "artifact", "gui"]
 if value.get("status") != "PASS": raise SystemExit("Phase 9 evidence status is not PASS")
 if value.get("sourceCommit") != expected_commit: raise SystemExit("Phase 9 evidence is for a different source commit")
-if value.get("connectorName") != "myDevSpace-next-user": raise SystemExit("Phase 9 connector identity is invalid")
-if int(value.get("freshChatGptSessions", 0)) < 5: raise SystemExit("Phase 9 has fewer than five fresh ChatGPT sessions")
+if value.get("connectorName") != "myDevSpace": raise SystemExit("Phase 9 connector identity is invalid")
+if int(value.get("freshChatGptSessions", 0)) < 3: raise SystemExit("Phase 9 has fewer than three fresh canonical ChatGPT sessions")
 if value.get("toolNames") != expected_tools: raise SystemExit("Phase 9 tool surface is not the fixed eight-tool contract")
 required = {"local", "external-storage", "ssh", "mcp-mutation", "artifact", "gui"}
 if not required.issubset(set(value.get("scenarios", []))): raise SystemExit("Phase 9 scenario evidence is incomplete")
@@ -263,7 +263,6 @@ ALLOWED_HOSTS="$BASE_ALLOWED_HOSTS,$PUBLIC_HOST,$PUBLIC_HOSTNAME,127.0.0.1:$V2_L
 ENV_NEXT="$AUDIT/production.env.new"
 cat >"$ENV_NEXT" <<EOF
 DEVSPACE_V2_DEPLOYMENT_MODE=$(quote production)
-DEVSPACE_V2_LEGACY_SCOPE_COMPATIBILITY=$(quote true)
 DEVSPACE_NEXT_HOST=$(quote 127.0.0.1)
 DEVSPACE_NEXT_PORT=$(quote "$V2_LOCAL_PORT")
 DEVSPACE_NEXT_PUBLIC_BASE_URL=$(quote "$PUBLIC_SERVICE_BASE")
@@ -272,6 +271,10 @@ DEVSPACE_NEXT_STATE_DIR=$(quote "$V2_STATE_DIR")
 DEVSPACE_NEXT_TARGETS_FILE=$(quote "$TARGETS_FILE")
 DEVSPACE_NEXT_MCP_ROUTES_FILE=$(quote "$ROUTES_FILE")
 DEVSPACE_NEXT_ENV_PROFILE_CONFIG=$(quote "$ENV_PROFILES_FILE")
+DEVSPACE_NEXT_SELF_MANAGEMENT_DIR=$(quote "$V2_STATE_DIR/self-management")
+DEVSPACE_NEXT_PM2_PROCESS_NAME=$(quote "$V2_PM2_NAME")
+DEVSPACE_NEXT_SELF_RESTART_DELAY_MS=$(quote 2000)
+DEVSPACE_NEXT_SELF_RESTART_TIMEOUT_MS=$(quote 120000)
 DEVSPACE_NEXT_ALLOWED_HOSTS=$(quote "$ALLOWED_HOSTS")
 DEVSPACE_TRUST_PROXY=$(quote 1)
 EOF

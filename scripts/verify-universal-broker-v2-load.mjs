@@ -292,13 +292,13 @@ function authorityContract(scopes, contracts) {
   ];
   const expectedInputs = {
     target: ["operation", "selector", "targetId", "cursor", "limit"],
-    context: ["operation", "contextId", "target", "path", "mode", "baseRef", "task", "query", "maxCharacters", "cursor", "limit"],
-    fs: ["operation", "target", "contextId", "path", "destination", "content", "patch", "query", "recursive", "overwrite", "expectedSha256", "disposition", "cursor", "limit"],
-    exec: ["target", "contextId", "cwd", "command", "tty", "mode", "yieldMs", "maxOutputChars", "envProfile"],
-    process: ["operation", "processId", "chars", "signal", "columns", "rows", "waitMs", "maxOutputChars", "cursor", "limit"],
-    mcp: ["operation", "route", "query", "name", "arguments", "uri", "cursor", "limit", "responsePolicy"],
-    artifact: ["operation", "source", "destination", "overwrite", "maxBytes", "ttlSeconds"],
-    gui: ["operation", "target", "sessionId", "generation", "action", "timeoutMs", "maxElements"],
+    context: ["operation", "contextId", "target", "path", "mode", "baseRef", "task", "query", "maxCharacters", "authorityId", "taskId", "authorityText", "actions", "correctionText", "expiresInSeconds", "cursor", "limit"],
+    fs: ["operation", "target", "contextId", "path", "destination", "content", "patch", "query", "recursive", "overwrite", "expectedSha256", "disposition", "authorityId", "cursor", "limit"],
+    exec: ["target", "contextId", "cwd", "command", "tty", "mode", "yieldMs", "maxOutputChars", "envProfile", "authorityId"],
+    process: ["operation", "processId", "chars", "signal", "columns", "rows", "authorityId", "transactionId", "reason", "delayMs", "waitMs", "maxOutputChars", "cursor", "limit"],
+    mcp: ["operation", "route", "query", "name", "arguments", "uri", "cursor", "limit", "responsePolicy", "authorityId"],
+    artifact: ["operation", "source", "destination", "overwrite", "maxBytes", "ttlSeconds", "authorityId"],
+    gui: ["operation", "target", "sessionId", "generation", "action", "timeoutMs", "maxElements", "authorityId"],
   };
   const scopeStable = JSON.stringify(scopes) === JSON.stringify(expectedScopes);
   const inputDrift = Object.entries(expectedInputs).flatMap(([name, expected]) => {
@@ -314,15 +314,35 @@ function authorityContract(scopes, contracts) {
 }
 
 async function writeSshFixture(temporary) {
+  const fakeBin = join(temporary, "ssh-fixture-bin");
+  await mkdir(fakeBin, { recursive: true });
+  const setpriv = join(fakeBin, "setpriv");
+  await writeFile(setpriv, [
+    "#!/bin/sh",
+    "[ \"$1\" = \"--no-new-privs\" ] || exit 64",
+    "shift",
+    "[ \"$1\" = \"--\" ] || exit 64",
+    "shift",
+    "exec \"$@\"",
+    "",
+  ].join("\n"));
+  await chmod(setpriv, 0o700);
+
   const path = join(temporary, "ssh-user-fixture.sh");
   await writeFile(path, [
     "#!/bin/sh",
+    `PATH=${shellQuote(fakeBin)}:$PATH`,
+    "export PATH",
     "for last do :; done",
     "exec /bin/sh -c \"$last\"",
     "",
   ].join("\n"));
   await chmod(path, 0o700);
   return path;
+}
+
+function shellQuote(value) {
+  return `'${value.replaceAll("'", `'"'"'`)}'`;
 }
 
 async function optionalRealSshLoad(options) {

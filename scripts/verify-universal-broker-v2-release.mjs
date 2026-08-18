@@ -10,8 +10,10 @@ const requireClean = process.argv.includes("--require-clean");
 
 run("npm", ["run", "typecheck"]);
 run("npm", ["run", "test"]);
+run("npm", ["audit", "--omit=dev", "--audit-level=low"]);
 run("npm", ["run", "build"]);
 run("npm", ["run", "v2:budget"]);
+run("npm", ["run", "v2:load:quick"]);
 
 for (const script of [
   "scripts/deploy-universal-broker-v2-production.sh",
@@ -23,6 +25,8 @@ for (const script of [
   "scripts/deploy-universal-broker-v2-pm2.sh",
   "scripts/undeploy-universal-broker-v2-pm2.sh",
   "scripts/configure-devspace-log-rotation.sh",
+  "scripts/upgrade-universal-broker-v2-production.sh",
+  "scripts/status-universal-broker-v2-upgrade.sh",
 ]) {
   run("/bin/bash", ["-n", script]);
 }
@@ -34,8 +38,12 @@ for (const script of [
 }
 
 verifyNoPrivilegeElevationSources();
+verifyRuntimeNoElevationSources();
+verifyOperationAuthoritySources();
+verifySelfManagementSources();
+verifyMetricsIsolationSources();
 verifyDeploymentSources();
-verifyOAuthCompatibilitySources();
+verifyGranularOAuthSources();
 verifyLiveVerifierSources();
 verifyTestComposition();
 verifyDist();
@@ -121,6 +129,13 @@ function verifyNoPrivilegeElevationSources() {
   const allowedAbsenceTests = new Set([
     "src/v2/contracts.test.ts",
     "src/v2/targets.test.ts",
+    "src/v2/authority.test.ts",
+    "src/v2/no-elevation.test.ts",
+  ]);
+  const allowedEnforcementSources = new Set([
+    "src/v2/authority-policy.ts",
+    "src/v2/no-elevation.ts",
+    "scripts/verify-universal-broker-v2-live.mjs",
   ]);
   for (const path of productionPaths) {
     const absolute = resolve(root, path);
@@ -128,6 +143,7 @@ function verifyNoPrivilegeElevationSources() {
     for (const file of files) {
       const relativePath = relative(root, file).replaceAll("\\", "/");
       if (relativePath === "scripts/verify-universal-broker-v2-release.mjs") continue;
+      if (allowedEnforcementSources.has(relativePath)) continue;
       if (/\.test\.[cm]?[jt]sx?$/u.test(file) && allowedAbsenceTests.has(relativePath)) continue;
       if (statSync(file).size > 8 * 1024 * 1024) continue;
       const source = readFileSync(file, "utf8");
@@ -172,26 +188,295 @@ function verifyTestComposition() {
   }
 }
 
-function verifyOAuthCompatibilitySources() {
+function verifyGranularOAuthSources() {
   const config = text("src/v2/config.ts");
   const http = text("src/v2/http-server.ts");
   const broker = text("src/v2/server.ts");
   const deploy = text("scripts/deploy-universal-broker-v2-production.sh");
+  const tests = text("src/v2/http-server.test.ts");
   for (const marker of [
-    "DEVSPACE_V2_LEGACY_SCOPE_COMPATIBILITY",
-    'deploymentMode === "production"',
-    "legacyScopeCompatibility",
+    "was removed in Universal Broker v2.1",
+    "UNIVERSAL_OWNER_SCOPES",
+    "OAUTH_OFFLINE_ACCESS_SCOPE",
   ]) {
-    if (!config.includes(marker)) fail(`Production OAuth compatibility config is missing: ${marker}`);
+    if (!config.includes(marker)) fail(`Granular OAuth source is missing: ${marker}`);
   }
-  for (const marker of ["authenticatedBrokerScopes", 'granted.includes("devspace")']) {
-    if (!http.includes(marker)) fail(`Production OAuth compatibility path is missing: ${marker}`);
+  for (const marker of [
+    "authenticatedBrokerScopes",
+    "granted.every",
+    "config.oauth.scopes.includes(scope)",
+  ]) {
+    if (!http.includes(marker)) fail(`Granular OAuth enforcement is missing: ${marker}`);
   }
-  if (broker.includes('scopes.includes("devspace")')) {
-    fail("The generic tool authorization layer must not grant blanket legacy scope authority.");
+  for (const forbidden of [
+    'granted.includes("devspace")',
+    'scopes.includes("devspace")',
+  ]) {
+    if (http.includes(forbidden) || broker.includes(forbidden)) {
+      fail(`Blanket legacy OAuth authority remains: ${forbidden}`);
+    }
   }
-  if (!deploy.includes("DEVSPACE_V2_LEGACY_SCOPE_COMPATIBILITY")) {
-    fail("The cutover environment must state the temporary legacy scope contract explicitly.");
+  if (deploy.includes("DEVSPACE_V2_LEGACY_SCOPE_COMPATIBILITY")) {
+    fail("Production deployment must not emit the removed legacy-scope compatibility flag.");
+  }
+  for (const marker of [
+    "rejects legacy-scope tokens",
+    'authenticatedBrokerScopes(["devspace"], production), undefined',
+  ]) {
+    if (!tests.includes(marker)) fail(`Legacy OAuth rejection test is missing: ${marker}`);
+  }
+}
+
+function verifyOperationAuthoritySources() {
+  const contracts = text("src/v2/contracts.ts");
+  const authority = text("src/v2/authority.ts");
+  const policy = text("src/v2/authority-policy.ts");
+  const server = text("src/v2/server.ts");
+  const tests = text("src/v2/authority.test.ts");
+  const packageJson = JSON.parse(text("package.json"));
+  for (const marker of [
+    'UNIVERSAL_BROKER_VERSION = "2.1.0"',
+    '"authorize"',
+    '"authority_status"',
+    '"invalidate_authority"',
+    '"release_authority"',
+    '"AUTHORITY_REQUIRED"',
+    '"AUTHORITY_CONSUMED"',
+    "authorityId",
+  ]) {
+    if (!contracts.includes(marker)) fail(`Operation-authority contract is missing: ${marker}`);
+  }
+  for (const marker of [
+    "OperationAuthorityRegistry",
+    "correctionEpoch",
+    "maximumUses",
+    "consumedUses",
+    "authorityScope",
+  ]) {
+    if (!authority.includes(marker) && !server.includes(marker)) {
+      fail(`Operation-authority implementation is missing: ${marker}`);
+    }
+  }
+  for (const marker of [
+    "minimumAuthorityRisk",
+    "authorityActionFromToolCall",
+    "commandRisk",
+    "filesystemRisk",
+    "mcpRisk",
+  ]) {
+    if (!policy.includes(marker)) fail(`Operation-risk classifier is missing: ${marker}`);
+  }
+  for (const marker of [
+    "withOperationAuthority",
+    'case "authorize"',
+    "authority.create",
+    "authority.require",
+    "authority.record",
+  ]) {
+    if (!server.includes(marker)) fail(`Operation-authority server gate is missing: ${marker}`);
+  }
+  for (const marker of [
+    "R3 authority is one-shot",
+    "correction invalidates every authority",
+    "R0 actions cannot be wrapped",
+  ]) {
+    if (!tests.includes(marker)) fail(`Operation-authority regression test is missing: ${marker}`);
+  }
+  if (!packageJson.scripts?.["v2:test"]?.includes("src/v2/authority.test.ts")) {
+    fail("The canonical v2 test gate omits operation-authority tests.");
+  }
+}
+
+function verifyRuntimeNoElevationSources() {
+  const boundary = text("src/v2/no-elevation.ts");
+  const policy = text("src/v2/authority-policy.ts");
+  const execution = text("src/v2/execution.ts");
+  const mcpProxy = text("src/v2/mcp-proxy.ts");
+  const targets = text("src/v2/targets.ts");
+  const tests = text("src/v2/no-elevation.test.ts");
+  const mcpTests = text("src/v2/mcp-proxy.test.ts");
+  const packageJson = JSON.parse(text("package.json"));
+  for (const marker of [
+    "assertServiceAccountBoundary",
+    "sandbox-exec",
+    "authorization-right-obtain",
+    "file-mode #o4000",
+    "file-mode #o2000",
+    "setpriv --no-new-privs",
+    "S-1-16-(12288|16384)",
+  ]) {
+    if (!boundary.includes(marker)) fail(`Runtime no-elevation boundary is missing: ${marker}`);
+  }
+  for (const marker of [
+    "assertNoElevationCommand",
+    "ELEVATION_PATTERNS",
+    "ELEVATION_BLOCKED",
+  ]) {
+    if (!policy.includes(marker)) fail(`No-elevation command policy is missing: ${marker}`);
+  }
+  for (const marker of [
+    "wrapLocalUserOnlyExecution",
+    "posixRemoteUserOnlyRunner",
+    "windowsNonElevatedPrelude",
+  ]) {
+    if (!execution.includes(marker)) fail(`Execution plane no-elevation wiring is missing: ${marker}`);
+  }
+  for (const marker of [
+    "wrapLocalUserOnlyExecution",
+    "posixRemoteUserOnlyRunner",
+  ]) {
+    if (!mcpProxy.includes(marker)) fail(`Downstream MCP no-elevation wiring is missing: ${marker}`);
+  }
+  if (!mcpTests.includes("local stdio MCP routes inherit the runtime no-elevation boundary")) {
+    fail("Downstream MCP no-elevation regression test is missing.");
+  }
+  for (const marker of [
+    "probeLocalUserAccountBoundary",
+    "setpriv_boundary=1",
+    "sandbox_boundary=1",
+    "blocked-elevated-token",
+  ]) {
+    if (!targets.includes(marker)) fail(`Target no-elevation probe is missing: ${marker}`);
+  }
+  for (const marker of [
+    "blocks sudo at the kernel sandbox boundary",
+    "rejects set-id executables generically",
+    "denies Authorization Services acquisition",
+  ]) {
+    if (!tests.includes(marker)) fail(`Runtime no-elevation regression test is missing: ${marker}`);
+  }
+  if (!packageJson.scripts?.["v2:test"]?.includes("src/v2/no-elevation.test.ts")) {
+    fail("The canonical v2 test gate omits no-elevation tests.");
+  }
+}
+
+function verifySelfManagementSources() {
+  const contracts = text("src/v2/contracts.ts");
+  const service = text("src/v2/self-management.ts");
+  const worker = text("src/v2/self-management-worker.ts");
+  const upgradeWorker = text("src/v2/production-upgrade-worker.ts");
+  const upgrade = text("scripts/upgrade-universal-broker-v2-production.sh");
+  const upgradeStatus = text("scripts/status-universal-broker-v2-upgrade.sh");
+  const server = text("src/v2/server.ts");
+  const start = text("scripts/start-universal-broker-v2-production.sh");
+  const deploy = text("scripts/deploy-universal-broker-v2-production.sh");
+  const tests = text("src/v2/self-management.test.ts");
+  const upgradeTests = text("src/v2/production-upgrade-worker.test.ts");
+  const packageJson = JSON.parse(text("package.json"));
+  for (const marker of ["restart_broker", "restart_status", "transactionId", "delayMs"]) {
+    if (!contracts.includes(marker)) fail(`Self-management contract is missing: ${marker}`);
+  }
+  for (const marker of [
+    "UniversalSelfManagementService",
+    "WAITING_FOR_RESPONSE",
+    "expectedDisconnect",
+    "launchDetachedRestartWorker",
+    "staleRecovered",
+  ]) {
+    if (!service.includes(marker)) fail(`Durable restart service is missing: ${marker}`);
+  }
+  for (const marker of [
+    'runPm2(request, ["restart"',
+    'runPm2(request, ["save"]',
+    "pidBefore",
+    "pidAfter",
+    "localHealthStatus",
+    "publicHealthStatus",
+  ]) {
+    if (!worker.includes(marker)) fail(`Detached restart worker is missing: ${marker}`);
+  }
+  for (const marker of [
+    'typed.operation === "restart_broker"',
+    'typed.operation === "restart_status"',
+    "selfManagement.requestRestart",
+    "selfManagement.status",
+  ]) {
+    if (!server.includes(marker)) fail(`Self-management MCP wiring is missing: ${marker}`);
+  }
+  if (!start.includes("DEVSPACE_NEXT_PM2_EXPECTED_SCRIPT")) {
+    fail("Production start script does not bind the expected PM2 script for restart verification.");
+  }
+  for (const marker of [
+    "DEVSPACE_NEXT_SELF_MANAGEMENT_DIR",
+    "DEVSPACE_NEXT_PM2_PROCESS_NAME",
+    "DEVSPACE_NEXT_SELF_RESTART_TIMEOUT_MS",
+  ]) {
+    if (!deploy.includes(marker)) fail(`Production deploy source is missing self-management config: ${marker}`);
+  }
+  for (const marker of [
+    "stale transactions fail closed",
+    "changes PM2 PID",
+  ]) {
+    if (!tests.includes(marker)) fail(`Self-management regression test is missing: ${marker}`);
+  }
+  if (!packageJson.scripts?.["v2:test"]?.includes("src/v2/self-management.test.ts")) {
+    fail("The canonical v2 test gate omits self-management tests.");
+  }
+  for (const marker of [
+    "PRODUCTION_UPGRADE_STATES",
+    "ROLLING_BACK",
+    "replacePm2Process",
+    "verifyNextRuntime",
+    "publicMetricsStatus",
+    "unauthenticatedMcpStatus",
+    "rollbackRuntime",
+  ]) {
+    if (!upgradeWorker.includes(marker)) fail(`Production upgrade worker is missing: ${marker}`);
+  }
+  for (const marker of [
+    "npm run release:verify -- --require-clean",
+    "DEVSPACE_V2_LOAD_SSH_TARGET",
+    "candidate-live.json",
+    "full-load-real-",
+    "DEVSPACE_V2_LOAD_REQUIRE_REAL_SSH=1",
+    "cleanup_on_exit",
+    "worktree remove --force",
+    "pm2-before.json",
+    "production.env.before",
+    "DEVSPACE_NEXT_OAUTH_STATE_DIR",
+    "CANDIDATE_OAUTH_DATABASE",
+    "PRODUCTION_OAUTH_DATABASE",
+    "Managed Universal Broker v2.1 runtime values",
+    "DEVSPACE_V2_LEGACY_SCOPE_COMPATIBILITY",
+    "oauth-before.sqlite",
+    "launchctl submit",
+    "production-upgrade-worker.js",
+  ]) {
+    if (!upgrade.includes(marker)) fail(`Production upgrade transaction is missing: ${marker}`);
+  }
+  if (!upgradeStatus.includes("transactionId")) {
+    fail("Production upgrade status reader does not resolve transaction IDs.");
+  }
+  for (const marker of [
+    "commits canonical pointers only after verification",
+    "rolls back env, process, start path, and audit link",
+  ]) {
+    if (!upgradeTests.includes(marker)) fail(`Production upgrade regression test is missing: ${marker}`);
+  }
+  if (!packageJson.scripts?.["v2:test"]?.includes("src/v2/production-upgrade-worker.test.ts")) {
+    fail("The canonical v2 test gate omits production-upgrade worker tests.");
+  }
+  if (packageJson.scripts?.["upgrade:v2"] !== "bash scripts/upgrade-universal-broker-v2-production.sh") {
+    fail("The canonical production upgrade command is missing.");
+  }
+}
+
+function verifyMetricsIsolationSources() {
+  const http = text("src/v2/http-server.ts");
+  const tests = text("src/v2/http-server.test.ts");
+  for (const marker of [
+    "isLoopbackRequest",
+    'hostname === "localhost"',
+    'hostname === "127.0.0.1"',
+    'metrics are loopback-only',
+  ]) {
+    if (!http.includes(marker)) fail(`Metrics isolation source is missing: ${marker}`);
+  }
+  for (const marker of [
+    'requestStatus(`${origin}${config.metricsPath}`, "home-ai.example.test")',
+    "403",
+  ]) {
+    if (!tests.includes(marker)) fail(`Metrics reverse-proxy regression test is missing: ${marker}`);
   }
 }
 
@@ -207,7 +492,14 @@ function verifyLiveVerifierSources() {
     "discoverTokenResource(mcpUrl, options.tokenResource)",
     "metadata?.resource",
     "JSON.stringify(userScopes)",
+    '"offline_access"',
     "fileMustExist: true",
+    "prepareExactAuthority",
+    "AUTHORITY_MISMATCH",
+    "AUTHORITY_CONSUMED",
+    "AUTHORITY_EXPIRED",
+    "ELEVATION_BLOCKED",
+    "runtimeElevationBlocked",
   ]) {
     if (!live.includes(marker)) fail(`The live verifier user-only parallel contract is missing: ${marker}`);
   }
@@ -288,6 +580,11 @@ function verifyDist() {
     "dist/v2/server.js",
     "dist/v2/http-server.js",
     "dist/v2/remote-windows-filesystem-helper.js",
+    "dist/v2/authority.js",
+    "dist/v2/no-elevation.js",
+    "dist/v2/self-management.js",
+    "dist/v2/self-management-worker.js",
+    "dist/v2/production-upgrade-worker.js",
     "dist/v2/doctor.js",
   ]) {
     if (!existsSync(resolve(root, path))) fail(`Missing build output: ${path}`);
@@ -321,6 +618,8 @@ function verifyPackage() {
     "scripts/start-universal-broker-v2-production.sh",
     "scripts/deploy-universal-broker-v2-pm2.sh",
     "scripts/undeploy-universal-broker-v2-pm2.sh",
+    "scripts/upgrade-universal-broker-v2-production.sh",
+    "scripts/status-universal-broker-v2-upgrade.sh",
     "scripts/verify-universal-broker-v2-live.mjs",
   ];
   const missing = required.filter((path) => !files.includes(path));
@@ -408,7 +707,7 @@ function verifyContract() {
   ].join("")]);
   const value = JSON.parse(output.trim());
   const expected = ["target", "context", "fs", "exec", "process", "mcp", "artifact", "gui"];
-  if (value.version !== "2.0.0" || JSON.stringify(value.tools) !== JSON.stringify(expected)) {
+  if (value.version !== "2.1.0" || JSON.stringify(value.tools) !== JSON.stringify(expected)) {
     fail(`Unexpected broker contract: ${output}`);
   }
   return value;

@@ -14,6 +14,7 @@ import {
 } from "./mcp-routes.js";
 import { UniversalMcpResultStore } from "./mcp-result-store.js";
 import { prepareSshControlPath } from "./ssh-control.js";
+import { posixRemoteUserOnlyRunner, wrapLocalUserOnlyExecution } from "./no-elevation.js";
 import type { TargetRegistry } from "./targets.js";
 
 export type UniversalMcpOperation =
@@ -37,6 +38,7 @@ export interface UniversalMcpInput {
   cursor?: string;
   limit?: number;
   responsePolicy?: Record<string, unknown>;
+  authorityId?: string;
 }
 
 type DownstreamTransport = StdioClientTransport | StreamableHTTPClientTransport;
@@ -275,6 +277,51 @@ export class UniversalMcpProxy {
     }
   }
 
+  async inspectInvocation(input: Pick<UniversalMcpInput, "route" | "name">): Promise<{
+    routeId: string;
+    routeFingerprint: string;
+    toolName: string;
+    annotations?: Record<string, unknown>;
+  }> {
+    return this.withSession(input.route, "inspect_invocation", async (session) => {
+      const name = requireText(input.name, "mcp.invoke requires name.");
+      const listed = await timed(
+        session.client.listTools(),
+        session.route.callTimeoutMs,
+        `${session.route.id} tools/list`,
+      );
+      const tool = listed.tools.find((candidate) => candidate.name === name);
+      if (!tool) {
+        throw new UniversalBrokerError(
+          "MCP_TOOL_NOT_FOUND",
+          `MCP tool ${name} is not exposed by route ${session.route.id}.`,
+          {
+            suggestions: listed.tools
+              .map((candidate) => ({ name: candidate.name }))
+              .sort((left, right) => left.name.localeCompare(right.name)),
+          },
+        );
+      }
+      return {
+        routeId: session.route.id,
+        routeFingerprint: session.routeFingerprint,
+        toolName: name,
+        ...(tool.annotations ? { annotations: tool.annotations as Record<string, unknown> } : {}),
+      };
+    });
+  }
+
+  async inspectRoute(selector: string | undefined): Promise<{
+    routeId: string;
+    routeFingerprint: string;
+  }> {
+    const route = await this.routes.resolve(selector);
+    return {
+      routeId: route.id,
+      routeFingerprint: routeFingerprint(route),
+    };
+  }
+
   readStoredResult(uri: string): Record<string, unknown> {
     return this.results.readByUri(uri);
   }
@@ -416,6 +463,9 @@ export class UniversalMcpProxy {
     const target = route.transport === "ssh-stdio"
       ? await this.targets.resolve(route.target)
       : undefined;
+    const localTarget = route.transport === "local-stdio"
+      ? await this.targets.resolve("local")
+      : undefined;
     const profile = route.envProfile
       ? await this.requireEnvProfiles().resolve(route.envProfile, target?.id ?? "local")
       : undefined;
@@ -446,20 +496,25 @@ export class UniversalMcpProxy {
           `Local stdio MCP route ${route.id} environment profile may not contain HTTP headers.`,
         );
       }
-      if (profile?.sourceFile) {
-        const remoteCommand = [route.command!, ...route.args]
-          .map(shellQuote)
-          .join(" ");
-        return new StdioClientTransport({
-          command: "/bin/sh",
-          args: ["-lc", `set -a; . ${shellQuote(profile.sourceFile)}; set +a; exec ${remoteCommand}`],
-          env: environment,
-          stderr: "pipe",
-        });
+      if (!localTarget) {
+        throw new UniversalBrokerError(
+          "CAPABILITY_UNAVAILABLE",
+          `Local target is unavailable for MCP route ${route.id}.`,
+        );
       }
+      const direct = profile?.sourceFile
+        ? {
+            executable: "/bin/sh",
+            args: [
+              "-lc",
+              `set -a; . ${shellQuote(profile.sourceFile)}; set +a; exec ${[route.command!, ...route.args].map(shellQuote).join(" ")}`,
+            ],
+          }
+        : { executable: route.command!, args: route.args };
+      const wrapped = wrapLocalUserOnlyExecution(localTarget.platform, direct, "gui");
       return new StdioClientTransport({
-        command: route.command!,
-        args: route.args,
+        command: wrapped.executable,
+        args: wrapped.args,
         env: environment,
         stderr: "pipe",
       });
@@ -483,6 +538,18 @@ export class UniversalMcpProxy {
     const remoteCommand = profile?.sourceFile
       ? `set -a; . ${shellQuote(profile.sourceFile)}; set +a; exec ${command}`
       : `exec ${command}`;
+    if (target.platform === "windows") {
+      throw new UniversalBrokerError(
+        "CAPABILITY_UNAVAILABLE",
+        `SSH stdio MCP route ${route.id} requires a POSIX target.`,
+      );
+    }
+    const userOnlyCommand = posixRemoteUserOnlyRunner(
+      target.platform,
+      "sh",
+      shellQuote(remoteCommand),
+      "gui",
+    );
     return new StdioClientTransport({
       command: "/usr/bin/ssh",
       args: [
@@ -494,7 +561,7 @@ export class UniversalMcpProxy {
         "-o", `ControlPath=${controlPath}`,
         "-T",
         target.sshHost,
-        `sh -lc ${shellQuote(remoteCommand)}`,
+        userOnlyCommand,
       ],
       env: environment,
       stderr: "pipe",

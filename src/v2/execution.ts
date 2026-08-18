@@ -32,6 +32,13 @@ import {
   type UniversalEnvProfileRegistry,
 } from "./env-profiles.js";
 import { prepareSshControlPath } from "./ssh-control.js";
+import { assertNoElevationCommand } from "./authority-policy.js";
+import {
+  posixRemoteUserOnlyRunner,
+  type InternalExecutionPolicy,
+  windowsNonElevatedPrelude,
+  wrapLocalUserOnlyExecution,
+} from "./no-elevation.js";
 import {
   type TargetDefinition,
   type TargetRegistry,
@@ -66,15 +73,31 @@ export interface ExecuteCommandInput {
   yieldMs?: number;
   maxOutputChars?: number;
   envProfile?: string;
+  authorityId?: string;
+  /** Internal helpers may select a constrained policy; MCP callers cannot set this field. */
+  internalPolicy?: InternalExecutionPolicy;
 }
 
 export interface ProcessOperationInput {
-  operation: "poll" | "write" | "resize" | "signal" | "wait" | "list" | "forget";
+  operation:
+    | "poll"
+    | "write"
+    | "resize"
+    | "signal"
+    | "wait"
+    | "list"
+    | "forget"
+    | "restart_broker"
+    | "restart_status";
   processId?: string;
   chars?: string;
   signal?: string;
   columns?: number;
   rows?: number;
+  authorityId?: string;
+  transactionId?: string;
+  reason?: string;
+  delayMs?: number;
   waitMs?: number;
   maxOutputChars?: number;
   cursor?: string;
@@ -177,6 +200,7 @@ export class UniversalExecutionPlane {
   async execute(input: ExecuteCommandInput): Promise<UniversalProcessSnapshot> {
     this.assertOpen();
     validateCommand(input.command);
+    if (!input.internalPolicy) assertNoElevationCommand(input.command);
     const resolved = await this.resolveExecution(input);
     this.assertQuota(resolved.target.id);
     await Promise.all([
@@ -228,6 +252,12 @@ export class UniversalExecutionPlane {
 
   async operate(input: ProcessOperationInput): Promise<Record<string, unknown>> {
     this.assertOpen();
+    if (input.operation === "restart_broker" || input.operation === "restart_status") {
+      throw new UniversalBrokerError(
+        "PRECONDITION_FAILED",
+        `${input.operation} must be handled by the broker self-management service.`,
+      );
+    }
     if (input.operation === "list") return this.list(input.cursor, input.limit);
     const processId = requireProcessId(input.processId, input.operation);
     const entry = this.requireEntry(processId);
@@ -416,13 +446,14 @@ export class UniversalExecutionPlane {
     processId: string,
   ): Promise<CommandSpec> {
     if (resolved.target.transport === "local") {
-      return localCommandSpec(resolved, input.command);
+      return localCommandSpec(resolved, input.command, input.internalPolicy);
     }
     return remoteCommandSpec({
       resolved,
       command: input.command,
       processId,
       tty: input.tty === true,
+      internalPolicy: input.internalPolicy,
       sshControlDir: this.options.sshControlDir,
       sshExecutable: this.options.sshExecutable ?? "ssh",
     });
@@ -488,7 +519,11 @@ export class UniversalExecutionPlane {
       entry.exitCode = code ?? undefined;
     } else if (entry.remoteMarkers) {
       const markers = entry.remoteMarkers;
-      if (markers.cwdRejected) {
+      if (markers.elevationBlocked) {
+        entry.state = "FAILED";
+        entry.errorCode = "ELEVATION_BLOCKED";
+        entry.errorMessage = "Remote execution target has an elevated Windows token; DevSpace requires an ordinary user token.";
+      } else if (markers.cwdRejected) {
         entry.state = "FAILED";
         entry.errorCode = "PATH_NOT_FOUND";
         entry.errorMessage = `Remote working directory is unavailable: ${entry.cwd}`;
@@ -761,16 +796,19 @@ class RemoteMarkerParser {
   readonly dispatchedMarker: string;
   readonly completedPrefix: string;
   readonly cwdRejectedMarker: string;
+  readonly elevationBlockedMarker: string;
   private remainder = "";
   dispatched = false;
   completed = false;
   cwdRejected = false;
+  elevationBlocked = false;
   exitCode?: number;
 
   constructor(nonce: string) {
     this.dispatchedMarker = `__DEVSPACE_DISPATCHED_${nonce}__`;
     this.completedPrefix = `__DEVSPACE_COMPLETED_${nonce}__:`;
     this.cwdRejectedMarker = `__DEVSPACE_CWD_REJECTED_${nonce}__`;
+    this.elevationBlockedMarker = `__DEVSPACE_ELEVATION_BLOCKED_${nonce}__`;
   }
 
   consume(value: string, final: boolean): string {
@@ -782,6 +820,7 @@ class RemoteMarkerParser {
     const retained = potentialMarkerSuffixLength(sanitized, [
       this.dispatchedMarker,
       this.cwdRejectedMarker,
+      this.elevationBlockedMarker,
       this.completedPrefix,
     ]);
     this.remainder = retained > 0 ? sanitized.slice(-retained) : "";
@@ -798,6 +837,10 @@ class RemoteMarkerParser {
       this.cwdRejected = true;
       result = result.replace(new RegExp(`${escapeRegExp(this.cwdRejectedMarker)}\\r?\\n?`, "g"), "");
     }
+    if (result.includes(this.elevationBlockedMarker)) {
+      this.elevationBlocked = true;
+      result = result.replace(new RegExp(`${escapeRegExp(this.elevationBlockedMarker)}\\r?\\n?`, "g"), "");
+    }
     const escapedPrefix = escapeRegExp(this.completedPrefix);
     const terminator = final ? "(?:\\r?\\n|$)" : "\\r?\\n";
     result = result.replace(new RegExp(`${escapedPrefix}(-?\\d+)${terminator}`, "g"), (_match, exitCode: string) => {
@@ -812,10 +855,15 @@ class RemoteMarkerParser {
 async function localCommandSpec(
   resolved: ResolvedExecution,
   command: string,
+  internalPolicy?: InternalExecutionPolicy,
 ): Promise<CommandSpec> {
-  const shell = localShellCommand(
-    resolved.target,
-    commandWithSourceFile(command, resolved.sourceFile),
+  const shell = wrapLocalUserOnlyExecution(
+    resolved.target.platform,
+    localShellCommand(
+      resolved.target,
+      commandWithSourceFile(command, resolved.sourceFile),
+    ),
+    internalPolicy,
   );
   const environment = {
     ...executionEnvironment(),
@@ -834,6 +882,7 @@ async function remoteCommandSpec(input: {
   command: string;
   processId: string;
   tty: boolean;
+  internalPolicy?: InternalExecutionPolicy;
   sshControlDir: string;
   sshExecutable: string;
 }): Promise<CommandSpec> {
@@ -854,6 +903,7 @@ async function remoteCommandSpec(input: {
         cwd,
         commandWithSourceFile(input.command, input.resolved.sourceFile),
         markers,
+        input.internalPolicy,
       );
   return {
     executable: input.sshExecutable,
@@ -882,9 +932,15 @@ function posixRemoteCommand(
   cwd: string,
   command: string,
   markers: RemoteMarkerParser,
+  internalPolicy?: InternalExecutionPolicy,
 ): string {
   const shell = posixShell(target.shell);
-  const runner = `${shell} -lc ${shellQuote(command)}`;
+  const runner = posixRemoteUserOnlyRunner(
+    target.platform,
+    shell,
+    shellQuote(command),
+    internalPolicy,
+  );
   const script = [
     `requested=${shellQuote(cwd)}`,
     "case \"$requested\" in '~') requested=$HOME ;; '~/'*) requested=$HOME/${requested#\~/} ;; esac",
@@ -914,6 +970,7 @@ function windowsRemoteCommand(
   const commandBase64 = Buffer.from(command, "utf16le").toString("base64");
   const source = [
     "$ErrorActionPreference='Stop'",
+    ...windowsNonElevatedPrelude(markers.elevationBlockedMarker),
     `$cwd='${escapedCwd}'`,
     `if(-not (Test-Path -LiteralPath $cwd -PathType Container)){[Console]::Error.WriteLine('${markers.cwdRejectedMarker}');exit 44}`,
     `Set-Location -LiteralPath $cwd`,

@@ -25,6 +25,7 @@ const userScopes = [
   "devspace.mcp",
   "devspace.artifact",
   "devspace.gui",
+  "offline_access",
 ];
 
 const options = parseArgs(process.argv.slice(2));
@@ -42,6 +43,15 @@ const audit = {
   health: undefined,
   protocolSessions: [],
   canaries: {},
+};
+const authorityAudit = {
+  prepared: 0,
+  byRisk: { R1: 0, R2: 0, R3: 0 },
+  mismatchRejected: false,
+  consumedRejected: false,
+  correctionInvalidated: false,
+  staticElevationBlocked: false,
+  runtimeElevationBlocked: false,
 };
 
 const health = await fetch(healthUrl);
@@ -98,6 +108,101 @@ async function runCanaries(client, root, canaries) {
   await call(client, "fs", { operation: "copy", path: file, destination: copy, overwrite: false });
   await call(client, "fs", { operation: "remove", path: copy, disposition: "permanent" });
   canaries.localUserFilesystem = true;
+
+  const exactAuthorityPath = join(root, "authority-exact.txt");
+  const exactAuthorityArgs = {
+    operation: "write",
+    path: exactAuthorityPath,
+    content: "authority-exact\n",
+    overwrite: false,
+  };
+  const exactAuthorityId = await prepareExactAuthority(
+    client,
+    "fs",
+    exactAuthorityArgs,
+    "R1",
+    "Verify exact local mutation authority and one-use consumption.",
+  );
+  const mismatchResult = await client.callTool({
+    name: "fs",
+    arguments: {
+      ...exactAuthorityArgs,
+      path: `${exactAuthorityPath}.mismatch`,
+      authorityId: exactAuthorityId,
+    },
+  });
+  assert(errorCode(mismatchResult) === "AUTHORITY_MISMATCH", "authority mismatch was not rejected");
+  authorityAudit.mismatchRejected = true;
+  const exactResult = await client.callTool({
+    name: "fs",
+    arguments: { ...exactAuthorityArgs, authorityId: exactAuthorityId },
+  });
+  assert(exactResult.isError !== true && exactResult.structuredContent?.ok !== false, "exact authority action failed");
+  const consumedResult = await client.callTool({
+    name: "fs",
+    arguments: { ...exactAuthorityArgs, authorityId: exactAuthorityId },
+  });
+  assert(errorCode(consumedResult) === "AUTHORITY_CONSUMED", "consumed authority was reusable");
+  authorityAudit.consumedRejected = true;
+
+  const correctedPath = join(root, "authority-corrected.txt");
+  const correctedArgs = {
+    operation: "write",
+    path: correctedPath,
+    content: "must-not-run\n",
+    overwrite: false,
+  };
+  const correctedAuthorityId = await prepareExactAuthority(
+    client,
+    "fs",
+    correctedArgs,
+    "R1",
+    "Prepare a canary that will be invalidated by a correction.",
+  );
+  await call(client, "context", {
+    operation: "invalidate_authority",
+    correctionText: "Do not execute the prepared corrected-file write.",
+  });
+  const correctedResult = await client.callTool({
+    name: "fs",
+    arguments: { ...correctedArgs, authorityId: correctedAuthorityId },
+  });
+  assert(errorCode(correctedResult) === "AUTHORITY_EXPIRED", "corrected authority was not invalidated");
+  authorityAudit.correctionInvalidated = true;
+
+  const staticElevation = await client.callTool({
+    name: "exec",
+    arguments: {
+      target: "local",
+      cwd: root,
+      command: "sudo -n true",
+      mode: "foreground",
+    },
+  });
+  assert(errorCode(staticElevation) === "ELEVATION_BLOCKED", "static elevation command was not blocked");
+  authorityAudit.staticElevationBlocked = true;
+
+  const runtimeElevation = data(await call(client, "exec", {
+    target: "local",
+    cwd: root,
+    command: "python3 -c 'import base64,os;p=base64.b64decode(\"L3Vzci9iaW4vc3Vkbw==\").decode();os.execv(p,[p,\"-n\",\"true\"])'",
+    mode: "foreground",
+    yieldMs: 30_000,
+  }));
+  assert(
+    runtimeElevation.state === "EXITED"
+      && Number(runtimeElevation.exitCode) !== 0
+      && /not permitted|permission|denied/i.test(String(runtimeElevation.output ?? "")),
+    "runtime OS boundary did not block an obfuscated elevation exec",
+  );
+  authorityAudit.runtimeElevationBlocked = true;
+
+  await call(client, "fs", {
+    operation: "remove",
+    path: exactAuthorityPath,
+    disposition: "permanent",
+  });
+  canaries.operationAuthority = authorityAudit;
 
   const externalRoot = data(await call(client, "fs", {
     operation: "stat",
@@ -452,15 +557,12 @@ async function runCanaries(client, root, canaries) {
   assert(guiObservation.sessionId && guiObservation.generation, "local generic GUI observation failed");
   let guiAction;
   for (let attempt = 0; attempt < 2; attempt += 1) {
-    const result = await client.callTool({
-      name: "gui",
-      arguments: {
-        operation: "act",
-        target: "local",
-        sessionId: guiObservation.sessionId,
-        generation: guiObservation.generation,
-        action: { type: "key_code", keyCode: 53 },
-      },
+    const result = await callWithAuthority(client, "gui", {
+      operation: "act",
+      target: "local",
+      sessionId: guiObservation.sessionId,
+      generation: guiObservation.generation,
+      action: { type: "key_code", keyCode: 53 },
     });
     if (result.isError !== true && result.structuredContent?.ok !== false) {
       guiAction = data(result);
@@ -532,11 +634,54 @@ function fetchArtifact(resourceUri) {
 }
 
 async function call(client, name, args) {
-  const result = await client.callTool({ name, arguments: args });
+  const result = await callWithAuthority(client, name, args);
   if (result.isError === true || result.structuredContent?.ok === false) {
     throw new Error(`${name} failed: ${JSON.stringify(result.structuredContent ?? result.content).slice(0, 4_000)}`);
   }
   return result;
+}
+
+async function callWithAuthority(client, name, args) {
+  let result = await client.callTool({ name, arguments: args });
+  if (errorCode(result) !== "AUTHORITY_REQUIRED") return result;
+  const requiredRisk = result.structuredContent?.error?.evidence?.requiredRisk;
+  assert(["R1", "R2", "R3"].includes(requiredRisk), `invalid required authority risk: ${requiredRisk}`);
+  const authorityId = await prepareExactAuthority(
+    client,
+    name,
+    args,
+    requiredRisk,
+    `Live verification authorizes this exact ${name} canary action.`,
+  );
+  result = await client.callTool({
+    name,
+    arguments: { ...args, authorityId },
+  });
+  return result;
+}
+
+async function prepareExactAuthority(client, tool, args, risk, authorityText) {
+  const prepared = await client.callTool({
+    name: "context",
+    arguments: {
+      operation: "authorize",
+      taskId: `live-${tool}-${randomUUID()}`,
+      authorityText,
+      actions: [{ tool, arguments: args, risk }],
+    },
+  });
+  if (prepared.isError === true || prepared.structuredContent?.ok === false) {
+    throw new Error(`context.authorize failed: ${JSON.stringify(prepared.structuredContent ?? prepared.content).slice(0, 4_000)}`);
+  }
+  const authorityId = data(prepared).authorityId;
+  assert(typeof authorityId === "string", "context.authorize returned no authorityId");
+  authorityAudit.prepared += 1;
+  authorityAudit.byRisk[risk] += 1;
+  return authorityId;
+}
+
+function errorCode(result) {
+  return result.structuredContent?.error?.code;
 }
 
 function data(result) {

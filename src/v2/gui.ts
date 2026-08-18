@@ -29,6 +29,7 @@ export interface UniversalGuiInput {
   action?: Record<string, unknown>;
   timeoutMs?: number;
   maxElements?: number;
+  authorityId?: string;
 }
 
 export interface GuiApplicationObservation {
@@ -178,6 +179,25 @@ export class UniversalGuiService {
       case "wait":
         return this.wait(input);
     }
+  }
+
+  async authorityTarget(input: Pick<UniversalGuiInput, "target" | "sessionId">): Promise<{
+    generation: string;
+    target: TargetDefinition;
+  }> {
+    this.assertOpen();
+    this.pruneExpired();
+    const session = input.sessionId ? this.requireSession(input.sessionId) : undefined;
+    const binding = await this.targets.resolveWithGeneration(
+      input.target ?? session?.targetId ?? "local",
+    );
+    if (session && session.targetId !== binding.target.id) {
+      throw new UniversalBrokerError(
+        "PRECONDITION_FAILED",
+        `GUI session ${session.sessionId} belongs to ${session.targetId}, not ${binding.target.id}.`,
+      );
+    }
+    return binding;
   }
 
   close(): void {
@@ -553,6 +573,7 @@ export class MacOsGuiNodeRunner implements GuiNodeRunner {
     const scriptPath = await this.ensureInstalled(target);
     const args = guiNodeArguments(request);
     let process = await this.execution.execute({
+        internalPolicy: "gui",
       target: target.id,
       cwd: target.defaultCwd,
       command: ["/usr/bin/osascript", shellQuote(scriptPath), ...args.map(shellQuote)].join(" "),

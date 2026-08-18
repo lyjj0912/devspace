@@ -22,6 +22,8 @@ const DEFAULT_MAX_RUNNING_PROCESSES_PER_TARGET = 16;
 const DEFAULT_PROCESS_BUFFER_CHARACTERS = 1_000_000;
 const DEFAULT_PROCESS_OUTPUT_MAX_BYTES = 100 * 1024 * 1024;
 const DEFAULT_COMPLETED_PROCESS_TTL_MS = 15 * 60 * 1_000;
+const DEFAULT_SELF_RESTART_DELAY_MS = 2_000;
+const DEFAULT_SELF_RESTART_TIMEOUT_MS = 120_000;
 const DEFAULT_ARTIFACT_MAXIMUM_ENTRIES = 64;
 const DEFAULT_ARTIFACT_MAXIMUM_TOTAL_BYTES = 2 * 1024 * 1024 * 1024;
 const DEFAULT_ARTIFACT_MAXIMUM_FILE_BYTES = 1024 * 1024 * 1024;
@@ -34,6 +36,7 @@ const DEFAULT_DOWNSTREAM_MCP_SESSION_IDLE_TTL_MS = 5 * 60_000;
 const DEFAULT_MCP_RESULT_MAXIMUM_ENTRIES = 64;
 const DEFAULT_MCP_RESULT_MAXIMUM_CHARACTERS = 10_000_000;
 const DEFAULT_MCP_RESULT_TTL_MS = 15 * 60_000;
+export const OAUTH_OFFLINE_ACCESS_SCOPE = "offline_access";
 
 export type UniversalBrokerDeploymentMode = "parallel" | "production";
 
@@ -50,7 +53,6 @@ export interface UniversalBrokerNextConfig {
   artifactPathPrefix: string;
   stateDir: string;
   oauthStateDir: string;
-  legacyScopeCompatibility: boolean;
   targetConfigPath: string;
   mcpRouteConfigPath: string;
   contextStorePath: string;
@@ -65,6 +67,11 @@ export interface UniversalBrokerNextConfig {
   contextDiffTtlMs: number;
   processOutputDir: string;
   sshControlDir: string;
+  selfManagementDir: string;
+  selfRestartPm2ProcessName: string;
+  selfRestartExpectedScript?: string;
+  selfRestartDelayMs: number;
+  selfRestartTimeoutMs: number;
   maxRunningProcesses: number;
   maxRunningProcessesPerTarget: number;
   processBufferCharacters: number;
@@ -139,16 +146,19 @@ export function loadUniversalBrokerNextConfig(
   if (stateDir === resolve(base.stateDir)) {
     throw new Error("DEVSPACE_NEXT_STATE_DIR must be separate from the production state directory.");
   }
-  const oauthStateDir = deploymentMode === "production"
-    ? resolve(base.stateDir)
-    : stateDir;
-  const legacyScopeCompatibility = parseBoolean(
-    env.DEVSPACE_V2_LEGACY_SCOPE_COMPATIBILITY,
-    deploymentMode === "production",
+  const oauthStateDir = resolve(expandHomePath(
+    env.DEVSPACE_NEXT_OAUTH_STATE_DIR
+      ?? (deploymentMode === "production" ? base.stateDir : stateDir),
+  ));
+  const legacyScopeCompatibility = env.DEVSPACE_V2_LEGACY_SCOPE_COMPATIBILITY;
+  if (legacyScopeCompatibility !== undefined && parseBoolean(
+    legacyScopeCompatibility,
+    false,
     "DEVSPACE_V2_LEGACY_SCOPE_COMPATIBILITY",
-  );
-  if (deploymentMode !== "production" && legacyScopeCompatibility) {
-    throw new Error("Legacy devspace scope compatibility is available only in production deployment mode.");
+  )) {
+    throw new Error(
+      "DEVSPACE_V2_LEGACY_SCOPE_COMPATIBILITY was removed in Universal Broker v2.1; issue granular scopes instead.",
+    );
   }
   const productionMcpUrl = new URL("/mcp", base.publicBaseUrl).href;
   if (deploymentMode === "parallel" && publicMcpUrl === productionMcpUrl) {
@@ -174,7 +184,6 @@ export function loadUniversalBrokerNextConfig(
     artifactPathPrefix,
     stateDir,
     oauthStateDir,
-    legacyScopeCompatibility,
     targetConfigPath: resolve(expandHomePath(
       env.DEVSPACE_NEXT_TARGETS_FILE ?? join(configDir, "targets.v2.json"),
     )),
@@ -243,6 +252,31 @@ export function loadUniversalBrokerNextConfig(
       env.DEVSPACE_NEXT_SSH_CONTROL_DIR
         ?? join(process.env.HOME ?? "~", ".devspace", "run", "v2-ssh"),
     )),
+    selfManagementDir: resolve(expandHomePath(
+      env.DEVSPACE_NEXT_SELF_MANAGEMENT_DIR
+        ?? join(stateDir, "self-management"),
+    )),
+    selfRestartPm2ProcessName: parseBoundedText(
+      env.DEVSPACE_NEXT_PM2_PROCESS_NAME,
+      deploymentMode === "production" ? "devspace-v2-production" : "devspace-next",
+      "DEVSPACE_NEXT_PM2_PROCESS_NAME",
+      128,
+    ),
+    selfRestartExpectedScript: env.DEVSPACE_NEXT_PM2_EXPECTED_SCRIPT?.trim()
+      ? resolve(expandHomePath(env.DEVSPACE_NEXT_PM2_EXPECTED_SCRIPT))
+      : undefined,
+    selfRestartDelayMs: parseBoundedPositiveInteger(
+      env.DEVSPACE_NEXT_SELF_RESTART_DELAY_MS,
+      DEFAULT_SELF_RESTART_DELAY_MS,
+      "DEVSPACE_NEXT_SELF_RESTART_DELAY_MS",
+      15_000,
+    ),
+    selfRestartTimeoutMs: parseBoundedPositiveInteger(
+      env.DEVSPACE_NEXT_SELF_RESTART_TIMEOUT_MS,
+      DEFAULT_SELF_RESTART_TIMEOUT_MS,
+      "DEVSPACE_NEXT_SELF_RESTART_TIMEOUT_MS",
+      10 * 60_000,
+    ),
     maxRunningProcesses: parseBoundedPositiveInteger(
       env.DEVSPACE_NEXT_MAX_RUNNING_PROCESSES,
       DEFAULT_MAX_RUNNING_PROCESSES,
@@ -354,7 +388,7 @@ export function loadUniversalBrokerNextConfig(
       ownerToken: base.oauth.ownerToken,
       accessTokenTtlSeconds: base.oauth.accessTokenTtlSeconds,
       refreshTokenTtlSeconds: base.oauth.refreshTokenTtlSeconds,
-      scopes: [...UNIVERSAL_OWNER_SCOPES],
+      scopes: [...UNIVERSAL_OWNER_SCOPES, OAUTH_OFFLINE_ACCESS_SCOPE],
       allowedRedirectHosts: base.oauth.allowedRedirectHosts,
     },
     logging: base.logging,
@@ -410,6 +444,19 @@ function parseBoundedPositiveInteger(
     throw new Error(`Invalid ${name}: ${parsed} exceeds ${maximum}`);
   }
   return parsed;
+}
+
+function parseBoundedText(
+  value: string | undefined,
+  fallback: string,
+  name: string,
+  maximum: number,
+): string {
+  const normalized = value?.trim() || fallback;
+  if (!normalized || normalized.length > maximum || /[\r\n\0]/u.test(normalized)) {
+    throw new Error(`Invalid ${name}: expected 1 through ${maximum} single-line characters.`);
+  }
+  return normalized;
 }
 
 function parseBoolean(

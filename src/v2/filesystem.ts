@@ -95,6 +95,7 @@ export interface UniversalFilesystemInput {
   overwrite?: boolean;
   expectedSha256?: string;
   disposition?: "trash" | "permanent";
+  authorityId?: string;
   cursor?: string;
   limit?: number;
 }
@@ -507,6 +508,7 @@ export class UniversalFilesystemService {
     let result: UniversalProcessSnapshot | undefined;
     try {
       result = await this.execution.execute({
+        internalPolicy: "filesystem",
         target: target.id,
         cwd: target.defaultCwd ?? "~",
         command: `Remove-Item -LiteralPath ${powershellLiteral(remoteScript)} -Force -ErrorAction SilentlyContinue`,
@@ -536,6 +538,7 @@ export class UniversalFilesystemService {
     responseMarker: string,
   ): Promise<unknown> {
     let result = await this.execution.execute({
+        internalPolicy: "filesystem",
       target: target.id,
       cwd: target.defaultCwd ?? "~",
       command,

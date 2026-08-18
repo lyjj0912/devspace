@@ -5,6 +5,7 @@ import { homedir, platform as nodePlatform, arch, tmpdir } from "node:os";
 import { promisify } from "node:util";
 import * as z from "zod/v4";
 import { UniversalBrokerError } from "./errors.js";
+import { macosUserOnlyProfile, windowsIntegrityIsElevated } from "./no-elevation.js";
 
 const execFileAsync = promisify(execFile);
 const TARGET_ID_PATTERN = /^[a-z][a-z0-9._-]{0,63}$/;
@@ -206,32 +207,36 @@ export class TargetRegistry {
 
   private async probeLocal(target: TargetDefinition): Promise<TargetObservation> {
     const observedAtMs = this.now();
-    const [git, rsync] = await Promise.all([
+    const platform = target.platform === "unknown" ? currentPlatform() : target.platform;
+    const [git, rsync, boundary] = await Promise.all([
       commandAvailable("git", this.execute),
       commandAvailable("rsync", this.execute),
+      probeLocalUserAccountBoundary(platform, this.execute),
     ]);
     return {
       targetId: target.id,
-      status: "ONLINE",
+      status: boundary.available ? "ONLINE" : "DEGRADED",
       observedAt: new Date(observedAtMs).toISOString(),
       expiresAt: new Date(observedAtMs + target.probeTtlMs).toISOString(),
-      platform: target.platform === "unknown" ? currentPlatform() : target.platform,
+      platform,
       architecture: arch(),
       homeDirectory: homedir(),
       temporaryDirectory: tmpdir(),
       capabilities: {
-        fs: true,
-        exec: true,
-        pty: process.platform !== "win32",
+        fs: boundary.available,
+        exec: boundary.available,
+        pty: boundary.available && process.platform !== "win32",
         sftp: false,
         rsync,
         git,
-        gui: target.gui.mode !== "none",
-        mcp: true,
-        durableProcess: target.durableProcess.mode !== "none",
+        gui: boundary.available && target.gui.mode !== "none",
+        mcp: boundary.available,
+        durableProcess: boundary.available && target.durableProcess.mode !== "none",
       },
+      ...(!boundary.available ? { reason: boundary.reason } : {}),
       evidence: {
         transport: "local",
+        userAccountBoundary: boundary.mechanism,
       },
     };
   }
@@ -246,6 +251,7 @@ export class TargetRegistry {
       return this.probeWindowsSsh(target, observedAtMs, expiresAt);
     }
 
+    const macosProfile = shellQuote(macosUserOnlyProfile());
     const script = [
       "printf '__DEVSPACE_TARGET_V1__\\n'",
       "printf 'kernel=%s\\n' \"$(uname -s 2>/dev/null || printf unknown)\"",
@@ -254,6 +260,8 @@ export class TargetRegistry {
       "printf 'temporary=%s\\n' \"${TMPDIR:-/tmp}\"",
       "command -v git >/dev/null 2>&1 && printf 'git=1\\n' || printf 'git=0\\n'",
       "command -v rsync >/dev/null 2>&1 && printf 'rsync=1\\n' || printf 'rsync=0\\n'",
+      "if command -v setpriv >/dev/null 2>&1 && setpriv --no-new-privs -- sh -c 'grep -Eq \"^NoNewPrivs:[[:space:]]*1\" /proc/self/status && grep -Eq \"^CapPrm:[[:space:]]*0+$\" /proc/self/status && grep -Eq \"^CapEff:[[:space:]]*0+$\" /proc/self/status && grep -Eq \"^CapAmb:[[:space:]]*0+$\" /proc/self/status' >/dev/null 2>&1; then printf 'setpriv_boundary=1\\n'; else printf 'setpriv_boundary=0\\n'; fi",
+      `if [ -x /usr/bin/sandbox-exec ] && /usr/bin/sandbox-exec -p ${macosProfile} /bin/echo boundary-ok >/dev/null 2>&1 && ! /usr/bin/sandbox-exec -p ${macosProfile} /bin/ps -p $$ >/dev/null 2>&1; then printf 'sandbox_boundary=1\\n'; else printf 'sandbox_boundary=0\\n'; fi`,
     ].join("; ");
 
     try {
@@ -273,9 +281,14 @@ export class TargetRegistry {
       const platform = target.platform === "unknown"
         ? platformFromKernel(fields.kernel)
         : target.platform;
+      const boundary = platform === "linux"
+        ? { available: fields.setpriv_boundary === "1", mechanism: "verified setpriv --no-new-privs with zero process capabilities" }
+        : platform === "macos"
+          ? { available: fields.sandbox_boundary === "1", mechanism: "verified sandbox-exec + authorization/set-id deny" }
+          : { available: false, mechanism: "unsupported" };
       return {
         targetId: target.id,
-        status: "ONLINE",
+        status: boundary.available ? "ONLINE" : "DEGRADED",
         observedAt: new Date(observedAtMs).toISOString(),
         expiresAt,
         platform,
@@ -283,19 +296,23 @@ export class TargetRegistry {
         homeDirectory: fields.home,
         temporaryDirectory: fields.temporary,
         capabilities: {
-          fs: true,
-          exec: true,
+          fs: boundary.available,
+          exec: boundary.available,
           pty: false,
           sftp: false,
           rsync: fields.rsync === "1",
           git: fields.git === "1",
-          gui: target.gui.mode !== "none",
-          mcp: true,
-          durableProcess: target.durableProcess.mode !== "none",
+          gui: boundary.available && target.gui.mode !== "none",
+          mcp: boundary.available,
+          durableProcess: boundary.available && target.durableProcess.mode !== "none",
         },
+        ...(!boundary.available ? {
+          reason: `Strict user-account execution boundary is unavailable: ${boundary.mechanism}.`,
+        } : {}),
         evidence: {
           transport: "ssh",
           sshHost: target.sshHost,
+          userAccountBoundary: boundary.mechanism,
           ptyProbe: "not_run_phase_2",
           sftpProbe: "not_run_phase_2",
         },
@@ -316,7 +333,7 @@ export class TargetRegistry {
         sshArguments(
           target.sshHost!,
           this.probeTimeoutMs,
-          "powershell -NoProfile -NonInteractive -Command \"Write-Output '__DEVSPACE_TARGET_V1__'; Write-Output ('architecture=' + $env:PROCESSOR_ARCHITECTURE); Write-Output ('home=' + $HOME); Write-Output ('temporary=' + [IO.Path]::GetTempPath()); if (Get-Command git -ErrorAction SilentlyContinue) { Write-Output 'git=1' } else { Write-Output 'git=0' }\"",
+          "powershell -NoProfile -NonInteractive -Command \"Write-Output '__DEVSPACE_TARGET_V1__'; Write-Output ('architecture=' + $env:PROCESSOR_ARCHITECTURE); Write-Output ('home=' + $HOME); Write-Output ('temporary=' + [IO.Path]::GetTempPath()); if (Get-Command git -ErrorAction SilentlyContinue) { Write-Output 'git=1' } else { Write-Output 'git=0' }; $groups=(& whoami.exe /groups /fo csv /nh 2>$null | Out-String); if($groups -match 'S-1-16-(12288|16384)'){Write-Output 'elevated=1'}else{Write-Output 'elevated=0'}\"",
         ),
         {
           timeout: this.probeTimeoutMs + 1_000,
@@ -328,9 +345,10 @@ export class TargetRegistry {
       if (!result.stdout.includes("__DEVSPACE_TARGET_V1__")) {
         throw new Error("Remote probe marker missing");
       }
+      const elevated = fields.elevated !== "0";
       return {
         targetId: target.id,
-        status: "ONLINE",
+        status: elevated ? "DEGRADED" : "ONLINE",
         observedAt: new Date(observedAtMs).toISOString(),
         expiresAt,
         platform: "windows",
@@ -338,19 +356,23 @@ export class TargetRegistry {
         homeDirectory: fields.home,
         temporaryDirectory: fields.temporary,
         capabilities: {
-          fs: true,
-          exec: true,
+          fs: !elevated,
+          exec: !elevated,
           pty: false,
           sftp: false,
           rsync: false,
           git: fields.git === "1",
-          gui: target.gui.mode !== "none",
-          mcp: true,
-          durableProcess: target.durableProcess.mode !== "none",
+          gui: !elevated && target.gui.mode !== "none",
+          mcp: !elevated,
+          durableProcess: !elevated && target.durableProcess.mode !== "none",
         },
+        ...(elevated ? {
+          reason: "Strict user-account execution boundary rejected a high-integrity or unverifiable Windows token.",
+        } : {}),
         evidence: {
           transport: "ssh",
           sshHost: target.sshHost,
+          userAccountBoundary: elevated ? "blocked-elevated-token" : "medium-or-lower-integrity-token",
           ptyProbe: "not_run_phase_2",
           sftpProbe: "not_run_phase_2",
         },
@@ -552,6 +574,96 @@ function parseKeyValueOutput(output: string): Record<string, string> {
     fields[line.slice(0, separator)] = line.slice(separator + 1);
   }
   return fields;
+}
+
+async function probeLocalUserAccountBoundary(
+  platform: TargetPlatform,
+  execute: typeof execFileAsync,
+): Promise<{ available: boolean; mechanism: string; reason?: string }> {
+  if (platform === "macos") {
+    try {
+      const profile = macosUserOnlyProfile();
+      await execute("/usr/bin/sandbox-exec", ["-p", profile, "/bin/echo", "boundary-ok"], {
+        timeout: 5_000,
+        encoding: "utf8",
+        maxBuffer: 64 * 1024,
+      });
+      try {
+        await execute("/usr/bin/sandbox-exec", ["-p", profile, "/bin/ps", "-p", String(process.pid)], {
+          timeout: 5_000,
+          encoding: "utf8",
+          maxBuffer: 64 * 1024,
+        });
+        return {
+          available: false,
+          mechanism: "sandbox-set-id-test-failed-open",
+          reason: "macOS sandbox permitted a set-id executable.",
+        };
+      } catch {
+        return {
+          available: true,
+          mechanism: "verified sandbox-exec + authorization/set-id deny",
+        };
+      }
+    } catch (error) {
+      return {
+        available: false,
+        mechanism: "unverifiable-macos-sandbox",
+        reason: `Unable to verify macOS sandbox boundary: ${boundedError(error)}`,
+      };
+    }
+  }
+  if (platform === "linux") {
+    try {
+      await execute("setpriv", [
+        "--no-new-privs",
+        "--",
+        "sh",
+        "-c",
+        "grep -Eq '^NoNewPrivs:[[:space:]]*1' /proc/self/status && grep -Eq '^CapPrm:[[:space:]]*0+$' /proc/self/status && grep -Eq '^CapEff:[[:space:]]*0+$' /proc/self/status && grep -Eq '^CapAmb:[[:space:]]*0+$' /proc/self/status",
+      ], {
+        timeout: 5_000,
+        encoding: "utf8",
+        maxBuffer: 64 * 1024,
+      });
+      return {
+        available: true,
+        mechanism: "verified setpriv --no-new-privs with zero process capabilities",
+      };
+    } catch (error) {
+      return {
+        available: false,
+        mechanism: "unverifiable-linux-no-new-privs",
+        reason: `Unable to verify Linux no_new_privs: ${boundedError(error)}`,
+      };
+    }
+  }
+  if (platform === "windows") {
+    try {
+      const result = await execute("whoami.exe", ["/groups", "/fo", "csv", "/nh"], {
+        timeout: 5_000,
+        encoding: "utf8",
+        maxBuffer: 256 * 1024,
+      });
+      const elevated = windowsIntegrityIsElevated(result.stdout);
+      return {
+        available: !elevated,
+        mechanism: elevated ? "blocked-elevated-token" : "medium-or-lower-integrity-token",
+        ...(elevated ? { reason: "Windows process token is elevated." } : {}),
+      };
+    } catch (error) {
+      return {
+        available: false,
+        mechanism: "unverifiable-windows-token",
+        reason: `Unable to verify Windows integrity level: ${boundedError(error)}`,
+      };
+    }
+  }
+  return {
+    available: false,
+    mechanism: "unsupported-platform",
+    reason: `Strict user-account execution is unsupported for platform ${platform}.`,
+  };
 }
 
 async function commandAvailable(

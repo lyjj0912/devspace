@@ -56,9 +56,17 @@ export async function collectUniversalBrokerDoctor(
       metrics: `http://${config.host}:${config.port}${config.metricsPath}`,
       stateDir: config.stateDir,
       oauthStateReused: config.oauthStateDir === config.serverConfig.stateDir,
-      legacyScopeCompatibility: config.legacyScopeCompatibility,
+      granularScopesOnly: true,
     },
     contracts: budgets,
+    selfManagement: {
+      stateDir: config.selfManagementDir,
+      pm2ProcessName: config.selfRestartPm2ProcessName,
+      expectedScript: config.selfRestartExpectedScript,
+      restartDelayMs: config.selfRestartDelayMs,
+      restartTimeoutMs: config.selfRestartTimeoutMs,
+      transactionModel: "detached-worker-with-post-reconnect-readback",
+    },
     registries: {
       targets: {
         path: config.targetConfigPath,
@@ -100,6 +108,7 @@ export async function collectUniversalBrokerDoctor(
       processesPerTarget: config.maxRunningProcessesPerTarget,
       processOutputBytes: config.processOutputMaxBytes,
       completedProcessTtlMs: config.completedProcessTtlMs,
+      restartTimeoutMs: config.selfRestartTimeoutMs,
       downstreamMcpSessions: config.downstreamMcpMaximumSessions,
       downstreamMcpIdleTtlMs: config.downstreamMcpSessionIdleTtlMs,
       mcpResultEntries: config.mcpResultMaximumEntries,

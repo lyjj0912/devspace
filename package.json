@@ -1,6 +1,6 @@
 {
   "name": "@waishnav/devspace",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "description": "Universal MCP broker for local and remote development capabilities.",
   "type": "module",
   "main": "dist/v2/server.js",
@@ -24,7 +24,9 @@
     "scripts/verify-universal-broker-v2-live.mjs",
     "scripts/verify-universal-broker-v2-load.mjs",
     "scripts/configure-devspace-log-rotation.sh",
-    "scripts/verify-universal-broker-v2-release.mjs"
+    "scripts/verify-universal-broker-v2-release.mjs",
+    "scripts/upgrade-universal-broker-v2-production.sh",
+    "scripts/status-universal-broker-v2-upgrade.sh"
   ],
   "publishConfig": {
     "access": "public"
@@ -45,14 +47,16 @@
     "ops:logrotate": "bash scripts/configure-devspace-log-rotation.sh",
     "release:verify": "node scripts/verify-universal-broker-v2-release.mjs",
     "release:live": "node scripts/personal-release-gate.mjs --live-only --require-clean",
-    "v2:test": "tsx src/v2/contracts.test.ts && tsx src/v2/config.test.ts && tsx src/v2/live-verifier.test.ts && tsx src/v2/errors.test.ts && tsx src/v2/targets.test.ts && tsx src/v2/env-profiles.test.ts && tsx src/v2/env-profiles-integration.test.ts && tsx src/v2/ssh-control.test.ts && tsx src/v2/text-resource-store.test.ts && tsx src/v2/metrics.test.ts && tsx src/v2/doctor.test.ts && tsx src/v2/contexts.test.ts && tsx src/v2/execution.test.ts && tsx src/v2/filesystem.test.ts && tsx src/v2/mcp-routes.test.ts && tsx src/v2/mcp-result-store.test.ts && tsx src/v2/mcp-proxy.test.ts && tsx src/v2/artifact-service.test.ts && tsx src/v2/gui.test.ts && tsx src/v2/server.test.ts && tsx src/v2/http-server.test.ts && tsx src/v2/remote-windows-filesystem-helper.test.ts",
+    "v2:test": "tsx src/v2/contracts.test.ts && tsx src/v2/authority.test.ts && tsx src/v2/no-elevation.test.ts && tsx src/v2/self-management.test.ts && tsx src/v2/production-upgrade-worker.test.ts && tsx src/v2/config.test.ts && tsx src/v2/live-verifier.test.ts && tsx src/v2/errors.test.ts && tsx src/v2/targets.test.ts && tsx src/v2/env-profiles.test.ts && tsx src/v2/env-profiles-integration.test.ts && tsx src/v2/ssh-control.test.ts && tsx src/v2/text-resource-store.test.ts && tsx src/v2/metrics.test.ts && tsx src/v2/doctor.test.ts && tsx src/v2/contexts.test.ts && tsx src/v2/execution.test.ts && tsx src/v2/filesystem.test.ts && tsx src/v2/mcp-routes.test.ts && tsx src/v2/mcp-result-store.test.ts && tsx src/v2/mcp-proxy.test.ts && tsx src/v2/artifact-service.test.ts && tsx src/v2/gui.test.ts && tsx src/v2/server.test.ts && tsx src/v2/http-server.test.ts && tsx src/v2/remote-windows-filesystem-helper.test.ts",
     "v2:budget": "node scripts/check-universal-broker-v2-budgets.mjs",
     "v2:load": "node --expose-gc scripts/verify-universal-broker-v2-load.mjs",
     "v2:load:quick": "node --expose-gc scripts/verify-universal-broker-v2-load.mjs --quick",
     "v2:live": "node scripts/verify-universal-broker-v2-live.mjs",
     "test": "tsx src/config.test.ts && tsx src/incoming-artifacts.test.ts && tsx src/apply-patch.test.ts && tsx src/process-platform.test.ts && tsx src/mcp-sessions.test.ts && tsx src/server-shutdown.test.ts && tsx src/local-agent-runtime.test.ts && tsx src/local-agent-adapters.test.ts && tsx src/local-agent-availability.test.ts && tsx src/local-agent-profiles.test.ts && tsx src/local-agent-targets.test.ts && tsx src/local-agent-store.test.ts && tsx src/roots.test.ts && tsx src/skills.test.ts && tsx src/maintenance.test.ts && tsx src/oauth-store.test.ts && tsx src/cli.test.ts && npm run v2:test",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "v2:deploy": "bash scripts/deploy-universal-broker-v2-production.sh"
+    "v2:deploy": "bash scripts/deploy-universal-broker-v2-production.sh",
+    "upgrade:v2": "bash scripts/upgrade-universal-broker-v2-production.sh",
+    "upgrade:v2:status": "bash scripts/status-universal-broker-v2-upgrade.sh"
   },
   "keywords": [],
   "author": "",
@@ -61,7 +65,7 @@
     "@agentclientprotocol/sdk": "^1.1.0",
     "@anthropic-ai/claude-agent-sdk": "^0.3.200",
     "@clack/prompts": "^1.5.1",
-    "@earendil-works/pi-coding-agent": "^0.80.3",
+    "@earendil-works/pi-coding-agent": "0.84.2",
     "@modelcontextprotocol/ext-apps": "^1.7.2",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@openai/codex-sdk": "^0.142.5",
@@ -83,9 +87,15 @@
     "typescript": "^6.0.3"
   },
   "overrides": {
-    "protobufjs": "7.6.4",
+    "protobufjs": "7.6.5",
     "ws": "8.21.0",
-    "undici": "8.5.0"
+    "undici": "8.9.0",
+    "@hono/node-server": "1.19.15",
+    "body-parser": "2.3.0",
+    "brace-expansion": "5.0.9",
+    "fast-uri": "3.1.5",
+    "hono": "4.12.34",
+    "ip-address": "10.5.0"
   },
   "optionalDependencies": {
     "node-pty": "^1.1.0"

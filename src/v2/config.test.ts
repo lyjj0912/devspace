@@ -6,7 +6,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { loadConfig } from "../config.js";
 import { UNIVERSAL_OWNER_SCOPES } from "./contracts.js";
-import { loadUniversalBrokerNextConfig } from "./config.js";
+import { loadUniversalBrokerNextConfig, OAUTH_OFFLINE_ACCESS_SCOPE } from "./config.js";
 
 test("next config uses an isolated port, endpoint, state directory, and full owner scopes", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "devspace-v2-config-test-"));
@@ -25,7 +25,6 @@ test("next config uses an isolated port, endpoint, state directory, and full own
   assert.equal(next.publicMcpUrl, `http://127.0.0.1:${base.port + 1}/mcp-next`);
   assert.equal(next.stateDir, join(base.stateDir, "universal-broker-v2"));
   assert.equal(next.oauthStateDir, next.stateDir);
-  assert.equal(next.legacyScopeCompatibility, false);
   assert.equal(next.targetConfigPath, join(root, ".config", "targets.v2.json"));
   assert.equal(next.mcpRouteConfigPath, join(root, ".config", "mcp-routes.v2.json"));
   assert.equal(next.contextStorePath, join(next.stateDir, "contexts.json"));
@@ -39,6 +38,11 @@ test("next config uses an isolated port, endpoint, state directory, and full own
   assert.equal(next.contextDiffMaximumCharacters, 50_000_000);
   assert.equal(next.contextDiffTtlMs, 15 * 60_000);
   assert.equal(next.processOutputDir, join(next.stateDir, "process-output"));
+  assert.equal(next.selfManagementDir, join(next.stateDir, "self-management"));
+  assert.equal(next.selfRestartPm2ProcessName, "devspace-next");
+  assert.equal(next.selfRestartExpectedScript, undefined);
+  assert.equal(next.selfRestartDelayMs, 2_000);
+  assert.equal(next.selfRestartTimeoutMs, 120_000);
   assert.equal(next.maxRunningProcesses, 32);
   assert.equal(next.maxRunningProcessesPerTarget, 16);
   assert.equal(next.processBufferCharacters, 1_000_000);
@@ -58,7 +62,7 @@ test("next config uses an isolated port, endpoint, state directory, and full own
   assert.equal(next.mcpResultMaximumCharacters, 10_000_000);
   assert.equal(next.mcpResultTtlMs, 15 * 60_000);
   assert.equal(next.maximumMcpSessions, 128);
-  assert.deepEqual(next.oauth.scopes, [...UNIVERSAL_OWNER_SCOPES]);
+  assert.deepEqual(next.oauth.scopes, [...UNIVERSAL_OWNER_SCOPES, OAUTH_OFFLINE_ACCESS_SCOPE]);
   assert.notEqual(next.stateDir, base.stateDir);
 });
 
@@ -78,9 +82,18 @@ test("production v2 uses canonical production routes and may reuse the legacy OA
   assert.equal(production.metricsPath, "/metrics");
   assert.equal(production.artifactPathPrefix, "/artifacts");
   assert.equal(production.oauthStateDir, base.stateDir);
-  assert.equal(production.legacyScopeCompatibility, true);
   assert.equal(production.stateDir, join(root, "v2-production-state"));
   assert.equal(production.publicBaseUrl, new URL(base.publicBaseUrl).origin);
+  assert.equal(production.selfRestartPm2ProcessName, "devspace-v2-production");
+
+  const isolatedCandidate = loadUniversalBrokerNextConfig(base, {
+    DEVSPACE_V2_DEPLOYMENT_MODE: "production",
+    DEVSPACE_NEXT_PUBLIC_BASE_URL: base.publicBaseUrl,
+    DEVSPACE_NEXT_STATE_DIR: join(root, "candidate-state"),
+    DEVSPACE_NEXT_OAUTH_STATE_DIR: join(root, "candidate-oauth"),
+  });
+  assert.equal(isolatedCandidate.oauthStateDir, join(root, "candidate-oauth"));
+  assert.notEqual(isolatedCandidate.oauthStateDir, base.stateDir);
 
   assert.throws(
     () => loadUniversalBrokerNextConfig(base, {
@@ -95,13 +108,13 @@ test("production v2 uses canonical production routes and may reuse the legacy OA
     DEVSPACE_V2_DEPLOYMENT_MODE: "production",
     DEVSPACE_V2_LEGACY_SCOPE_COMPATIBILITY: "false",
   });
-  assert.equal(granularOnly.legacyScopeCompatibility, false);
+  assert.deepEqual(granularOnly.oauth.scopes, [...UNIVERSAL_OWNER_SCOPES, OAUTH_OFFLINE_ACCESS_SCOPE]);
 
   assert.throws(
     () => loadUniversalBrokerNextConfig(base, {
       DEVSPACE_V2_LEGACY_SCOPE_COMPATIBILITY: "true",
     }),
-    /only in production deployment mode/,
+    /removed in Universal Broker v2\.1/,
   );
   assert.throws(
     () => loadUniversalBrokerNextConfig(base, {
@@ -140,6 +153,11 @@ test("next config accepts explicit parallel deployment values", async (t) => {
     DEVSPACE_NEXT_CONTEXT_DIFF_TTL_MS: "45000",
     DEVSPACE_NEXT_PROCESS_OUTPUT_DIR: join(root, "process-output"),
     DEVSPACE_NEXT_SSH_CONTROL_DIR: join(root, "ssh-control"),
+    DEVSPACE_NEXT_SELF_MANAGEMENT_DIR: join(root, "self-management"),
+    DEVSPACE_NEXT_PM2_PROCESS_NAME: "devspace-custom",
+    DEVSPACE_NEXT_PM2_EXPECTED_SCRIPT: join(root, "start-custom.sh"),
+    DEVSPACE_NEXT_SELF_RESTART_DELAY_MS: "3000",
+    DEVSPACE_NEXT_SELF_RESTART_TIMEOUT_MS: "180000",
     DEVSPACE_NEXT_MAX_RUNNING_PROCESSES: "10",
     DEVSPACE_NEXT_MAX_RUNNING_PROCESSES_PER_TARGET: "4",
     DEVSPACE_NEXT_PROCESS_BUFFER_CHARACTERS: "200000",
@@ -186,6 +204,11 @@ test("next config accepts explicit parallel deployment values", async (t) => {
   assert.equal(next.contextDiffTtlMs, 45_000);
   assert.equal(next.processOutputDir, join(root, "process-output"));
   assert.equal(next.sshControlDir, join(root, "ssh-control"));
+  assert.equal(next.selfManagementDir, join(root, "self-management"));
+  assert.equal(next.selfRestartPm2ProcessName, "devspace-custom");
+  assert.equal(next.selfRestartExpectedScript, join(root, "start-custom.sh"));
+  assert.equal(next.selfRestartDelayMs, 3_000);
+  assert.equal(next.selfRestartTimeoutMs, 180_000);
   assert.equal(next.maxRunningProcesses, 10);
   assert.equal(next.maxRunningProcessesPerTarget, 4);
   assert.equal(next.processBufferCharacters, 200_000);

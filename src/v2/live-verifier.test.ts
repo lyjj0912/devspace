@@ -15,6 +15,7 @@ const expectedScopes = [
   "devspace.mcp",
   "devspace.artifact",
   "devspace.gui",
+  "offline_access",
 ];
 
 test("live verifier defaults to parallel v2 and creates only a temporary user token", async (t) => {

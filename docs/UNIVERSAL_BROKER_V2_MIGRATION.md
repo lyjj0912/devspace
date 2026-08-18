@@ -1,79 +1,66 @@
-# DevSpace Universal Broker v2 Migration
+# DevSpace Universal Broker v2.1 Migration
 
-## Rule
+## Authority
 
-The existing production service remains authoritative until one clean v2
-revision passes source, package, load, live, connector, cutover, rollback, and
-cleanup gates. Partial milestones are not production completion.
+This document distinguishes the completed v2 cutover from the v2.1 hardening
+upgrade. Historical parallel aliases and temporary OAuth compatibility are not
+current production authority.
 
-## Phases
+## Historical v2 cutover
 
-### Phase 0 — contracts and budgets
+The original sequence froze the fixed eight-tool contract, ran `/mcp-next` with
+isolated state, completed local/SSH/Windows filesystem and execution parity,
+added generic MCP/artifact/GUI planes, exercised load and rollback, and finally
+moved canonical `/mcp` to Universal Broker v2.
 
-Freeze the fixed eight-tool schema, error model, target and route formats,
-payload budgets, and rollback boundary.
+The former administrator-helper design was removed before production. No root
+daemon, remote elevation client, passwordless adapter, higher-authority scope,
+or system-password path is part of the product.
 
-### Phase 1 — parallel service
+## v2.1 hardening upgrade
 
-Run `/mcp-next` on isolated state and OAuth storage while legacy `/mcp` remains
-available.
+v2.1 keeps the same eight top-level tools and adds operations within them.
 
-### Phase 2 — target and context
+### Gate 1 — exact operation authority
 
-Implement deterministic target resolution, truthful probes, lazy instructions
-and Skills, existing-path-only contexts, worktree lifecycle, diff resources, and
-quotas.
+Add R0–R3 classification, `context.authorize`, status/release/correction
+operations, exact fingerprints, target-generation and route-fingerprint
+binding, one-shot R3 use, and receipts. Existing read operations remain R0.
 
-### Phase 3 — execution and process
+### Gate 2 — runtime no-elevation
 
-Unify local and SSH commands, PTY, background conversion, process input,
-signals, output resources, dispatch ambiguity, and quotas. All commands execute
-as the configured target account.
+Enforce the ordinary-account boundary through macOS sandboxing, Linux
+`no_new_privs`, Windows integrity checks, service-account startup checks,
+truthful target probes, and the same boundary for local/SSH stdio MCP providers.
 
-### Phase 4 — filesystem
+### Gate 3 — granular OAuth only
 
-Provide local, POSIX SSH/SFTP, and Windows SSH filesystem parity with atomic
-writes, preconditions, patches, transfers, and explicit deletion.
+Retain the six tool scopes plus `offline_access`. Reject the legacy single scope
+at metadata, token, and request boundaries. A production environment containing
+the removed compatibility flag must fail startup.
 
-### Phase 5 — generic MCP proxy
+### Gate 4 — durable self-management
 
-Proxy local-stdio, SSH-stdio, and Streamable HTTP routes, including tools,
-resources, prompts, lazy schemas, result paging, pooling, and no replay after
-ambiguous dispatch.
+Add `process.restart_broker` and `process.restart_status`. Restart is performed
+by an independent user-level worker after the MCP response grace period and is
+verified after reconnect.
 
-### Phase 6 — artifact and GUI
+### Gate 5 — management-plane isolation
 
-Implement bidirectional artifacts and generic GUI sessions. Prefer application
-protocols such as Chrome DevTools MCP to operating-system GUI automation.
+A public reverse-proxy request must receive 403 from `/metrics`; local health and
+public OAuth discovery remain available as designed.
 
-### Phase 7 — lifecycle and load
+## Connector rule
 
-Apply session, process, context, worktree-byte, result, artifact, GUI, and log
-limits. Run deterministic churn and large-output tests.
-
-### Phase 8 — ChatGPT connector validation
-
-Register `myDevSpace-next-user` and validate the same eight tools in at least five
-fresh ChatGPT sessions. Verify local files, external storage, SSH targets,
-generic MCP mutation, artifact exchange, and GUI behavior.
-
-### Phase 9 — production cutover
-
-Run the blue/green transaction, authenticated canaries, public-route switch,
-rollback rehearsal, stabilization, connector migration, and final owner
-credential rotation.
-
-## Removed design
-
-The former administrator-helper phase is intentionally removed. DevSpace does
-not ship a root daemon, remote elevation client, passwordless adapter, higher
-authority scope, or higher-authority tool input. Operations outside the target
-account are performed manually by the user in Terminal.
+The canonical connector name is `myDevSpace`. A connector alias retained by an
+already-open ChatGPT conversation is stale session state, not installed-state
+authority. Post-deploy evidence must come from a freshly connected canonical
+session exposing the fixed eight tools.
 
 ## Legacy mapping
 
 ```text
-open_workspace        -> context
+open_workspace        -> context.open
 read/apply_patch      -> fs
 exec_command          -> exec + process
 local_shell           -> exec(target=local)
@@ -81,17 +68,24 @@ Jira/browser shortcut -> mcp route
 artifact download     -> artifact
 ```
 
-Legacy tools are removed only after the new connector is stable.
+The mapping is documentation only; legacy top-level tools and blanket OAuth
+scope do not remain in v2.1 production.
 
-## Rollback
+## Upgrade and rollback
 
-Rollback restores the prior public route, PM2 process, OAuth database, and
-environment from one deployment audit directory. Additive v2 state remains
-isolated and does not prevent the legacy service from restarting.
+An upgrade builds an immutable release from one clean pushed revision, verifies
+its candidate against isolated candidate OAuth state, records the current
+PM2/env/Funnel/canonical-OAuth state, switches only the named production process,
+runs local and public canaries, and updates the canonical start path only after
+PASS. Failure restores the previous release and environment.
+
+A restart of the same release uses the durable in-product restart transaction.
+A release upgrade uses the deployment transaction; neither relies on the MCP
+connection surviving process replacement.
 
 ## Completion rule
 
-Completion requires one clean pushed revision, no elevation components, all
-release gates passing, real connector evidence, production cutover and rollback
-evidence, final credential rotation, clean worktrees, and no temporary relay or
-verification residue.
+Completion requires one clean pushed revision, the fixed eight-tool contract,
+all authority/no-elevation/OAuth/restart/metrics gates, deterministic and real
+load evidence, canonical connector evidence, exact production readback, and no
+temporary worker, test, relay, release, or process residue.

@@ -40,6 +40,7 @@ export interface UniversalArtifactInput {
   overwrite?: boolean;
   maxBytes?: number;
   ttlSeconds?: number;
+  authorityId?: string;
 }
 
 interface ArtifactRecord {

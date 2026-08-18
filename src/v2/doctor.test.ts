@@ -29,6 +29,17 @@ test("doctor JSON reports contracts, registries, targets, and quotas without cre
   assert.equal(JSON.stringify(report).includes("owner-token-not-for-output"), false);
   assert.equal((report.quotas as { httpMcpSessions: number }).httpMcpSessions, 128);
   assert.deepEqual(
+    report.selfManagement,
+    {
+      stateDir: join(root, "next", "self-management"),
+      pm2ProcessName: "devspace-next",
+      expectedScript: undefined,
+      restartDelayMs: 2_000,
+      restartTimeoutMs: 120_000,
+      transactionModel: "detached-worker-with-post-reconnect-readback",
+    },
+  );
+  assert.deepEqual(
     report.endpoint,
     {
       deploymentMode: "parallel",
@@ -38,7 +49,7 @@ test("doctor JSON reports contracts, registries, targets, and quotas without cre
       metrics: "http://127.0.0.1:7677/metrics-next",
       stateDir: join(root, "next"),
       oauthStateReused: false,
-      legacyScopeCompatibility: false,
+      granularScopesOnly: true,
     },
   );
 });

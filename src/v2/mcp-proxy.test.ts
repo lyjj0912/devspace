@@ -117,6 +117,32 @@ test("generic local-stdio proxy discovers, invokes, mutates, and pages downstrea
   assert.equal(closed.closed, true);
 });
 
+test("local stdio MCP routes inherit the runtime no-elevation boundary", { skip: process.platform !== "darwin" }, async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-v2-mcp-no-elevation-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const routePath = join(root, "routes.json");
+  await writeRouteFile(routePath, {
+    blocked: {
+      displayName: "Blocked elevation fixture",
+      transport: "local-stdio",
+      command: "/usr/bin/sudo",
+      args: ["-n", "true"],
+      startupTimeoutMs: 1_000,
+      callTimeoutMs: 1_000,
+    },
+  });
+  const proxy = new UniversalMcpProxy(
+    new UniversalMcpRouteRegistry(routePath),
+    new TargetRegistry({ configPath: join(root, "targets.json") }),
+    { sshControlDir: join(root, "ssh") },
+  );
+  t.after(() => proxy.close());
+  await assert.rejects(
+    proxy.execute({ operation: "search_tools", route: "blocked", query: "anything" }),
+    hasCode("TRANSPORT_UNAVAILABLE"),
+  );
+});
+
 test("generic Streamable HTTP route uses the same proxy contract", async (t) => {
   const fixture = await startHttpFixture(t);
   const root = await mkdtemp(join(tmpdir(), "devspace-v2-mcp-http-"));

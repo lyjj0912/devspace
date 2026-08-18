@@ -4,7 +4,12 @@
   "title": "DevSpace Universal Broker v2 Error",
   "type": "object",
   "additionalProperties": false,
-  "required": ["code", "message", "retryable", "operationId"],
+  "required": [
+    "code",
+    "message",
+    "retryable",
+    "operationId"
+  ],
   "properties": {
     "code": {
       "enum": [
@@ -28,16 +33,33 @@
         "HOST_ARTIFACT_CAPABILITY_UNAVAILABLE",
         "GUI_STATE_CHANGED",
         "OUTPUT_TRUNCATED",
-        "RESOURCE_QUOTA_EXCEEDED"
+        "RESOURCE_QUOTA_EXCEEDED",
+        "AUTHORITY_REQUIRED",
+        "AUTHORITY_EXPIRED",
+        "AUTHORITY_MISMATCH",
+        "AUTHORITY_CONSUMED",
+        "ELEVATION_BLOCKED"
       ]
     },
-    "message": { "type": "string", "minLength": 1 },
-    "retryable": { "type": "boolean" },
-    "operationId": { "type": "string", "pattern": "^op_[A-Za-z0-9_-]+$" },
-    "evidence": { "type": "object" },
+    "message": {
+      "type": "string",
+      "minLength": 1
+    },
+    "retryable": {
+      "type": "boolean"
+    },
+    "operationId": {
+      "type": "string",
+      "pattern": "^op_[A-Za-z0-9_-]+$"
+    },
+    "evidence": {
+      "type": "object"
+    },
     "suggestions": {
       "type": "array",
-      "items": { "type": "object" }
+      "items": {
+        "type": "object"
+      }
     }
   }
 }

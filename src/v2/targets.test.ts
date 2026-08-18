@@ -152,6 +152,7 @@ test("Windows SSH probes report the target temporary directory", async (t) => {
         "home=C:\\Users\\test",
         "temporary=C:\\Users\\test\\AppData\\Local\\Temp\\",
         "git=1",
+        "elevated=0",
         "",
       ].join("\n"),
       stderr: "",
@@ -161,6 +162,74 @@ test("Windows SSH probes report the target temporary directory", async (t) => {
   const observation = await registry.probe("windows");
   assert.equal(observation.status, "ONLINE");
   assert.equal(observation.temporaryDirectory, "C:\\Users\\test\\AppData\\Local\\Temp\\");
+});
+
+test("POSIX SSH probes degrade when the runtime no-elevation primitive is unavailable", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-v2-target-boundary-test-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const configPath = join(root, "targets.json");
+  await writeTargetConfig(configPath, {
+    linux: sshTarget("Linux", ["linux"]),
+  });
+  const registry = new TargetRegistry({
+    configPath,
+    execute: (async () => ({
+      stdout: [
+        "__DEVSPACE_TARGET_V1__",
+        "kernel=Linux",
+        "architecture=x86_64",
+        "home=/home/test",
+        "temporary=/tmp",
+        "git=1",
+        "rsync=1",
+        "setpriv_boundary=0",
+        "sandbox_boundary=0",
+        "",
+      ].join("\n"),
+      stderr: "",
+    })) as never,
+  });
+  const observation = await registry.probe("linux");
+  assert.equal(observation.status, "DEGRADED");
+  assert.equal(observation.capabilities.exec, false);
+  assert.match(observation.reason ?? "", /setpriv/u);
+});
+
+test("Windows SSH probes reject high-integrity tokens", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-v2-target-windows-boundary-test-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const configPath = join(root, "targets.json");
+  await writeFile(configPath, JSON.stringify({
+    version: 1,
+    targets: {
+      windows: {
+        displayName: "Windows",
+        transport: "ssh",
+        sshHost: "windows",
+        platform: "windows",
+        shell: "powershell",
+      },
+    },
+  }));
+  const registry = new TargetRegistry({
+    configPath,
+    execute: (async () => ({
+      stdout: [
+        "__DEVSPACE_TARGET_V1__",
+        "architecture=AMD64",
+        "home=C:\\Users\\test",
+        "temporary=C:\\Temp\\",
+        "git=1",
+        "elevated=1",
+        "",
+      ].join("\n"),
+      stderr: "",
+    })) as never,
+  });
+  const observation = await registry.probe("windows");
+  assert.equal(observation.status, "DEGRADED");
+  assert.equal(observation.capabilities.exec, false);
+  assert.match(observation.reason ?? "", /high-integrity/u);
 });
 
 function sshTarget(displayName: string, aliases: string[]) {

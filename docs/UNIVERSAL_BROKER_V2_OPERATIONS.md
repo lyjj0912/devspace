@@ -1,32 +1,39 @@
-# DevSpace Universal Broker v2 Operations
+# DevSpace Universal Broker v2.1 Operations
 
-## Modes
+## Runtime modes
 
-Parallel mode runs beside the existing service:
+Parallel verification uses `/mcp-next` with isolated state. Production binds the
+canonical `/mcp` endpoint on the recorded production port. Once initial cutover
+is complete, production upgrades switch between immutable v2 release
+directories; they do not recreate a legacy runtime.
 
-```text
-legacy production  http://127.0.0.1:7676/mcp
-parallel v2        http://127.0.0.1:7677/mcp-next
-```
+## Owner-managed configuration
 
-Production mode binds the canonical `/mcp` endpoint only through the cutover
-transaction.
-
-## Configuration
-
-Owner-managed files are stored under `~/.devspace` and must be mode `0600` when
-they can contain routes or environment references:
+Files under `~/.devspace` that can contain route or environment references use
+mode `0600`:
 
 ```text
 ~/.devspace/targets.v2.json
 ~/.devspace/mcp-routes.v2.json
 ~/.devspace/env-profiles.v2.json
+~/.devspace/universal-broker-v2-production.env
 ```
 
-Target entries contain no elevation mode, helper command, socket, or system
-password. Each target runs as its configured local or SSH account.
+Important production values include:
 
-## Commands
+```text
+DEVSPACE_NEXT_SELF_MANAGEMENT_DIR
+DEVSPACE_NEXT_PM2_PROCESS_NAME
+DEVSPACE_NEXT_PM2_EXPECTED_SCRIPT
+DEVSPACE_NEXT_SELF_RESTART_DELAY_MS
+DEVSPACE_NEXT_SELF_RESTART_TIMEOUT_MS
+DEVSPACE_NEXT_OAUTH_STATE_DIR
+```
+
+The removed legacy-scope compatibility flag must be absent or false. Setting it
+true is a startup error.
+
+## Verification commands
 
 ```bash
 npm run typecheck
@@ -35,67 +42,103 @@ npm run build
 npm run v2:budget
 npm run v2:load
 npm run release:verify -- --require-clean
-npm run deploy:v2
-npm run undeploy:v2
-npm run cutover:v2
-npm run rollback:v2
-npm run finalize:v2
 ```
 
-`deploy:v2` starts or reloads only the parallel process. `cutover:v2` requires
-clean source, pushed revision equality, load evidence, live canaries, and fresh
-ChatGPT connector evidence. `finalize:v2` performs connector and credential
-cleanup only after cutover stabilization.
+`release:verify` runs the canonical test composition, a production dependency
+audit with low-or-higher findings blocked, build, budget, quick load,
+source/package boundary scans, granular OAuth checks, operation-authority checks,
+runtime no-elevation checks, restart-worker checks, and metrics isolation checks.
+Production deployment additionally runs full and real-target load/live canaries.
 
-## Health and authentication checks
+## Operation authority workflow
 
-```bash
-curl -fsS http://127.0.0.1:7677/healthz-next
-curl -fsS https://home-ai.tail733d38.ts.net/v2/healthz-next
-```
+R0 reads need no lease. Before an R1–R3 action, prepare the exact action through
+`context.authorize` using the current controlling instruction, then pass the
+returned `authorityId` to that exact call.
 
-An unauthenticated initialize request to the corresponding MCP endpoint must
-return HTTP 401.
+An authority record does not wildcard another path, command, target, route, GUI
+generation, or argument set. Target and MCP authorities also bind the current
+registry generation or route fingerprint; owner configuration changes require a
+new authority. R3 is consumed once even when the result becomes UNCERTAIN. After
+a user correction, call `context.invalidate_authority`; create a new record only
+for the corrected action.
+
+Release unused authority with `context.release_authority`. Inspect receipts with
+`context.authority_status`.
 
 ## Filesystem and command behavior
 
 Paths must already exist when opening a context. `fs` and `exec` operate with the
 selected target account's permissions. Long-running commands return a process
-handle rather than occupying one HTTP request indefinitely.
+handle instead of occupying one HTTP request indefinitely.
 
-If an operation requires a higher operating-system identity, stop the MCP
-operation and present the exact command and reason to the user. The user may run
-it directly in Terminal. Do not request, transmit, paste, store, or inspect the
-system password through DevSpace.
+If an operation requires a higher operating-system identity, stop the MCP action
+and present the exact reason. The user may perform it manually outside DevSpace.
+DevSpace must not request, transmit, paste, store, or inspect the system password.
 
-## Deployment
+## Durable broker restart
 
-The production transaction:
+1. Prepare one R3 action for `process.restart_broker` with the exact reason and
+   delay.
+2. Call `process.restart_broker` and retain the returned transaction ID.
+3. The broker writes request/status files and launches a user-level worker.
+4. The worker waits for the response grace period, replaces the PM2 process,
+   saves PM2 state, and verifies PID/cwd/script and local/public health.
+5. Reconnect the canonical connector.
+6. Call `process.restart_status` with the transaction ID; no authority is needed
+   for this read.
+7. Treat only `PASS` as completion. Preserve `FAIL` evidence and do not blindly
+   repeat the restart.
 
-1. verifies a clean, pushed revision;
-2. runs typecheck, tests, build, budgets, load, and package checks;
-3. backs up OAuth state, routes, environment, PM2, and public ingress;
-4. starts v2 on a blue/green local port;
-5. runs authenticated local canaries;
-6. switches the public route;
-7. runs public canaries;
-8. rehearses rollback to legacy and back to v2;
-9. records cutover evidence.
+A restart changes no release revision. Use the production upgrade transaction to
+switch to a different immutable release.
 
-No system-password or elevation setup is part of deployment.
+## Health, metrics, and authentication
 
-## Logs and lifecycle
+```bash
+curl -fsS http://127.0.0.1:7678/healthz
+curl -fsS https://home-ai.tail733d38.ts.net/healthz
+curl -fsS -H 'Host: 127.0.0.1:7678' http://127.0.0.1:7678/metrics
+```
 
-PM2 log rotation is configured separately and bounded. Temporary OAuth clients,
-artifacts, test files, process outputs, context worktrees, status relays, and
-verification servers are removed after use. Release gates reject test fixtures,
-temporary files, and elevation components in `dist` or the npm package.
+Expected boundaries:
+
+- local and public health: 200;
+- unauthenticated MCP initialize: 401;
+- local metrics with local Host: 200;
+- public metrics: 403.
+
+## Production upgrade transaction
+
+The upgrade procedure:
+
+1. verifies a clean pushed revision;
+2. creates an immutable release worktree;
+3. runs install, release gate, full load, and real-target canaries;
+4. starts the candidate with an isolated candidate OAuth database while retaining
+   the canonical production OAuth database for the final switch;
+5. captures current PM2, environment, OAuth, Funnel, and release evidence;
+6. schedules the process switch through an independent user-level worker so the
+   initiating MCP connection is not the transaction owner;
+7. verifies the new PID, cwd/script, local/public health, OAuth boundary,
+   authority canaries, no-elevation canaries, metrics isolation, and connector
+   reconnect;
+8. updates the canonical start path and audit link only after PASS;
+9. restores the previous release/environment on failure.
+
+## Logs and cleanup
+
+PM2 log rotation is bounded separately. Authority records, restart transactions,
+process output, artifacts, contexts, and downstream results have TTL or count
+limits. Temporary OAuth clients, canaries, worker jobs, test files, and staging
+paths are removed after verification. Audit and first-failure evidence remain.
 
 ## Failure handling
 
-- Preserve the first failing boundary and operation ID.
+- Preserve the first failing boundary and operation/transaction ID.
 - Do not repeat an identical failed request.
 - Do not replay a command or external mutation after possible dispatch.
-- Roll back the public route and OAuth database from the captured transaction
-  when cutover canaries fail.
-- Leave existing production active when v2 evidence is incomplete.
+- Do not infer restart/deploy success from a disconnected connector; reconnect
+  and read durable status plus PM2/health evidence.
+- Leave the previous production release active when upgrade evidence is
+  incomplete.

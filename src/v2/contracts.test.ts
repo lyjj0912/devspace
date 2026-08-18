@@ -85,6 +85,7 @@ test("contracts expose only user-account authority", async () => {
     "action",
     "timeoutMs",
     "maxElements",
+    "authorityId",
   ]);
   for (const path of [
     "../../contracts/tools-v2.schema.json",

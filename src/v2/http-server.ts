@@ -24,6 +24,8 @@ import {
 } from "../mcp-sessions.js";
 import { SingleUserOAuthProvider } from "../oauth-provider.js";
 import { UniversalArtifactService } from "./artifact-service.js";
+import { OperationAuthorityRegistry } from "./authority.js";
+import { minimumAuthorityRisk } from "./authority-policy.js";
 import { ContextRegistry } from "./contexts.js";
 import { UniversalExecutionPlane } from "./execution.js";
 import { UniversalEnvProfileRegistry } from "./env-profiles.js";
@@ -34,9 +36,11 @@ import {
 } from "./gui.js";
 import { UniversalMcpProxy } from "./mcp-proxy.js";
 import { UniversalMcpResultStore } from "./mcp-result-store.js";
+import { assertServiceAccountBoundary } from "./no-elevation.js";
 import { UniversalMcpRouteRegistry } from "./mcp-routes.js";
 import { UniversalBrokerMetrics } from "./metrics.js";
 import { createUniversalBrokerMcpServer } from "./server.js";
+import { UniversalSelfManagementService } from "./self-management.js";
 import { TargetRegistry } from "./targets.js";
 import { UniversalTextResourceStore } from "./text-resource-store.js";
 import {
@@ -59,18 +63,22 @@ export interface RunningUniversalBrokerNextServer {
   mcpProxy: UniversalMcpProxy;
   artifacts: UniversalArtifactService;
   gui: UniversalGuiService;
+  authority: OperationAuthorityRegistry;
+  selfManagement: UniversalSelfManagementService;
   close(): Promise<void>;
 }
 
 export interface CreateUniversalBrokerNextServerOptions {
   incomingArtifactAdapters?: readonly IncomingArtifactAdapter[];
   guiRunner?: GuiNodeRunner;
+  selfManagement?: UniversalSelfManagementService;
 }
 
 export function createUniversalBrokerNextServer(
   config = loadUniversalBrokerNextConfig(loadConfig()),
   options: CreateUniversalBrokerNextServerOptions = {},
 ): RunningUniversalBrokerNextServer {
+  assertServiceAccountBoundary();
   const allowedHosts = config.allowedHosts.includes("*")
     ? undefined
     : Array.from(new Set([config.host, ...config.allowedHosts]));
@@ -81,6 +89,7 @@ export function createUniversalBrokerNextServer(
     maximumSessions: config.maximumMcpSessions,
   });
   const metrics = new UniversalBrokerMetrics();
+  const authority = new OperationAuthorityRegistry({ minimumRisk: minimumAuthorityRisk });
   const envProfiles = new UniversalEnvProfileRegistry({
     configPath: config.envProfileConfigPath,
   });
@@ -159,6 +168,16 @@ export function createUniversalBrokerNextServer(
       payloadBudgetCharacters: config.guiPayloadBudgetCharacters,
     },
   );
+  const selfManagement = options.selfManagement ?? new UniversalSelfManagementService({
+    stateDir: config.selfManagementDir,
+    pm2ProcessName: config.selfRestartPm2ProcessName,
+    localHealthUrl: `http://${managementHost(config.host)}:${config.port}${config.healthPath}`,
+    publicHealthUrl: joinPublicUrl(config.publicBaseUrl, config.healthPath),
+    expectedCwd: process.cwd(),
+    expectedScript: config.selfRestartExpectedScript,
+    defaultDelayMs: config.selfRestartDelayMs,
+    timeoutMs: config.selfRestartTimeoutMs,
+  });
   const mcpUrl = new URL(config.publicMcpUrl);
   const resourceServerUrl = resourceUrlFromServerUrl(mcpUrl);
   const resourceMetadataUrl = prefixedResourceMetadataUrl(
@@ -307,10 +326,11 @@ export function createUniversalBrokerNextServer(
       res.status(403).type("text/plain").send("metrics are loopback-only\n");
       return;
     }
-    const [contextStats, executionStats, mcpStats] = await Promise.all([
+    const [contextStats, executionStats, mcpStats, selfManagementStats] = await Promise.all([
       Promise.resolve(contexts.stats()),
       Promise.resolve(execution.stats()),
       mcpProxy.stats(),
+      selfManagement.stats(),
     ]);
     res.type("text/plain; version=0.0.4").send(metrics.render({
       devspace_open_http_sessions: gauge("Open MCP HTTP sessions", transports.size),
@@ -324,6 +344,9 @@ export function createUniversalBrokerNextServer(
       devspace_artifacts: gauge("Published artifacts", numeric(artifacts.stats().artifacts)),
       devspace_artifact_bytes: gauge("Published artifact bytes", numeric(artifacts.stats().totalBytes)),
       devspace_gui_sessions: gauge("Open GUI sessions", numeric(gui.stats().sessions)),
+      devspace_operation_authorities: gauge("Active operation authority records", numeric(authority.stats().authorities)),
+      devspace_restart_transactions: gauge("Retained broker restart transactions", numeric(selfManagementStats.restartTransactions)),
+      devspace_active_restart_transactions: gauge("Active broker restart transactions", numeric(selfManagementStats.activeRestartTransactions)),
     }));
   });
 
@@ -420,6 +443,8 @@ export function createUniversalBrokerNextServer(
           mcpProxy,
           artifacts,
           gui,
+          authority,
+          selfManagement,
         });
         await server.connect(transport);
       } else {
@@ -457,6 +482,8 @@ export function createUniversalBrokerNextServer(
     mcpProxy,
     artifacts,
     gui,
+    authority,
+    selfManagement,
     close: () => {
       closePromise ??= (async () => {
         clearInterval(cleanupTimer);
@@ -476,18 +503,12 @@ export function createUniversalBrokerNextServer(
 
 export function authenticatedBrokerScopes(
   scopes: readonly string[] | undefined,
-  config: Pick<UniversalBrokerNextConfig, "deploymentMode" | "legacyScopeCompatibility" | "oauth">,
+  config: Pick<UniversalBrokerNextConfig, "oauth">,
 ): string[] | undefined {
   if (!scopes) return undefined;
   const granted = [...new Set(scopes)];
-  if (
-    config.deploymentMode === "production"
-    && config.legacyScopeCompatibility
-    && granted.includes("devspace")
-  ) {
-    return [...new Set([...granted, ...config.oauth.scopes])];
-  }
-  return granted.some((scope) => config.oauth.scopes.includes(scope))
+  if (granted.length === 0) return undefined;
+  return granted.every((scope) => config.oauth.scopes.includes(scope))
     ? granted
     : undefined;
 }
@@ -555,11 +576,25 @@ function sendJsonRpcError(
   });
 }
 
+function managementHost(host: string): string {
+  if (host === "0.0.0.0" || host === "::" || host === "[::]") return "127.0.0.1";
+  return host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
+}
+
 function isLoopbackRequest(req: Request): boolean {
   const address = req.socket.remoteAddress ?? "";
-  return address === "127.0.0.1"
+  const socketIsLoopback = address === "127.0.0.1"
     || address === "::1"
     || address === "::ffff:127.0.0.1";
+  if (!socketIsLoopback) return false;
+  const host = req.header("host")?.trim();
+  if (!host) return false;
+  try {
+    const hostname = new URL(`http://${host}`).hostname;
+    return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]" || hostname === "::1";
+  } catch {
+    return false;
+  }
 }
 
 function gauge(help: string, value: number): { help: string; value: number } {
