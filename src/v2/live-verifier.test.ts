@@ -97,7 +97,10 @@ test("live verifier defaults to parallel v2 and creates only a temporary user to
     "--base-url", `http://127.0.0.1:${address.port}`,
     "--database", databasePath,
   ], { cwd: resolve("."), stdio: ["ignore", "pipe", "pipe"] });
+  let stdout = "";
   let stderr = "";
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
   child.stderr.setEncoding("utf8");
   child.stderr.on("data", (chunk) => { stderr += chunk; });
   const exitCode = await new Promise<number | null>((resolveExit, reject) => {
@@ -107,9 +110,20 @@ test("live verifier defaults to parallel v2 and creates only a temporary user to
   await observed;
   assert.notEqual(exitCode, 0);
   assert.match(stderr, /418|fixture intentionally stops/u);
+  const report = JSON.parse(stdout) as {
+    ok?: boolean;
+    failure?: { name?: string; message?: string };
+    cleanup?: { ok?: boolean; failures?: unknown[] };
+  };
+  assert.equal(report.ok, false);
+  assert.equal(report.cleanup?.ok, true);
+  assert.equal(report.cleanup?.failures, undefined);
+  assert.match(report.failure?.message ?? "", /418|fixture intentionally stops/u);
+  assert.doesNotMatch(stdout, /dsv2_[A-Za-z0-9_-]{16,}/u);
 
   const cleaned = new Database(databasePath, { readonly: true });
   assert.equal((cleaned.prepare("SELECT count(*) AS count FROM oauth_access_tokens").get() as { count: number }).count, 0);
+  assert.equal((cleaned.prepare("SELECT count(*) AS count FROM oauth_refresh_tokens").get() as { count: number }).count, 0);
   assert.equal((cleaned.prepare("SELECT count(*) AS count FROM oauth_clients").get() as { count: number }).count, 0);
   cleaned.close();
 

@@ -37,6 +37,7 @@ const healthUrl = options.healthUrl
   ? new URL(options.healthUrl)
   : new URL(options.healthPath, baseUrl);
 const audit = {
+  ok: false,
   baseUrl: baseUrl.href,
   mcpUrl: mcpUrl.href,
   healthUrl: healthUrl.href,
@@ -69,6 +70,7 @@ let foreignCredential;
 let primary;
 let secondary;
 let foreign;
+let terminalError;
 try {
   credential = createTemporaryAccessToken(options.databasePath, tokenResource);
   foreignCredential = createTemporaryAccessToken(options.databasePath, tokenResource);
@@ -105,18 +107,47 @@ try {
   primary = undefined;
   secondary = undefined;
   foreign = undefined;
+  audit.ok = true;
+} catch (error) {
+  terminalError = error;
+  audit.failure = safeErrorSummary(error);
 } finally {
-  if (primary) await primary.client.close().catch(() => undefined);
-  if (secondary) await secondary.client.close().catch(() => undefined);
-  if (foreign) await foreign.client.close().catch(() => undefined);
-  credential?.cleanup();
-  foreignCredential?.cleanup();
-  await rm(root, { recursive: true, force: true });
+  const cleanupFailures = [];
+  for (const [label, session] of [["primary", primary], ["secondary", secondary], ["foreign", foreign]]) {
+    if (!session) continue;
+    try {
+      await session.client.close();
+    } catch (error) {
+      cleanupFailures.push({ label, ...safeErrorSummary(error) });
+    }
+  }
+  for (const [label, temporaryCredential] of [["primary-oauth", credential], ["foreign-oauth", foreignCredential]]) {
+    if (!temporaryCredential) continue;
+    try {
+      temporaryCredential.cleanup();
+    } catch (error) {
+      cleanupFailures.push({ label, ...safeErrorSummary(error) });
+    }
+  }
+  try {
+    await rm(root, { recursive: true, force: true });
+  } catch (error) {
+    cleanupFailures.push({ label: "temporary-root", ...safeErrorSummary(error) });
+  }
+  audit.cleanup = {
+    ok: cleanupFailures.length === 0,
+    ...(cleanupFailures.length > 0 ? { failures: cleanupFailures } : {}),
+  };
+  if (cleanupFailures.length > 0 && !terminalError) {
+    terminalError = new Error("Live verifier cleanup failed.");
+    audit.ok = false;
+    audit.failure = safeErrorSummary(terminalError);
+  }
+  const serialized = JSON.stringify(audit, null, 2);
+  if (options.output) await writeFile(options.output, `${serialized}\n`, { mode: 0o600 });
+  console.log(serialized);
 }
-
-const serialized = JSON.stringify(audit, null, 2);
-if (options.output) await writeFile(options.output, `${serialized}\n`, { mode: 0o600 });
-console.log(serialized);
+if (terminalError) throw terminalError;
 
 async function runCanaries(client, sameClientTransport, foreignClient, root, canaries) {
   const targets = data(await call(client, "target", { operation: "list", limit: 100 }));
@@ -926,6 +957,21 @@ function createTemporaryAccessToken(databasePath, resource) {
         cleanupDb.close();
       }
     },
+  };
+}
+
+function safeErrorSummary(error) {
+  const name = error instanceof Error && error.name
+    ? error.name.slice(0, 128)
+    : "Error";
+  const source = error instanceof Error ? error.message : String(error);
+  const message = source
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]+/giu, "Bearer [REDACTED]")
+    .replace(/\bdsv2_[A-Za-z0-9_-]+\b/gu, "dsv2_[REDACTED]")
+    .slice(0, 4_000);
+  return {
+    name,
+    message: message || "Unknown error",
   };
 }
 
