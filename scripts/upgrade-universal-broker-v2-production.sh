@@ -273,12 +273,15 @@ fi
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 REQUESTED_AT="$(python3 -c 'import datetime; print(datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="microseconds").replace("+00:00","Z"))')"
 TRANSACTION_ID="upgrade_$(python3 -c 'import uuid; print(uuid.uuid4())')"
+TRANSACTION_UUID="${TRANSACTION_ID#upgrade_}"
+PM2_WORKER_NAME="devspace-v2-upgrade-${TRANSACTION_UUID:0:8}"
 AUDIT_DIR="${DEPLOYMENT_ROOT}/upgrade-${STAMP}-${HEAD:0:12}"
 [[ ! -e "$AUDIT_DIR" ]] || { echo "Audit directory already exists: $AUDIT_DIR" >&2; exit 1; }
 mkdir -m 700 "$AUDIT_DIR"
 STATUS_PATH="$AUDIT_DIR/status.json"
 REQUEST_PATH="$AUDIT_DIR/request.json"
 WORKER_LOG="$AUDIT_DIR/worker.log"
+SCHEDULER_EVIDENCE="$AUDIT_DIR/scheduler.json"
 RELEASE="$RELEASE_ROOT/$HEAD"
 NEW_SCRIPT="$RELEASE/scripts/start-universal-broker-v2-production.sh"
 CANDIDATE_NAME="devspace-v2-candidate-${HEAD:0:8}"
@@ -514,22 +517,102 @@ def write(path,value,mode=0o600):
 write(request_path,request)
 write(status_path,status)
 PY
-WORKER="$RELEASE/dist/v2/production-upgrade-worker.js"
+WORKER="$RELEASE/dist/v2/production-upgrade-worker-cli.js"
 [[ -f "$WORKER" ]] || { echo "Production upgrade worker is missing: $WORKER" >&2; exit 1; }
+SCHEDULER_KIND=""
+LAUNCHD_RC=""
 if [[ "$(uname -s)" == Darwin ]]; then
   LABEL="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["launchdLabel"])' "$REQUEST_PATH")"
+  set +e
   /bin/launchctl submit -l "$LABEL" -o "$WORKER_LOG" -e "$WORKER_LOG" -- \
     "$(command -v node)" "$WORKER" "$REQUEST_PATH"
+  LAUNCHD_RC=$?
+  set -e
+  if [[ "$LAUNCHD_RC" == 0 ]]; then
+    SCHEDULER_KIND="launchd"
+  else
+    SCHEDULER_KIND="pm2"
+    : > "$WORKER_LOG"
+    chmod 600 "$WORKER_LOG"
+    /usr/bin/env -i \
+      HOME="$HOME" USER="${USER:-$(id -un)}" LOGNAME="${LOGNAME:-${USER:-$(id -un)}}" \
+      PATH="$(dirname "$(command -v node)"):/usr/bin:/bin:/usr/sbin:/sbin" \
+      TMPDIR="${TMPDIR:-/tmp}" LANG="${LANG:-C}" LC_ALL="${LC_ALL:-${LANG:-C}}" \
+      PM2_HOME="${PM2_HOME:-$HOME/.pm2}" \
+      DEVSPACE_UPGRADE_SCHEDULER=pm2 DEVSPACE_UPGRADE_PM2_WORKER_NAME="$PM2_WORKER_NAME" \
+      "$PM2_EXECUTABLE" start "$WORKER" \
+        --name "$PM2_WORKER_NAME" \
+        --interpreter "$(command -v node)" \
+        --cwd "$AUDIT_DIR" \
+        --no-autorestart --merge-logs \
+        --output "$WORKER_LOG" --error "$WORKER_LOG" --time \
+        -- "$REQUEST_PATH"
+  fi
 else
+  SCHEDULER_KIND="nohup"
   nohup "$(command -v node)" "$WORKER" "$REQUEST_PATH" >> "$WORKER_LOG" 2>&1 </dev/null &
+fi
+
+python3 - "$SCHEDULER_EVIDENCE" "$TRANSACTION_ID" "$SCHEDULER_KIND" "$PM2_WORKER_NAME" "${LABEL:-}" "${LAUNCHD_RC:-}" <<'PYSCHEDULER'
+import datetime,json,os,sys,tempfile
+path,transaction_id,kind,worker_name,label,launchd_rc=sys.argv[1:]
+value={
+  "version":1,
+  "transactionId":transaction_id,
+  "scheduler":kind,
+  "workerName":worker_name if kind=="pm2" else None,
+  "launchdLabel":label or None,
+  "launchdSubmitStatus":int(launchd_rc) if launchd_rc else None,
+  "scheduledAt":datetime.datetime.now(datetime.timezone.utc).isoformat(),
+}
+fd,tmp=tempfile.mkstemp(prefix='.'+os.path.basename(path)+'.',dir=os.path.dirname(path))
+try:
+  with os.fdopen(fd,'w') as handle:
+    json.dump(value,handle,indent=2);handle.write('\n');handle.flush();os.fsync(handle.fileno())
+  os.chmod(tmp,0o600);os.replace(tmp,path)
+finally:
+  if os.path.exists(tmp):os.unlink(tmp)
+PYSCHEDULER
+
+CLAIMED_STATE=""
+for ((attempt=0; attempt<100; attempt++)); do
+  CLAIMED_STATE="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("state",""))' "$STATUS_PATH" 2>/dev/null || true)"
+  case "$CLAIMED_STATE" in
+    ACCEPTED|SWITCHING|VERIFYING|PASS|ROLLING_BACK) break ;;
+    FAIL|UNKNOWN)
+      echo "Production upgrade worker terminated before scheduling completed: $CLAIMED_STATE" >&2
+      exit 1
+      ;;
+  esac
+  sleep 0.1
+done
+if [[ ! "$CLAIMED_STATE" =~ ^(ACCEPTED|SWITCHING|VERIFYING|PASS|ROLLING_BACK)$ ]]; then
+  [[ "$SCHEDULER_KIND" != pm2 ]] || { pm2 delete "$PM2_WORKER_NAME" >/dev/null 2>&1 || true; pm2 save >/dev/null 2>&1 || true; }
+  [[ -z "${LABEL:-}" ]] || /bin/launchctl remove "$LABEL" >/dev/null 2>&1 || true
+  python3 - "$STATUS_PATH" <<'PYCLAIM'
+import datetime,json,os,sys,tempfile
+path=sys.argv[1];value=json.load(open(path));at=datetime.datetime.now(datetime.timezone.utc).isoformat()
+value.update({"state":"FAIL","updatedAt":at,"error":"Detached upgrade scheduler did not claim the PREPARED transaction."})
+value["history"]=[*value.get("history",[]),{"state":"FAIL","at":at}]
+fd,tmp=tempfile.mkstemp(prefix='.'+os.path.basename(path)+'.',dir=os.path.dirname(path))
+try:
+  with os.fdopen(fd,'w') as handle:
+    json.dump(value,handle,indent=2);handle.write('\n');handle.flush();os.fsync(handle.fileno())
+  os.chmod(tmp,0o600);os.replace(tmp,path)
+finally:
+  if os.path.exists(tmp):os.unlink(tmp)
+PYCLAIM
+  echo "Detached upgrade scheduler did not claim the transaction." >&2
+  exit 1
 fi
 UPGRADE_SCHEDULED=1
 
-python3 - "$STATUS_PATH" <<'PY'
+python3 - "$STATUS_PATH" "$SCHEDULER_EVIDENCE" <<'PY'
 import json,sys
 status=json.load(open(sys.argv[1]))
 print(json.dumps({
   "status":"UPGRADE_SCHEDULED",
+  "scheduler":json.load(open(sys.argv[2]))["scheduler"],
   "transactionId":status["transactionId"],
   "statusPath":sys.argv[1],
   "expectedDisconnect":True,

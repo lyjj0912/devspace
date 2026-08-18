@@ -558,6 +558,9 @@ function verifySelfManagementSources() {
     "publicMetricsStatus",
     "unauthenticatedMcpStatus",
     "rollbackRuntime",
+    "schedulePm2WorkerCleanup",
+    "pm2WorkerCleanupEnvironment",
+    "scheduler-cleanup.json",
   ]) {
     if (!upgradeWorker.includes(marker)) fail(`Production upgrade worker is missing: ${marker}`);
   }
@@ -585,7 +588,12 @@ function verifySelfManagementSources() {
     "DEVSPACE_V2_LEGACY_SCOPE_COMPATIBILITY",
     "oauth-before.sqlite",
     "launchctl submit",
-    "production-upgrade-worker.js",
+    "production-upgrade-worker-cli.js",
+    "DEVSPACE_UPGRADE_SCHEDULER=pm2",
+    "DEVSPACE_UPGRADE_PM2_WORKER_NAME",
+    "--no-autorestart",
+    "scheduler.json",
+    "Detached upgrade scheduler did not claim the transaction.",
     "SOURCE_TREE",
     "DIST_EVIDENCE",
     '"gitExecutable":git_executable',
@@ -601,6 +609,7 @@ function verifySelfManagementSources() {
     "rolls back env, process, start path, and audit link",
     "records UNKNOWN when rollback cannot establish the previous runtime",
     "acceptedAt",
+    "PM2 fallback worker schedules credential-free terminal cleanup",
   ]) {
     if (!upgradeTests.includes(marker)) fail(`Production upgrade regression test is missing: ${marker}`);
   }
@@ -865,6 +874,7 @@ function verifyDist() {
     "dist/v2/self-management.js",
     "dist/v2/self-management-worker.js",
     "dist/v2/production-upgrade-worker.js",
+    "dist/v2/production-upgrade-worker-cli.js",
     "dist/v2/doctor.js",
   ]) {
     if (!existsSync(resolve(root, path))) fail(`Missing build output: ${path}`);

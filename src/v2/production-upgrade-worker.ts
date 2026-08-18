@@ -1,4 +1,4 @@
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
   chmod,
@@ -324,6 +324,74 @@ export function pm2CommandEnvironment(
     ...inherited,
     PATH: pm2ExecutablePath(inherited.PATH, nodeExecutable),
   };
+}
+
+export function pm2WorkerCleanupEnvironment(
+  inherited: NodeJS.ProcessEnv,
+  nodeExecutable = process.execPath,
+): NodeJS.ProcessEnv {
+  const sanitized: NodeJS.ProcessEnv = {};
+  for (const key of ["HOME", "USER", "LOGNAME", "TMPDIR", "LANG", "LC_ALL", "PM2_HOME"]) {
+    const value = inherited[key];
+    if (value) sanitized[key] = value;
+  }
+  sanitized.PATH = pm2ExecutablePath(inherited.PATH, nodeExecutable);
+  return sanitized;
+}
+
+export function schedulePm2WorkerCleanup(
+  pm2Executable: string,
+  workerName: string,
+  auditDirectory: string,
+  delayMs = 750,
+): number {
+  if (!isAbsolute(pm2Executable)) {
+    throw new Error(`PM2 executable must be absolute: ${pm2Executable}`);
+  }
+  if (!/^[A-Za-z0-9_.-]{1,128}$/u.test(workerName)) {
+    throw new Error(`Invalid PM2 cleanup worker name: ${workerName}`);
+  }
+  if (!isAbsolute(auditDirectory)) {
+    throw new Error(`PM2 cleanup audit directory must be absolute: ${auditDirectory}`);
+  }
+  if (!Number.isInteger(delayMs) || delayMs < 0 || delayMs > 30_000) {
+    throw new Error(`Invalid PM2 cleanup delay: ${delayMs}`);
+  }
+  const cleanupProgram = [
+    'const { spawnSync } = require("node:child_process");',
+    'const { chmodSync, renameSync, writeFileSync } = require("node:fs");',
+    'const { join } = require("node:path");',
+    'const [pm2, workerName, auditDirectory, delayText] = process.argv.slice(1);',
+    'const delay = Number(delayText);',
+    'setTimeout(() => {',
+    '  const run = (args) => spawnSync(pm2, args, { cwd: auditDirectory, env: process.env, encoding: "utf8", timeout: 30000 });',
+    '  const deleted = run(["delete", workerName]);',
+    '  const saved = run(["save"]);',
+    '  const evidence = { version: 1, workerName, deleted: deleted.status === 0, deleteStatus: deleted.status, dumpSaved: saved.status === 0, saveStatus: saved.status, completedAt: new Date().toISOString() };',
+    '  const evidencePath = join(auditDirectory, "scheduler-cleanup.json");',
+    '  const temporary = `${evidencePath}.${process.pid}.tmp`;',
+    '  writeFileSync(temporary, `${JSON.stringify(evidence, null, 2)}\\n`, { mode: 0o600 });',
+    '  chmodSync(temporary, 0o600);',
+    '  renameSync(temporary, evidencePath);',
+    '  process.exitCode = saved.status === 0 ? 0 : 1;',
+    '}, delay);',
+  ].join("\n");
+  const child = spawn(process.execPath, [
+    "-e",
+    cleanupProgram,
+    pm2Executable,
+    workerName,
+    auditDirectory,
+    String(delayMs),
+  ], {
+    cwd: auditDirectory,
+    detached: true,
+    stdio: "ignore",
+    env: pm2WorkerCleanupEnvironment(process.env),
+  });
+  if (!child.pid) throw new Error("Failed to create detached PM2 cleanup process.");
+  child.unref();
+  return child.pid;
 }
 
 function pm2ExecutablePath(

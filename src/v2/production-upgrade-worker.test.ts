@@ -8,18 +8,21 @@ import {
   readFile,
   readlink,
   rm,
+  stat,
   symlink,
   writeFile,
 } from "node:fs/promises";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test, { type TestContext } from "node:test";
 import {
   directoryEvidence,
   pm2CommandEnvironment,
+  pm2WorkerCleanupEnvironment,
   productionPm2Environment,
   runProductionUpgradeWorker,
+  schedulePm2WorkerCleanup,
   type ProductionUpgradeRequest,
 } from "./production-upgrade-worker.js";
 
@@ -90,6 +93,69 @@ test("detached PM2 environment runs an env-node shebang under a minimal launchd 
   const value = JSON.parse(result.stdout) as { execPath: string; args: string[] };
   assert.equal(value.execPath, process.execPath);
   assert.deepEqual(value.args, ["jlist"]);
+});
+
+test("PM2 fallback worker schedules credential-free terminal cleanup and dump persistence", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-pm2-worker-cleanup-test-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const calls = join(root, "pm2.calls");
+  const pm2 = join(root, "pm2-fixture.sh");
+  await writeFile(pm2, [
+    "#!/bin/sh",
+    `printf '%s\\n' \"$*\" >> ${shellQuote(calls)}`,
+    "exit 0",
+    "",
+  ].join("\n"), { mode: 0o700 });
+  await chmod(pm2, 0o700);
+  const inherited = {
+    HOME: root,
+    USER: "fixture",
+    LOGNAME: "fixture",
+    PATH: "/usr/bin:/bin",
+    PM2_HOME: join(root, ".pm2"),
+    DEVSPACE_OAUTH_OWNER_TOKEN: "must-not-survive",
+  };
+  assert.deepEqual(pm2WorkerCleanupEnvironment(inherited, process.execPath), {
+    HOME: root,
+    USER: "fixture",
+    LOGNAME: "fixture",
+    PATH: `${dirname(process.execPath)}:/usr/bin:/bin`,
+    PM2_HOME: join(root, ".pm2"),
+  });
+  const previousEnvironment = process.env;
+  process.env = { ...inherited };
+  try {
+    const pid = schedulePm2WorkerCleanup(pm2, "devspace-v2-upgrade-deadbeef", root, 20);
+    assert.ok(pid > 0);
+  } finally {
+    process.env = previousEnvironment;
+  }
+  const evidencePath = join(root, "scheduler-cleanup.json");
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (await readFile(evidencePath, "utf8").catch(() => undefined)) break;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  const evidence = JSON.parse(await readFile(evidencePath, "utf8")) as {
+    version: number;
+    workerName: string;
+    deleted: boolean;
+    dumpSaved: boolean;
+    deleteStatus: number;
+    saveStatus: number;
+    completedAt: string;
+  };
+  assert.equal(evidence.version, 1);
+  assert.equal(evidence.workerName, "devspace-v2-upgrade-deadbeef");
+  assert.equal(evidence.deleted, true);
+  assert.equal(evidence.deleteStatus, 0);
+  assert.equal(evidence.dumpSaved, true);
+  assert.equal(evidence.saveStatus, 0);
+  assert.equal(typeof evidence.completedAt, "string");
+  assert.equal((await stat(evidencePath)).mode & 0o777, 0o600);
+  assert.deepEqual((await readFile(calls, "utf8")).trim().split("\n"), [
+    "delete devspace-v2-upgrade-deadbeef",
+    "save",
+  ]);
 });
 
 test("production upgrade worker switches one PM2 process and commits canonical pointers only after verification", async (t) => {
