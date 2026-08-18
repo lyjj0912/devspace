@@ -453,6 +453,7 @@ function verifySelfManagementSources() {
   const service = text("src/v2/self-management.ts");
   const worker = text("src/v2/self-management-worker.ts");
   const upgradeWorker = text("src/v2/production-upgrade-worker.ts");
+  const cleanupMonitor = text("src/v2/production-upgrade-cleanup-monitor.ts");
   const upgrade = text("scripts/upgrade-universal-broker-v2-production.sh");
   const upgradeStatus = text("scripts/status-universal-broker-v2-upgrade.sh");
   const server = text("src/v2/server.ts");
@@ -565,6 +566,16 @@ function verifySelfManagementSources() {
     if (!upgradeWorker.includes(marker)) fail(`Production upgrade worker is missing: ${marker}`);
   }
   for (const marker of [
+    "runPm2UpgradeCleanupMonitor",
+    "TERMINAL_STATES",
+    "scheduler-cleanup.json",
+    'runPm2(options, ["delete", options.workerName]',
+    'runPm2(options, ["save"]',
+    "dumpWorkerResidue",
+  ]) {
+    if (!cleanupMonitor.includes(marker)) fail(`Production upgrade cleanup monitor is missing: ${marker}`);
+  }
+  for (const marker of [
     "npm run release:verify -- --require-clean",
     "DEVSPACE_V2_LOAD_SSH_TARGET",
     "SKIP_COMPANY_GATES=0",
@@ -593,6 +604,10 @@ function verifySelfManagementSources() {
     "DEVSPACE_UPGRADE_PM2_WORKER_NAME",
     "--no-autorestart",
     "scheduler.json",
+    "production-upgrade-cleanup-monitor.js",
+    "scheduler-cleanup.log",
+    "cleanupMonitorPid",
+    "/usr/bin/nohup",
     "Detached upgrade scheduler did not claim the transaction.",
     "SOURCE_TREE",
     "DIST_EVIDENCE",
@@ -610,6 +625,7 @@ function verifySelfManagementSources() {
     "records UNKNOWN when rollback cannot establish the previous runtime",
     "acceptedAt",
     "PM2 fallback worker schedules credential-free terminal cleanup",
+    "external PM2 cleanup monitor persists dump state",
   ]) {
     if (!upgradeTests.includes(marker)) fail(`Production upgrade regression test is missing: ${marker}`);
   }
@@ -875,6 +891,7 @@ function verifyDist() {
     "dist/v2/self-management-worker.js",
     "dist/v2/production-upgrade-worker.js",
     "dist/v2/production-upgrade-worker-cli.js",
+    "dist/v2/production-upgrade-cleanup-monitor.js",
     "dist/v2/doctor.js",
   ]) {
     if (!existsSync(resolve(root, path))) fail(`Missing build output: ${path}`);

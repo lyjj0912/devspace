@@ -25,6 +25,7 @@ import {
   schedulePm2WorkerCleanup,
   type ProductionUpgradeRequest,
 } from "./production-upgrade-worker.js";
+import { runPm2UpgradeCleanupMonitor } from "./production-upgrade-cleanup-monitor.js";
 
 const expectedScopes = [
   "devspace.read",
@@ -155,6 +156,72 @@ test("PM2 fallback worker schedules credential-free terminal cleanup and dump pe
   assert.deepEqual((await readFile(calls, "utf8")).trim().split("\n"), [
     "delete devspace-v2-upgrade-deadbeef",
     "save",
+  ]);
+});
+
+test("external PM2 cleanup monitor persists dump state after terminal worker self-delete races", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-pm2-cleanup-monitor-test-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const pm2Home = join(root, ".pm2");
+  const workerState = join(root, "worker.present");
+  const calls = join(root, "pm2.calls");
+  const statusPath = join(root, "status.json");
+  const pm2 = join(root, "pm2-fixture.sh");
+  await mkdir(pm2Home, { recursive: true });
+  await writeFile(workerState, "present\n");
+  await writeFile(statusPath, JSON.stringify({
+    transactionId: "upgrade_00000000-0000-4000-8000-000000000000",
+    state: "PASS",
+  }));
+  await writeFile(pm2, [
+    "#!/bin/sh",
+    `state=${shellQuote(workerState)}`,
+    `calls=${shellQuote(calls)}`,
+    `dump=${shellQuote(join(pm2Home, "dump.pm2"))}`,
+    "printf '%s\\n' \"$*\" >> \"$calls\"",
+    "case \"$1\" in",
+    "  jlist)",
+    "    if [ -f \"$state\" ]; then printf '%s\\n' '[{\"name\":\"devspace-v2-upgrade-feedface\"}]'; else printf '%s\\n' '[]'; fi",
+    "    ;;",
+    "  delete)",
+    "    rm -f \"$state\"",
+    "    ;;",
+    "  save)",
+    "    if [ -f \"$state\" ]; then printf '%s\\n' '[{\"name\":\"devspace-v2-upgrade-feedface\"}]' > \"$dump\"; else printf '%s\\n' '[]' > \"$dump\"; fi",
+    "    ;;",
+    "  *) exit 64 ;;",
+    "esac",
+    "",
+  ].join("\n"), { mode: 0o700 });
+  await chmod(pm2, 0o700);
+  const evidence = await runPm2UpgradeCleanupMonitor({
+    statusPath,
+    pm2Executable: pm2,
+    workerName: "devspace-v2-upgrade-feedface",
+    auditDirectory: root,
+    timeoutMs: 1_000,
+    pollMs: 10,
+    graceMs: 0,
+    env: {
+      HOME: root,
+      PATH: `${dirname(process.execPath)}:/usr/bin:/bin`,
+      PM2_HOME: pm2Home,
+    },
+  });
+  assert.equal(evidence.ok, true);
+  assert.equal(evidence.terminalState, "PASS");
+  assert.equal(evidence.workerPresentBefore, true);
+  assert.equal(evidence.deleteAttempted, true);
+  assert.equal(evidence.workerPresentAfter, false);
+  assert.equal(evidence.dumpWorkerResidue, false);
+  assert.equal(evidence.dumpSaved, true);
+  const persistedPath = join(root, "scheduler-cleanup.json");
+  assert.equal((await stat(persistedPath)).mode & 0o777, 0o600);
+  assert.deepEqual((await readFile(calls, "utf8")).trim().split("\n"), [
+    "jlist",
+    "delete devspace-v2-upgrade-feedface",
+    "save",
+    "jlist",
   ]);
 });
 

@@ -282,6 +282,7 @@ STATUS_PATH="$AUDIT_DIR/status.json"
 REQUEST_PATH="$AUDIT_DIR/request.json"
 WORKER_LOG="$AUDIT_DIR/worker.log"
 SCHEDULER_EVIDENCE="$AUDIT_DIR/scheduler.json"
+CLEANUP_MONITOR_LOG="$AUDIT_DIR/scheduler-cleanup.log"
 RELEASE="$RELEASE_ROOT/$HEAD"
 NEW_SCRIPT="$RELEASE/scripts/start-universal-broker-v2-production.sh"
 CANDIDATE_NAME="devspace-v2-candidate-${HEAD:0:8}"
@@ -519,8 +520,11 @@ write(status_path,status)
 PY
 WORKER="$RELEASE/dist/v2/production-upgrade-worker-cli.js"
 [[ -f "$WORKER" ]] || { echo "Production upgrade worker is missing: $WORKER" >&2; exit 1; }
+CLEANUP_MONITOR="$RELEASE/dist/v2/production-upgrade-cleanup-monitor.js"
+[[ -f "$CLEANUP_MONITOR" ]] || { echo "Production upgrade cleanup monitor is missing: $CLEANUP_MONITOR" >&2; exit 1; }
 SCHEDULER_KIND=""
 LAUNCHD_RC=""
+CLEANUP_MONITOR_PID=""
 if [[ "$(uname -s)" == Darwin ]]; then
   LABEL="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["launchdLabel"])' "$REQUEST_PATH")"
   set +e
@@ -547,15 +551,26 @@ if [[ "$(uname -s)" == Darwin ]]; then
         --no-autorestart --merge-logs \
         --output "$WORKER_LOG" --error "$WORKER_LOG" --time \
         -- "$REQUEST_PATH"
+    : > "$CLEANUP_MONITOR_LOG"
+    chmod 600 "$CLEANUP_MONITOR_LOG"
+    /usr/bin/env -i \
+      HOME="$HOME" USER="${USER:-$(id -un)}" LOGNAME="${LOGNAME:-${USER:-$(id -un)}}" \
+      PATH="$(dirname "$(command -v node)"):/usr/bin:/bin:/usr/sbin:/sbin" \
+      TMPDIR="${TMPDIR:-/tmp}" LANG="${LANG:-C}" LC_ALL="${LC_ALL:-${LANG:-C}}" \
+      PM2_HOME="${PM2_HOME:-$HOME/.pm2}" \
+      /usr/bin/nohup "$(command -v node)" "$CLEANUP_MONITOR" \
+        "$STATUS_PATH" "$PM2_EXECUTABLE" "$PM2_WORKER_NAME" "$AUDIT_DIR" 900000 \
+        >> "$CLEANUP_MONITOR_LOG" 2>&1 </dev/null &
+    CLEANUP_MONITOR_PID=$!
   fi
 else
   SCHEDULER_KIND="nohup"
   nohup "$(command -v node)" "$WORKER" "$REQUEST_PATH" >> "$WORKER_LOG" 2>&1 </dev/null &
 fi
 
-python3 - "$SCHEDULER_EVIDENCE" "$TRANSACTION_ID" "$SCHEDULER_KIND" "$PM2_WORKER_NAME" "${LABEL:-}" "${LAUNCHD_RC:-}" <<'PYSCHEDULER'
+python3 - "$SCHEDULER_EVIDENCE" "$TRANSACTION_ID" "$SCHEDULER_KIND" "$PM2_WORKER_NAME" "${LABEL:-}" "${LAUNCHD_RC:-}" "${CLEANUP_MONITOR_PID:-}" <<'PYSCHEDULER'
 import datetime,json,os,sys,tempfile
-path,transaction_id,kind,worker_name,label,launchd_rc=sys.argv[1:]
+path,transaction_id,kind,worker_name,label,launchd_rc,cleanup_monitor_pid=sys.argv[1:]
 value={
   "version":1,
   "transactionId":transaction_id,
@@ -563,6 +578,7 @@ value={
   "workerName":worker_name if kind=="pm2" else None,
   "launchdLabel":label or None,
   "launchdSubmitStatus":int(launchd_rc) if launchd_rc else None,
+  "cleanupMonitorPid":int(cleanup_monitor_pid) if cleanup_monitor_pid else None,
   "scheduledAt":datetime.datetime.now(datetime.timezone.utc).isoformat(),
 }
 fd,tmp=tempfile.mkstemp(prefix='.'+os.path.basename(path)+'.',dir=os.path.dirname(path))
