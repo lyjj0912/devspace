@@ -152,5 +152,6 @@ test("live verifier defaults to parallel v2 and creates only a temporary user to
   assert.match(source, /Explicit --skip-company-gates deployment option\./u);
   assert.match(source, /companyGateSkipped: options\.skipCompanyGates/u);
   assert.match(source, /if \(!options\.skipCompanyGates\)/u);
+  assert.match(source, /id: "r2-local-remove"[\s\S]*disposition: "trash"/u);
   assert.doesNotMatch(source, /templateDatabasePath|--template-database|JSON\.stringify\(\["devspace"/u);
 });

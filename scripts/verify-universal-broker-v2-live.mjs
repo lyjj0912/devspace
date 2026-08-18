@@ -186,7 +186,7 @@ async function runCanaries(client, sameClientTransport, foreignClient, root, can
           ? {
               id: "r2-local-remove",
               tool: "fs",
-              arguments: { operation: "remove", target: "local", path: previewR2Path, disposition: "permanent" },
+              arguments: { operation: "remove", target: "local", path: previewR2Path, disposition: "trash" },
             }
           : {
               id: "r2-remote-write",
