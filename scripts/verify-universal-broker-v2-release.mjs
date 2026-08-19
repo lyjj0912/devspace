@@ -847,7 +847,7 @@ function verifyLiveVerifierSources() {
     "AUTHORITY_ACTION_MISMATCH",
     "AUTHORITY_PRINCIPAL_MISMATCH",
     "AUTHORITY_CONSUMED",
-    "AUTHORITY_EXPIRED",
+    "AUTHORITY_STALE",
     "crossTransportAccepted",
     "crossClientRejected",
     "sameClientTransport",

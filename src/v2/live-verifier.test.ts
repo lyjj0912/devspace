@@ -133,6 +133,8 @@ test("live verifier defaults to parallel v2 and creates only a temporary user to
   assert.doesNotMatch(source, /audit\.health\?\.ok === true/u);
   assert.match(source, /errorCode\(mismatchResult\) === "AUTHORITY_ACTION_MISMATCH"/u);
   assert.match(source, /errorCode\(crossClientResult\) === "AUTHORITY_PRINCIPAL_MISMATCH"/u);
+  assert.match(source, /taskInstanceId: correctedAuthority\.taskInstanceId/u);
+  assert.match(source, /errorCode\(correctedResult\) === "AUTHORITY_STALE"/u);
   assert.match(source, /universal-broker-v2\/devspace\.sqlite/u);
   assert.match(source, /code !== "GUI_STATE_CHANGED"/u);
   assert.match(source, /for \(let attempt = 0; attempt < 2; attempt \+= 1\)/u);

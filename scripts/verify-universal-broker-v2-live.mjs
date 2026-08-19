@@ -249,7 +249,7 @@ async function runCanaries(client, sameClientTransport, foreignClient, root, can
     content: "authority-exact\n",
     overwrite: false,
   };
-  const exactAuthorityId = await prepareExactAuthority(
+  const exactAuthority = await prepareExactAuthority(
     client,
     "fs",
     exactAuthorityArgs,
@@ -261,7 +261,7 @@ async function runCanaries(client, sameClientTransport, foreignClient, root, can
     arguments: {
       ...exactAuthorityArgs,
       path: `${exactAuthorityPath}.mismatch`,
-      authorityId: exactAuthorityId,
+      authorityId: exactAuthority.authorityId,
     },
   });
   assert(
@@ -271,7 +271,7 @@ async function runCanaries(client, sameClientTransport, foreignClient, root, can
   authorityAudit.mismatchRejected = true;
   const crossClientResult = await foreignClient.callTool({
     name: "fs",
-    arguments: { ...exactAuthorityArgs, authorityId: exactAuthorityId },
+    arguments: { ...exactAuthorityArgs, authorityId: exactAuthority.authorityId },
   });
   assert(
     errorCode(crossClientResult) === "AUTHORITY_PRINCIPAL_MISMATCH",
@@ -280,13 +280,13 @@ async function runCanaries(client, sameClientTransport, foreignClient, root, can
   authorityAudit.crossClientRejected = true;
   const exactResult = await sameClientTransport.callTool({
     name: "fs",
-    arguments: { ...exactAuthorityArgs, authorityId: exactAuthorityId },
+    arguments: { ...exactAuthorityArgs, authorityId: exactAuthority.authorityId },
   });
   assert(exactResult.isError !== true && exactResult.structuredContent?.ok !== false, "exact authority action failed");
   authorityAudit.crossTransportAccepted = true;
   const consumedResult = await client.callTool({
     name: "fs",
-    arguments: { ...exactAuthorityArgs, authorityId: exactAuthorityId },
+    arguments: { ...exactAuthorityArgs, authorityId: exactAuthority.authorityId },
   });
   assert(errorCode(consumedResult) === "AUTHORITY_CONSUMED", "consumed authority was reusable");
   authorityAudit.consumedRejected = true;
@@ -298,7 +298,7 @@ async function runCanaries(client, sameClientTransport, foreignClient, root, can
     content: "must-not-run\n",
     overwrite: false,
   };
-  const correctedAuthorityId = await prepareExactAuthority(
+  const correctedAuthority = await prepareExactAuthority(
     client,
     "fs",
     correctedArgs,
@@ -307,13 +307,14 @@ async function runCanaries(client, sameClientTransport, foreignClient, root, can
   );
   await call(client, "context", {
     operation: "invalidate_authority",
+    taskInstanceId: correctedAuthority.taskInstanceId,
     correctionText: "Do not execute the prepared corrected-file write.",
   });
   const correctedResult = await client.callTool({
     name: "fs",
-    arguments: { ...correctedArgs, authorityId: correctedAuthorityId },
+    arguments: { ...correctedArgs, authorityId: correctedAuthority.authorityId },
   });
-  assert(errorCode(correctedResult) === "AUTHORITY_EXPIRED", "corrected authority was not invalidated");
+  assert(errorCode(correctedResult) === "AUTHORITY_STALE", "corrected authority was not invalidated");
   authorityAudit.correctionInvalidated = true;
 
   const staticElevation = await client.callTool({
@@ -893,7 +894,7 @@ async function callWithAuthority(client, name, args) {
   if (errorCode(result) !== "AUTHORITY_REQUIRED") return result;
   const requiredRisk = result.structuredContent?.error?.evidence?.requiredRisk;
   assert(["R1", "R2", "R3"].includes(requiredRisk), `invalid required authority risk: ${requiredRisk}`);
-  const authorityId = await prepareExactAuthority(
+  const authority = await prepareExactAuthority(
     client,
     name,
     args,
@@ -902,7 +903,7 @@ async function callWithAuthority(client, name, args) {
   );
   result = await client.callTool({
     name,
-    arguments: { ...args, authorityId },
+    arguments: { ...args, authorityId: authority.authorityId },
   });
   return result;
 }
@@ -920,11 +921,14 @@ async function prepareExactAuthority(client, tool, args, risk, authorityText) {
   if (prepared.isError === true || prepared.structuredContent?.ok === false) {
     throw new Error(`context.authorize failed: ${JSON.stringify(prepared.structuredContent ?? prepared.content).slice(0, 4_000)}`);
   }
-  const authorityId = data(prepared).authorityId;
+  const preparedData = data(prepared);
+  const authorityId = preparedData.authorityId;
+  const taskInstanceId = preparedData.taskInstanceId;
   assert(typeof authorityId === "string", "context.authorize returned no authorityId");
+  assert(typeof taskInstanceId === "string", "context.authorize returned no taskInstanceId");
   authorityAudit.prepared += 1;
   authorityAudit.byRisk[risk] += 1;
-  return authorityId;
+  return { authorityId, taskInstanceId };
 }
 
 function errorCode(result) {
