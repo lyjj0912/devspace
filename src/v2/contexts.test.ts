@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { access, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { access, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -35,6 +35,48 @@ test("context.open requires an existing directory and never creates a guessed pa
   await assert.rejects(
     fixture.contexts.open({ path: file }),
     (error: unknown) => contextErrorCode(error) === "PATH_TYPE_MISMATCH",
+  );
+});
+
+test("legacy ownerless context records are backed up and quarantined without deleting worktrees", async (t) => {
+  const fixture = await createFixture(t);
+  const retainedWorktree = join(fixture.root, "legacy-managed-worktree");
+  await mkdir(retainedWorktree, { recursive: true });
+  await writeFile(join(retainedWorktree, "README.md"), "retained legacy worktree\n");
+  await mkdir(join(fixture.root, "v2-state"), { recursive: true });
+  const legacyPayload = `${JSON.stringify({
+    version: 1,
+    contexts: [{
+      contextId: "ctx_legacy",
+      targetId: "local",
+      root: retainedWorktree,
+      mode: "worktree",
+      instructionSetHash: "legacy",
+      instructions: [],
+      managed: true,
+      createdAt: "2026-01-01T00:00:00.000Z",
+      lastUsedAt: "2026-01-01T00:00:00.000Z",
+    }],
+  }, null, 2)}\n`;
+  await writeFile(fixture.storePath, legacyPayload, { mode: 0o600 });
+
+  const cleanup = await fixture.contexts.cleanupExpired();
+  assert.equal(cleanup.remaining, 0);
+  const digest = createHash("sha256").update(legacyPayload).digest("hex");
+  const backupName = `contexts.json.pre-v2.${digest}.json`;
+  assert.ok((await readdir(join(fixture.root, "v2-state"))).includes(backupName));
+  assert.equal(
+    await readFile(join(fixture.root, "v2-state", backupName), "utf8"),
+    legacyPayload,
+  );
+  assert.deepEqual(JSON.parse(await readFile(fixture.storePath, "utf8")), {
+    version: 2,
+    contexts: [],
+    tombstones: [],
+  });
+  assert.equal(
+    await readFile(join(retainedWorktree, "README.md"), "utf8"),
+    "retained legacy worktree\n",
   );
 });
 

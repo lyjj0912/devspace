@@ -116,6 +116,11 @@ interface ContextStoreFile {
   tombstones: ContextTombstone[];
 }
 
+interface ParsedContextStore {
+  store: ContextStoreFile;
+  legacy: boolean;
+}
+
 interface ContextTombstone {
   contextId: string;
   principalKeyFingerprint: string;
@@ -1312,7 +1317,13 @@ export class ContextRegistry {
   private async loadFromStore(): Promise<void> {
     let parsed: ContextStoreFile = { version: STORE_VERSION, contexts: [], tombstones: [] };
     try {
-      parsed = parseContextStore(await readFile(this.options.storePath, "utf8"));
+      const content = await readFile(this.options.storePath, "utf8");
+      const decoded = parseContextStore(content);
+      parsed = decoded.store;
+      if (decoded.legacy) {
+        await preserveLegacyContextStore(this.options.storePath, content);
+        await writeContextStoreFile(this.options.storePath, parsed);
+      }
     } catch (error) {
       if (!isNodeError(error, "ENOENT")) {
         throw new UniversalBrokerError(
@@ -1365,8 +1376,6 @@ export class ContextRegistry {
 
   private persist(): Promise<void> {
     const operation = this.mutationQueue.then(async () => {
-      await mkdir(dirname(this.options.storePath), { recursive: true });
-      const temporary = `${this.options.storePath}.tmp-${process.pid}-${randomUUID()}`;
       const payload: ContextStoreFile = {
         version: STORE_VERSION,
         contexts: [...this.contexts.values()]
@@ -1374,8 +1383,7 @@ export class ContextRegistry {
         tombstones: [...this.tombstones.values()]
           .sort((left, right) => left.contextId.localeCompare(right.contextId)),
       };
-      await writeFile(temporary, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
-      await rename(temporary, this.options.storePath);
+      await writeContextStoreFile(this.options.storePath, payload);
     });
     this.mutationQueue = operation.catch(() => undefined);
     return operation;
@@ -1863,20 +1871,77 @@ function boundedContextInteger(
   return parsed;
 }
 
-function parseContextStore(content: string): ContextStoreFile {
-  const parsed = JSON.parse(content) as Partial<ContextStoreFile>;
-  if (
-    parsed.version !== STORE_VERSION
-    || !Array.isArray(parsed.contexts)
-    || !Array.isArray(parsed.tombstones)
-  ) {
-    throw new Error("unsupported context store format");
-  }
-  return {
-    version: STORE_VERSION,
-    contexts: parsed.contexts,
-    tombstones: parsed.tombstones,
+function parseContextStore(content: string): ParsedContextStore {
+  const parsed = JSON.parse(content) as {
+    version?: unknown;
+    contexts?: unknown;
+    tombstones?: unknown;
   };
+  if (
+    parsed.version === STORE_VERSION
+    && Array.isArray(parsed.contexts)
+    && Array.isArray(parsed.tombstones)
+  ) {
+    return {
+      store: {
+        version: STORE_VERSION,
+        contexts: parsed.contexts as ContextRecord[],
+        tombstones: parsed.tombstones as ContextTombstone[],
+      },
+      legacy: false,
+    };
+  }
+  if (
+    parsed.version === 1
+    && Array.isArray(parsed.contexts)
+    && !("tombstones" in parsed)
+    && parsed.contexts.every(isLegacyContextRecord)
+  ) {
+    return {
+      store: { version: STORE_VERSION, contexts: [], tombstones: [] },
+      legacy: true,
+    };
+  }
+  throw new Error("unsupported context store format");
+}
+
+function isLegacyContextRecord(value: unknown): boolean {
+  if (!value || typeof value !== "object") return false;
+  const record = value as Partial<ContextRecord>;
+  return Boolean(
+    typeof record.contextId === "string"
+    && record.contextId.startsWith("ctx_")
+    && typeof record.targetId === "string"
+    && record.targetId.length > 0
+    && typeof record.root === "string"
+    && record.root.length > 0
+    && (record.mode === "existing" || record.mode === "worktree")
+    && typeof record.instructionSetHash === "string"
+    && Array.isArray(record.instructions)
+    && Number.isFinite(Date.parse(record.createdAt ?? ""))
+    && Number.isFinite(Date.parse(record.lastUsedAt ?? ""))
+  );
+}
+
+async function preserveLegacyContextStore(storePath: string, content: string): Promise<void> {
+  const digest = createHash("sha256").update(content).digest("hex");
+  const backupPath = `${storePath}.pre-v2.${digest}.json`;
+  try {
+    await writeFile(backupPath, content, { encoding: "utf8", flag: "wx", mode: 0o600 });
+  } catch (error) {
+    if (!isNodeError(error, "EEXIST")) throw error;
+    const existing = await readFile(backupPath, "utf8");
+    if (createHash("sha256").update(existing).digest("hex") !== digest) {
+      throw new Error(`Legacy context store backup digest mismatch: ${backupPath}`);
+    }
+  }
+}
+
+async function writeContextStoreFile(storePath: string, payload: ContextStoreFile): Promise<void> {
+  await mkdir(dirname(storePath), { recursive: true });
+  const temporary = `${storePath}.tmp-${process.pid}-${randomUUID()}`;
+  await writeFile(temporary, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
+  await rename(temporary, storePath);
 }
 
 function validateContextRecord(record: ContextRecord): void {
