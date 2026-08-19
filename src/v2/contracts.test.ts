@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
+import * as z from "zod/v4";
 import {
   UNIVERSAL_BROKER_BUDGETS,
   UNIVERSAL_BROKER_VERSION,
@@ -11,6 +12,43 @@ import {
   UNIVERSAL_TOOL_OPERATIONS,
   universalRequestMetaSchema,
 } from "./contracts.js";
+import {
+  EXEC_RISK_CLASSIFIER_GENERATION,
+  PROCESS_RISK_CLASSIFIER_GENERATION,
+} from "./authority-policy.js";
+import {
+  RUNTIME_AUTHORITY_CONTRACT_GENERATION,
+  RUNTIME_SCHEMA_GENERATION,
+} from "./runtime-contract-identity.js";
+import { digest } from "./runtime-identity.js";
+
+test("dependency-free runtime contract identities match live contracts", () => {
+  assert.equal(RUNTIME_SCHEMA_GENERATION, digest({
+    version: UNIVERSAL_BROKER_VERSION,
+    tools: UNIVERSAL_TOOL_NAMES.map((name) => {
+      const contract = UNIVERSAL_TOOL_CONTRACTS[name];
+      return {
+        name,
+        title: contract.title,
+        description: contract.description,
+        inputSchema: z.toJSONSchema(z.object(contract.inputSchema), {
+          target: "draft-07",
+          io: "input",
+          reused: "inline",
+        }),
+        annotations: contract.annotations,
+      };
+    }),
+    errors: UNIVERSAL_ERROR_CODES,
+    budgets: UNIVERSAL_BROKER_BUDGETS,
+  }));
+  assert.equal(RUNTIME_AUTHORITY_CONTRACT_GENERATION, digest({
+    exec: EXEC_RISK_CLASSIFIER_GENERATION,
+    process: PROCESS_RISK_CLASSIFIER_GENERATION,
+    canonicalization: "operation-authority-v5",
+    principal: "stable-principal-v1",
+  }));
+});
 
 test("checked-in contract manifests match the TypeScript authority", async () => {
   const tools = await readJson("../../contracts/tools-v2.schema.json") as {

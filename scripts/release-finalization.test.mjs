@@ -31,6 +31,19 @@ try {
   });
   assert.equal(packageEvidence.status, "PASS");
   assert.equal(created.manifest.buildDigest, packageEvidence.buildDigest);
+  assert.equal(created.manifest.schemaGeneration, `sha256:${"a".repeat(64)}`);
+  assert.equal(created.manifest.authorityContractGeneration, `sha256:${"b".repeat(64)}`);
+  await assert.rejects(stat(join(release, "node_modules")), /ENOENT/u, "release must remain dependency-free");
+
+  const brokenSource = join(root, "broken-source");
+  await createFixtureSource(brokenSource);
+  await rm(join(brokenSource, "dist", "v2", "runtime-contract-identity.js"));
+  assert.throws(() => createReleasePackage({
+    sourceRoot: brokenSource,
+    outputRoot: join(root, "broken-release"),
+    sourceRevision,
+    runtimeRevision: sourceRevision,
+  }), /missing dependency-free contract identities/u);
 
   const ownerDirectory = join(root, "persistent-identity");
   const firstOwner = ensureOwnerInstanceId(ownerDirectory);
@@ -120,10 +133,36 @@ console.log("Release package/finalization tests: PASS");
 
 async function createFixtureSource(source) {
   await mkdir(join(source, "dist"), { recursive: true });
+  await mkdir(join(source, "dist", "v2"), { recursive: true });
+  await mkdir(join(source, "node_modules", "fixture-identity-dependency"), { recursive: true });
   await mkdir(join(source, "config"), { recursive: true });
   await mkdir(join(source, "contracts"), { recursive: true });
   await mkdir(join(source, "scripts"), { recursive: true });
   await writeFile(join(source, "dist", "server.js"), "export const ready = true;\n");
+  await writeJson(join(source, "node_modules", "fixture-identity-dependency", "package.json"), {
+    name: "fixture-identity-dependency",
+    version: "1.0.0",
+    type: "module",
+    exports: "./index.js",
+  });
+  await writeFile(join(source, "node_modules", "fixture-identity-dependency", "index.js"), [
+    `export const schemaGeneration = "sha256:${"a".repeat(64)}";`,
+    `export const authorityContractGeneration = "sha256:${"b".repeat(64)}";`,
+    "",
+  ].join("\n"));
+  await writeFile(join(source, "dist", "v2", "runtime-identity.js"), [
+    'import "fixture-identity-dependency";',
+    'import { RUNTIME_SCHEMA_GENERATION, RUNTIME_AUTHORITY_CONTRACT_GENERATION } from "./runtime-contract-identity.js";',
+    "export function createRuntimeIdentity() {",
+    "  return { schemaGeneration: RUNTIME_SCHEMA_GENERATION, authorityContractGeneration: RUNTIME_AUTHORITY_CONTRACT_GENERATION };",
+    "}",
+    "",
+  ].join("\n"));
+  await writeFile(join(source, "dist", "v2", "runtime-contract-identity.js"), [
+    `export const RUNTIME_SCHEMA_GENERATION = "sha256:${"a".repeat(64)}";`,
+    `export const RUNTIME_AUTHORITY_CONTRACT_GENERATION = "sha256:${"b".repeat(64)}";`,
+    "",
+  ].join("\n"));
   await writeJson(join(source, "package.json"), { name: "fixture-broker", version: "1.0.0", license: "MIT" });
   await writeJson(join(source, "package-lock.json"), {
     name: "fixture-broker",

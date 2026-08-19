@@ -1,17 +1,12 @@
 import { createHash } from "node:crypto";
-import * as z from "zod/v4";
 import {
-  UNIVERSAL_BROKER_BUDGETS,
   UNIVERSAL_BROKER_VERSION,
-  UNIVERSAL_ERROR_CODES,
-  UNIVERSAL_TOOL_NAMES,
-  UNIVERSAL_TOOL_CONTRACTS,
   type RuntimeIdentity,
 } from "./contracts.js";
 import {
-  EXEC_RISK_CLASSIFIER_GENERATION,
-  PROCESS_RISK_CLASSIFIER_GENERATION,
-} from "./authority-policy.js";
+  RUNTIME_AUTHORITY_CONTRACT_GENERATION,
+  RUNTIME_SCHEMA_GENERATION,
+} from "./runtime-contract-identity.js";
 
 export interface RuntimeIdentityInput {
   config: unknown;
@@ -25,31 +20,8 @@ export interface RuntimeIdentityInput {
 export function createRuntimeIdentity(input: RuntimeIdentityInput): RuntimeIdentity {
   return Object.freeze({
     productVersion: UNIVERSAL_BROKER_VERSION,
-    schemaGeneration: digest({
-      version: UNIVERSAL_BROKER_VERSION,
-      tools: UNIVERSAL_TOOL_NAMES.map((name) => {
-        const contract = UNIVERSAL_TOOL_CONTRACTS[name];
-        return {
-          name,
-          title: contract.title,
-          description: contract.description,
-          inputSchema: z.toJSONSchema(z.object(contract.inputSchema), {
-            target: "draft-07",
-            io: "input",
-            reused: "inline",
-          }),
-          annotations: contract.annotations,
-        };
-      }),
-      errors: UNIVERSAL_ERROR_CODES,
-      budgets: UNIVERSAL_BROKER_BUDGETS,
-    }),
-    authorityContractGeneration: digest({
-      exec: EXEC_RISK_CLASSIFIER_GENERATION,
-      process: PROCESS_RISK_CLASSIFIER_GENERATION,
-      canonicalization: "operation-authority-v5",
-      principal: "stable-principal-v1",
-    }),
+    schemaGeneration: RUNTIME_SCHEMA_GENERATION,
+    authorityContractGeneration: RUNTIME_AUTHORITY_CONTRACT_GENERATION,
     configDigest: digest(redactConfigForDigest(input.config)),
     sourceRevision: boundedIdentity(input.sourceRevision, "unknown-source"),
     runtimeRevision: boundedIdentity(input.runtimeRevision, "development-runtime"),

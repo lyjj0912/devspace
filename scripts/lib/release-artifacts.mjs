@@ -537,14 +537,21 @@ function gitRevision(root) {
 }
 
 function runtimeContractIdentities(root) {
-  const modulePath = resolveContained(root, "dist/v2/runtime-identity.js");
-  if (!existsSync(modulePath)) return undefined;
+  const modulePath = resolveContained(root, "dist/v2/runtime-contract-identity.js");
+  if (!existsSync(modulePath)) {
+    if (existsSync(resolveContained(root, "dist/v2/runtime-identity.js"))) {
+      throw new Error("Packaged runtime is missing dependency-free contract identities.");
+    }
+    return undefined;
+  }
   try {
     const output = execFileSync(process.execPath, ["--input-type=module", "-e", `
       import { pathToFileURL } from "node:url";
       const module = await import(pathToFileURL(process.argv[1]).href);
-      const identity = module.createRuntimeIdentity({ config: {}, startedAt: "2000-01-01T00:00:00.000Z" });
-      process.stdout.write(JSON.stringify({ schemaGeneration: identity.schemaGeneration, authorityContractGeneration: identity.authorityContractGeneration }));
+      process.stdout.write(JSON.stringify({
+        schemaGeneration: module.RUNTIME_SCHEMA_GENERATION,
+        authorityContractGeneration: module.RUNTIME_AUTHORITY_CONTRACT_GENERATION,
+      }));
     `, modulePath], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
     const value = JSON.parse(output);
     if (!/^sha256:[a-f0-9]{64}$/u.test(value.schemaGeneration)

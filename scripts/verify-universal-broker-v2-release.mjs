@@ -959,6 +959,7 @@ function verifyDist() {
     "dist/cli.js",
     "dist/v2/server.js",
     "dist/v2/http-server.js",
+    "dist/v2/runtime-contract-identity.js",
     "dist/v2/remote-windows-filesystem-helper.js",
     "dist/v2/authority.js",
     "dist/v2/authority-store.js",
