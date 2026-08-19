@@ -264,14 +264,17 @@ async function runCanaries(client, sameClientTransport, foreignClient, root, can
       authorityId: exactAuthorityId,
     },
   });
-  assert(errorCode(mismatchResult) === "AUTHORITY_MISMATCH", "authority mismatch was not rejected");
+  assert(
+    errorCode(mismatchResult) === "AUTHORITY_ACTION_MISMATCH",
+    "authority action mismatch was not rejected",
+  );
   authorityAudit.mismatchRejected = true;
   const crossClientResult = await foreignClient.callTool({
     name: "fs",
     arguments: { ...exactAuthorityArgs, authorityId: exactAuthorityId },
   });
   assert(
-    errorCode(crossClientResult) === "AUTHORITY_MISMATCH",
+    errorCode(crossClientResult) === "AUTHORITY_PRINCIPAL_MISMATCH",
     "a different OAuth client reused another client's authority",
   );
   authorityAudit.crossClientRejected = true;
