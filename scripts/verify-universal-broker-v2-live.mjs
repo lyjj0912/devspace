@@ -494,7 +494,8 @@ async function runCanaries(client, sameClientTransport, foreignClient, root, can
     source: { target: options.companyTarget, path: companyPath, name: "company-artifact.txt", mimeType: "text/plain" },
     ttlSeconds: 60,
   }));
-  const companyArtifactResponse = await fetchArtifact(companyPublished.resourceUri);
+  assert(typeof companyPublished.downloadUrl === "string", "company Mac artifact download URL is missing");
+  const companyArtifactResponse = await fetchArtifact(companyPublished.downloadUrl);
   assert(companyArtifactResponse.status === 200 && (await companyArtifactResponse.text()).includes("user-file"), "company Mac artifact publication failed");
   await call(client, "fs", {
     operation: "remove",
@@ -547,8 +548,8 @@ async function runCanaries(client, sameClientTransport, foreignClient, root, can
       source: { target: options.windowsTarget, path: windowsArtifactPath, name: "windows-artifact.txt", mimeType: "text/plain" },
       ttlSeconds: 60,
     }));
-    assert(typeof windowsPublished.resourceUri === "string", "Windows artifact publication URI is missing");
-    const windowsArtifactResponse = await fetchArtifact(windowsPublished.resourceUri);
+    assert(typeof windowsPublished.downloadUrl === "string", "Windows artifact download URL is missing");
+    const windowsArtifactResponse = await fetchArtifact(windowsPublished.downloadUrl);
     assert(windowsArtifactResponse.status === 200 && (await windowsArtifactResponse.text()).includes("user-file"), "Windows artifact round trip failed");
     await call(client, "fs", {
       operation: "remove",
@@ -734,8 +735,8 @@ async function runCanaries(client, sameClientTransport, foreignClient, root, can
     source: { target: "local", path: artifactDestination, name: "artifact-copy.txt", mimeType: "text/plain" },
     ttlSeconds: 60,
   }));
-  assert(typeof published.resourceUri === "string", "artifact publish URI missing");
-  const response = await fetchArtifact(published.resourceUri);
+  assert(typeof published.downloadUrl === "string", "artifact download URL missing");
+  const response = await fetchArtifact(published.downloadUrl);
   assert(response.status === 200 && (await response.text()).includes("user-file"), "artifact HTTP publication failed");
   canaries.artifact = true;
 
