@@ -29,6 +29,7 @@ export async function runRestartWorker(requestPath: string): Promise<void> {
     expectedDisconnect: true,
     ...(request.reason ? { reason: request.reason } : {}),
     workerPid: process.pid,
+    handoffAcknowledgedAt: new Date().toISOString(),
   };
   await atomicRestartStatusWrite(request.statusPath, status);
   try {
@@ -67,10 +68,12 @@ export async function runRestartWorker(requestPath: string): Promise<void> {
         if (before?.pid && after.pid === before.pid) {
           throw new Error(`PM2 PID did not change: ${after.pid}`);
         }
-        const localHealthStatus = await healthStatus(request.localHealthUrl);
+        const localHealth = await healthStatus(request.localHealthUrl);
+        const localHealthStatus = localHealth.status;
         if (localHealthStatus !== 200) throw new Error(`Local health returned ${localHealthStatus}.`);
+        if (request.expectedIdentity) assertRuntimeIdentity(localHealth.body, request.expectedIdentity);
         const publicHealthStatus = request.publicHealthUrl
-          ? await healthStatus(request.publicHealthUrl)
+          ? (await healthStatus(request.publicHealthUrl)).status
           : undefined;
         if (request.publicHealthUrl && publicHealthStatus !== 200) {
           throw new Error(`Public health returned ${publicHealthStatus}.`);
@@ -91,6 +94,7 @@ export async function runRestartWorker(requestPath: string): Promise<void> {
             pm2Saved: true,
             expectedCwd: request.expectedCwd,
             expectedScript: request.expectedScript,
+            expectedIdentity: request.expectedIdentity,
           },
         };
         await atomicRestartStatusWrite(request.statusPath, status);
@@ -152,7 +156,7 @@ function runPm2(
   return { stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
 }
 
-async function healthStatus(url: string): Promise<number> {
+async function healthStatus(url: string): Promise<{ status: number; body?: unknown }> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 5_000);
   timer.unref?.();
@@ -163,10 +167,37 @@ async function healthStatus(url: string): Promise<number> {
       cache: "no-store",
       signal: controller.signal,
     });
-    await response.body?.cancel();
-    return response.status;
+    const contentType = response.headers.get("content-type") ?? "";
+    const body = contentType.includes("application/json")
+      ? await response.json().catch(() => undefined)
+      : undefined;
+    if (body === undefined) await response.body?.cancel();
+    return { status: response.status, body };
   } finally {
     clearTimeout(timer);
+  }
+}
+
+function assertRuntimeIdentity(
+  value: unknown,
+  expected: NonNullable<RestartWorkerRequest["expectedIdentity"]>,
+): void {
+  const record = value && typeof value === "object" ? value as Record<string, unknown> : {};
+  const identity = record.identity && typeof record.identity === "object"
+    ? record.identity as Record<string, unknown>
+    : record;
+  for (const key of [
+    "productVersion",
+    "schemaGeneration",
+    "authorityContractGeneration",
+    "configDigest",
+    "sourceRevision",
+    "runtimeRevision",
+    "buildDigest",
+  ] as const) {
+    if (identity[key] !== expected[key]) {
+      throw new Error(`Restart runtime identity mismatch for ${key}.`);
+    }
   }
 }
 

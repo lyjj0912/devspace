@@ -1,21 +1,17 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import {
   spawn,
   type ChildProcessWithoutNullStreams,
 } from "node:child_process";
 import {
-  createWriteStream,
-  type WriteStream,
-} from "node:fs";
-import {
   mkdir,
-  open,
   realpath,
   rm,
   stat,
 } from "node:fs/promises";
 import { homedir } from "node:os";
 import {
+  dirname,
   isAbsolute,
   join,
   resolve,
@@ -29,10 +25,32 @@ import {
 } from "./errors.js";
 import {
   resolveLocalProfileSourceFile,
+  resolvedEnvProfileExecutionGeneration,
+  type ResolvedEnvProfile,
   type UniversalEnvProfileRegistry,
 } from "./env-profiles.js";
 import { prepareSshControlPath } from "./ssh-control.js";
-import { assertNoElevationCommand } from "./authority-policy.js";
+import {
+  assertNoElevationCommand,
+  commandRisk,
+  EXEC_RISK_CLASSIFIER_GENERATION,
+  type ProcessAuthorityBinding,
+} from "./authority-policy.js";
+import type { AuthorityRiskClass } from "./contracts.js";
+import type { OperationAuthorityDispatchController } from "./authority.js";
+import {
+  createCapabilityCallContextFromTrustedPrincipal,
+  requireCapabilityCallContext,
+  type CapabilityCallContext,
+  type CapabilityCallContextProvider,
+} from "./capability-call-context.js";
+import {
+  sameDurableProcessIdentity,
+  type DurableProcessAdapter,
+  type DurableProcessEvents,
+  type DurableProcessHandle,
+  type DurableProcessIdentity,
+} from "./durable-process-adapter.js";
 import {
   assertInternalExecutionCommand,
   internalExecutionSpec,
@@ -42,13 +60,31 @@ import {
   wrapLocalUserOnlyExecution,
 } from "./no-elevation.js";
 import {
+  assertTargetCapability,
   type TargetDefinition,
   type TargetRegistry,
 } from "./targets.js";
+import {
+  RESOURCE_DEFAULT_COMPLETED_PROCESS_TTL_MS,
+  RESOURCE_DEFAULT_CONCURRENT_PROCESSES,
+  RESOURCE_DEFAULT_INLINE_OUTPUT_BYTES,
+  RESOURCE_DEFAULT_PROCESSES,
+  RESOURCE_DEFAULT_PROCESS_OUTPUT_BYTES,
+} from "./resource-defaults.js";
+import { SynchronousQuotaReservations } from "./quota-reservations.js";
+import {
+  ProcessOutputSpool,
+  type ProcessOutputChannel,
+} from "./process-output-spool.js";
+import {
+  FileProcessStateStore,
+  type PersistentProcessRecord,
+  type ProcessStateStore,
+} from "./process-state.js";
 
-const DEFAULT_AUTO_YIELD_MS = 1_500;
-const DEFAULT_FOREGROUND_YIELD_MS = 30_000;
-const DEFAULT_PROCESS_OUTPUT_CHARACTERS = 12_000;
+const DEFAULT_AUTO_YIELD_MS = 10_000;
+const DEFAULT_FOREGROUND_YIELD_MS = 10_000;
+const DEFAULT_PROCESS_OUTPUT_CHARACTERS = RESOURCE_DEFAULT_INLINE_OUTPUT_BYTES;
 const MAX_PROCESS_OUTPUT_CHARACTERS = 1_000_000;
 const MAX_COMMAND_CHARACTERS = 100_000;
 const MAX_WAIT_MS = 110_000;
@@ -61,6 +97,7 @@ export type UniversalProcessState =
   | "EXITED"
   | "SIGNALED"
   | "FAILED"
+  | "ORPHANED"
   | "UNKNOWN";
 
 export type ExecutionMode = "auto" | "foreground" | "background";
@@ -75,9 +112,26 @@ export interface ExecuteCommandInput {
   yieldMs?: number;
   maxOutputChars?: number;
   envProfile?: string;
+  durable?: boolean;
   authorityId?: string;
   /** Internal helpers may select a constrained policy; MCP callers cannot set this field. */
   internalPolicy?: InternalExecutionPolicy;
+}
+
+/** Internal broker-to-execution fence. This is not part of the public MCP input contract. */
+export interface PreparedExecExecutionBinding {
+  targetId: string;
+  targetGeneration: string;
+  targetTransport: TargetDefinition["transport"];
+  targetPlatform: TargetDefinition["platform"];
+  shellDialect: TargetDefinition["shell"];
+  effectiveEnvProfile?: string;
+  effectiveEnvProfileGeneration?: string;
+  effectiveCwd: string;
+  mode: ExecutionMode;
+  tty: boolean;
+  classifierGeneration: string;
+  launchRisk: AuthorityRiskClass;
 }
 
 export interface ProcessOperationInput {
@@ -120,7 +174,15 @@ export interface UniversalProcessSnapshot extends Record<string, unknown> {
   outputTruncated: boolean;
   outputBytes: number;
   outputFileTruncated: boolean;
+  outputOffsets?: {
+    global: number;
+    stdout: number;
+    stderr: number;
+    pty: number;
+  };
   resourceUri: string;
+  durable?: boolean;
+  pid?: number;
   exitCode?: number;
   signal?: string;
   errorCode?: string;
@@ -132,30 +194,42 @@ export interface ExecutionPlaneOptions {
   contexts: ContextRegistry;
   outputDir: string;
   sshControlDir: string;
-  maxRunningProcesses: number;
-  maxRunningProcessesPerTarget: number;
-  processBufferCharacters: number;
-  processOutputMaxBytes: number;
-  completedProcessTtlMs: number;
+  maxProcessRecords?: number;
+  maxRunningProcesses?: number;
+  maxRunningProcessesPerTarget?: number;
+  /** @deprecated Inline retention is byte bounded; kept for configuration compatibility. */
+  processBufferCharacters?: number;
+  processOutputMaxBytes?: number;
+  completedProcessTtlMs?: number;
   envProfiles?: UniversalEnvProfileRegistry;
   sshExecutable?: string;
   now?: () => number;
   spawnProcess?: typeof spawn;
+  ownerProvider?: CapabilityCallContextProvider;
+  processStateStore?: ProcessStateStore;
+  processStateDir?: string;
+  durableAdapter?: DurableProcessAdapter;
 }
 
 interface ProcessHandle {
   pid?: number;
-  write(data: string): void;
-  resize?(columns: number, rows: number): void;
-  kill(signal: NodeJS.Signals): void;
+  write(data: string): void | Promise<void>;
+  resize?(columns: number, rows: number): void | Promise<void>;
+  kill(signal: NodeJS.Signals): void | Promise<void>;
+  pauseOutput?(): void;
+  resumeOutput?(): void;
+  close?(): void | Promise<void>;
 }
 
 interface ProcessEntry {
   processId: string;
+  principalKeyFingerprint: string;
   targetId: string;
+  targetGeneration: string;
   transport: "local" | "ssh";
   cwd: string;
   tty: boolean;
+  launchRisk: AuthorityRiskClass;
   state: UniversalProcessState;
   startedAtMs: number;
   endedAtMs?: number;
@@ -164,8 +238,11 @@ interface ProcessEntry {
   errorCode?: string;
   errorMessage?: string;
   requestedSignal?: NodeJS.Signals;
+  durable: boolean;
+  durableIdentity?: DurableProcessIdentity;
+  dispatched: boolean;
   handle?: ProcessHandle;
-  output: ProcessOutput;
+  output: ProcessOutputSpool;
   outputClose?: Promise<void>;
   exitPromise: Promise<void>;
   resolveExit: () => void;
@@ -183,8 +260,10 @@ interface CommandSpec {
 
 interface ResolvedExecution {
   target: TargetDefinition;
+  targetGeneration: string;
   cwd: string;
   environment: Record<string, string>;
+  envProfileGeneration?: string;
   sourceFile?: string;
 }
 
@@ -192,15 +271,115 @@ export class UniversalExecutionPlane {
   private readonly entries = new Map<string, ProcessEntry>();
   private readonly now: () => number;
   private readonly spawnProcess: typeof spawn;
+  private readonly ownerProvider: CapabilityCallContextProvider;
+  private readonly maximumProcessRecords: number;
+  private readonly maximumRunningProcesses: number;
+  private readonly maximumRunningProcessesPerTarget: number;
+  private readonly maximumInlineOutputBytes: number;
+  private readonly maximumProcessOutputBytes: number;
+  private readonly completedProcessTtlMs: number;
+  private readonly reservations: SynchronousQuotaReservations;
+  private readonly stateStore: ProcessStateStore;
+  private readonly pendingStateWrites = new Set<Promise<void>>();
+  private recoveryPromise?: Promise<void>;
+  private readonly nonDurableAfterRestart = new Map<string, string>();
   private closed = false;
 
   constructor(private readonly options: ExecutionPlaneOptions) {
     this.now = options.now ?? Date.now;
     this.spawnProcess = options.spawnProcess ?? spawn;
+    this.maximumProcessRecords = boundedOption(
+      options.maxProcessRecords,
+      RESOURCE_DEFAULT_PROCESSES,
+      1,
+      100_000,
+      "maxProcessRecords",
+    );
+    this.maximumRunningProcesses = boundedOption(
+      options.maxRunningProcesses,
+      RESOURCE_DEFAULT_CONCURRENT_PROCESSES,
+      1,
+      10_000,
+      "maxRunningProcesses",
+    );
+    this.maximumRunningProcessesPerTarget = boundedOption(
+      options.maxRunningProcessesPerTarget,
+      this.maximumRunningProcesses,
+      1,
+      10_000,
+      "maxRunningProcessesPerTarget",
+    );
+    this.maximumInlineOutputBytes = boundedOption(
+      options.processBufferCharacters,
+      RESOURCE_DEFAULT_INLINE_OUTPUT_BYTES,
+      1,
+      10_000_000,
+      "processBufferCharacters",
+    );
+    this.maximumProcessOutputBytes = boundedOption(
+      options.processOutputMaxBytes,
+      RESOURCE_DEFAULT_PROCESS_OUTPUT_BYTES,
+      1_000,
+      2_000_000_000,
+      "processOutputMaxBytes",
+    );
+    this.completedProcessTtlMs = boundedOption(
+      options.completedProcessTtlMs,
+      RESOURCE_DEFAULT_COMPLETED_PROCESS_TTL_MS,
+      1_000,
+      7 * 24 * 60 * 60_000,
+      "completedProcessTtlMs",
+    );
+    this.reservations = new SynchronousQuotaReservations("process", {
+      records: this.maximumProcessRecords,
+      concurrent: this.maximumRunningProcesses,
+    });
+    const compatibilityOwner = createCapabilityCallContextFromTrustedPrincipal({
+      principalKeyFingerprint: createHash("sha256")
+        .update(JSON.stringify({
+          authority: "legacy-single-owner-execution-plane",
+          outputDir: resolve(options.outputDir),
+        }))
+        .digest("hex"),
+    });
+    this.ownerProvider = options.ownerProvider ?? (() => compatibilityOwner);
+    this.stateStore = options.processStateStore ?? new FileProcessStateStore(
+      options.processStateDir ?? join(dirname(options.outputDir), "processes"),
+    );
   }
 
-  async execute(input: ExecuteCommandInput): Promise<UniversalProcessSnapshot> {
+  async prepareAuthorityBinding(
+    input: ExecuteCommandInput,
+    target: TargetDefinition,
+    targetGeneration: string,
+    callContext?: CapabilityCallContext,
+  ): Promise<PreparedExecExecutionBinding> {
+    await this.ensureRecovered();
+    const resolved = await this.resolveExecution(input, callContext);
+    if (resolved.target.id !== target.id || resolved.targetGeneration !== targetGeneration) {
+      throw new UniversalBrokerError(
+        "AUTHORITY_STALE",
+        "Execution target changed while canonicalizing its authority resource.",
+      );
+    }
+    return prepareExecExecutionBinding(
+      input,
+      resolved.target,
+      resolved.targetGeneration,
+      resolved.envProfileGeneration,
+      resolved.cwd,
+    );
+  }
+
+  async execute(
+    input: ExecuteCommandInput,
+    expectedBinding?: PreparedExecExecutionBinding,
+    dispatch?: OperationAuthorityDispatchController,
+    callContext?: CapabilityCallContext,
+  ): Promise<UniversalProcessSnapshot> {
     this.assertOpen();
+    await this.ensureRecovered();
+    const owner = this.owner(callContext);
     validateCommand(input.command);
     assertNoElevationCommand(input.command);
     assertInternalExecutionCommand(input.internalPolicy, input.command);
@@ -211,71 +390,126 @@ export class UniversalExecutionPlane {
         { evidence: { policy: typeof input.internalPolicy === "string" ? input.internalPolicy : input.internalPolicy.kind } },
       );
     }
-    const resolved = await this.resolveExecution(input);
+    if (input.durable === true && !this.options.durableAdapter) {
+      throw new UniversalBrokerError(
+        "CAPABILITY_UNAVAILABLE",
+        "durable=true requires a configured external process-manager adapter.",
+        { evidence: { reasonCode: "DURABLE_PROCESS_ADAPTER_REQUIRED" } },
+      );
+    }
+    const resolved = await this.resolveExecution(input, callContext);
+    const observedBinding = prepareExecExecutionBinding(
+      input,
+      resolved.target,
+      resolved.targetGeneration,
+      resolved.envProfileGeneration,
+      resolved.cwd,
+    );
+    assertPreparedExecExecutionBinding(expectedBinding, observedBinding);
+    const launchRisk = observedBinding.launchRisk;
     await assertCachedExecutionCapability(
       this.options.targets,
       resolved.target,
       input.tty === true,
     );
-    this.assertQuota(resolved.target.id);
-    await Promise.all([
-      mkdir(this.options.outputDir, { recursive: true, mode: 0o700 }),
-      mkdir(this.options.sshControlDir, { recursive: true, mode: 0o700 }),
-    ]);
-
-    const processId = `proc_${randomUUID()}`;
-    const output = new ProcessOutput({
-      path: join(this.options.outputDir, `${processId}.log`),
-      maximumBufferedCharacters: this.options.processBufferCharacters,
-      maximumFileBytes: this.options.processOutputMaxBytes,
-    });
-    await output.open();
-    let resolveExit!: () => void;
-    const exitPromise = new Promise<void>((resolvePromise) => {
-      resolveExit = resolvePromise;
-    });
-    const entry: ProcessEntry = {
-      processId,
-      targetId: resolved.target.id,
-      transport: resolved.target.transport,
-      cwd: resolved.cwd,
-      tty: input.tty === true,
-      state: "STARTING",
-      startedAtMs: this.now(),
-      output,
-      exitPromise,
-      resolveExit,
-    };
-    this.entries.set(processId, entry);
-
+    const reservation = this.reserveProcess(resolved.target.id);
     try {
-      const spec = await this.commandSpec(resolved, input, processId);
-      entry.remoteMarkers = spec.remoteMarkers;
-      if (entry.tty) await this.startPty(entry, spec);
-      else this.startPipe(entry, spec);
-      if (entry.state === "STARTING") entry.state = "RUNNING";
-    } catch (error) {
-      this.finishSpawnFailure(entry, error);
-    }
+      await Promise.all([
+        mkdir(this.options.outputDir, { recursive: true, mode: 0o700 }),
+        mkdir(this.options.sshControlDir, { recursive: true, mode: 0o700 }),
+      ]);
 
-    const mode = input.mode ?? "auto";
-    const yieldMs = executionYield(mode, input.yieldMs);
-    if (yieldMs > 0) await waitForExit(entry, yieldMs);
-    const snapshot = this.snapshot(entry, input.maxOutputChars);
-    return validateExecutionSnapshot(snapshot);
+      const processId = `proc_${randomUUID()}`;
+      const output = new ProcessOutputSpool({
+        path: join(this.options.outputDir, `${processId}.log`),
+        maximumInlineBytes: this.maximumInlineOutputBytes,
+        maximumFileBytes: this.maximumProcessOutputBytes,
+      });
+      await output.open();
+      let resolveExit!: () => void;
+      const exitPromise = new Promise<void>((resolvePromise) => {
+        resolveExit = resolvePromise;
+      });
+      const entry: ProcessEntry = {
+        processId,
+        principalKeyFingerprint: owner.principalKeyFingerprint,
+        targetId: resolved.target.id,
+        targetGeneration: resolved.targetGeneration,
+        transport: resolved.target.transport,
+        cwd: resolved.cwd,
+        tty: input.tty === true,
+        launchRisk,
+        state: "STARTING",
+        startedAtMs: this.now(),
+        durable: input.durable === true,
+        dispatched: false,
+        output,
+        exitPromise,
+        resolveExit,
+      };
+      reservation.commit(() => this.entries.set(processId, entry));
+      await this.persistEntry(entry);
+
+      try {
+        const spec = await this.commandSpec(resolved, input, processId);
+        entry.remoteMarkers = spec.remoteMarkers;
+        dispatch?.claim();
+        if (entry.durable) await this.startDurable(entry, spec, dispatch);
+        else if (entry.tty) await this.startPty(entry, spec, dispatch);
+        else this.startPipe(entry, spec, dispatch);
+        if (entry.state === "STARTING") entry.state = "RUNNING";
+        await this.persistEntry(entry);
+      } catch (error) {
+        this.finishSpawnFailure(entry, error);
+        await this.persistEntry(entry).catch(() => undefined);
+        if (
+          error instanceof UniversalBrokerError
+          && [
+            "AUTHORITY_REQUIRED",
+            "AUTHORITY_EXPIRED",
+            "AUTHORITY_PRINCIPAL_MISMATCH",
+            "AUTHORITY_ACTION_MISMATCH",
+            "AUTHORITY_STALE",
+            "AUTHORITY_CONSUMED",
+            "AUTHORITY_STORE_UNAVAILABLE",
+            "AUTHORITY_STATE_UNCERTAIN",
+            "RESOURCE_BUSY",
+          ].includes(error.code)
+        ) {
+          throw error;
+        }
+      }
+
+      const mode = input.mode ?? "auto";
+      const yieldMs = executionYield(mode, input.yieldMs);
+      if (yieldMs > 0) await waitForExit(entry, yieldMs);
+      const snapshot = this.snapshot(entry, input.maxOutputChars);
+      return validateExecutionSnapshot(snapshot);
+    } finally {
+      reservation.release();
+    }
   }
 
-  async operate(input: ProcessOperationInput): Promise<Record<string, unknown>> {
+  async operate(
+    input: ProcessOperationInput,
+    dispatch?: OperationAuthorityDispatchController,
+    callContext?: CapabilityCallContext,
+  ): Promise<Record<string, unknown>> {
     this.assertOpen();
+    await this.ensureRecovered();
+    const owner = this.owner(callContext);
     if (input.operation === "restart_broker" || input.operation === "restart_status") {
       throw new UniversalBrokerError(
         "PRECONDITION_FAILED",
         `${input.operation} must be handled by the broker self-management service.`,
       );
     }
-    if (input.operation === "list") return this.list(input.cursor, input.limit);
+    if (input.operation === "list") return this.list(owner, input.cursor, input.limit);
     const processId = requireProcessId(input.processId, input.operation);
-    const entry = this.requireEntry(processId);
+    const entry = this.requireEntry(processId, owner);
+    if (["write", "resize", "signal", "forget"].includes(input.operation)) {
+      dispatch?.claim();
+    }
 
     switch (input.operation) {
       case "poll":
@@ -296,7 +530,15 @@ export class UniversalExecutionPlane {
             { evidence: { processId, state: entry.state } },
           );
         }
-        entry.handle?.write(input.chars ?? "");
+        if (!entry.handle) {
+          throw new UniversalBrokerError(
+            "PROCESS_NOT_FOUND",
+            `Process has no active provider handle: ${processId}`,
+            { evidence: { processId, state: entry.state } },
+          );
+        }
+        dispatch?.markDispatched();
+        await entry.handle.write(input.chars ?? "");
         if (input.waitMs) await waitForExit(entry, boundedWait(input.waitMs));
         return this.snapshot(entry, input.maxOutputChars);
       }
@@ -310,14 +552,24 @@ export class UniversalExecutionPlane {
         }
         const columns = terminalDimension(input.columns, "columns");
         const rows = terminalDimension(input.rows, "rows");
-        entry.handle.resize(columns, rows);
+        dispatch?.markDispatched();
+        await entry.handle.resize(columns, rows);
         return this.snapshot(entry, input.maxOutputChars);
       }
       case "signal": {
         if (!isRunning(entry)) return this.snapshot(entry, input.maxOutputChars);
         const signal = processSignal(input.signal);
+        if (!entry.handle) {
+          throw new UniversalBrokerError(
+            "PROCESS_NOT_FOUND",
+            `Process has no active provider handle: ${processId}`,
+            { evidence: { processId, state: entry.state } },
+          );
+        }
+        dispatch?.markDispatched();
+        await entry.handle.kill(signal);
         entry.requestedSignal = signal;
-        entry.handle?.kill(signal);
+        await this.persistEntry(entry);
         await waitForExit(entry, boundedWait(input.waitMs ?? 2_000));
         return this.snapshot(entry, input.maxOutputChars);
       }
@@ -329,33 +581,58 @@ export class UniversalExecutionPlane {
             { evidence: { processId, state: entry.state } },
           );
         }
+        dispatch?.markDispatched();
         await this.forgetEntry(entry);
         return { processId, forgotten: true };
       }
     }
   }
 
+  authorityBinding(
+    processId: string | undefined,
+    operation: ProcessOperationInput["operation"],
+    callContext?: CapabilityCallContext,
+  ): ProcessAuthorityBinding {
+    const entry = this.requireEntry(requireProcessId(processId, operation), this.owner(callContext));
+    return {
+      targetId: entry.targetId,
+      targetGeneration: entry.targetGeneration,
+      targetTransport: entry.transport,
+      tty: entry.tty,
+      launchRisk: entry.launchRisk,
+    };
+  }
+
   async readOutput(
     processId: string,
     offset: number,
     limit: number,
+    callContext?: CapabilityCallContext,
+    channel: "global" | ProcessOutputChannel = "global",
   ): Promise<{ text: string; nextOffset?: number; totalBytes: number; truncated: boolean }> {
-    const entry = this.requireEntry(processId);
+    await this.ensureRecovered();
+    const entry = this.requireEntry(processId, this.owner(callContext));
     if (entry.outputClose) await Promise.race([
       entry.outputClose,
       new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 50)),
     ]);
-    return entry.output.read(offset, limit);
+    return entry.output.read(offset, limit, channel);
   }
 
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
-    const running = [...this.entries.values()].filter(isRunning);
+    const running = [...this.entries.values()].filter((entry) => isRunning(entry) && !entry.durable);
+    const durable = [...this.entries.values()].filter((entry) => isRunning(entry) && entry.durable);
+    await Promise.allSettled(durable.map(async (entry) => {
+      await entry.handle?.close?.();
+      await entry.output.close();
+      await this.persistEntry(entry);
+    }));
     for (const entry of running) {
       entry.requestedSignal = "SIGTERM";
       try {
-        entry.handle?.kill("SIGTERM");
+        await entry.handle?.kill("SIGTERM");
       } catch {
         // Continue shutting down other processes.
       }
@@ -367,11 +644,21 @@ export class UniversalExecutionPlane {
     for (const entry of running.filter(isRunning)) {
       entry.requestedSignal = "SIGKILL";
       try {
-        entry.handle?.kill("SIGKILL");
+        await entry.handle?.kill("SIGKILL");
       } catch {
         // Process may already have exited.
       }
     }
+    await Promise.race([
+      Promise.allSettled(running.map((entry) => entry.exitPromise)),
+      new Promise<void>((resolvePromise) => setTimeout(resolvePromise, 2_000)),
+    ]);
+    await Promise.allSettled(
+      [...this.entries.values()]
+        .map((entry) => entry.outputClose)
+        .filter((pending): pending is Promise<void> => pending !== undefined),
+    );
+    await this.drainPendingStateWrites();
   }
 
   stats(): Record<string, unknown> {
@@ -392,11 +679,18 @@ export class UniversalExecutionPlane {
     };
   }
 
-  private async resolveExecution(input: ExecuteCommandInput): Promise<ResolvedExecution> {
+  private async resolveExecution(
+    input: ExecuteCommandInput,
+    callContext?: CapabilityCallContext,
+  ): Promise<ResolvedExecution> {
     const context = input.contextId
-      ? await this.options.contexts.get(input.contextId)
+      ? await this.options.contexts.get(input.contextId, callContext)
       : undefined;
-    const target = await this.options.targets.resolve(input.target ?? context?.targetId);
+    const targetBinding = await this.options.targets.resolveWithGeneration(input.target ?? context?.targetId);
+    const target = targetBinding.target;
+    assertTargetCapability(target, "exec");
+    if (input.tty === true) assertTargetCapability(target, "pty");
+    if (input.durable === true) assertTargetCapability(target, "durableProcess");
     if (context && context.targetId !== target.id) {
       throw new UniversalBrokerError(
         "PRECONDITION_FAILED",
@@ -415,6 +709,32 @@ export class UniversalExecutionPlane {
     const cwd = target.transport === "local"
       ? await resolveLocalCwd(requestedCwd)
       : requestedCwd;
+    const profile = await this.resolveEnvironmentProfile(input, target);
+    const envProfileGeneration = profile
+      ? await resolvedEnvProfileExecutionGeneration(
+          profile,
+          target.transport === "local" ? "local" : "remote",
+        )
+      : undefined;
+    const sourceFile = profile?.sourceFile
+      ? target.transport === "local"
+        ? resolveLocalProfileSourceFile(profile.sourceFile)
+        : profile.sourceFile
+      : undefined;
+    return {
+      target,
+      targetGeneration: targetBinding.generation,
+      cwd,
+      environment: profile?.environment ?? {},
+      ...(envProfileGeneration ? { envProfileGeneration } : {}),
+      ...(sourceFile ? { sourceFile } : {}),
+    };
+  }
+
+  private async resolveEnvironmentProfile(
+    input: ExecuteCommandInput,
+    target: TargetDefinition,
+  ): Promise<ResolvedEnvProfile | undefined> {
     const profileName = input.envProfile ?? target.envProfile;
     const profile = profileName
       ? await this.requireEnvProfiles().resolve(profileName, target.id)
@@ -431,17 +751,7 @@ export class UniversalExecutionPlane {
         `Windows environment profile source files are unavailable on target ${target.id}.`,
       );
     }
-    const sourceFile = profile?.sourceFile
-      ? target.transport === "local"
-        ? resolveLocalProfileSourceFile(profile.sourceFile)
-        : profile.sourceFile
-      : undefined;
-    return {
-      target,
-      cwd,
-      environment: profile?.environment ?? {},
-      ...(sourceFile ? { sourceFile } : {}),
-    };
+    return profile;
   }
 
   private requireEnvProfiles(): UniversalEnvProfileRegistry {
@@ -474,8 +784,14 @@ export class UniversalExecutionPlane {
     });
   }
 
-  private startPipe(entry: ProcessEntry, spec: CommandSpec): void {
+  private startPipe(
+    entry: ProcessEntry,
+    spec: CommandSpec,
+    dispatch?: OperationAuthorityDispatchController,
+  ): void {
     const detached = process.platform !== "win32";
+    dispatch?.markDispatched();
+    entry.dispatched = true;
     const child = this.spawnProcess(spec.executable, spec.args, {
       cwd: spec.cwd,
       env: spec.env,
@@ -485,17 +801,23 @@ export class UniversalExecutionPlane {
     }) as ChildProcessWithoutNullStreams;
     entry.handle = {
       pid: child.pid,
-      write: (data) => child.stdin.write(data),
+      write: (data) => writeWritable(child.stdin, data),
       kill: (signal) => terminateProcessTree(child, signal, detached),
     };
-    child.stdout.on("data", (data: Buffer) => this.appendOutput(entry, data.toString("utf8")));
-    child.stderr.on("data", (data: Buffer) => this.appendOutput(entry, data.toString("utf8")));
+    this.attachReadableOutput(entry, child.stdout, "stdout");
+    this.attachReadableOutput(entry, child.stderr, "stderr");
     child.once("error", (error) => this.finishSpawnFailure(entry, error));
     child.once("close", (code, signal) => this.finish(entry, code, signal ?? undefined));
   }
 
-  private async startPty(entry: ProcessEntry, spec: CommandSpec): Promise<void> {
+  private async startPty(
+    entry: ProcessEntry,
+    spec: CommandSpec,
+    dispatch?: OperationAuthorityDispatchController,
+  ): Promise<void> {
     const nodePty = await import("node-pty");
+    dispatch?.markDispatched();
+    entry.dispatched = true;
     const pty: IPty = nodePty.spawn(spec.executable, spec.args, {
       cwd: spec.cwd,
       env: normalizePtyEnvironment(spec.env),
@@ -508,24 +830,90 @@ export class UniversalExecutionPlane {
       write: (data) => pty.write(data),
       resize: (columns, rows) => pty.resize(columns, rows),
       kill: (signal) => pty.kill(signal),
+      pauseOutput: () => pty.pause(),
+      resumeOutput: () => pty.resume(),
     };
-    pty.onData((data) => this.appendOutput(entry, data));
+    pty.onData((data) => {
+      pty.pause();
+      void this.appendOutput(entry, "pty", Buffer.from(data, "utf8"))
+        .finally(() => {
+          if (isRunning(entry)) pty.resume();
+        });
+    });
     pty.onExit(({ exitCode, signal }) => {
       this.finish(entry, exitCode, signal ? String(signal) : undefined);
     });
   }
 
-  private appendOutput(entry: ProcessEntry, value: string): void {
-    const visible = entry.remoteMarkers
-      ? entry.remoteMarkers.consume(value, false)
-      : value;
-    if (visible) entry.output.append(visible);
+  private async startDurable(
+    entry: ProcessEntry,
+    spec: CommandSpec,
+    dispatch?: OperationAuthorityDispatchController,
+  ): Promise<void> {
+    const adapter = this.options.durableAdapter!;
+    const events = this.durableEvents(entry);
+    dispatch?.markDispatched();
+    entry.dispatched = true;
+    const handle = await adapter.launch({
+      processId: entry.processId,
+      targetId: entry.targetId,
+      executable: spec.executable,
+      args: spec.args,
+      cwd: spec.cwd,
+      environment: spec.env,
+      tty: entry.tty,
+    }, events);
+    assertDurableIdentity(handle.identity);
+    entry.durableIdentity = { ...handle.identity };
+    entry.handle = adaptDurableHandle(handle);
+  }
+
+  private durableEvents(entry: ProcessEntry): DurableProcessEvents {
+    return {
+      output: (channel, data) => {
+        entry.handle?.pauseOutput?.();
+        void this.appendOutput(entry, channel, data).finally(() => entry.handle?.resumeOutput?.());
+      },
+      exit: (exitCode, signal) => this.finish(entry, exitCode, signal),
+      error: (error) => this.finishSpawnFailure(entry, error),
+    };
+  }
+
+  private attachReadableOutput(
+    entry: ProcessEntry,
+    readable: NodeJS.ReadableStream & { pause(): unknown; resume(): unknown },
+    channel: "stdout" | "stderr",
+  ): void {
+    readable.on("data", (value: Buffer | string) => {
+      readable.pause();
+      const data = Buffer.isBuffer(value) ? value : Buffer.from(value, "utf8");
+      void this.appendOutput(entry, channel, data).finally(() => {
+        if (isRunning(entry)) readable.resume();
+      });
+    });
+  }
+
+  private appendOutput(
+    entry: ProcessEntry,
+    channel: ProcessOutputChannel,
+    data: Uint8Array,
+  ): Promise<unknown> {
+    let visible = Buffer.from(data);
+    if (entry.remoteMarkers) {
+      const sanitized = entry.remoteMarkers.consume(visible.toString("utf8"), false, channel);
+      visible = Buffer.from(sanitized, "utf8");
+    }
+    return visible.byteLength > 0 ? entry.output.append(channel, visible) : Promise.resolve();
   }
 
   private finish(entry: ProcessEntry, code: number | null, signal?: string): void {
     if (!isRunning(entry) && entry.state !== "STARTING") return;
-    const finalOutput = entry.remoteMarkers?.consume("", true) ?? "";
-    if (finalOutput) entry.output.append(finalOutput);
+    if (entry.remoteMarkers) {
+      for (const channel of ["stdout", "stderr"] as const) {
+        const finalOutput = entry.remoteMarkers.consume("", true, channel);
+        if (finalOutput) void entry.output.append(channel, Buffer.from(finalOutput, "utf8"));
+      }
+    }
     entry.endedAtMs = this.now();
 
     if (entry.requestedSignal) {
@@ -565,20 +953,22 @@ export class UniversalExecutionPlane {
     entry.outputClose = entry.output.close();
     entry.resolveExit();
     this.scheduleCleanup(entry);
+    void this.persistEntry(entry).catch(() => undefined);
   }
 
   private finishSpawnFailure(entry: ProcessEntry, error: unknown): void {
     if (!isRunning(entry) && entry.state !== "STARTING") return;
     entry.endedAtMs = this.now();
-    entry.state = "FAILED";
+    entry.state = entry.durable && entry.dispatched ? "UNKNOWN" : "FAILED";
     entry.errorCode = entry.transport === "ssh"
       ? "TRANSPORT_UNAVAILABLE"
       : "TRANSPORT_UNAVAILABLE";
     entry.errorMessage = boundedError(error);
-    entry.output.append(`${entry.errorMessage}\n`);
+    void entry.output.append("stderr", Buffer.from(`${entry.errorMessage}\n`, "utf8"));
     entry.outputClose = entry.output.close();
     entry.resolveExit();
     this.scheduleCleanup(entry);
+    void this.persistEntry(entry).catch(() => undefined);
   }
 
   private snapshot(entry: ProcessEntry, maxOutputChars?: number): UniversalProcessSnapshot {
@@ -597,7 +987,10 @@ export class UniversalExecutionPlane {
       outputTruncated: drained.truncated,
       outputBytes: entry.output.totalFileBytes,
       outputFileTruncated: entry.output.fileTruncated,
+      outputOffsets: entry.output.currentOffsets,
       resourceUri: processOutputResourceUri(entry.processId, 0, 1_048_576),
+      durable: entry.durable,
+      ...(entry.handle?.pid !== undefined ? { pid: entry.handle.pid } : {}),
       ...(entry.exitCode !== undefined ? { exitCode: entry.exitCode } : {}),
       ...(entry.signal ? { signal: entry.signal } : {}),
       ...(entry.errorCode ? { errorCode: entry.errorCode } : {}),
@@ -605,16 +998,24 @@ export class UniversalExecutionPlane {
     };
   }
 
-  private async list(cursor?: string, requestedLimit?: number): Promise<Record<string, unknown>> {
+  private async list(
+    owner: CapabilityCallContext,
+    cursor?: string,
+    requestedLimit?: number,
+  ): Promise<Record<string, unknown>> {
     const offset = parseCursor(cursor);
     const limit = Math.min(Math.max(requestedLimit ?? DEFAULT_LIST_LIMIT, 1), MAX_LIST_LIMIT);
-    const entries = [...this.entries.values()].map((entry) => ({
+    const entries = [...this.entries.values()]
+      .filter((entry) => entry.principalKeyFingerprint === owner.principalKeyFingerprint)
+      .map((entry) => ({
       processId: entry.processId,
       targetId: entry.targetId,
       transport: entry.transport,
       cwd: entry.cwd,
       tty: entry.tty,
       state: entry.state,
+      durable: entry.durable,
+      ...(entry.handle?.pid !== undefined ? { pid: entry.handle.pid } : {}),
       startedAt: new Date(entry.startedAtMs).toISOString(),
       ...(entry.endedAtMs ? { endedAt: new Date(entry.endedAtMs).toISOString() } : {}),
       ...(entry.exitCode !== undefined ? { exitCode: entry.exitCode } : {}),
@@ -628,32 +1029,46 @@ export class UniversalExecutionPlane {
     };
   }
 
-  private assertQuota(targetId: string): void {
+  private reserveProcess(targetId: string) {
     const running = [...this.entries.values()].filter(isRunning);
-    if (running.length >= this.options.maxRunningProcesses) {
-      throw new UniversalBrokerError(
-        "RESOURCE_QUOTA_EXCEEDED",
-        `Global running-process limit reached: ${this.options.maxRunningProcesses}`,
-        { evidence: { maximum: this.options.maxRunningProcesses, current: running.length } },
-      );
-    }
     const targetRunning = running.filter((entry) => entry.targetId === targetId).length;
-    if (targetRunning >= this.options.maxRunningProcessesPerTarget) {
+    if (targetRunning >= this.maximumRunningProcessesPerTarget) {
       throw new UniversalBrokerError(
         "RESOURCE_QUOTA_EXCEEDED",
-        `Running-process limit reached for target ${targetId}: ${this.options.maxRunningProcessesPerTarget}`,
+        `Running-process limit reached for target ${targetId}: ${this.maximumRunningProcessesPerTarget}`,
         {
           evidence: {
             targetId,
-            maximum: this.options.maxRunningProcessesPerTarget,
+            maximum: this.maximumRunningProcessesPerTarget,
             current: targetRunning,
           },
         },
       );
     }
+    return this.reservations.reserve(
+      {
+        records: this.entries.size + this.nonDurableAfterRestart.size,
+        concurrent: running.length,
+      },
+      { records: 1, concurrent: 1 },
+    );
   }
 
-  private requireEntry(processId: string): ProcessEntry {
+  private requireEntry(processId: string, owner: CapabilityCallContext): ProcessEntry {
+    const nonDurableOwner = this.nonDurableAfterRestart.get(processId);
+    if (nonDurableOwner) {
+      this.assertProcessOwner(nonDurableOwner, owner, processId);
+      throw new UniversalBrokerError(
+        "PROCESS_NOT_FOUND",
+        `Process ${processId} was non-durable and cannot be reattached after broker restart.`,
+        {
+          evidence: {
+            processId,
+            reasonCode: "NON_DURABLE_PROCESS_NOT_REATTACHABLE",
+          },
+        },
+      );
+    }
     const entry = this.entries.get(processId);
     if (!entry) {
       throw new UniversalBrokerError(
@@ -662,14 +1077,19 @@ export class UniversalExecutionPlane {
         { evidence: { processId } },
       );
     }
+    this.assertProcessOwner(entry.principalKeyFingerprint, owner, processId);
     return entry;
   }
 
   private scheduleCleanup(entry: ProcessEntry): void {
     if (entry.cleanupTimer) clearTimeout(entry.cleanupTimer);
+    const delay = Math.max(
+      0,
+      (entry.endedAtMs ?? this.now()) + this.completedProcessTtlMs - this.now(),
+    );
     entry.cleanupTimer = setTimeout(() => {
       void this.forgetEntry(entry).catch(() => undefined);
-    }, this.options.completedProcessTtlMs);
+    }, delay);
     entry.cleanupTimer.unref();
   }
 
@@ -677,7 +1097,190 @@ export class UniversalExecutionPlane {
     if (entry.cleanupTimer) clearTimeout(entry.cleanupTimer);
     this.entries.delete(entry.processId);
     await entry.output.close();
-    await rm(entry.output.path, { force: true });
+    await Promise.all([
+      rm(entry.output.path, { force: true }),
+      rm(entry.output.channelPath("stdout"), { force: true }),
+      rm(entry.output.channelPath("stderr"), { force: true }),
+      rm(entry.output.channelPath("pty"), { force: true }),
+      this.stateStore.delete(entry.processId),
+    ]);
+  }
+
+  private ensureRecovered(): Promise<void> {
+    this.recoveryPromise ??= this.recoverPersistedProcesses();
+    return this.recoveryPromise;
+  }
+
+  private async recoverPersistedProcesses(): Promise<void> {
+    const records = await this.stateStore.loadAll();
+    if (records.length > this.maximumProcessRecords) {
+      throw new UniversalBrokerError(
+        "RESOURCE_QUOTA_EXCEEDED",
+        "Persisted process records exceed the configured process quota.",
+        { evidence: { records: records.length, maximum: this.maximumProcessRecords } },
+      );
+    }
+    for (const record of records) {
+      if (!record.durable) {
+        this.nonDurableAfterRestart.set(record.processId, record.principalKeyFingerprint);
+        continue;
+      }
+      const output = new ProcessOutputSpool({
+        path: record.outputPath,
+        maximumInlineBytes: this.maximumInlineOutputBytes,
+        maximumFileBytes: this.maximumProcessOutputBytes,
+      });
+      await output.open({ existing: true });
+      let resolveExit!: () => void;
+      const exitPromise = new Promise<void>((resolvePromise) => {
+        resolveExit = resolvePromise;
+      });
+      const entry: ProcessEntry = {
+        processId: record.processId,
+        principalKeyFingerprint: record.principalKeyFingerprint,
+        targetId: record.targetId,
+        targetGeneration: record.targetGeneration,
+        transport: record.transport,
+        cwd: record.cwd,
+        tty: record.tty,
+        launchRisk: record.launchRisk,
+        state: persistentState(record.state),
+        startedAtMs: record.startedAtMs,
+        endedAtMs: record.endedAtMs,
+        exitCode: record.exitCode,
+        signal: record.signal,
+        errorCode: record.errorCode,
+        errorMessage: record.errorMessage,
+        durable: true,
+        durableIdentity: record.durableIdentity,
+        dispatched: true,
+        output,
+        exitPromise,
+        resolveExit,
+      };
+      this.entries.set(entry.processId, entry);
+      if (!isRunning(entry)) {
+        resolveExit();
+        this.scheduleCleanup(entry);
+        continue;
+      }
+      if (!record.durableIdentity) {
+        entry.state = "ORPHANED";
+        entry.endedAtMs = this.now();
+        entry.errorCode = "PROCESS_NOT_FOUND";
+        entry.errorMessage = "Durable process record has no external manager identity.";
+        resolveExit();
+        this.scheduleCleanup(entry);
+        await this.persistEntry(entry);
+        continue;
+      }
+      if (!this.options.durableAdapter) {
+        entry.state = "UNKNOWN";
+        entry.endedAtMs = this.now();
+        entry.errorCode = "PROCESS_NOT_FOUND";
+        entry.errorMessage = "The durable process adapter is unavailable after restart; execution was not replayed.";
+        resolveExit();
+        this.scheduleCleanup(entry);
+        await this.persistEntry(entry);
+        continue;
+      }
+      let reattached;
+      try {
+        reattached = await this.options.durableAdapter.reattach(
+          record.durableIdentity,
+          this.durableEvents(entry),
+        );
+      } catch (error) {
+        entry.state = "UNKNOWN";
+        entry.endedAtMs = this.now();
+        entry.errorCode = "TRANSPORT_INTERRUPTED";
+        entry.errorMessage = `Durable process reattach is unknown; execution was not replayed: ${boundedError(error)}`;
+        resolveExit();
+        this.scheduleCleanup(entry);
+        await this.persistEntry(entry);
+        continue;
+      }
+      if (!sameDurableProcessIdentity(record.durableIdentity, reattached.identity)) {
+        entry.state = "ORPHANED";
+        entry.endedAtMs = this.now();
+        entry.errorCode = "PROCESS_NOT_FOUND";
+        entry.errorMessage = "External manager handle no longer identifies the original PID/start token.";
+        resolveExit();
+        this.scheduleCleanup(entry);
+      } else if (reattached.state === "RUNNING") {
+        entry.handle = adaptDurableHandle(reattached.handle);
+        entry.state = "RUNNING";
+      } else if (reattached.state === "EXITED") {
+        entry.state = reattached.signal ? "SIGNALED" : "EXITED";
+        entry.exitCode = reattached.exitCode;
+        entry.signal = reattached.signal;
+        entry.endedAtMs = this.now();
+        resolveExit();
+        this.scheduleCleanup(entry);
+      } else {
+        entry.state = reattached.state;
+        entry.endedAtMs = this.now();
+        entry.errorCode = reattached.state === "ORPHANED" ? "PROCESS_NOT_FOUND" : "TRANSPORT_INTERRUPTED";
+        entry.errorMessage = reattached.state === "ORPHANED"
+          ? "External process manager handle exists but the original process does not."
+          : reattached.message ?? "Durable process state is unknown; execution was not replayed.";
+        resolveExit();
+        this.scheduleCleanup(entry);
+      }
+      await this.persistEntry(entry);
+    }
+  }
+
+  private persistEntry(entry: ProcessEntry): Promise<void> {
+    const record: Omit<PersistentProcessRecord, "schemaVersion" | "checksum"> = {
+      processId: entry.processId,
+      principalKeyFingerprint: entry.principalKeyFingerprint,
+      targetId: entry.targetId,
+      targetGeneration: entry.targetGeneration,
+      transport: entry.transport,
+      cwd: entry.cwd,
+      tty: entry.tty,
+      launchRisk: entry.launchRisk,
+      state: entry.state,
+      startedAtMs: entry.startedAtMs,
+      endedAtMs: entry.endedAtMs,
+      exitCode: entry.exitCode,
+      signal: entry.signal,
+      errorCode: entry.errorCode,
+      errorMessage: entry.errorMessage,
+      outputPath: entry.output.path,
+      durable: entry.durable,
+      durableIdentity: entry.durableIdentity,
+    };
+    let tracked: Promise<void>;
+    tracked = this.stateStore.save(record).finally(() => {
+      this.pendingStateWrites.delete(tracked);
+    });
+    this.pendingStateWrites.add(tracked);
+    return tracked;
+  }
+
+  private async drainPendingStateWrites(): Promise<void> {
+    while (this.pendingStateWrites.size > 0) {
+      await Promise.allSettled([...this.pendingStateWrites]);
+    }
+  }
+
+  private assertProcessOwner(
+    expected: string,
+    owner: CapabilityCallContext,
+    processId: string,
+  ): void {
+    if (expected === owner.principalKeyFingerprint) return;
+    throw new UniversalBrokerError(
+      "AUTHORITY_PRINCIPAL_MISMATCH",
+      `Process ${processId} belongs to a different authenticated principal.`,
+      { evidence: { processId, providerDispatchCount: 0 } },
+    );
+  }
+
+  private owner(callContext?: CapabilityCallContext): CapabilityCallContext {
+    return requireCapabilityCallContext(callContext, this.ownerProvider);
   }
 
   private assertOpen(): void {
@@ -690,121 +1293,76 @@ export class UniversalExecutionPlane {
   }
 }
 
-class ProcessOutput {
-  private pending = "";
-  private droppedCharacters = 0;
-  private writeStream?: WriteStream;
-  private closePromise?: Promise<void>;
-  private fileBytes = 0;
-  fileTruncated = false;
+export function prepareExecExecutionBinding(
+  input: ExecuteCommandInput,
+  target: TargetDefinition,
+  targetGeneration: string,
+  effectiveEnvProfileGeneration?: string,
+  effectiveCwd = input.cwd
+    ?? target.defaultCwd
+    ?? (target.transport === "local" ? homedir() : "~"),
+): PreparedExecExecutionBinding {
+  const effectiveEnvProfile = input.envProfile ?? target.envProfile;
+  return {
+    targetId: target.id,
+    targetGeneration,
+    targetTransport: target.transport,
+    targetPlatform: target.platform,
+    shellDialect: target.shell,
+    effectiveEnvProfile,
+    effectiveEnvProfileGeneration,
+    effectiveCwd,
+    mode: input.mode ?? "auto",
+    tty: input.tty === true,
+    classifierGeneration: EXEC_RISK_CLASSIFIER_GENERATION,
+    launchRisk: commandRisk(input.command, {
+      targetId: target.id,
+      targetTransport: target.transport,
+      targetPlatform: target.platform,
+      shellDialect: target.shell,
+      mode: input.mode ?? "auto",
+      tty: input.tty === true,
+      envProfile: effectiveEnvProfile,
+    }),
+  };
+}
 
-  constructor(readonly options: {
-    path: string;
-    maximumBufferedCharacters: number;
-    maximumFileBytes: number;
-  }) {}
-
-  get path(): string {
-    return this.options.path;
-  }
-
-  get totalFileBytes(): number {
-    return this.fileBytes;
-  }
-
-  async open(): Promise<void> {
-    this.writeStream = createWriteStream(this.options.path, {
-      flags: "wx",
-      mode: 0o600,
-    });
-    await new Promise<void>((resolvePromise, reject) => {
-      this.writeStream!.once("open", () => resolvePromise());
-      this.writeStream!.once("error", reject);
-    });
-    this.writeStream.on("error", () => {
-      this.fileTruncated = true;
-    });
-  }
-
-  append(value: string): void {
-    if (!value) return;
-    this.appendFile(value);
-    this.pending += value;
-    if (this.pending.length <= this.options.maximumBufferedCharacters) return;
-    const overflow = this.pending.length - this.options.maximumBufferedCharacters;
-    this.pending = this.pending.slice(overflow);
-    this.droppedCharacters += overflow;
-  }
-
-  drain(maximumCharacters: number): { output: string; truncated: boolean } {
-    const marker = this.droppedCharacters > 0
-      ? `... ${this.droppedCharacters} buffered character(s) omitted; full output is available as a resource ...\n`
-      : "";
-    const available = Math.max(0, maximumCharacters - marker.length);
-    const body = this.pending.slice(0, available);
-    this.pending = this.pending.slice(body.length);
-    const truncated = this.droppedCharacters > 0 || this.pending.length > 0;
-    this.droppedCharacters = 0;
-    return { output: marker + body, truncated };
-  }
-
-  async read(offset: number, limit: number): Promise<{
-    text: string;
-    nextOffset?: number;
-    totalBytes: number;
-    truncated: boolean;
-  }> {
-    if (!Number.isInteger(offset) || offset < 0) {
-      throw new UniversalBrokerError("PRECONDITION_FAILED", `Invalid output offset: ${offset}`);
-    }
-    if (!Number.isInteger(limit) || limit < 1 || limit > 1_048_576) {
-      throw new UniversalBrokerError("PRECONDITION_FAILED", `Invalid output limit: ${limit}`);
-    }
-    const handle = await open(this.options.path, "r");
-    try {
-      const buffer = Buffer.alloc(limit);
-      const { bytesRead } = await handle.read(buffer, 0, limit, offset);
-      const totalBytes = this.fileBytes;
-      const nextOffset = offset + bytesRead;
-      return {
-        text: buffer.subarray(0, bytesRead).toString("utf8"),
-        ...(nextOffset < totalBytes ? { nextOffset } : {}),
-        totalBytes,
-        truncated: this.fileTruncated || nextOffset < totalBytes,
-      };
-    } finally {
-      await handle.close();
-    }
-  }
-
-  close(): Promise<void> {
-    if (this.closePromise) return this.closePromise;
-    const stream = this.writeStream;
-    if (!stream || stream.closed || stream.destroyed) {
-      this.closePromise = Promise.resolve();
-      return this.closePromise;
-    }
-    this.closePromise = new Promise<void>((resolvePromise) => {
-      stream.once("close", () => resolvePromise());
-      stream.end();
-    });
-    return this.closePromise;
-  }
-
-  private appendFile(value: string): void {
-    const stream = this.writeStream;
-    if (!stream || this.fileTruncated) return;
-    const data = Buffer.from(value);
-    const remaining = this.options.maximumFileBytes - this.fileBytes;
-    if (remaining <= 0) {
-      this.fileTruncated = true;
-      return;
-    }
-    const accepted = data.subarray(0, remaining);
-    this.fileBytes += accepted.byteLength;
-    stream.write(accepted);
-    if (accepted.byteLength < data.byteLength) this.fileTruncated = true;
-  }
+function assertPreparedExecExecutionBinding(
+  expected: PreparedExecExecutionBinding | undefined,
+  observed: PreparedExecExecutionBinding,
+): void {
+  if (!expected) return;
+  const dimensions = [
+    "targetId",
+    "targetGeneration",
+    "targetTransport",
+    "targetPlatform",
+    "shellDialect",
+    "effectiveEnvProfile",
+    "effectiveEnvProfileGeneration",
+    "effectiveCwd",
+    "mode",
+    "tty",
+    "classifierGeneration",
+    "launchRisk",
+  ] as const satisfies readonly (keyof PreparedExecExecutionBinding)[];
+  const mismatches = dimensions.filter((dimension) => expected[dimension] !== observed[dimension]);
+  if (mismatches.length === 0) return;
+  throw new UniversalBrokerError(
+    "AUTHORITY_STALE",
+    "Execution target or classifier binding changed after authority preparation; process dispatch was not attempted.",
+    {
+      evidence: {
+        mismatchedDimensions: mismatches,
+        expectedTargetId: expected.targetId,
+        observedTargetId: observed.targetId,
+        expectedTargetGeneration: expected.targetGeneration,
+        observedTargetGeneration: observed.targetGeneration,
+        expectedClassifierGeneration: expected.classifierGeneration,
+        observedClassifierGeneration: observed.classifierGeneration,
+      },
+    },
+  );
 }
 
 class RemoteMarkerParser {
@@ -812,7 +1370,7 @@ class RemoteMarkerParser {
   readonly completedPrefix: string;
   readonly cwdRejectedMarker: string;
   readonly elevationBlockedMarker: string;
-  private remainder = "";
+  private readonly remainders = new Map<ProcessOutputChannel, string>();
   dispatched = false;
   completed = false;
   cwdRejected = false;
@@ -826,44 +1384,44 @@ class RemoteMarkerParser {
     this.elevationBlockedMarker = `__DEVSPACE_ELEVATION_BLOCKED_${nonce}__`;
   }
 
-  consume(value: string, final: boolean): string {
-    const sanitized = this.sanitize(this.remainder + value, final);
-    if (final) {
-      this.remainder = "";
-      return sanitized;
+  consume(value: string, final: boolean, channel: ProcessOutputChannel): string {
+    const combined = (this.remainders.get(channel) ?? "") + value;
+    const segments = combined.match(/[^\n]*\n|[^\n]+$/gu) ?? [];
+    if (!final && segments.length > 0 && !segments.at(-1)!.endsWith("\n")) {
+      this.remainders.set(channel, segments.pop()!);
+    } else {
+      this.remainders.delete(channel);
     }
-    const retained = potentialMarkerSuffixLength(sanitized, [
-      this.dispatchedMarker,
-      this.cwdRejectedMarker,
-      this.elevationBlockedMarker,
-      this.completedPrefix,
-    ]);
-    this.remainder = retained > 0 ? sanitized.slice(-retained) : "";
-    return retained > 0 ? sanitized.slice(0, -retained) : sanitized;
+    return segments.map((segment) => this.sanitizeLine(segment)).join("");
   }
 
-  private sanitize(value: string, final: boolean): string {
-    let result = value;
-    if (result.includes(this.dispatchedMarker)) {
+  private sanitizeLine(segment: string): string {
+    const line = segment.endsWith("\r\n")
+      ? segment.slice(0, -2)
+      : segment.endsWith("\n")
+        ? segment.slice(0, -1)
+        : segment;
+    if (line === this.dispatchedMarker) {
       this.dispatched = true;
-      result = result.replace(new RegExp(`${escapeRegExp(this.dispatchedMarker)}\\r?\\n?`, "g"), "");
-    }
-    if (result.includes(this.cwdRejectedMarker)) {
-      this.cwdRejected = true;
-      result = result.replace(new RegExp(`${escapeRegExp(this.cwdRejectedMarker)}\\r?\\n?`, "g"), "");
-    }
-    if (result.includes(this.elevationBlockedMarker)) {
-      this.elevationBlocked = true;
-      result = result.replace(new RegExp(`${escapeRegExp(this.elevationBlockedMarker)}\\r?\\n?`, "g"), "");
-    }
-    const escapedPrefix = escapeRegExp(this.completedPrefix);
-    const terminator = final ? "(?:\\r?\\n|$)" : "\\r?\\n";
-    result = result.replace(new RegExp(`${escapedPrefix}(-?\\d+)${terminator}`, "g"), (_match, exitCode: string) => {
-      this.completed = true;
-      this.exitCode = Number(exitCode);
       return "";
-    });
-    return result;
+    }
+    if (line === this.cwdRejectedMarker) {
+      this.cwdRejected = true;
+      return "";
+    }
+    if (line === this.elevationBlockedMarker) {
+      this.elevationBlocked = true;
+      return "";
+    }
+    if (line.startsWith(this.completedPrefix)) {
+      const exitCode = line.slice(this.completedPrefix.length);
+      if (/^-?\d+$/u.test(exitCode)) {
+        this.completed = true;
+        this.exitCode = Number(exitCode);
+        return "";
+      }
+    }
+    return segment;
   }
 }
 
@@ -1002,7 +1560,7 @@ function posixRemoteCommand(
     `printf '%s%s\\n' ${shellQuote(markers.completedPrefix)} \"$rc\" >&2`,
     "exit 0",
   ].join("; ");
-  return `sh -lc ${shellQuote(script)}`;
+  return `/bin/sh -lc ${shellQuote(script)}`;
 }
 
 function windowsRemoteCommand(
@@ -1067,12 +1625,12 @@ function localShellCommand(target: TargetDefinition, command: string) {
 function posixShell(shell: TargetDefinition["shell"]): string {
   switch (shell) {
     case "zsh":
-      return "zsh";
+      return "/bin/zsh";
     case "bash":
-      return "bash";
+      return "/bin/bash";
     case "sh":
     case "auto":
-      return "sh";
+      return "/bin/sh";
     case "powershell":
     case "cmd":
       throw new UniversalBrokerError(
@@ -1317,32 +1875,6 @@ function commandWithSourceFile(command: string, sourceFile: string | undefined):
   return `set -a; . ${shellQuote(sourceFile)}; set +a; ${command}`;
 }
 
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function potentialMarkerSuffixLength(value: string, markers: string[]): number {
-  let retained = 0;
-  for (const marker of markers) {
-    const maximum = Math.min(marker.length - 1, value.length);
-    for (let length = maximum; length > retained; length -= 1) {
-      if (value.endsWith(marker.slice(0, length))) {
-        retained = length;
-        break;
-      }
-    }
-  }
-  const completedPrefix = markers.at(-1);
-  if (completedPrefix) {
-    const index = value.lastIndexOf(completedPrefix);
-    if (index >= 0) {
-      const suffix = value.slice(index + completedPrefix.length);
-      if (/^-?\d*$/.test(suffix)) retained = Math.max(retained, value.length - index);
-    }
-  }
-  return retained;
-}
-
 function boundedError(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
   const normalized = message.replace(/\s+/g, " ").trim();
@@ -1351,4 +1883,89 @@ function boundedError(error: unknown): string {
 
 function isNodeError(error: unknown, code: string): boolean {
   return error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === code;
+}
+
+function boundedOption(
+  value: number | undefined,
+  fallback: number,
+  minimum: number,
+  maximum: number,
+  field: string,
+): number {
+  const observed = value ?? fallback;
+  if (!Number.isSafeInteger(observed) || observed < minimum || observed > maximum) {
+    throw new UniversalBrokerError(
+      "PRECONDITION_FAILED",
+      `${field} must be an integer from ${minimum} through ${maximum}.`,
+    );
+  }
+  return observed;
+}
+
+function writeWritable(
+  writable: NodeJS.WritableStream,
+  data: string,
+): Promise<void> {
+  if (writable.write(data)) return Promise.resolve();
+  return new Promise<void>((resolvePromise, reject) => {
+    const cleanup = () => {
+      writable.removeListener("drain", onDrain);
+      writable.removeListener("error", onError);
+    };
+    const onDrain = () => {
+      cleanup();
+      resolvePromise();
+    };
+    const onError = (error: Error) => {
+      cleanup();
+      reject(error);
+    };
+    writable.once("drain", onDrain);
+    writable.once("error", onError);
+  });
+}
+
+function assertDurableIdentity(identity: DurableProcessIdentity): void {
+  if (
+    !identity.managerHandle?.trim()
+    || !Number.isSafeInteger(identity.pid)
+    || identity.pid < 1
+    || !identity.startToken?.trim()
+  ) {
+    throw new UniversalBrokerError(
+      "TRANSPORT_INTERRUPTED",
+      "Durable process adapter returned an invalid manager handle, PID, or start token.",
+    );
+  }
+}
+
+function adaptDurableHandle(handle: DurableProcessHandle): ProcessHandle {
+  return {
+    pid: handle.identity.pid,
+    write: (data) => Promise.resolve(handle.write(data)).then(() => undefined),
+    ...(handle.resize ? {
+      resize: (columns: number, rows: number) => Promise.resolve(handle.resize!(columns, rows)).then(() => undefined),
+    } : {}),
+    kill: (signal) => Promise.resolve(handle.kill(signal)).then(() => undefined),
+    ...(handle.pauseOutput ? { pauseOutput: () => handle.pauseOutput!() } : {}),
+    ...(handle.resumeOutput ? { resumeOutput: () => handle.resumeOutput!() } : {}),
+    ...(handle.close ? { close: () => Promise.resolve(handle.close!()).then(() => undefined) } : {}),
+  };
+}
+
+function persistentState(value: string): UniversalProcessState {
+  const states = new Set<UniversalProcessState>([
+    "STARTING",
+    "RUNNING",
+    "EXITED",
+    "SIGNALED",
+    "FAILED",
+    "ORPHANED",
+    "UNKNOWN",
+  ]);
+  if (states.has(value as UniversalProcessState)) return value as UniversalProcessState;
+  throw new UniversalBrokerError(
+    "STATE_CORRUPTED",
+    `Persisted process state is invalid: ${value}`,
+  );
 }

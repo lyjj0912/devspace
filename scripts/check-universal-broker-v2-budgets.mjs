@@ -13,25 +13,40 @@ import { fileURLToPath } from "node:url";
 import {
   assertUniversalBrokerBudgets,
   inspectUniversalBrokerBudgets,
-} from "../dist/v2/budgets.js";
-import { loadConfig } from "../dist/config.js";
+} from "../src/v2/budgets.ts";
+import { loadConfig } from "../src/config.ts";
 import {
   ContextRegistry,
   contextPayloadCharacters,
-} from "../dist/v2/contexts.js";
+} from "../src/v2/contexts.ts";
 import {
   UNIVERSAL_BROKER_BUDGETS,
-} from "../dist/v2/contracts.js";
-import { TargetRegistry } from "../dist/v2/targets.js";
+} from "../src/v2/contracts.ts";
+import { TargetRegistry } from "../src/v2/targets.ts";
 
 const root = resolve(fileURLToPath(new URL("..", import.meta.url)));
 verifyBaseline();
+verifyRevisionTwoLimits();
 const report = await inspectUniversalBrokerBudgets();
 console.log(JSON.stringify(report, null, 2));
 assertUniversalBrokerBudgets(report);
 const contextReport = await inspectContextBudgets();
 console.log(JSON.stringify(contextReport, null, 2));
 console.log("Universal Broker v2 budget gate: PASS");
+
+function verifyRevisionTwoLimits() {
+  const expected = {
+    maximumToolDescriptorCharacters: 9_000,
+    maximumReusedContextCharacters: 512,
+  };
+  for (const [name, limit] of Object.entries(expected)) {
+    if (UNIVERSAL_BROKER_BUDGETS[name] !== limit) {
+      throw new Error(
+        `Universal Broker v2.1 ${name} changed: expected ${limit}, observed ${UNIVERSAL_BROKER_BUDGETS[name]}`,
+      );
+    }
+  }
+}
 
 function verifyBaseline() {
   const baseline = JSON.parse(

@@ -6,7 +6,10 @@
   "additionalProperties": false,
   "required": [
     "targetId",
+    "endpointId",
+    "targetGeneration",
     "status",
+    "ready",
     "observedAt",
     "expiresAt",
     "platform",
@@ -15,7 +18,10 @@
   ],
   "properties": {
     "targetId": { "type": "string", "minLength": 1, "maxLength": 64 },
+    "endpointId": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "targetGeneration": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
     "status": { "enum": ["ONLINE", "OFFLINE", "DEGRADED", "UNKNOWN"] },
+    "ready": { "type": "boolean" },
     "observedAt": { "type": "string", "format": "date-time" },
     "expiresAt": { "type": "string", "format": "date-time" },
     "platform": { "enum": ["macos", "linux", "windows", "unknown"] },
@@ -52,14 +58,29 @@
     "evidence": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["transport"],
+      "required": [
+        "transport",
+        "endpointId",
+        "endpointFingerprint",
+        "configuredIdentity",
+        "observedIdentity",
+        "identityMatches",
+        "readiness"
+      ],
       "properties": {
         "transport": { "enum": ["local", "ssh"] },
+        "endpointId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "endpointFingerprint": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
         "sshHost": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "sshHostKeyFingerprint": { "type": "string", "minLength": 1, "maxLength": 256 },
         "userAccountBoundary": { "type": "string", "minLength": 1, "maxLength": 512 },
         "probeDurationMs": { "type": "number", "minimum": 0, "maximum": 600000 },
-        "targetGeneration": { "type": "string", "pattern": "^[a-f0-9]{16}$" },
+        "targetGeneration": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
         "cache": { "enum": ["hit", "miss", "shared"] },
+        "identityMatches": { "type": "boolean" },
+        "readiness": { "type": "boolean" },
+        "configuredIdentity": { "$ref": "#/$defs/configuredIdentity" },
+        "observedIdentity": { "$ref": "#/$defs/observedIdentity" },
         "capabilityProbes": {
           "type": "object",
           "additionalProperties": false,
@@ -72,6 +93,33 @@
     }
   },
   "$defs": {
+    "configuredIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["endpointId", "transport", "platform", "endpointFingerprint"],
+      "properties": {
+        "endpointId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "transport": { "enum": ["local", "ssh"] },
+        "sshHost": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "sshHostKeyFingerprint": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "user": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "hostname": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "platform": { "enum": ["macos", "linux", "windows", "unknown"] },
+        "endpointFingerprint": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+      }
+    },
+    "observedIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "hostname": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "user": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "platform": { "enum": ["macos", "linux", "windows", "unknown"] },
+        "homeDirectory": { "type": "string", "maxLength": 4096 },
+        "defaultShell": { "type": "string", "maxLength": 4096 },
+        "sshHostKeyFingerprint": { "type": "string", "minLength": 1, "maxLength": 256 }
+      }
+    },
     "capabilityProbe": {
       "type": "object",
       "additionalProperties": false,

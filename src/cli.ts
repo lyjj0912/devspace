@@ -255,7 +255,7 @@ async function serveUniversalBroker(env: NodeJS.ProcessEnv): Promise<void> {
       );
     }
   }
-  const { app, close, targets } = createUniversalBrokerNextServer(config);
+  const { app, managementApp, close, targets } = createUniversalBrokerNextServer(config);
   const targetSnapshot = await targets.inspect();
   const httpServer = app.listen(config.port, config.host, () => {
     console.log(
@@ -269,11 +269,23 @@ async function serveUniversalBroker(env: NodeJS.ProcessEnv): Promise<void> {
     console.log(`targets: ${targetSnapshot.targets.length} (${targetSnapshot.generation})`);
     console.log("auth: Owner password approval required");
   });
+  const managementServer = managementApp.listen(
+    config.managementPort,
+    config.managementHost,
+    () => {
+      console.log(
+        `devspace management listening on http://${config.managementHost}:${config.managementPort}${config.readyPath}`,
+      );
+    },
+  );
 
   let shuttingDown = false;
   const shutdown = async () => {
     if (shuttingDown) return;
     shuttingDown = true;
+    await new Promise<void>((resolvePromise, reject) => {
+      managementServer.close((error) => error ? reject(error) : resolvePromise());
+    });
     await shutdownHttpServer(httpServer, close);
     process.exit(0);
   };

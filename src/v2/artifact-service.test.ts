@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { createServer } from "node:http";
 import { Readable } from "node:stream";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
@@ -89,7 +89,7 @@ test("artifact.copy transfers through bounded staging without tool-text base64",
   assert.equal(JSON.stringify(result).includes("AAECAwT/"), false);
 });
 
-test("artifact.publish exposes a HEAD-safe one-time capability URL", async (t) => {
+test("artifact.publish exposes canonical owner-bound URI plus a reusable HTTP capability", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "devspace-v2-artifact-http-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   let baseUrl = "";
@@ -120,15 +120,17 @@ test("artifact.publish exposes a HEAD-safe one-time capability URL", async (t) =
     source: { path, mimeType: "text/plain" },
     ttlSeconds: 60,
   });
-  const uri = String(published.resourceUri);
-  const head = await fetch(uri, { method: "HEAD" });
+  assert.match(String(published.resourceUri), /^devspace:\/\/artifact\/[0-9a-f-]{36}$/u);
+  const downloadUrl = String(published.downloadUrl);
+  const head = await fetch(downloadUrl, { method: "HEAD" });
   assert.equal(head.status, 200);
   assert.equal(head.headers.get("content-length"), "18");
-  const first = await fetch(uri);
+  const first = await fetch(downloadUrl);
   assert.equal(first.status, 200);
   assert.equal(await first.text(), "one-time artifact\n");
-  const second = await fetch(uri);
-  assert.equal(second.status, 404);
+  const second = await fetch(downloadUrl);
+  assert.equal(second.status, 200);
+  assert.equal(await second.text(), "one-time artifact\n");
 });
 
 test("artifact byte quotas reject streams before destination publication", async (t) => {
@@ -147,6 +149,104 @@ test("artifact byte quotas reject streams before destination publication", async
   await assert.rejects(readFile(destination), { code: "ENOENT" });
 });
 
+test("artifact CAS deduplicates identical bytes and fails closed on object hash mismatch", async (t) => {
+  const fixture = await createFixture(t, [], {
+    maximumEntries: 8,
+    maximumArtifactBytes: 1_000,
+    maximumTotalBytes: 10_000,
+  });
+  const content = Buffer.from("same-content-addressed-bytes\n");
+  const sha256 = createHash("sha256").update(content).digest("hex");
+  const firstPath = join(fixture.root, "first.bin");
+  const secondPath = join(fixture.root, "second.bin");
+  await writeFile(firstPath, content);
+  await writeFile(secondPath, content);
+  await fixture.artifacts.execute({
+    operation: "publish",
+    source: { path: firstPath, size: content.length, sha256 },
+  }, "owner-a");
+  await fixture.artifacts.execute({
+    operation: "publish",
+    source: { path: secondPath, size: content.length, sha256 },
+  }, "owner-a");
+  assert.deepEqual(fixture.artifacts.stats(), {
+    artifacts: 2,
+    objects: 1,
+    totalBytes: content.length,
+    reservations: 0,
+    reservedEntries: 0,
+    reservedBytes: 0,
+    maximumEntries: 8,
+    maximumTotalBytes: 10_000,
+    maximumArtifactBytes: 1_000,
+    ttlMs: 60_000,
+  });
+
+  const objectPath = join(
+    fixture.root,
+    "artifact-staging",
+    "objects",
+    "sha256",
+    sha256.slice(0, 2),
+    sha256,
+  );
+  await chmod(objectPath, 0o600);
+  await writeFile(objectPath, Buffer.alloc(content.length, 0x78));
+  await assert.rejects(
+    fixture.artifacts.execute({
+      operation: "publish",
+      source: { path: secondPath, size: content.length, sha256 },
+    }, "owner-a"),
+    hasCode("PRECONDITION_FAILED"),
+  );
+  assert.equal((fixture.artifacts.stats().artifacts as number), 2);
+});
+
+test("artifact canonical handles deny cross-owner reads", async (t) => {
+  const fixture = await createFixture(t);
+  const path = join(fixture.root, "owner-bound.txt");
+  await writeFile(path, "owner-bound\n");
+  const published = await fixture.artifacts.execute({
+    operation: "publish",
+    source: { path, size: 12 },
+  }, { principalKeyFingerprint: "owner-a" });
+  const ownRead = await fixture.artifacts.readResource(
+    String(published.resourceUri),
+    { ownerFingerprint: "owner-a" },
+  );
+  assert.equal(Buffer.from(String(ownRead.blobBase64), "base64").toString(), "owner-bound\n");
+  await assert.rejects(
+    fixture.artifacts.readResource(String(published.resourceUri), "owner-b"),
+    hasCode("AUTHORITY_PRINCIPAL_MISMATCH"),
+  );
+});
+
+test("the 257th artifact reservation rejects before opening its source", async (t) => {
+  let opens = 0;
+  const adapter = fixtureAdapter(() => { opens += 1; });
+  const fixture = await createFixture(t, [adapter], {
+    maximumEntries: 256,
+    maximumArtifactBytes: 15,
+    maximumTotalBytes: 1_000,
+  });
+  for (let index = 0; index < 256; index += 1) {
+    await fixture.artifacts.execute({
+      operation: "receive",
+      source: { file: { fixture: true }, size: 15, name: `record-${index}.txt` },
+    }, "owner-quota");
+  }
+  assert.equal(opens, 256);
+  await assert.rejects(
+    fixture.artifacts.execute({
+      operation: "receive",
+      source: { file: { fixture: true }, size: 15 },
+    }, "owner-quota"),
+    hasCode("RESOURCE_QUOTA_EXCEEDED"),
+  );
+  assert.equal(opens, 256);
+  assert.equal(fixture.artifacts.stats().artifacts, 256);
+});
+
 interface Fixture {
   root: string;
   artifacts: UniversalArtifactService;
@@ -159,6 +259,8 @@ async function createFixture(
     root?: string;
     baseUrl?: string | (() => string);
     maximumArtifactBytes?: number;
+    maximumEntries?: number;
+    maximumTotalBytes?: number;
   } = {},
 ): Promise<Fixture> {
   const root = overrides.root ?? await mkdtemp(join(tmpdir(), "devspace-v2-artifact-test-"));
@@ -202,21 +304,22 @@ async function createFixture(
     incomingAdapters: adapters,
     baseUrl: overrides.baseUrl,
     maximumArtifactBytes: overrides.maximumArtifactBytes,
-    maximumTotalBytes: 10_000_000,
-    maximumEntries: 8,
+    maximumTotalBytes: overrides.maximumTotalBytes ?? 10_000_000,
+    maximumEntries: overrides.maximumEntries ?? 8,
     ttlMs: 60_000,
   });
   t.after(() => artifacts.close());
   return { root, artifacts };
 }
 
-function fixtureAdapter(): IncomingArtifactAdapter {
+function fixtureAdapter(onOpen?: () => void): IncomingArtifactAdapter {
   return {
     id: "fixture",
     canHandle(value) {
       return Boolean(value && typeof value === "object" && (value as { fixture?: boolean }).fixture);
     },
     async open() {
+      onOpen?.();
       const content = Buffer.from("native-fixture\n");
       return {
         name: "native.txt",

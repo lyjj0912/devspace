@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://devspace.local/contracts/mcp-risk-policy.schema.json",
+  "title": "DevSpace Universal Broker v2 Broker-Owned MCP Risk Policy",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "routeId", "tools"],
+  "properties": {
+    "version": { "const": 1 },
+    "routeId": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9._-]{0,63}$"
+    },
+    "tools": {
+      "type": "object",
+      "propertyNames": { "minLength": 1, "maxLength": 256 },
+      "additionalProperties": {
+        "$ref": "#/$defs/toolPolicy"
+      }
+    }
+  },
+  "$defs": {
+    "toolPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["risk", "toolContractSha256"],
+      "properties": {
+        "risk": { "enum": ["R0", "R2", "R3"] },
+        "toolContractSha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        }
+      }
+    }
+  }
+}

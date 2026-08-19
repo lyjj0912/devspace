@@ -25,6 +25,7 @@
       "required": ["displayName", "transport", "platform"],
       "properties": {
         "displayName": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "endpointId": { "type": "string", "minLength": 1, "maxLength": 128 },
         "aliases": {
           "type": "array",
           "uniqueItems": true,
@@ -32,6 +33,9 @@
         },
         "transport": { "enum": ["local", "ssh"] },
         "sshHost": { "type": "string", "minLength": 1 },
+        "sshHostKeyFingerprint": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "user": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "expectedHostname": { "type": "string", "minLength": 1, "maxLength": 256 },
         "platform": { "enum": ["macos", "linux", "windows", "unknown"] },
         "shell": { "enum": ["auto", "sh", "bash", "zsh", "powershell", "cmd"] },
         "defaultCwd": { "type": "string", "minLength": 1 },
@@ -52,6 +56,19 @@
           "properties": {
             "mode": { "enum": ["none", "local-ipc", "ssh-stdio"] },
             "command": { "type": "string", "minLength": 1 }
+          }
+        },
+        "capabilities": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "fs": { "type": "boolean" },
+            "exec": { "type": "boolean" },
+            "pty": { "type": "boolean" },
+            "mcp": { "type": "boolean" },
+            "artifact": { "type": "boolean" },
+            "gui": { "type": "boolean" },
+            "durableProcess": { "type": "boolean" }
           }
         }
       },

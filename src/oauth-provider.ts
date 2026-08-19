@@ -10,7 +10,11 @@ import type {
   OAuthTokens,
 } from "@modelcontextprotocol/sdk/shared/auth.js";
 import { checkResourceAllowed, resourceUrlFromServerUrl } from "@modelcontextprotocol/sdk/shared/auth-utils.js";
-import { SqliteOAuthClientsStore, SqliteOAuthStore } from "./oauth-store.js";
+import {
+  SqliteOAuthClientsStore,
+  SqliteOAuthStore,
+  type PersistedRefreshTokenRecord,
+} from "./oauth-store.js";
 
 export interface OAuthConfig {
   ownerToken: string;
@@ -18,6 +22,11 @@ export interface OAuthConfig {
   refreshTokenTtlSeconds: number;
   scopes: string[];
   allowedRedirectHosts: string[];
+  canonicalConnector?: {
+    name: string;
+    installationEpoch: number;
+    schemaGeneration: string;
+  };
 }
 
 interface AuthorizationCodeRecord {
@@ -116,6 +125,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
   private readonly codes = new Map<string, AuthorizationCodeRecord>();
   private readonly oauthStore: SqliteOAuthStore;
   private readonly resourceServerUrl: URL;
+  private readonly canonicalConnector: OAuthConfig["canonicalConnector"];
 
   constructor(
     private readonly config: OAuthConfig,
@@ -123,6 +133,8 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     stateDir: string,
   ) {
     this.resourceServerUrl = resourceUrlFromServerUrl(resourceServerUrl);
+    this.canonicalConnector = config.canonicalConnector ?? canonicalConnectorFromEnvironment(process.env);
+    if (this.canonicalConnector) validateCanonicalConnector(this.canonicalConnector);
     this.oauthStore = new SqliteOAuthStore(stateDir);
     this.clientsStore = new SqliteOAuthClientsStore(this.oauthStore, config.allowedRedirectHosts);
   }
@@ -218,6 +230,9 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     if (!record || record.clientId !== client.client_id || record.expiresAt < Math.floor(Date.now() / 1000)) {
       throw new InvalidGrantError("Invalid refresh token");
     }
+    if (!this.oauthStore.credentialBindingIsCurrent(record)) {
+      throw new InvalidGrantError("Refresh token belongs to a stale connector binding or token family");
+    }
     if (resource && !checkResourceAllowed({ requestedResource: resource, configuredResource: this.resourceServerUrl })) {
       throw new InvalidGrantError("Invalid resource");
     }
@@ -231,7 +246,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
       client.client_id,
       requestedScopes,
       resource ?? (record.resource ? new URL(record.resource) : undefined),
-      refreshTokenHash,
+      { hash: refreshTokenHash, record },
     );
   }
 
@@ -239,6 +254,9 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     const record = this.oauthStore.getAccessToken(hashToken(token));
     if (!record || record.expiresAt < Math.floor(Date.now() / 1000)) {
       throw new InvalidTokenError("Invalid or expired access token");
+    }
+    if (!this.oauthStore.credentialBindingIsCurrent(record)) {
+      throw new InvalidTokenError("Access token belongs to a stale connector binding or token family");
     }
 
     return {
@@ -275,13 +293,30 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     clientId: string,
     scopes: string[],
     resource?: URL,
-    consumedRefreshTokenHash?: string,
+    consumed?: { hash: string; record: PersistedRefreshTokenRecord },
   ): OAuthTokens {
     const now = Math.floor(Date.now() / 1000);
     const accessToken = randomToken();
     const refreshToken = randomToken();
     const accessExpiresAt = now + this.config.accessTokenTtlSeconds;
     const refreshExpiresAt = now + this.config.refreshTokenTtlSeconds;
+    const connectorBinding = consumed?.record.connectorBindingId
+      ? undefined
+      : this.canonicalConnector
+        ? this.oauthStore.ensureCanonicalConnectorBinding({
+            canonicalName: this.canonicalConnector.name,
+            clientId,
+            installationEpoch: this.canonicalConnector.installationEpoch,
+            schemaGeneration: this.canonicalConnector.schemaGeneration,
+          })
+        : undefined;
+    const binding = {
+      familyId: consumed?.record.familyId ?? `family-${randomUUID()}`,
+      connectorBindingId: consumed?.record.connectorBindingId ?? connectorBinding?.bindingId,
+      connectorDrainEpoch: consumed?.record.connectorDrainEpoch ?? connectorBinding?.drainEpoch,
+      installationEpoch: consumed?.record.installationEpoch ?? connectorBinding?.installationEpoch,
+      rotationSequence: (consumed?.record.rotationSequence ?? -1) + 1,
+    };
 
     const saved = this.oauthStore.saveTokenPair(
       {
@@ -291,6 +326,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
           scopes,
           expiresAt: accessExpiresAt,
           resource: resource?.href,
+          ...binding,
         },
         refreshTokenHash: hashToken(refreshToken),
         refreshToken: {
@@ -298,9 +334,10 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
           scopes,
           expiresAt: refreshExpiresAt,
           resource: resource?.href,
+          ...binding,
         },
       },
-      consumedRefreshTokenHash,
+      consumed?.hash,
     );
     if (!saved) {
       throw new InvalidGrantError("Invalid refresh token");
@@ -334,4 +371,29 @@ function authorizationFormFields(
 
 function hashToken(token: string): string {
   return createHash("sha256").update(token).digest("base64url");
+}
+
+function canonicalConnectorFromEnvironment(env: NodeJS.ProcessEnv): OAuthConfig["canonicalConnector"] {
+  const name = env.DEVSPACE_OAUTH_CANONICAL_CONNECTOR_NAME ?? env.DEVSPACE_NEXT_CANONICAL_CONNECTOR_NAME;
+  const epoch = env.DEVSPACE_OAUTH_CONNECTOR_INSTALLATION_EPOCH;
+  const schemaGeneration = env.DEVSPACE_EXPECTED_SCHEMA_GENERATION;
+  if (!name) return undefined;
+  if (!epoch || !schemaGeneration) {
+    throw new Error("Canonical connector binding requires name, installation epoch, and schema generation together.");
+  }
+  const connector = { name, installationEpoch: Number(epoch), schemaGeneration };
+  validateCanonicalConnector(connector);
+  return connector;
+}
+
+function validateCanonicalConnector(connector: NonNullable<OAuthConfig["canonicalConnector"]>): void {
+  if (!Number.isInteger(connector.installationEpoch) || connector.installationEpoch < 1) {
+    throw new Error("DEVSPACE_OAUTH_CONNECTOR_INSTALLATION_EPOCH must be a positive integer.");
+  }
+  if (!/^[A-Za-z][A-Za-z0-9._-]{0,127}$/u.test(connector.name)) {
+    throw new Error("DEVSPACE_OAUTH_CANONICAL_CONNECTOR_NAME is invalid.");
+  }
+  if (!/^sha256:[a-f0-9]{64}$/u.test(connector.schemaGeneration)) {
+    throw new Error("DEVSPACE_EXPECTED_SCHEMA_GENERATION is invalid for OAuth connector binding.");
+  }
 }

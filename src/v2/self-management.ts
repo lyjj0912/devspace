@@ -6,18 +6,19 @@ import {
 } from "node:fs";
 import {
   mkdir,
+  open as openFile,
   readFile,
   readdir,
   rename,
   rm,
   stat,
-  writeFile,
 } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, spawnSync, type SpawnOptions } from "node:child_process";
 import { UniversalBrokerError } from "./errors.js";
+import type { RuntimeIdentity } from "./contracts.js";
 
 export const RESTART_TRANSACTION_STATES = [
   "REQUESTED",
@@ -52,6 +53,7 @@ export interface RestartWorkerRequest {
   expectedScript?: string;
   localHealthUrl: string;
   publicHealthUrl?: string;
+  expectedIdentity?: RuntimeIdentity;
   statusPath: string;
   requestPath: string;
   workerLogPath: string;
@@ -76,6 +78,7 @@ export interface RestartTransactionStatus extends Record<string, unknown> {
   publicHealthStatus?: number;
   error?: string;
   evidence?: Record<string, unknown>;
+  handoffAcknowledgedAt?: string;
 }
 
 export interface UniversalSelfManagementOptions {
@@ -92,6 +95,7 @@ export interface UniversalSelfManagementOptions {
   pm2Executable?: string;
   launchWorker?: (request: RestartWorkerRequest) => void;
   platform?: NodeJS.Platform;
+  runtimeIdentity?: RuntimeIdentity;
 }
 
 const TRANSACTION_ID_PATTERN = /^restart_[0-9a-f-]{36}$/u;
@@ -118,6 +122,7 @@ export class UniversalSelfManagementService {
   private readonly workerPath: string;
   private readonly pm2Executable?: string;
   private readonly launchWorker: (request: RestartWorkerRequest) => void;
+  private readonly runtimeIdentity?: RuntimeIdentity;
 
   constructor(options: UniversalSelfManagementOptions) {
     this.stateDir = resolve(options.stateDir);
@@ -149,6 +154,7 @@ export class UniversalSelfManagementService {
         ?? fileURLToPath(new URL("./self-management-worker.js", import.meta.url)),
     );
     this.pm2Executable = options.pm2Executable;
+    this.runtimeIdentity = options.runtimeIdentity;
     this.launchWorker = options.launchWorker
       ?? ((request) => launchDetachedRestartWorker(
         request,
@@ -196,6 +202,7 @@ export class UniversalSelfManagementService {
       ...(this.expectedScript ? { expectedScript: this.expectedScript } : {}),
       localHealthUrl: this.localHealthUrl,
       ...(this.publicHealthUrl ? { publicHealthUrl: this.publicHealthUrl } : {}),
+      ...(this.runtimeIdentity ? { expectedIdentity: this.runtimeIdentity } : {}),
       statusPath,
       requestPath,
       workerLogPath,
@@ -216,6 +223,7 @@ export class UniversalSelfManagementService {
         localHealthUrl: this.localHealthUrl,
         publicHealthUrl: this.publicHealthUrl,
         responseGraceMs: delayMs,
+        expectedIdentity: this.runtimeIdentity,
       },
     };
     await atomicJsonWrite(requestPath, request);
@@ -231,7 +239,7 @@ export class UniversalSelfManagementService {
       };
       await atomicJsonWrite(statusPath, failed);
       throw new UniversalBrokerError(
-        "TRANSPORT_UNAVAILABLE",
+        "SUPERVISOR_UNAVAILABLE",
         "Unable to launch the independent broker restart worker.",
         { evidence: { transactionId, error: failed.error } },
       );
@@ -428,8 +436,20 @@ function workerEnvironment(): NodeJS.ProcessEnv {
 async function atomicJsonWrite(path: string, value: unknown): Promise<void> {
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
   const temporary = join(dirname(path), `.${basename(path)}.${process.pid}.${randomUUID()}.tmp`);
-  await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+  const file = await openFile(temporary, "wx", 0o600);
+  try {
+    await file.writeFile(`${JSON.stringify(value, null, 2)}\n`, "utf8");
+    await file.sync();
+  } finally {
+    await file.close();
+  }
   await rename(temporary, path);
+  const directory = await openFile(dirname(path), "r");
+  try {
+    await directory.sync();
+  } finally {
+    await directory.close();
+  }
 }
 
 function resolvePm2Executable(configured?: string): string {

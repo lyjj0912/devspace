@@ -188,6 +188,7 @@ export function posixRemoteUserOnlyRunner(
   command: string,
   internalPolicy?: InternalExecutionPolicy,
 ): string {
+  const pinnedShell = pinnedPosixShell(shell);
   const exact = internalExecutionSpec(internalPolicy, command);
   if (exact) {
     const policy = internalPolicy as GuiInternalExecutionPolicy;
@@ -209,15 +210,42 @@ export function posixRemoteUserOnlyRunner(
   const quotedCommand = shellQuote(command);
   if (platform === "macos") {
     const profile = shellQuote(macosUserOnlyProfile(internalPolicy));
-    return `/usr/bin/sandbox-exec -p ${profile} ${shell} -lc ${quotedCommand}`;
+    return `/usr/bin/sandbox-exec -p ${profile} ${pinnedShell} -lc ${quotedCommand}`;
   }
   if (platform === "linux") {
-    return `setpriv --no-new-privs -- ${shell} -lc ${quotedCommand}`;
+    const invocation = `${pinnedShell} -lc ${quotedCommand}`;
+    return [
+      "if [ -x /usr/bin/setpriv ] && [ ! -L /usr/bin/setpriv ]; then",
+      `/usr/bin/setpriv --no-new-privs -- ${invocation};`,
+      "elif [ -x /bin/setpriv ] && [ ! -L /bin/setpriv ]; then",
+      `/bin/setpriv --no-new-privs -- ${invocation};`,
+      "else exit 78; fi",
+    ].join(" ");
   }
   throw new UniversalBrokerError(
     "ELEVATION_BLOCKED",
     `Strict POSIX user-account enforcement is unavailable for platform ${platform}.`,
   );
+}
+
+function pinnedPosixShell(shell: string): "/bin/sh" | "/bin/bash" | "/bin/zsh" {
+  switch (shell) {
+    case "sh":
+    case "/bin/sh":
+      return "/bin/sh";
+    case "bash":
+    case "/bin/bash":
+      return "/bin/bash";
+    case "zsh":
+    case "/bin/zsh":
+      return "/bin/zsh";
+    default:
+      throw new UniversalBrokerError(
+        "ELEVATION_BLOCKED",
+        "Remote POSIX execution requires a broker-pinned system shell.",
+        { evidence: { shell } },
+      );
+  }
 }
 
 function verifyLocalGuiScript(policy: GuiInternalExecutionPolicy): void {

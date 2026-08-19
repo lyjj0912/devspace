@@ -8,11 +8,13 @@
     "code",
     "message",
     "retryable",
-    "operationId"
+    "dispatchState"
   ],
   "properties": {
     "code": {
       "enum": [
+        "AUTHENTICATION_FAILED",
+        "SCOPE_INSUFFICIENT",
         "CAPABILITY_UNAVAILABLE",
         "TARGET_NOT_FOUND",
         "TARGET_AMBIGUOUS",
@@ -28,17 +30,37 @@
         "MCP_ROUTE_NOT_FOUND",
         "MCP_TOOL_NOT_FOUND",
         "MCP_PROVIDER_ERROR",
+        "MCP_CONNECTION_UNAVAILABLE",
         "MCP_RESULT_UNKNOWN",
+        "DISPATCH_STATE_UNKNOWN",
         "HOST_ACTION_BLOCKED",
+        "HOST_CAPABILITY_UNAVAILABLE",
         "HOST_ARTIFACT_CAPABILITY_UNAVAILABLE",
         "GUI_STATE_CHANGED",
         "OUTPUT_TRUNCATED",
         "RESOURCE_QUOTA_EXCEEDED",
+        "RESOURCE_BUSY",
         "AUTHORITY_REQUIRED",
         "AUTHORITY_EXPIRED",
+        "AUTHORITY_PRINCIPAL_MISMATCH",
+        "AUTHORITY_ACTION_MISMATCH",
+        "AUTHORITY_STALE",
+        "AUTHORITY_STORE_UNAVAILABLE",
+        "HUMAN_ATTESTATION_REQUIRED",
+        "STATE_CORRUPTED",
+        "INVALID_ARGUMENT",
+        "RESOURCE_EXPIRED",
+        "TARGET_IDENTITY_MISMATCH",
+        "PROCESS_NOT_DURABLE",
+        "GUI_GENERATION_MISMATCH",
+        "SCHEMA_STALE",
+        "AUTHORITY_STATE_UNCERTAIN",
         "AUTHORITY_MISMATCH",
         "AUTHORITY_CONSUMED",
-        "ELEVATION_BLOCKED"
+        "ELEVATION_BLOCKED",
+        "ELEVATION_DENIED",
+        "SUPERVISOR_UNAVAILABLE",
+        "FINALIZATION_STAGE_CONFLICT"
       ]
     },
     "message": {
@@ -48,14 +70,28 @@
     "retryable": {
       "type": "boolean"
     },
-    "operationId": {
-      "type": "string",
-      "pattern": "^op_[A-Za-z0-9_-]+$"
+    "dispatchState": {
+      "enum": [
+        "NOT_DISPATCHED",
+        "CLAIMED",
+        "DISPATCHED",
+        "ACKNOWLEDGED",
+        "UNKNOWN"
+      ]
+    },
+    "resourceKey": {
+      "type": "string"
     },
     "evidence": {
       "type": "object"
     },
     "suggestions": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "recovery": {
       "type": "array",
       "items": {
         "type": "object"

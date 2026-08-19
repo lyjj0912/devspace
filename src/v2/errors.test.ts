@@ -12,6 +12,7 @@ test("universal result helpers preserve stable operation and error contracts", (
     ok: true,
     operationId: "op_success",
     data: { value: 1 },
+    observedSchemaGeneration: `sha256:${"0".repeat(64)}`,
   });
 
   const failure = failedToolResult(new UniversalBrokerError(
@@ -30,7 +31,10 @@ test("universal result helpers preserve stable operation and error contracts", (
       code: "TARGET_NOT_FOUND",
       message: "Unknown target",
       retryable: false,
+      dispatchState: "NOT_DISPATCHED",
       suggestions: [{ targetId: "local" }],
+      recovery: [{ targetId: "local" }],
     },
+    observedSchemaGeneration: `sha256:${"0".repeat(64)}`,
   });
 });

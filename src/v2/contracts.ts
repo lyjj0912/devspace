@@ -32,6 +32,7 @@ export const UNIVERSAL_TOOL_OPERATIONS = {
     "copy",
     "move",
     "remove",
+    "restore",
     "hash",
     "sync",
   ],
@@ -62,6 +63,8 @@ export const UNIVERSAL_OWNER_SCOPES = [
 ] as const;
 
 export const UNIVERSAL_ERROR_CODES = [
+  "AUTHENTICATION_FAILED",
+  "SCOPE_INSUFFICIENT",
   "CAPABILITY_UNAVAILABLE",
   "TARGET_NOT_FOUND",
   "TARGET_AMBIGUOUS",
@@ -77,27 +80,47 @@ export const UNIVERSAL_ERROR_CODES = [
   "MCP_ROUTE_NOT_FOUND",
   "MCP_TOOL_NOT_FOUND",
   "MCP_PROVIDER_ERROR",
+  "MCP_CONNECTION_UNAVAILABLE",
   "MCP_RESULT_UNKNOWN",
+  "DISPATCH_STATE_UNKNOWN",
   "HOST_ACTION_BLOCKED",
+  "HOST_CAPABILITY_UNAVAILABLE",
   "HOST_ARTIFACT_CAPABILITY_UNAVAILABLE",
   "GUI_STATE_CHANGED",
   "OUTPUT_TRUNCATED",
   "RESOURCE_QUOTA_EXCEEDED",
+  "RESOURCE_BUSY",
   "AUTHORITY_REQUIRED",
   "AUTHORITY_EXPIRED",
+  "AUTHORITY_PRINCIPAL_MISMATCH",
+  "AUTHORITY_ACTION_MISMATCH",
+  "AUTHORITY_STALE",
+  "AUTHORITY_STORE_UNAVAILABLE",
+  "HUMAN_ATTESTATION_REQUIRED",
+  "STATE_CORRUPTED",
+  "INVALID_ARGUMENT",
+  "RESOURCE_EXPIRED",
+  "TARGET_IDENTITY_MISMATCH",
+  "PROCESS_NOT_DURABLE",
+  "GUI_GENERATION_MISMATCH",
+  "SCHEMA_STALE",
+  "AUTHORITY_STATE_UNCERTAIN",
   "AUTHORITY_MISMATCH",
   "AUTHORITY_CONSUMED",
   "ELEVATION_BLOCKED",
+  "ELEVATION_DENIED",
+  "SUPERVISOR_UNAVAILABLE",
+  "FINALIZATION_STAGE_CONFLICT",
 ] as const;
 
 export type UniversalErrorCode = (typeof UNIVERSAL_ERROR_CODES)[number];
 
 export const UNIVERSAL_BROKER_BUDGETS = Object.freeze({
   maximumTools: 8,
-  maximumToolDescriptorCharacters: 12_000,
+  maximumToolDescriptorCharacters: 9_000,
   maximumServerInstructionCharacters: 2_000,
   maximumInitialContextCharacters: 4_000,
-  maximumReusedContextCharacters: 800,
+  maximumReusedContextCharacters: 512,
   maximumMetaCharacters: 8_000,
 });
 
@@ -113,20 +136,92 @@ export const UNIVERSAL_BROKER_INSTRUCTIONS = [
   "Large results are returned through resource handles rather than repeated in tool text.",
 ].join(" ");
 
+export type DispatchState =
+  | "NOT_DISPATCHED"
+  | "CLAIMED"
+  | "DISPATCHED"
+  | "ACKNOWLEDGED"
+  | "UNKNOWN";
+
+export interface WarningRecord {
+  code: string;
+  message: string;
+  evidence?: Record<string, unknown>;
+}
+
+export interface RuntimeIdentity {
+  productVersion: string;
+  schemaGeneration: string;
+  authorityContractGeneration: string;
+  configDigest: string;
+  sourceRevision: string;
+  runtimeRevision: string;
+  buildDigest: string;
+  startedAt: string;
+}
+
+/** Public correlation and optimistic-concurrency metadata shared by all eight tools. */
+export interface UniversalRequestMeta {
+  requestId?: string;
+  transactionId?: string;
+  taskInstanceId?: string;
+  authorityId?: string;
+  expectedSchemaGeneration?: string;
+  expectedTargetGeneration?: string;
+  expectedRouteGeneration?: string;
+  humanApprovalAttestation?: string;
+}
+
+export interface SuccessEnvelope<T> {
+  ok: true;
+  operationId: string;
+  data: T;
+  warnings?: WarningRecord[];
+  resourceUri?: string;
+  nextCursor?: string;
+  observedSchemaGeneration: string;
+  observedTargetGeneration?: string;
+  observedRouteGeneration?: string;
+}
+
 const cursorSchema = z.string().min(1).optional();
 const limitSchema = z.number().int().min(1).max(10_000).optional();
 const genericRecordSchema = z.record(z.string(), z.unknown());
+
+export const UNIVERSAL_REQUEST_META_INPUT_SCHEMA = {
+  requestId: z.string().min(1).max(256).optional(),
+  transactionId: z.string().min(1).max(128).optional(),
+  taskInstanceId: z.string().min(1).max(128).optional(),
+  authorityId: z.string().min(1).max(256).optional(),
+  expectedSchemaGeneration: z.string().min(1).max(256).optional(),
+  expectedTargetGeneration: z.string().min(1).max(256).optional(),
+  expectedRouteGeneration: z.string().min(1).max(256).optional(),
+  humanApprovalAttestation: z.string().min(1).max(16_384).optional(),
+} as const satisfies z.ZodRawShape;
+
+export const universalRequestMetaSchema = z.strictObject(
+  UNIVERSAL_REQUEST_META_INPUT_SCHEMA,
+);
 
 export const universalResultOutputSchema: z.ZodRawShape = {
   ok: z.boolean(),
   operationId: z.string(),
   data: genericRecordSchema.optional(),
+  warnings: z.array(genericRecordSchema).optional(),
+  resourceUri: z.string().optional(),
+  nextCursor: z.string().optional(),
+  observedSchemaGeneration: z.string(),
+  observedTargetGeneration: z.string().optional(),
+  observedRouteGeneration: z.string().optional(),
   error: z
     .object({
       code: z.enum(UNIVERSAL_ERROR_CODES),
       message: z.string(),
       retryable: z.boolean(),
+      dispatchState: z.enum(["NOT_DISPATCHED", "CLAIMED", "DISPATCHED", "ACKNOWLEDGED", "UNKNOWN"]),
+      resourceKey: z.string().optional(),
       evidence: genericRecordSchema.optional(),
+      recovery: z.array(genericRecordSchema).optional(),
       suggestions: z.array(genericRecordSchema).optional(),
     })
     .optional(),
@@ -147,7 +242,7 @@ export interface UniversalToolContract<TShape extends z.ZodRawShape = z.ZodRawSh
 const targetContract = {
   title: "Resolve target",
   description:
-    "List, resolve, or probe local and remote execution targets. Use this before guessing a machine, alias, platform, or capability.",
+    "List, resolve, or probe local and remote targets and capabilities.",
   inputSchema: {
     operation: z.enum(UNIVERSAL_TOOL_OPERATIONS.target),
     selector: z.string().min(1).optional(),
@@ -167,7 +262,7 @@ const targetContract = {
 const contextContract = {
   title: "Manage context",
   description:
-    "Open, search, diff, or close a project context, or preview and prepare exact operation authority. Context supplies workflow defaults and is not an access boundary.",
+    "Manage project context and preview or prepare exact operation authority.",
   inputSchema: {
     operation: z.enum(UNIVERSAL_TOOL_OPERATIONS.context),
     contextId: z.string().min(1).optional(),
@@ -179,6 +274,8 @@ const contextContract = {
     query: z.string().min(1).optional(),
     maxCharacters: z.number().int().min(100).max(100_000).optional(),
     authorityId: z.string().min(1).optional(),
+    taskInstanceId: z.string().min(1).max(128).optional(),
+    taskLabel: z.string().min(1).max(256).optional(),
     taskId: z.string().min(1).max(256).optional(),
     authorityText: z.string().min(1).max(8_000).optional(),
     actions: z.array(z.strictObject({
@@ -204,7 +301,7 @@ const contextContract = {
 const fsContract = {
   title: "Operate on files",
   description:
-    "Perform generic local or remote filesystem operations, including reads, atomic writes, patches, transfers, and explicit deletion.",
+    "Read or atomically mutate local and remote files.",
   inputSchema: {
     operation: z.enum(UNIVERSAL_TOOL_OPERATIONS.fs),
     target: z.string().min(1).optional(),
@@ -218,6 +315,8 @@ const fsContract = {
     overwrite: z.boolean().optional(),
     expectedSha256: z.string().min(1).optional(),
     disposition: z.enum(["trash", "permanent"]).optional(),
+    trashId: z.string().min(1).optional(),
+    finalSymlink: z.enum(["follow", "preserve", "replace", "reject"]).optional(),
     authorityId: z.string().min(1).optional(),
     cursor: cursorSchema,
     limit: limitSchema,
@@ -233,7 +332,7 @@ const fsContract = {
 const execContract = {
   title: "Execute command",
   description:
-    "Run a command locally or over SSH as the configured target user, with PTY support and automatic conversion to a managed background process. DevSpace always uses that account and never accepts system credentials.",
+    "Run a command as the configured local or SSH target user.",
   inputSchema: {
     target: z.string().min(1).optional(),
     contextId: z.string().min(1).optional(),
@@ -244,6 +343,7 @@ const execContract = {
     yieldMs: z.number().int().min(0).max(30_000).optional(),
     maxOutputChars: z.number().int().min(1).max(1_000_000).optional(),
     envProfile: z.string().min(1).optional(),
+    durable: z.boolean().optional(),
     authorityId: z.string().min(1).optional(),
   },
   annotations: {
@@ -257,7 +357,7 @@ const execContract = {
 const processContract = {
   title: "Manage process",
   description:
-    "Poll, write to, resize, signal, wait for, list, or forget managed local and remote processes returned by exec.",
+    "Operate managed processes returned by exec.",
   inputSchema: {
     operation: z.enum(UNIVERSAL_TOOL_OPERATIONS.process),
     processId: z.string().min(1).optional(),
@@ -285,7 +385,7 @@ const processContract = {
 const mcpContract = {
   title: "Use MCP route",
   description:
-    "Discover or invoke arbitrary configured MCP routes over local stdio, SSH stdio, or Streamable HTTP without service-specific DevSpace tools.",
+    "Discover or invoke configured MCP routes.",
   inputSchema: {
     operation: z.enum(UNIVERSAL_TOOL_OPERATIONS.mcp),
     route: z.string().min(1).optional(),
@@ -309,7 +409,7 @@ const mcpContract = {
 const artifactContract = {
   title: "Transfer artifact",
   description:
-    "Receive, publish, or copy files between the MCP host, local storage, and remote targets using streaming transfer and hashes.",
+    "Receive, publish, or copy verified file artifacts.",
   inputSchema: {
     operation: z.enum(UNIVERSAL_TOOL_OPERATIONS.artifact),
     source: genericRecordSchema,
@@ -330,7 +430,7 @@ const artifactContract = {
 const guiContract = {
   title: "Operate GUI",
   description:
-    "Observe or act through an optional generic operating-system GUI session. Prefer filesystem, exec, or application MCP protocols when available.",
+    "Observe or act through a bounded operating-system GUI session.",
   inputSchema: {
     operation: z.enum(UNIVERSAL_TOOL_OPERATIONS.gui),
     target: z.string().min(1).optional(),
@@ -339,6 +439,7 @@ const guiContract = {
     action: genericRecordSchema.optional(),
     timeoutMs: z.number().int().min(0).max(120_000).optional(),
     maxElements: z.number().int().min(1).max(1_000).optional(),
+    focusPolicy: z.enum(["preserve", "allow"]).optional(),
     authorityId: z.string().min(1).optional(),
   },
   annotations: {

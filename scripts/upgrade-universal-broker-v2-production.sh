@@ -15,6 +15,7 @@ DEPLOYMENT_ROOT="${HOME}/.devspace/deployments/universal-broker-v2"
 PRODUCTION_ENV="${HOME}/.devspace/universal-broker-v2-production.env"
 CANONICAL_START="${HOME}/.devspace/start.sh"
 CURRENT_AUDIT_LINK="${DEPLOYMENT_ROOT}/current"
+IDENTITY_DIRECTORY="${HOME}/.devspace/identity"
 
 usage() {
   cat <<'EOF'
@@ -32,6 +33,7 @@ Options:
   --deployment-root PATH     Upgrade audit root
   --production-env PATH      Active production environment file
   --canonical-start PATH     Canonical user start script
+  --identity-directory PATH  Stable owner identity directory (never release-scoped)
 EOF
 }
 
@@ -48,6 +50,7 @@ while [[ $# -gt 0 ]]; do
     --deployment-root) DEPLOYMENT_ROOT="$2"; CURRENT_AUDIT_LINK="$2/current"; shift 2 ;;
     --production-env) PRODUCTION_ENV="$2"; shift 2 ;;
     --canonical-start) CANONICAL_START="$2"; shift 2 ;;
+    --identity-directory) IDENTITY_DIRECTORY="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -58,6 +61,7 @@ RELEASE_ROOT="$(mkdir -p "$RELEASE_ROOT" && cd "$RELEASE_ROOT" && pwd -P)"
 DEPLOYMENT_ROOT="$(mkdir -p "$DEPLOYMENT_ROOT" && cd "$DEPLOYMENT_ROOT" && pwd -P)"
 PRODUCTION_ENV="$(python3 -c 'import os,sys; print(os.path.abspath(os.path.expanduser(sys.argv[1])))' "$PRODUCTION_ENV")"
 CANONICAL_START="$(python3 -c 'import os,sys; print(os.path.abspath(os.path.expanduser(sys.argv[1])))' "$CANONICAL_START")"
+IDENTITY_DIRECTORY="$(python3 -c 'import os,sys; print(os.path.abspath(os.path.expanduser(sys.argv[1])))' "$IDENTITY_DIRECTORY")"
 CURRENT_AUDIT_LINK="${DEPLOYMENT_ROOT}/current"
 
 for command in git node npm pm2 curl python3; do
@@ -132,6 +136,7 @@ managed={
   "DEVSPACE_V2_LEGACY_SCOPE_COMPATIBILITY",
   "DEVSPACE_NEXT_HOST",
   "DEVSPACE_NEXT_PORT",
+  "DEVSPACE_NEXT_MANAGEMENT_PORT",
   "DEVSPACE_NEXT_PUBLIC_BASE_URL",
   "DEVSPACE_NEXT_MCP_PATH",
   "DEVSPACE_NEXT_STATE_DIR",
@@ -146,6 +151,20 @@ managed={
   "DEVSPACE_NEXT_SELF_RESTART_TIMEOUT_MS",
   "DEVSPACE_NEXT_ALLOWED_HOSTS",
   "DEVSPACE_TRUST_PROXY",
+  "DEVSPACE_NEXT_AUTHORITY_OWNER_INSTANCE_ID",
+  "DEVSPACE_RELEASE_MANIFEST",
+  "DEVSPACE_EXPECTED_SOURCE_REVISION",
+  "DEVSPACE_EXPECTED_RUNTIME_REVISION",
+  "DEVSPACE_EXPECTED_BUILD_DIGEST",
+  "DEVSPACE_EXPECTED_SCHEMA_GENERATION",
+  "DEVSPACE_EXPECTED_AUTHORITY_CONTRACT_GENERATION",
+  "DEVSPACE_EXPECTED_CONFIG_SCHEMA_IDENTITY",
+  "DEVSPACE_OAUTH_CANONICAL_CONNECTOR_NAME",
+  "DEVSPACE_OAUTH_CONNECTOR_INSTALLATION_EPOCH",
+  "DEVSPACE_NEXT_CANONICAL_CONNECTOR_NAME",
+  "DEVSPACE_SOURCE_REVISION",
+  "DEVSPACE_RUNTIME_REVISION",
+  "DEVSPACE_BUILD_DIGEST",
 }
 pattern=re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=")
 kept=[]
@@ -165,6 +184,11 @@ PYENV
     printf 'DEVSPACE_V2_DEPLOYMENT_MODE=%s\n' "$(quote production)"
     printf 'DEVSPACE_NEXT_HOST=%s\n' "$(quote 127.0.0.1)"
     printf 'DEVSPACE_NEXT_PORT=%s\n' "$(quote "$port")"
+    if (( port <= 64535 )); then
+      printf 'DEVSPACE_NEXT_MANAGEMENT_PORT=%s\n' "$(quote "$((port + 1000))")"
+    else
+      printf 'DEVSPACE_NEXT_MANAGEMENT_PORT=%s\n' "$(quote "$((port - 1000))")"
+    fi
     printf 'DEVSPACE_NEXT_PUBLIC_BASE_URL=%s\n' "$(quote "$PUBLIC_BASE_URL")"
     printf 'DEVSPACE_NEXT_MCP_PATH=%s\n' "$(quote /mcp)"
     printf 'DEVSPACE_NEXT_STATE_DIR=%s\n' "$(quote "$state_dir")"
@@ -179,6 +203,20 @@ PYENV
     printf 'DEVSPACE_NEXT_SELF_RESTART_TIMEOUT_MS=%s\n' "$(quote 120000)"
     printf 'DEVSPACE_NEXT_ALLOWED_HOSTS=%s\n' "$(quote "$ALLOWED_HOSTS")"
     printf 'DEVSPACE_TRUST_PROXY=%s\n' "$(quote 1)"
+    printf 'DEVSPACE_NEXT_AUTHORITY_OWNER_INSTANCE_ID=%s\n' "$(quote "$OWNER_INSTANCE_ID")"
+    printf 'DEVSPACE_RELEASE_MANIFEST=%s\n' "$(quote "$BUILD_MANIFEST")"
+    printf 'DEVSPACE_EXPECTED_SOURCE_REVISION=%s\n' "$(quote "$MANIFEST_SOURCE_REVISION")"
+    printf 'DEVSPACE_EXPECTED_RUNTIME_REVISION=%s\n' "$(quote "$MANIFEST_RUNTIME_REVISION")"
+    printf 'DEVSPACE_EXPECTED_BUILD_DIGEST=%s\n' "$(quote "$MANIFEST_BUILD_DIGEST")"
+    printf 'DEVSPACE_EXPECTED_SCHEMA_GENERATION=%s\n' "$(quote "$MANIFEST_SCHEMA_GENERATION")"
+    printf 'DEVSPACE_EXPECTED_AUTHORITY_CONTRACT_GENERATION=%s\n' "$(quote "$MANIFEST_AUTHORITY_GENERATION")"
+    printf 'DEVSPACE_EXPECTED_CONFIG_SCHEMA_IDENTITY=%s\n' "$(quote "$MANIFEST_CONFIG_SCHEMA_IDENTITY")"
+    printf 'DEVSPACE_OAUTH_CANONICAL_CONNECTOR_NAME=%s\n' "$(quote "$CANONICAL_CONNECTOR_NAME")"
+    printf 'DEVSPACE_OAUTH_CONNECTOR_INSTALLATION_EPOCH=%s\n' "$(quote "$CONNECTOR_INSTALLATION_EPOCH")"
+    printf 'DEVSPACE_NEXT_CANONICAL_CONNECTOR_NAME=%s\n' "$(quote "$CANONICAL_CONNECTOR_NAME")"
+    printf 'DEVSPACE_SOURCE_REVISION=%s\n' "$(quote "$MANIFEST_SOURCE_REVISION")"
+    printf 'DEVSPACE_RUNTIME_REVISION=%s\n' "$(quote "$MANIFEST_RUNTIME_REVISION")"
+    printf 'DEVSPACE_BUILD_DIGEST=%s\n' "$(quote "$MANIFEST_BUILD_DIGEST")"
   } >> "$temporary"
   chmod 600 "$temporary"
   mv -f "$temporary" "$path"
@@ -214,6 +252,9 @@ ENV_PROFILES_FILE="$(read_env DEVSPACE_NEXT_ENV_PROFILE_CONFIG)"
 ALLOWED_HOSTS="$(read_env DEVSPACE_NEXT_ALLOWED_HOSTS)"
 PRODUCTION_STATE_DIR="$(read_env DEVSPACE_NEXT_STATE_DIR)"
 CONFIGURED_OAUTH_STATE_DIR="$(read_env DEVSPACE_NEXT_OAUTH_STATE_DIR)"
+EXISTING_OWNER_INSTANCE_ID="$(read_env DEVSPACE_NEXT_AUTHORITY_OWNER_INSTANCE_ID)"
+CANONICAL_CONNECTOR_NAME="$(read_env DEVSPACE_OAUTH_CANONICAL_CONNECTOR_NAME)"
+CONNECTOR_INSTALLATION_EPOCH="$(read_env DEVSPACE_OAUTH_CONNECTOR_INSTALLATION_EPOCH)"
 [[ -n "$PUBLIC_BASE_URL" && -n "$TARGETS_FILE" && -n "$ROUTES_FILE" && -n "$ENV_PROFILES_FILE" ]] || {
   echo "Current production environment lacks required v2 paths." >&2
   exit 1
@@ -223,6 +264,15 @@ PUBLIC_HOST="$(python3 -c 'from urllib.parse import urlparse; import sys; print(
 [[ -n "$PUBLIC_HOST" ]] || { echo "Public base URL has no host: $PUBLIC_BASE_URL" >&2; exit 1; }
 [[ -n "$ALLOWED_HOSTS" ]] || ALLOWED_HOSTS="localhost,127.0.0.1,::1,$PUBLIC_HOST,127.0.0.1:$PRODUCTION_PORT,127.0.0.1:$CANDIDATE_PORT"
 [[ -n "$PRODUCTION_STATE_DIR" ]] || PRODUCTION_STATE_DIR="${HOME}/.local/share/devspace/universal-broker-v2-production"
+CANONICAL_CONNECTOR_NAME="${CANONICAL_CONNECTOR_NAME:-myDevSpace}"
+CONNECTOR_INSTALLATION_EPOCH="${CONNECTOR_INSTALLATION_EPOCH:-1}"
+[[ "$CANONICAL_CONNECTOR_NAME" =~ ^[A-Za-z][A-Za-z0-9._-]{0,127}$ ]] || { echo "Canonical connector name is invalid." >&2; exit 1; }
+[[ "$CONNECTOR_INSTALLATION_EPOCH" =~ ^[1-9][0-9]*$ ]] || { echo "Connector installation epoch is invalid." >&2; exit 1; }
+OWNER_INSTANCE_ID="$(node "$ROOT/scripts/ensure-owner-instance-id.mjs" "$IDENTITY_DIRECTORY")"
+[[ -z "$EXISTING_OWNER_INSTANCE_ID" || "$EXISTING_OWNER_INSTANCE_ID" == "$OWNER_INSTANCE_ID" ]] || {
+  echo "Production ownerInstanceId differs from the stable provisioned identity." >&2
+  exit 1
+}
 for file in "$TARGETS_FILE" "$ROUTES_FILE" "$ENV_PROFILES_FILE"; do
   [[ -f "$file" ]] || { echo "Required owner configuration is missing: $file" >&2; exit 1; }
 done
@@ -284,6 +334,7 @@ WORKER_LOG="$AUDIT_DIR/worker.log"
 SCHEDULER_EVIDENCE="$AUDIT_DIR/scheduler.json"
 CLEANUP_MONITOR_LOG="$AUDIT_DIR/scheduler-cleanup.log"
 RELEASE="$RELEASE_ROOT/$HEAD"
+IMMUTABLE_RELEASE="$RELEASE_ROOT/${HEAD}-package"
 NEW_SCRIPT="$RELEASE/scripts/start-universal-broker-v2-production.sh"
 CANDIDATE_NAME="devspace-v2-candidate-${HEAD:0:8}"
 CANDIDATE_STATE="$AUDIT_DIR/candidate-state"
@@ -339,6 +390,30 @@ fi
       npm run v2:load 2>&1 | tee "$FULL_LOAD_LOG"
   fi
 )
+if [[ -d "$IMMUTABLE_RELEASE" ]]; then
+  node "$RELEASE/scripts/release-artifacts.mjs" verify \
+    --package "$IMMUTABLE_RELEASE" --source-revision "$HEAD" --runtime-revision "$HEAD" \
+    >"$AUDIT_DIR/immutable-release.json"
+else
+  (
+    cd "$RELEASE"
+    node scripts/release-artifacts.mjs create \
+      --source . --output "$IMMUTABLE_RELEASE" --source-revision "$HEAD" --runtime-revision "$HEAD"
+  ) >"$AUDIT_DIR/immutable-release.json"
+fi
+BUILD_MANIFEST="$IMMUTABLE_RELEASE/BUILD-MANIFEST.json"
+MANIFEST_TSV="$(node -e '
+const v=require(process.argv[1]);
+process.stdout.write(["sourceRevision","runtimeRevision","buildDigest","schemaGeneration","authorityContractGeneration","configSchemaIdentity"].map(k=>v[k]).join("\t"));
+' "$BUILD_MANIFEST")"
+IFS=$'\t' read -r MANIFEST_SOURCE_REVISION MANIFEST_RUNTIME_REVISION MANIFEST_BUILD_DIGEST MANIFEST_SCHEMA_GENERATION MANIFEST_AUTHORITY_GENERATION MANIFEST_CONFIG_SCHEMA_IDENTITY <<<"$MANIFEST_TSV"
+[[ "$MANIFEST_SOURCE_REVISION" == "$HEAD" && "$MANIFEST_RUNTIME_REVISION" == "$HEAD" ]] || {
+  echo "Immutable release manifest revision does not bind the upgrade HEAD." >&2
+  exit 1
+}
+node "$RELEASE/scripts/release-artifacts.mjs" verify-runtime-tree \
+  --package "$IMMUTABLE_RELEASE" --runtime-root "$RELEASE" \
+  >"$AUDIT_DIR/source-runtime-equivalence.json"
 DIST_EVIDENCE="$(
   cd "$RELEASE"
   node --input-type=module -e \
@@ -367,6 +442,15 @@ run_pm2_with_environment_file "$CANDIDATE_ENV" \
   --cwd "$RELEASE" \
   --time
 wait_http "http://127.0.0.1:${CANDIDATE_PORT}/healthz" 200
+CANDIDATE_MANAGEMENT_PORT="$((CANDIDATE_PORT <= 64535 ? CANDIDATE_PORT + 1000 : CANDIDATE_PORT - 1000))"
+curl -fsS --max-time 10 "http://127.0.0.1:${CANDIDATE_PORT}/healthz" >"$AUDIT_DIR/candidate-gateway-identity.json"
+node "$RELEASE/scripts/release-artifacts.mjs" verify-gateway \
+  --package "$IMMUTABLE_RELEASE" --identity "$AUDIT_DIR/candidate-gateway-identity.json" \
+  >"$AUDIT_DIR/candidate-gateway-verification.json"
+curl -fsS --max-time 10 "http://127.0.0.1:${CANDIDATE_MANAGEMENT_PORT}/readyz" >"$AUDIT_DIR/candidate-runtime-identity.json"
+node "$RELEASE/scripts/release-artifacts.mjs" verify-runtime \
+  --package "$IMMUTABLE_RELEASE" --identity "$AUDIT_DIR/candidate-runtime-identity.json" \
+  >"$AUDIT_DIR/candidate-runtime-verification.json"
 LOCAL_METRICS="$(curl -sS --max-time 10 -H "Host: 127.0.0.1:${CANDIDATE_PORT}" -o /dev/null -w '%{http_code}' "http://127.0.0.1:${CANDIDATE_PORT}/metrics" || true)"
 PUBLIC_HOST_METRICS="$(curl -sS --max-time 10 -H "Host: $PUBLIC_HOST" -o /dev/null -w '%{http_code}' "http://127.0.0.1:${CANDIDATE_PORT}/metrics" || true)"
 [[ "$LOCAL_METRICS" == 200 && "$PUBLIC_HOST_METRICS" == 403 ]] || {
@@ -443,6 +527,7 @@ python3 - \
   "$REQUEST_PATH" "$STATUS_PATH" "$TRANSACTION_ID" "$REQUESTED_AT" \
   "$PROCESS_NAME" "$PM2_EXECUTABLE" "$GIT_EXECUTABLE" "$PREVIOUS_PID" "$PREVIOUS_CWD" "$PREVIOUS_SCRIPT" "$PREVIOUS_AUDIT_TARGET" \
   "$HEAD" "$SOURCE_TREE" "$DIST_FILES" "$DIST_SHA256" "$RELEASE" "$NEW_SCRIPT" "$PRODUCTION_ENV" "$ENV_BACKUP" "$NEXT_ENV" \
+  "$BUILD_MANIFEST" "$MANIFEST_BUILD_DIGEST" "$MANIFEST_RUNTIME_REVISION" "$MANIFEST_SCHEMA_GENERATION" "$MANIFEST_AUTHORITY_GENERATION" "$MANIFEST_CONFIG_SCHEMA_IDENTITY" \
   "$CANONICAL_START" "$START_BACKUP" "$AUDIT_DIR" "$CURRENT_AUDIT_LINK" "$WORKER_LOG" \
   "http://127.0.0.1:${PRODUCTION_PORT}/healthz" "${PUBLIC_BASE_URL}/healthz" \
   "${PUBLIC_BASE_URL}/metrics" "${PUBLIC_BASE_URL}/mcp" \
@@ -452,6 +537,7 @@ import json,os,sys,tempfile
   request_path,status_path,transaction_id,requested_at,
   process_name,pm2_executable,git_executable,previous_pid,previous_cwd,previous_script,previous_audit_target,
   head,source_tree,dist_files,dist_sha256,release,new_script,production_env,env_backup,next_env,
+  build_manifest,manifest_build_digest,manifest_runtime_revision,manifest_schema_generation,manifest_authority_generation,manifest_config_schema_identity,
   canonical_start,start_backup,audit_dir,current_audit_link,worker_log,
   local_health,public_health,public_metrics,public_mcp,oauth_metadata,live_evidence,
 )=sys.argv[1:]
@@ -476,6 +562,14 @@ request={
     "release":release,
     "script":new_script,
     "dist":{"files":int(dist_files),"sha256":dist_sha256},
+    "manifest":{
+      "path":build_manifest,
+      "buildDigest":manifest_build_digest,
+      "runtimeRevision":manifest_runtime_revision,
+      "schemaGeneration":manifest_schema_generation,
+      "authorityContractGeneration":manifest_authority_generation,
+      "configSchemaIdentity":manifest_config_schema_identity,
+    },
   },
   "productionEnvPath":production_env,
   "productionEnvBackupPath":env_backup,

@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import {
   McpServer,
   ResourceTemplate,
@@ -12,10 +11,20 @@ import type {
 import {
   OperationAuthorityRegistry,
   type AuthorityActionDescriptor,
-  type AuthorityGrant,
   type CreateOperationAuthorityInput,
+  type OperationAuthorityDispatchController,
   type RequestedAuthorityAction,
 } from "./authority.js";
+import {
+  resolveAuthorityPrincipal,
+  type AuthorityAuthenticationInfo,
+  type AuthorityPrincipalConfiguration,
+  type AuthorityRequestIdentity,
+} from "./authority-principal.js";
+import {
+  createCapabilityCallContextFromTrustedPrincipal,
+  type CapabilityCallContext,
+} from "./capability-call-context.js";
 import {
   artifactAction,
   artifactRisk,
@@ -34,16 +43,19 @@ import {
 } from "./authority-policy.js";
 import type { ContextRegistry } from "./contexts.js";
 import type { UniversalSelfManagementService } from "./self-management.js";
-import type {
-  ExecuteCommandInput,
-  ProcessOperationInput,
-  UniversalExecutionPlane,
+import {
+  type PreparedExecExecutionBinding,
+  type ExecuteCommandInput,
+  type ProcessOperationInput,
+  type UniversalExecutionPlane,
 } from "./execution.js";
 import type {
   UniversalFilesystemInput,
   UniversalFilesystemService,
 } from "./filesystem.js";
 import type {
+  McpInvocationAuthorityBinding,
+  PreparedMcpInvocation,
   UniversalMcpInput,
   UniversalMcpProxy,
 } from "./mcp-proxy.js";
@@ -56,19 +68,25 @@ import {
   UNIVERSAL_BROKER_VERSION,
   UNIVERSAL_TOOL_CONTRACTS,
   UNIVERSAL_TOOL_NAMES,
+  universalRequestMetaSchema,
   type AuthorityRiskClass,
+  type RuntimeIdentity,
+  type UniversalRequestMeta,
   type UniversalToolContract,
   type UniversalToolName,
 } from "./contracts.js";
 import {
   executeUniversalTool,
+  failedToolResult,
   successfulToolResult,
   UniversalBrokerError,
 } from "./errors.js";
 import {
+  assertTargetCapability,
   type TargetRegistry,
   targetSummary,
 } from "./targets.js";
+import type { UniversalBrokerMetrics } from "./metrics.js";
 
 export interface UniversalBrokerServices {
   targets?: TargetRegistry;
@@ -79,7 +97,15 @@ export interface UniversalBrokerServices {
   artifacts?: UniversalArtifactService;
   gui?: UniversalGuiService;
   authority?: OperationAuthorityRegistry;
+  authorityPrincipal?: AuthorityPrincipalConfiguration;
   selfManagement?: UniversalSelfManagementService;
+  runtimeIdentity?: RuntimeIdentity;
+  metrics?: UniversalBrokerMetrics;
+}
+
+interface UniversalBrokerRequestBoundary {
+  runtimeIdentity?: RuntimeIdentity;
+  metrics?: UniversalBrokerMetrics;
 }
 
 export function createUniversalBrokerMcpServer(
@@ -98,31 +124,84 @@ export function createUniversalBrokerMcpServer(
   const authority = services.authority ?? new OperationAuthorityRegistry({
     minimumRisk: minimumAuthorityRisk,
   });
+  const principalConfiguration = services.authorityPrincipal ?? {
+    environment: "production",
+    mode: "single-owner",
+  };
+  const authorityPrincipal: AuthorityPrincipalResolver = (extra) => (
+    resolveAuthorityPrincipal(extra, principalConfiguration).fingerprint
+  );
+  const requestBoundary: UniversalBrokerRequestBoundary = {
+    runtimeIdentity: services.runtimeIdentity,
+    metrics: services.metrics,
+  };
 
-  if (services.execution) registerProcessOutputResource(server, services.execution);
-  if (services.mcpProxy) registerMcpResultResource(server, services.mcpProxy);
-  if (services.contexts) registerContextDiffResource(server, services.contexts);
+  if (services.mcpProxy && services.metrics) {
+    services.mcpProxy.setOperationalObserver?.({
+      reconnect: ({ routeId, result }) => services.metrics!.recordMcpReconnect(routeId, result),
+      connection: ({ routeId, state }) => services.metrics!.recordMcpConnection(routeId, state),
+    });
+  }
+
+  if (services.execution) {
+    registerProcessOutputResource(server, services.execution, authorityPrincipal);
+  }
+  if (services.mcpProxy) registerMcpResultResource(server, services.mcpProxy, authorityPrincipal);
+  if (services.contexts) registerContextDiffResource(server, services.contexts, authorityPrincipal);
+  if (services.artifacts) registerArtifactResource(server, services.artifacts, authorityPrincipal);
 
   for (const name of UNIVERSAL_TOOL_NAMES) {
     if (name === "target" && services.targets) {
-      registerTargetTool(server, services.targets);
+      registerTargetTool(server, services.targets, authorityPrincipal, requestBoundary);
     } else if (name === "context" && services.contexts && services.targets) {
       registerContextTool(
         server,
         services.contexts,
         services.targets,
+        services.execution,
         services.mcpProxy,
         services.gui,
         authority,
+        authorityPrincipal,
+        requestBoundary,
       );
     } else if (name === "exec" && services.execution && services.targets && services.contexts) {
-      registerExecTool(server, services.execution, services.targets, services.contexts, authority);
+      registerExecTool(
+        server,
+        services.execution,
+        services.targets,
+        services.contexts,
+        authority,
+        authorityPrincipal,
+        requestBoundary,
+      );
     } else if (name === "process" && services.execution) {
-      registerProcessTool(server, services.execution, authority, services.selfManagement);
+      registerProcessTool(
+        server,
+        services.execution,
+        authority,
+        authorityPrincipal,
+        services.selfManagement,
+        requestBoundary,
+      );
     } else if (name === "fs" && services.filesystem && services.targets && services.contexts) {
-      registerFilesystemTool(server, services.filesystem, services.targets, services.contexts, authority);
+      registerFilesystemTool(
+        server,
+        services.filesystem,
+        services.targets,
+        services.contexts,
+        authority,
+        authorityPrincipal,
+        requestBoundary,
+      );
     } else if (name === "mcp" && services.mcpProxy) {
-      registerMcpTool(server, services.mcpProxy, authority);
+      registerMcpTool(
+        server,
+        services.mcpProxy,
+        authority,
+        authorityPrincipal,
+        requestBoundary,
+      );
     } else if (
       name === "artifact"
       && services.artifacts
@@ -135,14 +214,17 @@ export function createUniversalBrokerMcpServer(
         services.targets,
         services.contexts,
         authority,
+        authorityPrincipal,
+        requestBoundary,
       );
     } else if (name === "gui" && services.gui && services.targets) {
-      registerGuiTool(server, services.gui, authority);
+      registerGuiTool(server, services.gui, authority, authorityPrincipal, requestBoundary);
     } else {
       registerUnavailableTool(
         server,
         name,
         UNIVERSAL_TOOL_CONTRACTS[name] as UniversalToolContract,
+        requestBoundary,
       );
     }
   }
@@ -154,6 +236,8 @@ function registerGuiTool(
   server: McpServer,
   gui: UniversalGuiService,
   authority: OperationAuthorityRegistry,
+  authorityPrincipal: AuthorityPrincipalResolver,
+  requestBoundary: UniversalBrokerRequestBoundary,
 ): void {
   const contract = UNIVERSAL_TOOL_CONTRACTS.gui;
   registerAppTool(
@@ -166,27 +250,37 @@ function registerGuiTool(
       annotations: contract.annotations,
       _meta: {},
     },
-    async (input, extra) => executeUniversalTool(async () => {
-      requireScope(extra.authInfo?.scopes, "devspace.gui");
-      const typed = input as UniversalGuiInput;
-      const targetBinding = typed.operation === "act"
-        ? await gui.authorityTarget(typed)
-        : undefined;
+    async (input, extra) => executeMeasuredUniversalTool(
+      requestBoundary,
+      "gui",
+      input.operation,
+      extra,
+      async (requestMeta, observation) => {
+      const authenticated = requireAuthenticatedPrincipal(extra, authorityPrincipal);
+      requireScope(authenticated.authInfo, "devspace.gui");
+      const typed = mergeOperationRequestMeta(input, requestMeta) as UniversalGuiInput;
+      assertGenerationApplicability(requestMeta, "gui", typed.operation, {
+        target: true,
+        route: false,
+      });
+      const targetBinding = await gui.authorityTarget(typed, authenticated.callContext);
+      assertTargetGeneration(requestMeta, targetBinding.generation, observation);
       const action = bindTargetAuthority(
-        guiAction(typed, targetBinding?.target.id),
+        guiAction(typed, targetBinding.target.id),
         targetBinding,
       );
       const risk: AuthorityRiskClass = typed.operation === "act" ? "R3" : "R0";
       const data = await withOperationAuthority(
         authority,
         typed.authorityId,
-        authorityScope(extra),
+        () => authenticated.principalKeyFingerprint,
         action,
         risk,
-        () => gui.execute(typed),
+        () => gui.execute(typed, authenticated.callContext),
       );
       return successfulToolResult(data, undefined, guiSummaryText(typed.operation, data));
-    }),
+      },
+    ),
   );
 }
 
@@ -196,6 +290,8 @@ function registerArtifactTool(
   targets: TargetRegistry,
   contexts: ContextRegistry,
   authority: OperationAuthorityRegistry,
+  authorityPrincipal: AuthorityPrincipalResolver,
+  requestBoundary: UniversalBrokerRequestBoundary,
 ): void {
   const contract = UNIVERSAL_TOOL_CONTRACTS.artifact;
   registerAppTool(
@@ -208,25 +304,51 @@ function registerArtifactTool(
       annotations: contract.annotations,
       _meta: {},
     },
-    async (input, extra) => executeUniversalTool(async () => {
-      requireScope(extra.authInfo?.scopes, "devspace.artifact");
+    async (input, extra) => executeMeasuredUniversalTool(
+      requestBoundary,
+      "artifact",
+      input.operation,
+      extra,
+      async (requestMeta, observation) => {
+      const authenticated = requireAuthenticatedPrincipal(extra, authorityPrincipal);
+      requireScope(authenticated.authInfo, "devspace.artifact");
       requireScope(
-        extra.authInfo?.scopes,
+        authenticated.authInfo,
         input.operation === "publish" ? "devspace.read" : "devspace.write",
       );
-      const typed = input as UniversalArtifactInput;
+      const typed = mergeOperationRequestMeta(input, requestMeta) as UniversalArtifactInput;
+      assertGenerationApplicability(requestMeta, "artifact", typed.operation, {
+        target: true,
+        route: false,
+      });
       const normalized = await normalizeArtifactAuthority(
         typed,
         targets,
         contexts,
+        authenticated.callContext,
       );
+      for (const binding of normalized.bindings) {
+        assertTargetCapability(binding.target, "artifact");
+      }
+      const targetGenerations = [...new Set(
+        normalized.bindings.map((binding) => binding.generation),
+      )];
+      if (requestMeta.expectedTargetGeneration !== undefined && targetGenerations.length !== 1) {
+        assertGenerationApplicability(requestMeta, "artifact", typed.operation, {
+          target: false,
+          route: false,
+        });
+      }
+      if (targetGenerations.length === 1) {
+        assertTargetGeneration(requestMeta, targetGenerations[0]!, observation);
+      }
       const data = await withOperationAuthority(
         authority,
         typed.authorityId,
-        authorityScope(extra),
+        () => authenticated.principalKeyFingerprint,
         normalized.action,
         normalized.risk,
-        () => artifacts.execute(typed),
+        () => artifacts.execute(typed, authenticated.callContext),
       );
       const result = successfulToolResult(
         data,
@@ -248,7 +370,8 @@ function registerArtifactTool(
         });
       }
       return result;
-    }),
+      },
+    ),
   );
 }
 
@@ -256,6 +379,8 @@ function registerMcpTool(
   server: McpServer,
   proxy: UniversalMcpProxy,
   authority: OperationAuthorityRegistry,
+  authorityPrincipal: AuthorityPrincipalResolver,
+  requestBoundary: UniversalBrokerRequestBoundary,
 ): void {
   const contract = UNIVERSAL_TOOL_CONTRACTS.mcp;
   registerAppTool(
@@ -268,34 +393,68 @@ function registerMcpTool(
       annotations: contract.annotations,
       _meta: {},
     },
-    async (input, extra) => executeUniversalTool(async () => {
-      requireScope(extra.authInfo?.scopes, "devspace.mcp");
-      const typed = input as UniversalMcpInput;
+    async (input, extra) => executeMeasuredUniversalTool(
+      requestBoundary,
+      "mcp",
+      input.operation,
+      extra,
+      async (requestMeta, observation) => {
+      const authenticated = requireAuthenticatedPrincipal(extra, authorityPrincipal);
+      requireScope(authenticated.authInfo, "devspace.mcp");
+      const typed = mergeOperationRequestMeta(input, requestMeta) as UniversalMcpInput;
+      const routeSelector = typed.route ?? mcpResultRouteSelector(typed.uri);
+      const routeApplicable = typed.operation !== "routes"
+        && !(typed.operation === "close" && routeSelector === undefined);
+      assertGenerationApplicability(requestMeta, "mcp", typed.operation, {
+        target: false,
+        route: routeApplicable,
+      });
       let routeBinding: RouteAuthorityBinding | undefined;
-      if (typed.operation === "invoke") {
-        routeBinding = await proxy.inspectInvocation(typed);
-      } else if (typed.operation === "close") {
-        routeBinding = await proxy.inspectRoute(typed.route);
+      let preparedInvocation: PreparedMcpInvocation | undefined;
+      if (routeApplicable) {
+        routeBinding = await proxy.inspectRoute(routeSelector);
+        assertRouteGeneration(requestMeta, routeBinding.routeGeneration, observation);
       }
-      const action = bindRouteAuthority(
-        mcpAction(typed, routeBinding?.routeId),
-        routeBinding,
-      );
-      const risk = minimumAuthorityRisk(action);
-      const data = await withOperationAuthority(
-        authority,
-        typed.authorityId,
-        authorityScope(extra),
-        action,
-        risk,
-        () => proxy.execute(typed),
-      );
+      if (typed.operation === "invoke") {
+        preparedInvocation = await proxy.prepareInvocation(
+          typed,
+          authenticated.callContext,
+          requestMeta,
+        );
+        assertRouteGeneration(
+          requestMeta,
+          preparedInvocation.binding.routeGeneration,
+          observation,
+        );
+      }
+      const invocationBinding = preparedInvocation?.binding;
+      const action = invocationBinding
+        ? mcpAction(typed, invocationBinding)
+        : bindRouteAuthority(mcpAction(typed, routeBinding?.routeId), routeBinding);
+      const risk = invocationBinding?.risk ?? minimumAuthorityRisk(action);
+      let data: Record<string, unknown>;
+      try {
+        data = await withOperationAuthority(
+          authority,
+          typed.authorityId,
+          () => authenticated.principalKeyFingerprint,
+          action,
+          risk,
+          (dispatch) => preparedInvocation
+            ? preparedInvocation.execute(dispatch)
+            : proxy.execute(typed, authenticated.callContext, requestMeta),
+          { adapterBoundary: Boolean(preparedInvocation) },
+        );
+      } finally {
+        preparedInvocation?.release();
+      }
       return successfulToolResult(
         data,
         undefined,
         mcpSummaryText(typed.operation, data),
       );
-    }),
+      },
+    ),
   );
 }
 
@@ -305,6 +464,8 @@ function registerFilesystemTool(
   targets: TargetRegistry,
   contexts: ContextRegistry,
   authority: OperationAuthorityRegistry,
+  authorityPrincipal: AuthorityPrincipalResolver,
+  requestBoundary: UniversalBrokerRequestBoundary,
 ): void {
   const contract = UNIVERSAL_TOOL_CONTRACTS.fs;
   registerAppTool(
@@ -317,18 +478,30 @@ function registerFilesystemTool(
       annotations: contract.annotations,
       _meta: {},
     },
-    async (input, extra) => executeUniversalTool(async () => {
+    async (input, extra) => executeMeasuredUniversalTool(
+      requestBoundary,
+      "fs",
+      input.operation,
+      extra,
+      async (requestMeta, observation) => {
+      const authenticated = requireAuthenticatedPrincipal(extra, authorityPrincipal);
       requireScope(
-        extra.authInfo?.scopes,
+        authenticated.authInfo,
         isFilesystemMutation(input.operation) ? "devspace.write" : "devspace.read",
       );
-      const typed = input as UniversalFilesystemInput;
+      const typed = mergeOperationRequestMeta(input, requestMeta) as UniversalFilesystemInput;
+      assertGenerationApplicability(requestMeta, "fs", typed.operation, {
+        target: true,
+        route: false,
+      });
       const targetBinding = await resolveSelectedTargetBinding(
         targets,
         contexts,
         typed.target,
         typed.contextId,
+        authenticated.callContext,
       );
+      assertTargetGeneration(requestMeta, targetBinding.generation, observation);
       const action = bindTargetAuthority(
         filesystemAction(typed, targetBinding.target.id),
         targetBinding,
@@ -341,17 +514,18 @@ function registerFilesystemTool(
       const data = await withOperationAuthority(
         authority,
         typed.authorityId,
-        authorityScope(extra),
+        () => authenticated.principalKeyFingerprint,
         action,
         risk,
-        () => filesystem.execute(typed),
+        () => filesystem.execute(typed, authenticated.callContext),
       );
       return successfulToolResult(
         data,
         undefined,
         filesystemSummaryText(typed.operation, data),
       );
-    }),
+      },
+    ),
   );
 }
 
@@ -361,6 +535,8 @@ function registerExecTool(
   targets: TargetRegistry,
   contexts: ContextRegistry,
   authority: OperationAuthorityRegistry,
+  authorityPrincipal: AuthorityPrincipalResolver,
+  requestBoundary: UniversalBrokerRequestBoundary,
 ): void {
   const contract = UNIVERSAL_TOOL_CONTRACTS.exec;
   registerAppTool(
@@ -373,35 +549,82 @@ function registerExecTool(
       annotations: contract.annotations,
       _meta: {},
     },
-    async (input, extra) => executeUniversalTool(async () => {
-      requireScope(extra.authInfo?.scopes, "devspace.exec");
-      const typed = input as ExecuteCommandInput;
+    async (input, extra) => executeMeasuredUniversalTool(
+      requestBoundary,
+      "exec",
+      "run",
+      extra,
+      async (requestMeta, observation) => {
+      const authenticated = requireAuthenticatedPrincipal(extra, authorityPrincipal);
+      requireScope(authenticated.authInfo, "devspace.exec");
+      const typed = mergeOperationRequestMeta(input, requestMeta) as ExecuteCommandInput;
+      assertGenerationApplicability(requestMeta, "exec", "run", {
+        target: true,
+        route: false,
+      });
       const targetBinding = await resolveSelectedTargetBinding(
         targets,
         contexts,
         typed.target,
         typed.contextId,
+        authenticated.callContext,
       );
-      const resource = typed.cwd ?? typed.contextId ?? "default";
-      const action = bindTargetAuthority(
-        execAction(typed, targetBinding.target.id, resource),
-        targetBinding,
+      assertTargetGeneration(requestMeta, targetBinding.generation, observation);
+      const executionBinding = await execution.prepareAuthorityBinding(
+        typed,
+        targetBinding.target,
+        targetBinding.generation,
+        authenticated.callContext,
       );
+      const action = execAction(typed, targetBinding.target.id, executionBinding.effectiveCwd, {
+        targetGeneration: targetBinding.generation,
+        targetTransport: targetBinding.target.transport,
+        targetPlatform: targetBinding.target.platform,
+        shellDialect: targetBinding.target.shell,
+        effectiveEnvProfile: typed.envProfile ?? targetBinding.target.envProfile,
+        effectiveEnvProfileGeneration: executionBinding.effectiveEnvProfileGeneration,
+      });
       const risk = minimumAuthorityRisk(action);
+      assertExecBindingRisk(risk, executionBinding);
       const data = await withOperationAuthority(
         authority,
         typed.authorityId,
-        authorityScope(extra),
+        () => authenticated.principalKeyFingerprint,
         action,
         risk,
-        () => execution.execute(typed),
+        (dispatch) => execution.execute(
+          typed,
+          executionBinding,
+          dispatch,
+          authenticated.callContext,
+        ),
+        { adapterBoundary: true },
       );
       return successfulToolResult(
         data,
         undefined,
         processSummaryText(data),
       );
-    }),
+      },
+    ),
+  );
+}
+
+function assertExecBindingRisk(
+  actionRisk: AuthorityRiskClass,
+  executionBinding: PreparedExecExecutionBinding,
+): void {
+  if (actionRisk === executionBinding.launchRisk) return;
+  throw new UniversalBrokerError(
+    "PRECONDITION_FAILED",
+    "Exec action and execution-plane classifier bindings disagree; process dispatch was not attempted.",
+    {
+      evidence: {
+        actionRisk,
+        executionRisk: executionBinding.launchRisk,
+        classifierGeneration: executionBinding.classifierGeneration,
+      },
+    },
   );
 }
 
@@ -409,7 +632,9 @@ function registerProcessTool(
   server: McpServer,
   execution: UniversalExecutionPlane,
   authority: OperationAuthorityRegistry,
+  authorityPrincipal: AuthorityPrincipalResolver,
   selfManagement?: UniversalSelfManagementService,
+  requestBoundary: UniversalBrokerRequestBoundary = {},
 ): void {
   const contract = UNIVERSAL_TOOL_CONTRACTS.process;
   registerAppTool(
@@ -422,16 +647,45 @@ function registerProcessTool(
       annotations: contract.annotations,
       _meta: {},
     },
-    async (input, extra) => executeUniversalTool(async () => {
-      requireScope(extra.authInfo?.scopes, "devspace.exec");
-      const typed = input as ProcessOperationInput;
+    async (input, extra) => executeMeasuredUniversalTool(
+      requestBoundary,
+      "process",
+      input.operation,
+      extra,
+      async (requestMeta, observation) => {
+      const authenticated = requireAuthenticatedPrincipal(extra, authorityPrincipal);
+      requireScope(authenticated.authInfo, "devspace.exec");
+      const typed = mergeOperationRequestMeta(input, requestMeta) as ProcessOperationInput;
+      const targetApplicable = processOperationTargetsRecord(typed.operation);
+      assertGenerationApplicability(requestMeta, "process", typed.operation, {
+        target: targetApplicable,
+        route: false,
+      });
+      const observedProcessBinding = targetApplicable
+        ? execution.authorityBinding(
+            typed.processId,
+            typed.operation,
+            authenticated.callContext,
+          )
+        : undefined;
+      if (observedProcessBinding?.targetGeneration) {
+        assertTargetGeneration(
+          requestMeta,
+          observedProcessBinding.targetGeneration,
+          observation,
+        );
+      }
+      const processBinding = processOperationNeedsBinding(typed.operation)
+        ? observedProcessBinding
+        : undefined;
+      const action = processAction(typed, processBinding);
       const data = await withOperationAuthority(
         authority,
         typed.authorityId,
-        authorityScope(extra),
-        processAction(typed),
-        processRisk(typed.operation),
-        async () => {
+        () => authenticated.principalKeyFingerprint,
+        action,
+        processRisk(typed.operation, action.parameters),
+        async (dispatch) => {
           if (typed.operation === "restart_broker") {
             if (!selfManagement) return unavailableSelfManagement("restart_broker");
             return selfManagement.requestRestart({
@@ -449,8 +703,9 @@ function registerProcessTool(
             }
             return selfManagement.status(typed.transactionId);
           }
-          return execution.operate(typed);
+          return execution.operate(typed, dispatch, authenticated.callContext);
         },
+        { adapterBoundary: processOperationNeedsBinding(typed.operation) },
       );
       const text = typed.operation === "list"
         ? `Managed processes: ${Array.isArray(data.processes) ? data.processes.length : 0}`
@@ -460,7 +715,8 @@ function registerProcessTool(
             ? `Broker restart ${String(data.transactionId)}: ${String(data.state)}`
             : processSummaryText(data);
       return successfulToolResult(data, undefined, text);
-    }),
+      },
+    ),
   );
 }
 
@@ -471,9 +727,18 @@ function unavailableSelfManagement(operation: string): never {
   );
 }
 
+function processOperationNeedsBinding(operation: ProcessOperationInput["operation"]): boolean {
+  return ["write", "resize", "signal", "forget"].includes(operation);
+}
+
+function processOperationTargetsRecord(operation: ProcessOperationInput["operation"]): boolean {
+  return ["poll", "write", "resize", "signal", "wait", "forget"].includes(operation);
+}
+
 function registerProcessOutputResource(
   server: McpServer,
   execution: UniversalExecutionPlane,
+  authorityPrincipal: AuthorityPrincipalResolver,
 ): void {
   server.registerResource(
     "Universal Broker process output",
@@ -487,11 +752,17 @@ function registerProcessOutputResource(
       mimeType: "text/plain",
     },
     async (uri, variables, extra) => {
-      requireScope(extra.authInfo?.scopes, "devspace.exec");
+      const authenticated = requireAuthenticatedPrincipal(extra, authorityPrincipal);
+      requireScope(authenticated.authInfo, "devspace.exec");
       const processId = templateVariable(variables.processId, "processId");
       const offset = numericTemplateVariable(variables.offset, "offset", 0, Number.MAX_SAFE_INTEGER);
       const limit = numericTemplateVariable(variables.limit, "limit", 1, 1_048_576);
-      const chunk = await execution.readOutput(processId, offset, limit);
+      const chunk = await execution.readOutput(
+        processId,
+        offset,
+        limit,
+        authenticated.callContext,
+      );
       return {
         contents: [{
           uri: uri.href,
@@ -513,11 +784,12 @@ function registerProcessOutputResource(
 function registerMcpResultResource(
   server: McpServer,
   proxy: UniversalMcpProxy,
+  authorityPrincipal: AuthorityPrincipalResolver,
 ): void {
   server.registerResource(
     "Universal Broker MCP result",
     new ResourceTemplate(
-      "devspace://mcp-result/{resultId}/{offset}/{limit}",
+      "devspace://mcp/{routeId}/result/{resultId}/{offset}/{limit}",
       { list: undefined },
     ),
     {
@@ -526,8 +798,9 @@ function registerMcpResultResource(
       mimeType: "application/json",
     },
     async (uri, _variables, extra) => {
-      requireScope(extra.authInfo?.scopes, "devspace.mcp");
-      const page = proxy.readStoredResult(uri.href);
+      const authenticated = requireAuthenticatedPrincipal(extra, authorityPrincipal);
+      requireScope(authenticated.authInfo, "devspace.mcp");
+      const page = proxy.readStoredResult(uri.href, authenticated.callContext);
       return {
         contents: [{
           uri: uri.href,
@@ -542,7 +815,48 @@ function registerMcpResultResource(
   );
 }
 
-function registerTargetTool(server: McpServer, targets: TargetRegistry): void {
+function registerArtifactResource(
+  server: McpServer,
+  artifacts: UniversalArtifactService,
+  authorityPrincipal: AuthorityPrincipalResolver,
+): void {
+  server.registerResource(
+    "Universal Broker artifact",
+    new ResourceTemplate("devspace://artifact/{artifactId}", { list: undefined }),
+    {
+      title: "Immutable artifact content",
+      description: "Owner-bound bytes from an immutable Universal Broker CAS artifact.",
+      mimeType: "application/octet-stream",
+    },
+    async (uri, _variables, extra) => {
+      const authenticated = requireAuthenticatedPrincipal(extra, authorityPrincipal);
+      requireScope(authenticated.authInfo, "devspace.artifact");
+      requireScope(authenticated.authInfo, "devspace.read");
+      const page = await artifacts.readResource(uri.href, authenticated.callContext);
+      return {
+        contents: [{
+          uri: uri.href,
+          mimeType: String(page.mimeType ?? "application/octet-stream"),
+          blob: String(page.blobBase64 ?? ""),
+          _meta: Object.fromEntries(
+            Object.entries(page).filter(([key]) => ![
+              "uri",
+              "mimeType",
+              "blobBase64",
+            ].includes(key)),
+          ),
+        }],
+      };
+    },
+  );
+}
+
+function registerTargetTool(
+  server: McpServer,
+  targets: TargetRegistry,
+  authorityPrincipal: AuthorityPrincipalResolver,
+  requestBoundary: UniversalBrokerRequestBoundary,
+): void {
   const contract = UNIVERSAL_TOOL_CONTRACTS.target;
   registerAppTool(
     server,
@@ -554,8 +868,20 @@ function registerTargetTool(server: McpServer, targets: TargetRegistry): void {
       annotations: contract.annotations,
       _meta: {},
     },
-    async ({ operation, selector, targetId, refresh, cursor, limit }, extra) => executeUniversalTool(async () => {
-      requireScope(extra.authInfo?.scopes, "devspace.read");
+    async (input, extra) => executeMeasuredUniversalTool(
+      requestBoundary,
+      "target",
+      input.operation,
+      extra,
+      async (requestMeta, observation) => {
+      const authenticated = requireAuthenticatedPrincipal(extra, authorityPrincipal);
+      requireScope(authenticated.authInfo, "devspace.read");
+      const { operation, selector, targetId, refresh, cursor, limit } =
+        mergeOperationRequestMeta(input, requestMeta);
+      assertGenerationApplicability(requestMeta, "target", operation, {
+        target: operation !== "list",
+        route: false,
+      });
       switch (operation) {
         case "list": {
           const data = await targets.list({ cursor, limit });
@@ -565,6 +891,7 @@ function registerTargetTool(server: McpServer, targets: TargetRegistry): void {
           const { generation, target: resolved } = await targets.resolveWithGeneration(
             selector ?? targetId,
           );
+          assertTargetGeneration(requestMeta, generation, observation);
           const data = {
             generation,
             target: targetSummary(resolved),
@@ -572,15 +899,18 @@ function registerTargetTool(server: McpServer, targets: TargetRegistry): void {
           return successfulToolResult(data, undefined, `Resolved target: ${resolved.id}`);
         }
         case "probe": {
-          const observation = await targets.probe(targetId ?? selector, { refresh });
+          const binding = await targets.resolveWithGeneration(targetId ?? selector);
+          assertTargetGeneration(requestMeta, binding.generation, observation);
+          const targetObservation = await targets.probe(binding.target.id, { refresh });
           return successfulToolResult(
-            { observation },
+            { observation: targetObservation },
             undefined,
-            `${observation.targetId}: ${observation.status}`,
+            `${targetObservation.targetId}: ${targetObservation.status}`,
           );
         }
       }
-    }),
+      },
+    ),
   );
 }
 
@@ -588,9 +918,12 @@ function registerContextTool(
   server: McpServer,
   contexts: ContextRegistry,
   targets: TargetRegistry,
+  execution: UniversalExecutionPlane | undefined,
   mcpProxy: UniversalMcpProxy | undefined,
   gui: UniversalGuiService | undefined,
   authority: OperationAuthorityRegistry,
+  authorityPrincipal: AuthorityPrincipalResolver,
+  requestBoundary: UniversalBrokerRequestBoundary,
 ): void {
   const contract = UNIVERSAL_TOOL_CONTRACTS.context;
   registerAppTool(
@@ -603,41 +936,68 @@ function registerContextTool(
       annotations: contract.annotations,
       _meta: {},
     },
-    async ({
-      operation,
-      contextId,
-      target,
-      path,
-      mode,
-      baseRef,
-      task,
-      query,
-      cursor,
-      limit,
-      maxCharacters,
-      authorityId,
-      taskId,
-      authorityText,
-      actions,
-      correctionText,
-      expiresInSeconds,
-    }, extra) => executeUniversalTool(async () => {
-      requireScope(extra.authInfo?.scopes, "devspace.read");
-      const scopeId = authorityScope(extra);
+    async (input, extra) => executeMeasuredUniversalTool(
+      requestBoundary,
+      "context",
+      input.operation,
+      extra,
+      async (requestMeta, observation) => {
+      const authenticated = requireAuthenticatedPrincipal(extra, authorityPrincipal);
+      requireScope(authenticated.authInfo, "devspace.read");
+      const {
+        operation,
+        contextId,
+        target,
+        path,
+        mode,
+        baseRef,
+        task,
+        query,
+        cursor,
+        limit,
+        maxCharacters,
+        authorityId,
+        taskInstanceId,
+        taskLabel,
+        taskId,
+        authorityText,
+        actions,
+        correctionText,
+        expiresInSeconds,
+      } = mergeOperationRequestMeta(input, requestMeta);
+      const targetApplicable = ["open", "search", "diff", "close"].includes(operation);
+      assertGenerationApplicability(requestMeta, "context", operation, {
+        target: targetApplicable,
+        route: false,
+      });
+      let openTargetBinding: ResolvedTargetAuthorityBinding | undefined;
+      if (operation === "open") {
+        openTargetBinding = await targets.resolveWithGeneration(target);
+        assertTargetGeneration(requestMeta, openTargetBinding.generation, observation);
+      } else if (operation === "search" && !contextId) {
+        const localBinding = await targets.resolveWithGeneration("local");
+        assertTargetGeneration(requestMeta, localBinding.generation, observation);
+      } else if (targetApplicable && contextId) {
+        const context = await contexts.get(contextId, authenticated.callContext);
+        assertTargetGeneration(requestMeta, context.targetGeneration, observation);
+      }
+      const principal = () => authenticated.principalKeyFingerprint;
       if (operation === "close" || (operation === "open" && mode === "worktree")) {
-        requireScope(extra.authInfo?.scopes, "devspace.write");
+        requireScope(authenticated.authInfo, "devspace.write");
       }
       switch (operation) {
         case "authority_preview": {
-          requireAuthorityPlanningInputScopes(extra.authInfo?.scopes, actions);
+          requireAuthorityPlanningInputScopes(authenticated.authInfo, actions);
           const normalizedActions = await normalizeRequestedAuthorityActions(
             actions,
             targets,
             contexts,
+            execution,
             mcpProxy,
             gui,
+            authenticated.callContext,
           );
-          requireAuthorityPlanningScopes(extra.authInfo?.scopes, normalizedActions);
+          requireAuthorityPlanningScopes(authenticated.authInfo, normalizedActions);
           const data = authority.preview(normalizedActions);
           return successfulToolResult(
             data,
@@ -646,21 +1006,24 @@ function registerContextTool(
           );
         }
         case "authorize": {
-          requireAuthorityPlanningInputScopes(extra.authInfo?.scopes, actions);
+          requireAuthorityPlanningInputScopes(authenticated.authInfo, actions);
           const normalizedActions = await normalizeRequestedAuthorityActions(
             actions,
             targets,
             contexts,
+            execution,
             mcpProxy,
             gui,
+            authenticated.callContext,
           );
-          requireAuthorityPlanningScopes(extra.authInfo?.scopes, normalizedActions);
+          requireAuthorityPlanningScopes(authenticated.authInfo, normalizedActions);
           const data = authority.create({
-            taskId: taskId ?? "",
+            taskInstanceId,
+            taskLabel: taskLabel ?? taskId,
             authorityText: authorityText ?? "",
             actions: normalizedActions,
             expiresInSeconds,
-          } satisfies CreateOperationAuthorityInput, scopeId);
+          } satisfies CreateOperationAuthorityInput, principal());
           return successfulToolResult(
             data,
             undefined,
@@ -674,11 +1037,15 @@ function registerContextTool(
               "context.authority_status requires authorityId.",
             );
           }
-          const data = authority.status(authorityId, scopeId);
+          const data = authority.status(authorityId, principal());
           return successfulToolResult(data, undefined, `Task authority status: ${authorityId}`);
         }
         case "invalidate_authority": {
-          const data = authority.invalidate(scopeId, correctionText ?? "");
+          const data = authority.invalidate(
+            principal(),
+            taskInstanceId ?? "",
+            correctionText ?? "",
+          );
           return successfulToolResult(
             data,
             undefined,
@@ -692,33 +1059,38 @@ function registerContextTool(
               "context.release_authority requires authorityId.",
             );
           }
-          const data = authority.release(authorityId, scopeId);
+          const data = authority.release(authorityId, principal());
           return successfulToolResult(data, undefined, `Released task authority ${authorityId}.`);
         }
         case "open": {
           const rawAction = contextAction(operation, { target, path, contextId, mode, baseRef });
-          const targetBinding = mode === "worktree"
-            ? await targets.resolveWithGeneration(target)
-            : undefined;
-          const action = bindTargetAuthority(rawAction, targetBinding);
+          const action = bindTargetAuthority(rawAction, openTargetBinding);
           const data = await withOperationAuthority(
             authority,
             authorityId,
-            scopeId,
+            principal,
             action,
             minimumAuthorityRisk(action),
-            () => contexts.open({ target, path, mode, baseRef, task }),
+            () => contexts.open(
+              { target, path, mode, baseRef, task },
+              authenticated.callContext,
+            ),
           );
           return successfulToolResult(
             data,
             undefined,
             data.reused
-              ? `Reused context ${data.contextId} at ${data.root}`
+              ? `Reused context ${data.contextId} (${data.targetId}@${
+                data.targetGeneration.slice(0, 12)
+              })`
               : `Opened context ${data.contextId} at ${data.root}`,
           );
         }
         case "search": {
-          const data = await contexts.search({ contextId, query, cursor, limit });
+          const data = await contexts.search(
+            { contextId, query, cursor, limit },
+            authenticated.callContext,
+          );
           const count = Array.isArray(data.results) ? data.results.length : 0;
           return successfulToolResult(data, undefined, `Context search returned ${count} result(s).`);
         }
@@ -733,10 +1105,10 @@ function registerContextTool(
           const data = await withOperationAuthority(
             authority,
             authorityId,
-            scopeId,
+            principal,
             action,
             minimumAuthorityRisk(action),
-            () => contexts.close(contextId),
+            () => contexts.close(contextId, authenticated.callContext),
           );
           return successfulToolResult(data, undefined, `Closed context ${contextId}.`);
         }
@@ -747,7 +1119,10 @@ function registerContextTool(
               "context.diff requires contextId.",
             );
           }
-          const data = await contexts.diff({ contextId, maxCharacters });
+          const data = await contexts.diff(
+            { contextId, maxCharacters },
+            authenticated.callContext,
+          );
           return successfulToolResult(
             data,
             undefined,
@@ -755,13 +1130,15 @@ function registerContextTool(
           );
         }
       }
-    }),
+      },
+    ),
   );
 }
 
 function registerContextDiffResource(
   server: McpServer,
   contexts: ContextRegistry,
+  authorityPrincipal: AuthorityPrincipalResolver,
 ): void {
   server.registerResource(
     "Universal Broker context diff",
@@ -775,8 +1152,9 @@ function registerContextDiffResource(
       mimeType: "text/x-diff",
     },
     async (uri, _variables, extra) => {
-      requireScope(extra.authInfo?.scopes, "devspace.read");
-      const page = contexts.readDiffResource(uri.href);
+      const authenticated = requireAuthenticatedPrincipal(extra, authorityPrincipal);
+      requireScope(authenticated.authInfo, "devspace.read");
+      const page = contexts.readDiffResource(uri.href, authenticated.callContext);
       return {
         contents: [{
           uri: uri.href,
@@ -791,45 +1169,373 @@ function registerContextDiffResource(
   );
 }
 
-interface AuthorityRequestExtra {
-  authInfo?: { clientId?: string };
-  sessionId?: string;
+type AuthorityRequestExtra = AuthorityRequestIdentity & {
+  _meta?: Record<string, unknown>;
+  requestId?: string | number;
+};
+type AuthorityPrincipalResolver = (extra: AuthorityRequestExtra) => string;
+
+interface AuthenticatedAuthorityRequest {
+  authInfo: AuthorityAuthenticationInfo;
+  principalKeyFingerprint: string;
+  callContext: CapabilityCallContext;
+}
+
+interface GenerationObservation {
+  targetGeneration?: string;
+  routeGeneration?: string;
+}
+
+async function executeMeasuredUniversalTool(
+  boundary: UniversalBrokerRequestBoundary,
+  tool: UniversalToolName,
+  operation: string,
+  extra: AuthorityRequestExtra,
+  callback: (
+    requestMeta: UniversalRequestMeta,
+    observation: GenerationObservation,
+  ) => Promise<CallToolResult>,
+): Promise<CallToolResult> {
+  const startedAt = performance.now();
+  const observation: GenerationObservation = {};
+  const result = await executeUniversalTool(async () => {
+    const requestMeta = requestMetaFromExtra(extra);
+    assertSchemaGeneration(requestMeta, boundary.runtimeIdentity);
+    assertHumanApprovalVerifier(requestMeta);
+    return callback(requestMeta, observation);
+  });
+  applyObservedGenerations(result, boundary.runtimeIdentity, observation);
+  const metrics = boundary.metrics;
+  if (!metrics) return result;
+  const measured = measuredToolResult(result, tool);
+  try {
+    metrics.recordToolRequest(tool, operation, measured.result, performance.now() - startedAt);
+    if (measured.result === "unknown") {
+      metrics.recordDispatchUnknown(measured.transport);
+    }
+  } catch {
+    // Instrumentation must never replace the bounded tool result.
+  }
+  return result;
+}
+
+function requestMetaFromExtra(extra: AuthorityRequestExtra): UniversalRequestMeta {
+  const candidate = extra._meta?.devspace;
+  if (candidate === undefined) return {};
+  const parsed = universalRequestMetaSchema.safeParse(candidate);
+  if (parsed.success) return parsed.data;
+  throw new UniversalBrokerError(
+    "INVALID_ARGUMENT",
+    "MCP request metadata at params._meta.devspace is invalid.",
+    {
+      evidence: {
+        providerDispatchCount: 0,
+        issues: parsed.error.issues.slice(0, 20).map((issue) => ({
+          path: issue.path.join("."),
+          message: issue.message,
+        })),
+      },
+    },
+  );
+}
+
+function assertSchemaGeneration(
+  requestMeta: UniversalRequestMeta,
+  runtimeIdentity: RuntimeIdentity | undefined,
+): void {
+  const expected = requestMeta.expectedSchemaGeneration;
+  if (expected === undefined) return;
+  const observed = runtimeIdentity?.schemaGeneration ?? `sha256:${"0".repeat(64)}`;
+  if (expected === observed) return;
+  throw new UniversalBrokerError(
+    "SCHEMA_STALE",
+    "The request schema generation does not match this broker runtime.",
+    {
+      evidence: {
+        expectedSchemaGeneration: expected,
+        observedSchemaGeneration: observed,
+        providerDispatchCount: 0,
+        durableClaimCount: 0,
+      },
+    },
+  );
+}
+
+function assertHumanApprovalVerifier(requestMeta: UniversalRequestMeta): void {
+  if (requestMeta.humanApprovalAttestation === undefined) return;
+  throw new UniversalBrokerError(
+    "HUMAN_ATTESTATION_REQUIRED",
+    "Human approval attestation was supplied, but no verifier is configured.",
+    {
+      evidence: {
+        reasonCode: "HUMAN_APPROVAL_VERIFIER_UNAVAILABLE",
+        providerDispatchCount: 0,
+        durableClaimCount: 0,
+      },
+    },
+  );
+}
+
+function mergeOperationRequestMeta<T extends Record<string, unknown>>(
+  input: T,
+  requestMeta: UniversalRequestMeta,
+): T {
+  const merged: Record<string, unknown> = { ...input };
+  for (const field of ["authorityId", "taskInstanceId", "transactionId"] as const) {
+    const argumentValue = merged[field];
+    const metadataValue = requestMeta[field];
+    if (
+      typeof argumentValue === "string"
+      && metadataValue !== undefined
+      && argumentValue !== metadataValue
+    ) {
+      throw new UniversalBrokerError(
+        "INVALID_ARGUMENT",
+        `Tool argument ${field} conflicts with params._meta.devspace.${field}.`,
+        { evidence: { field, providerDispatchCount: 0, durableClaimCount: 0 } },
+      );
+    }
+    if (argumentValue === undefined && metadataValue !== undefined) {
+      merged[field] = metadataValue;
+    }
+  }
+  return merged as T;
+}
+
+function assertGenerationApplicability(
+  requestMeta: UniversalRequestMeta,
+  tool: UniversalToolName,
+  operation: string,
+  applicable: { target: boolean; route: boolean },
+): void {
+  const invalidField = requestMeta.expectedTargetGeneration !== undefined && !applicable.target
+    ? "expectedTargetGeneration"
+    : requestMeta.expectedRouteGeneration !== undefined && !applicable.route
+      ? "expectedRouteGeneration"
+      : undefined;
+  if (!invalidField) return;
+  throw new UniversalBrokerError(
+    "INVALID_ARGUMENT",
+    `${invalidField} does not apply to ${tool}.${operation}.`,
+    {
+      evidence: {
+        field: invalidField,
+        tool,
+        operation,
+        providerDispatchCount: 0,
+        durableClaimCount: 0,
+      },
+    },
+  );
+}
+
+function assertTargetGeneration(
+  requestMeta: UniversalRequestMeta,
+  observed: string,
+  observation: GenerationObservation,
+): void {
+  observation.targetGeneration = observed;
+  const expected = requestMeta.expectedTargetGeneration;
+  if (expected === undefined || expected === observed) return;
+  throw new UniversalBrokerError(
+    "AUTHORITY_STALE",
+    "The expected target generation is stale; provider dispatch was not attempted.",
+    {
+      evidence: {
+        expectedTargetGeneration: expected,
+        observedTargetGeneration: observed,
+        targetGeneration: observed,
+        providerDispatchCount: 0,
+        durableClaimCount: 0,
+      },
+    },
+  );
+}
+
+function assertRouteGeneration(
+  requestMeta: UniversalRequestMeta,
+  observed: string,
+  observation: GenerationObservation,
+): void {
+  observation.routeGeneration = observed;
+  const expected = requestMeta.expectedRouteGeneration;
+  if (expected === undefined || expected === observed) return;
+  throw new UniversalBrokerError(
+    "AUTHORITY_STALE",
+    "The expected MCP route generation is stale; provider dispatch was not attempted.",
+    {
+      evidence: {
+        expectedRouteGeneration: expected,
+        observedRouteGeneration: observed,
+        routeGeneration: observed,
+        providerDispatchCount: 0,
+        durableClaimCount: 0,
+      },
+    },
+  );
+}
+
+function applyObservedGenerations(
+  result: CallToolResult,
+  runtimeIdentity: RuntimeIdentity | undefined,
+  observation: GenerationObservation,
+): void {
+  const envelope = result.structuredContent;
+  if (!envelope || typeof envelope !== "object") return;
+  if (runtimeIdentity) envelope.observedSchemaGeneration = runtimeIdentity.schemaGeneration;
+  if (observation.targetGeneration) {
+    envelope.observedTargetGeneration = observation.targetGeneration;
+  }
+  if (observation.routeGeneration) {
+    envelope.observedRouteGeneration = observation.routeGeneration;
+  }
+}
+
+function measuredToolResult(
+  result: CallToolResult,
+  tool: UniversalToolName,
+): { result: "pass" | "fail" | "unknown"; transport: string } {
+  const envelope = result.structuredContent;
+  if (!envelope || typeof envelope !== "object") {
+    return { result: result.isError === true ? "fail" : "pass", transport: tool };
+  }
+  if (envelope.ok === true) {
+    const data = recordValue(envelope.data);
+    return {
+      result: data?.state === "UNKNOWN" ? "unknown" : "pass",
+      transport: measuredTransport(data, tool),
+    };
+  }
+  const error = recordValue(envelope.error);
+  const evidence = recordValue(error?.evidence);
+  const unknown = error?.dispatchState === "UNKNOWN"
+    || [
+      "AUTHORITY_STATE_UNCERTAIN",
+      "MCP_RESULT_UNKNOWN",
+      "EXECUTION_STATE_UNKNOWN",
+      "TRANSPORT_INTERRUPTED",
+    ].includes(String(error?.code ?? ""));
+  return {
+    result: unknown ? "unknown" : "fail",
+    transport: measuredTransport(evidence, tool),
+  };
+}
+
+function measuredTransport(
+  value: Record<string, unknown> | undefined,
+  fallback: UniversalToolName,
+): string {
+  for (const field of ["targetTransport", "transport"] as const) {
+    const candidate = value?.[field];
+    if (typeof candidate === "string" && candidate.trim()) return candidate;
+  }
+  return fallback === "mcp" ? "mcp" : fallback;
+}
+
+function recordValue(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function requireAuthenticatedPrincipal(
+  extra: AuthorityRequestExtra,
+  authorityPrincipal: AuthorityPrincipalResolver,
+): AuthenticatedAuthorityRequest {
+  const authInfo = extra.authInfo;
+  if (!authInfo) {
+    throw new UniversalBrokerError(
+      "AUTHENTICATION_FAILED",
+      "Validated authentication information is required for configured broker capabilities.",
+    );
+  }
+  const principalKeyFingerprint = authorityPrincipal(extra);
+  return {
+    authInfo,
+    principalKeyFingerprint,
+    callContext: createCapabilityCallContextFromTrustedPrincipal({
+      principalKeyFingerprint,
+    }),
+  };
 }
 
 async function withOperationAuthority<T extends Record<string, unknown>>(
   authority: OperationAuthorityRegistry,
   authorityId: string | undefined,
-  scopeId: string,
+  principalKeyFingerprint: () => string,
   action: AuthorityActionDescriptor,
   risk: AuthorityRiskClass,
-  execute: () => Promise<T>,
+  execute: (dispatch?: OperationAuthorityDispatchController) => Promise<T>,
+  options: { adapterBoundary?: boolean } = {},
 ): Promise<T> {
-  let grant: AuthorityGrant | undefined;
-  grant = authority.require(authorityId, scopeId, action, risk);
+  if (risk === "R0") return execute(undefined);
+  const dispatch = authority.prepareDispatch(
+    authorityId,
+    principalKeyFingerprint(),
+    action,
+    risk,
+  );
+  if (!options.adapterBoundary) {
+    try {
+      dispatch.claim();
+      dispatch.markDispatched();
+    } catch (error) {
+      if (dispatch.phase === "CLAIMED") {
+        dispatch.cancelNotDispatched({
+          providerCallCount: 0,
+          proof: "COARSE_BOUNDARY_PROVIDER_CALL_ZERO",
+        });
+      }
+      throw error;
+    }
+  }
+  let value: T;
   try {
-    const value = await execute();
-    authority.record(grant, "PASS", {
-      tool: action.tool,
-      operation: action.operation,
-    });
-    return value;
+    value = await execute(dispatch);
   } catch (error) {
+    if (dispatch.phase === "CLAIMED") {
+      try {
+        dispatch.cancelNotDispatched({
+          providerCallCount: 0,
+          proof: "ADAPTER_BOUNDARY_PROVIDER_CALL_ZERO",
+        });
+      } catch (cancellationError) {
+        throw cancellationError;
+      }
+      throw error;
+    }
+    if (dispatch.phase !== "DISPATCHED") throw error;
     const uncertain = error instanceof UniversalBrokerError
       && ["MCP_RESULT_UNKNOWN", "EXECUTION_STATE_UNKNOWN", "TRANSPORT_INTERRUPTED"].includes(error.code);
-    authority.record(grant, uncertain ? "UNCERTAIN" : "FAIL", {
+    dispatch.complete(uncertain ? "UNCERTAIN" : "FAIL", {
       tool: action.tool,
       operation: action.operation,
       errorCode: error instanceof UniversalBrokerError ? error.code : "UNEXPECTED_ERROR",
     });
     throw error;
   }
+  if (dispatch.phase === "CLAIMED") {
+    dispatch.cancelNotDispatched({
+      providerCallCount: 0,
+      proof: "ADAPTER_BOUNDARY_PROVIDER_CALL_ZERO",
+    });
+    return value;
+  }
+  if (dispatch.phase === "READY") return value;
+  const terminalState = successfulDispatchTerminalState(value);
+  dispatch.complete(terminalState, {
+    tool: action.tool,
+    operation: action.operation,
+  });
+  return value;
 }
 
-function authorityScope(extra: AuthorityRequestExtra): string {
-  const clientId = extra.authInfo?.clientId?.trim();
-  if (clientId) return `oauth-client:${clientId}`;
-  const sessionId = extra.sessionId?.trim() || "sessionless";
-  return `anonymous-session:${sessionId}`;
+function successfulDispatchTerminalState(
+  value: Record<string, unknown>,
+): "PASS" | "FAIL" | "UNCERTAIN" {
+  if (value.state === "UNKNOWN") return "UNCERTAIN";
+  if (value.state === "FAILED") return "FAIL";
+  return "PASS";
 }
 
 type ResolvedTargetAuthorityBinding = Awaited<ReturnType<TargetRegistry["resolveWithGeneration"]>>;
@@ -839,8 +1545,9 @@ async function resolveSelectedTargetBinding(
   contexts: ContextRegistry,
   selector: string | undefined,
   contextId: string | undefined,
+  callContext?: CapabilityCallContext,
 ): Promise<ResolvedTargetAuthorityBinding> {
-  const context = contextId ? await contexts.get(contextId) : undefined;
+  const context = contextId ? await contexts.get(contextId, callContext) : undefined;
   const binding = await targets.resolveWithGeneration(selector ?? context?.targetId);
   if (context && context.targetId !== binding.target.id) {
     throw new UniversalBrokerError(
@@ -868,8 +1575,18 @@ function bindTargetAuthority(
 
 interface RouteAuthorityBinding {
   routeId: string;
-  routeFingerprint: string;
-  annotations?: Record<string, unknown>;
+  routeGeneration: string;
+}
+
+function mcpResultRouteSelector(uri: string | undefined): string | undefined {
+  if (!uri?.startsWith("devspace://mcp/")) return undefined;
+  try {
+    const parsed = new URL(uri);
+    const [routeId, marker] = parsed.pathname.split("/").filter(Boolean);
+    return marker === "result" && routeId ? decodeURIComponent(routeId) : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function bindRouteAuthority(
@@ -877,16 +1594,12 @@ function bindRouteAuthority(
   binding: RouteAuthorityBinding | undefined,
 ): AuthorityActionDescriptor {
   if (!binding) return action;
-  const readOnly = binding.annotations?.readOnlyHint === true;
-  const destructive = binding.annotations?.destructiveHint === true;
   return {
     ...action,
     resource: binding.routeId,
     parameters: {
       ...(action.parameters ?? {}),
-      routeFingerprint: binding.routeFingerprint,
-      ...(readOnly ? { readOnly: true } : {}),
-      ...(destructive ? { destructive: true } : {}),
+      routeGeneration: binding.routeGeneration,
     },
   };
 }
@@ -901,8 +1614,10 @@ async function normalizeRequestedAuthorityActions(
   }> | undefined,
   targets: TargetRegistry,
   contexts: ContextRegistry,
+  execution: UniversalExecutionPlane | undefined,
   mcpProxy: UniversalMcpProxy | undefined,
   gui: UniversalGuiService | undefined,
+  callContext: CapabilityCallContext,
 ): Promise<RequestedAuthorityAction[]> {
   return Promise.all((actions ?? []).map(async (action) => ({
     ...(action.id ? { id: action.id } : {}),
@@ -911,8 +1626,10 @@ async function normalizeRequestedAuthorityActions(
       action.arguments,
       targets,
       contexts,
+      execution,
       mcpProxy,
       gui,
+      callContext,
     ),
     ...(action.risk ? { risk: action.risk } : {}),
     ...(action.uses ? { uses: action.uses } : {}),
@@ -920,14 +1637,14 @@ async function normalizeRequestedAuthorityActions(
 }
 
 function requireAuthorityPlanningInputScopes(
-  scopes: string[] | undefined,
+  authInfo: AuthorityAuthenticationInfo,
   actions: Array<{
     tool: UniversalToolName;
     arguments: Record<string, unknown>;
   }> | undefined,
 ): void {
   requireAuthorityPlanningScopes(
-    scopes,
+    authInfo,
     (actions ?? []).map((action) => ({
       descriptor: authorityActionFromToolCall(action.tool, action.arguments),
     })),
@@ -935,7 +1652,7 @@ function requireAuthorityPlanningInputScopes(
 }
 
 function requireAuthorityPlanningScopes(
-  scopes: string[] | undefined,
+  authInfo: AuthorityAuthenticationInfo,
   actions: RequestedAuthorityAction[],
 ): void {
   const required = new Set<string>();
@@ -966,7 +1683,7 @@ function requireAuthorityPlanningScopes(
         break;
     }
   }
-  for (const scope of [...required].sort()) requireScope(scopes, scope);
+  for (const scope of [...required].sort()) requireScope(authInfo, scope);
 }
 
 async function normalizeAuthorityAction(
@@ -974,14 +1691,29 @@ async function normalizeAuthorityAction(
   argumentsValue: Record<string, unknown>,
   targets: TargetRegistry,
   contexts: ContextRegistry,
+  execution: UniversalExecutionPlane | undefined,
   mcpProxy: UniversalMcpProxy | undefined,
   gui: UniversalGuiService | undefined,
+  callContext: CapabilityCallContext,
 ): Promise<AuthorityActionDescriptor> {
   const action = authorityActionFromToolCall(tool, argumentsValue);
   switch (tool) {
     case "target":
-    case "process":
       return action;
+    case "process": {
+      const input = argumentsValue as unknown as ProcessOperationInput;
+      if (!processOperationNeedsBinding(input.operation)) return action;
+      if (!execution) {
+        throw new UniversalBrokerError(
+          "CAPABILITY_UNAVAILABLE",
+          "Process authority cannot be prepared because the execution plane is unavailable.",
+        );
+      }
+      return processAction(
+        input,
+        execution.authorityBinding(input.processId, input.operation, callContext),
+      );
+    }
     case "context": {
       if (action.operation !== "open") return action;
       return bindTargetAuthority(
@@ -998,6 +1730,7 @@ async function normalizeAuthorityAction(
         contexts,
         input.target,
         input.contextId,
+        callContext,
       );
       return bindTargetAuthority(filesystemAction(input, binding.target.id), binding);
     }
@@ -1008,10 +1741,32 @@ async function normalizeAuthorityAction(
         contexts,
         input.target,
         input.contextId,
+        callContext,
       );
-      return bindTargetAuthority(
-        execAction(input, binding.target.id, input.cwd ?? input.contextId ?? "default"),
-        binding,
+      if (!execution) {
+        throw new UniversalBrokerError(
+          "CAPABILITY_UNAVAILABLE",
+          "Exec authority cannot be prepared because the execution plane is unavailable.",
+        );
+      }
+      const executionBinding = await execution.prepareAuthorityBinding(
+        input,
+        binding.target,
+        binding.generation,
+        callContext,
+      );
+      return execAction(
+        input,
+        binding.target.id,
+        executionBinding.effectiveCwd,
+        {
+          targetGeneration: binding.generation,
+          targetTransport: binding.target.transport,
+          targetPlatform: binding.target.platform,
+          shellDialect: binding.target.shell,
+          effectiveEnvProfile: input.envProfile ?? binding.target.envProfile,
+          effectiveEnvProfileGeneration: executionBinding.effectiveEnvProfileGeneration,
+        },
       );
     }
     case "mcp": {
@@ -1024,15 +1779,18 @@ async function normalizeAuthorityAction(
       const input = argumentsValue as unknown as UniversalMcpInput;
       if (input.operation === "routes") return action;
       const binding = input.operation === "invoke"
-        ? await mcpProxy.inspectInvocation(input)
+        ? await mcpProxy.inspectInvocation(input, callContext)
         : await mcpProxy.inspectRoute(input.route);
-      return bindRouteAuthority(mcpAction(input, binding.routeId), binding);
+      return "risk" in binding
+        ? mcpAction(input, binding as McpInvocationAuthorityBinding)
+        : bindRouteAuthority(mcpAction(input, binding.routeId), binding);
     }
     case "artifact": {
       const normalized = await normalizeArtifactAuthority(
         argumentsValue as unknown as UniversalArtifactInput,
         targets,
         contexts,
+        callContext,
       );
       return normalized.action;
     }
@@ -1044,7 +1802,7 @@ async function normalizeAuthorityAction(
         );
       }
       const input = argumentsValue as unknown as UniversalGuiInput;
-      const binding = await gui.authorityTarget(input);
+      const binding = await gui.authorityTarget(input, callContext);
       return bindTargetAuthority(guiAction(input, binding.target.id), binding);
     }
   }
@@ -1054,9 +1812,19 @@ async function normalizeArtifactAuthority(
   input: UniversalArtifactInput,
   targets: TargetRegistry,
   contexts: ContextRegistry,
-): Promise<{ action: AuthorityActionDescriptor; risk: AuthorityRiskClass }> {
-  const source = await normalizeArtifactEndpoint(input.source, targets, contexts);
-  const destination = await normalizeArtifactEndpoint(input.destination, targets, contexts);
+  callContext?: CapabilityCallContext,
+): Promise<{
+  action: AuthorityActionDescriptor;
+  risk: AuthorityRiskClass;
+  bindings: ResolvedTargetAuthorityBinding[];
+}> {
+  const source = await normalizeArtifactEndpoint(input.source, targets, contexts, callContext);
+  const destination = await normalizeArtifactEndpoint(
+    input.destination,
+    targets,
+    contexts,
+    callContext,
+  );
   const normalizedInput: UniversalArtifactInput = {
     ...input,
     source: source.endpoint ?? input.source,
@@ -1072,6 +1840,7 @@ async function normalizeArtifactAuthority(
     risk: artifactRisk(input.operation, {
       remote: bindings.some((binding) => binding.target.id !== "local"),
     }),
+    bindings,
   };
 }
 
@@ -1079,6 +1848,7 @@ async function normalizeArtifactEndpoint(
   endpoint: Record<string, unknown> | undefined,
   targets: TargetRegistry,
   contexts: ContextRegistry,
+  callContext?: CapabilityCallContext,
 ): Promise<{
   endpoint?: Record<string, unknown>;
   binding?: ResolvedTargetAuthorityBinding;
@@ -1088,7 +1858,13 @@ async function normalizeArtifactEndpoint(
   const contextId = typeof endpoint.contextId === "string" ? endpoint.contextId : undefined;
   const path = typeof endpoint.path === "string" ? endpoint.path : undefined;
   if (!target && !contextId && !path) return { endpoint };
-  const binding = await resolveSelectedTargetBinding(targets, contexts, target, contextId);
+  const binding = await resolveSelectedTargetBinding(
+    targets,
+    contexts,
+    target,
+    contextId,
+    callContext,
+  );
   return {
     endpoint: { ...endpoint, target: binding.target.id },
     binding,
@@ -1122,6 +1898,7 @@ function registerUnavailableTool(
   server: McpServer,
   name: UniversalToolName,
   contract: UniversalToolContract,
+  requestBoundary: UniversalBrokerRequestBoundary,
 ): void {
   registerAppTool(
     server,
@@ -1133,35 +1910,24 @@ function registerUnavailableTool(
       annotations: contract.annotations,
       _meta: {},
     },
-    async () => unavailableResult(name),
+    async (input, extra) => executeMeasuredUniversalTool(
+      requestBoundary,
+      name,
+      name === "exec" ? "run" : String((input as { operation?: unknown }).operation ?? "unknown"),
+      extra,
+      async () => failedToolResult(new UniversalBrokerError(
+        "CAPABILITY_UNAVAILABLE",
+        `${name} is registered in the Universal Broker contract but its backing service is not configured.`,
+        {
+          evidence: {
+            phase: "service-not-configured",
+            tool: name,
+            providerDispatchCount: 0,
+          },
+        },
+      )),
+    ),
   );
-}
-
-function unavailableResult(
-  name: UniversalToolName,
-  evidence: Record<string, unknown> = {
-    phase: "service-not-configured",
-    tool: name,
-  },
-): CallToolResult {
-  const operationId = `op_${randomUUID()}`;
-  const message = `${name} is registered in the Universal Broker contract but its backing service is not configured.`;
-  const structuredContent = {
-    ok: false,
-    operationId,
-    error: {
-      code: "CAPABILITY_UNAVAILABLE" as const,
-      message,
-      retryable: false,
-      evidence,
-    },
-  };
-
-  return {
-    isError: true,
-    content: [{ type: "text" as const, text: message }],
-    structuredContent,
-  };
 }
 
 function targetListText(targets: Array<Record<string, unknown>>): string {
@@ -1171,18 +1937,16 @@ function targetListText(targets: Array<Record<string, unknown>>): string {
     .join("\n");
 }
 
-function requireScope(scopes: string[] | undefined, required: string): void {
-  if (
-    scopes === undefined
-    || scopes.includes(required)
-  ) return;
+function requireScope(authInfo: AuthorityAuthenticationInfo, required: string): void {
+  const scopes = authInfo.scopes;
+  if (Array.isArray(scopes) && scopes.includes(required)) return;
   throw new UniversalBrokerError(
-    "PERMISSION_DENIED",
+    "SCOPE_INSUFFICIENT",
     `OAuth scope is required: ${required}`,
     {
       evidence: {
         requiredScope: required,
-        grantedScopes: scopes,
+        grantedScopes: Array.isArray(scopes) ? scopes : [],
       },
     },
   );

@@ -295,13 +295,13 @@ function authorityContract(scopes, contracts) {
   ];
   const expectedInputs = {
     target: ["operation", "selector", "targetId", "refresh", "cursor", "limit"],
-    context: ["operation", "contextId", "target", "path", "mode", "baseRef", "task", "query", "maxCharacters", "authorityId", "taskId", "authorityText", "actions", "correctionText", "expiresInSeconds", "cursor", "limit"],
-    fs: ["operation", "target", "contextId", "path", "destination", "content", "patch", "query", "recursive", "overwrite", "expectedSha256", "disposition", "authorityId", "cursor", "limit"],
-    exec: ["target", "contextId", "cwd", "command", "tty", "mode", "yieldMs", "maxOutputChars", "envProfile", "authorityId"],
+    context: ["operation", "contextId", "target", "path", "mode", "baseRef", "task", "query", "maxCharacters", "authorityId", "taskInstanceId", "taskLabel", "taskId", "authorityText", "actions", "correctionText", "expiresInSeconds", "cursor", "limit"],
+    fs: ["operation", "target", "contextId", "path", "destination", "content", "patch", "query", "recursive", "overwrite", "expectedSha256", "disposition", "trashId", "finalSymlink", "authorityId", "cursor", "limit"],
+    exec: ["target", "contextId", "cwd", "command", "tty", "mode", "yieldMs", "maxOutputChars", "envProfile", "durable", "authorityId"],
     process: ["operation", "processId", "chars", "signal", "columns", "rows", "authorityId", "transactionId", "reason", "delayMs", "waitMs", "maxOutputChars", "cursor", "limit"],
     mcp: ["operation", "route", "query", "name", "arguments", "uri", "cursor", "limit", "responsePolicy", "authorityId"],
     artifact: ["operation", "source", "destination", "overwrite", "maxBytes", "ttlSeconds", "authorityId"],
-    gui: ["operation", "target", "sessionId", "generation", "action", "timeoutMs", "maxElements", "authorityId"],
+    gui: ["operation", "target", "sessionId", "generation", "action", "timeoutMs", "maxElements", "focusPolicy", "authorityId"],
   };
   const scopeStable = JSON.stringify(scopes) === JSON.stringify(expectedScopes);
   const inputDrift = Object.entries(expectedInputs).flatMap(([name, expected]) => {
@@ -335,8 +335,10 @@ async function writeSshFixture(temporary) {
   await writeFile(path, [
     "#!/bin/sh",
     `PATH=${shellQuote(fakeBin)}:$PATH`,
+    `DEVSPACE_TEST_SETPRIV=${shellQuote(setpriv)}`,
     "export PATH",
     "for last do :; done",
+    "last=$(printf '%s' \"$last\" | sed \"s#/usr/bin/setpriv#$DEVSPACE_TEST_SETPRIV#g; s#/bin/setpriv#$DEVSPACE_TEST_SETPRIV#g\")",
     "exec /bin/sh -c \"$last\"",
     "",
   ].join("\n"));

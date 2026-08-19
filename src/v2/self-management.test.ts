@@ -93,8 +93,20 @@ test("restart worker changes PM2 PID and persists independently verifiable PASS 
   await chmod(fakePm2, 0o700);
 
   const local = createServer((_req, res) => {
+    res.setHeader("content-type", "application/json");
     res.statusCode = 200;
-    res.end("ok");
+    res.end(JSON.stringify({
+      identity: {
+        productVersion: "2.1.1",
+        schemaGeneration: `sha256:${"1".repeat(64)}`,
+        authorityContractGeneration: `sha256:${"2".repeat(64)}`,
+        configDigest: `sha256:${"3".repeat(64)}`,
+        sourceRevision: "source-test",
+        runtimeRevision: "runtime-test",
+        buildDigest: `sha256:${"4".repeat(64)}`,
+        startedAt: "2026-08-19T00:00:00.000Z",
+      },
+    }));
   });
   const publicServer = createServer((_req, res) => {
     res.statusCode = 200;
@@ -119,6 +131,16 @@ test("restart worker changes PM2 PID and persists independently verifiable PASS 
     expectedScript,
     localHealthUrl: `http://127.0.0.1:${localAddress.port}/healthz`,
     publicHealthUrl: `http://127.0.0.1:${publicAddress.port}/healthz`,
+    expectedIdentity: {
+      productVersion: "2.1.1",
+      schemaGeneration: `sha256:${"1".repeat(64)}`,
+      authorityContractGeneration: `sha256:${"2".repeat(64)}`,
+      configDigest: `sha256:${"3".repeat(64)}`,
+      sourceRevision: "source-test",
+      runtimeRevision: "runtime-test",
+      buildDigest: `sha256:${"4".repeat(64)}`,
+      startedAt: "2026-08-19T00:00:00.000Z",
+    },
     statusPath,
     requestPath,
     workerLogPath: join(transactionDir, "worker.log"),

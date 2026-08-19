@@ -3,7 +3,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { TargetRegistry } from "./targets.js";
+import { assertTargetCapability, TargetRegistry } from "./targets.js";
 
 test("target registry supplies local by default and resolves exact aliases", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "devspace-v2-targets-test-"));
@@ -410,12 +410,12 @@ test("a registry reload prevents an older in-flight probe from repopulating stal
       platform: "macos",
     },
   });
-  const reloadedSnapshot = await registry.inspect();
+  const reloadedBinding = await registry.resolveWithGeneration("company");
   releaseBase();
   const oldObservation = await oldProbe;
   assert.notEqual(
     (oldObservation.evidence as { targetGeneration?: string }).targetGeneration,
-    reloadedSnapshot.generation,
+    reloadedBinding.generation,
   );
   assert.equal(registry.stats().probeCacheEntries, 0);
   assert.equal(await registry.cachedObservation("company"), undefined);
@@ -424,7 +424,7 @@ test("a registry reload prevents an older in-flight probe from repopulating stal
   assert.equal(current.status, "ONLINE");
   assert.equal(
     (current.evidence as { targetGeneration?: string }).targetGeneration,
-    reloadedSnapshot.generation,
+    reloadedBinding.generation,
   );
   assert.equal((current.evidence as { cache?: string }).cache, "miss");
   assert.equal(registry.stats().probeCacheEntries, 1);
@@ -554,6 +554,160 @@ test("Windows SSH probes reject high-integrity tokens", async (t) => {
   assert.equal(observation.status, "DEGRADED");
   assert.equal(observation.capabilities.exec, false);
   assert.match(observation.reason ?? "", /high-integrity/u);
+});
+
+test("exact target generations are full SHA-256 bindings stable across unrelated additions", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-v2-target-exact-generation-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const configPath = join(root, "targets.json");
+  await writeTargetConfig(configPath, {
+    company: sshTarget("Company", ["company"]),
+  });
+  const registry = new TargetRegistry({ configPath });
+  const firstSnapshot = await registry.inspect();
+  const first = await registry.resolveWithGeneration("company");
+  assert.match(first.generation, /^[a-f0-9]{64}$/u);
+  assert.equal(first.generation, first.target.generation);
+
+  await writeTargetConfig(configPath, {
+    company: sshTarget("Company", ["company"]),
+    build: sshTarget("Build", ["build"]),
+  });
+  const addedSnapshot = await registry.inspect();
+  const afterAddition = await registry.resolveWithGeneration("company");
+  assert.notEqual(addedSnapshot.generation, firstSnapshot.generation);
+  assert.equal(afterAddition.generation, first.generation);
+
+  await writeTargetConfig(configPath, {
+    company: sshTarget("Company changed", ["company"]),
+    build: sshTarget("Build", ["build"]),
+  });
+  const changed = await registry.resolveWithGeneration("company");
+  assert.notEqual(changed.generation, first.generation);
+});
+
+test("target snapshots and exact bindings are deeply immutable", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-v2-target-frozen-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const registry = new TargetRegistry({ configPath: join(root, "missing.json") });
+  const snapshot = await registry.inspect();
+  const target = await registry.resolve("local");
+  assert.equal(Object.isFrozen(snapshot), true);
+  assert.equal(Object.isFrozen(snapshot.targets), true);
+  assert.equal(Object.isFrozen(target), true);
+  assert.equal(Object.isFrozen(target.aliases), true);
+  assert.equal(Object.isFrozen(target.gui), true);
+  assert.equal(Object.isFrozen(target.durableProcess), true);
+  assert.throws(() => (target.aliases as string[]).push("mutated"), TypeError);
+});
+
+test("configured target capabilities fail closed before a provider can be used", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-v2-target-capabilities-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const configPath = join(root, "targets.json");
+  await writeFile(configPath, JSON.stringify({
+    version: 1,
+    targets: {
+      restricted: {
+        displayName: "Restricted",
+        transport: "local",
+        platform: "macos",
+        capabilities: {
+          fs: false,
+          exec: false,
+          pty: false,
+          mcp: false,
+          artifact: false,
+          gui: false,
+          durableProcess: false,
+        },
+      },
+    },
+  }));
+  const target = await new TargetRegistry({ configPath }).resolve("restricted");
+
+  assert.deepEqual(target.configuredCapabilities, {
+    fs: false,
+    exec: false,
+    pty: false,
+    mcp: false,
+    artifact: false,
+    gui: false,
+    durableProcess: false,
+  });
+  for (const capability of Object.keys(target.configuredCapabilities) as Array<keyof typeof target.configuredCapabilities>) {
+    assert.throws(
+      () => assertTargetCapability(target, capability),
+      (error: unknown) => error instanceof Error
+        && "code" in error
+        && error.code === "CAPABILITY_UNAVAILABLE",
+    );
+  }
+});
+
+test("probe identity mismatch makes readiness false and exposes both identities", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-v2-target-identity-mismatch-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const configPath = join(root, "targets.json");
+  await writeFile(configPath, JSON.stringify({
+    version: 1,
+    targets: {
+      company: {
+        displayName: "Company",
+        endpointId: "company-mac",
+        transport: "ssh",
+        sshHost: "company",
+        user: "expected-user",
+        expectedHostname: "expected-host",
+        platform: "macos",
+      },
+    },
+  }));
+  const registry = new TargetRegistry({
+    configPath,
+    execute: (async (executable: string, args: string[]) => {
+      if (executable === "sftp") return { stdout: "", stderr: "" };
+      if (args.includes("-tt")) return { stdout: "__DEVSPACE_PTY_OK__\r\n", stderr: "" };
+      return {
+        stdout: [
+          "__DEVSPACE_TARGET_V1__",
+          "kernel=Darwin",
+          "hostname=other-host",
+          "user=other-user",
+          "shell=/bin/zsh",
+          "architecture=arm64",
+          "home=/Users/other-user",
+          "temporary=/tmp",
+          "git=1",
+          "rsync=1",
+          "setpriv_boundary=0",
+          "sandbox_boundary=1",
+          "",
+        ].join("\n"),
+        stderr: "",
+      };
+    }) as never,
+  });
+  const observation = await registry.probe("company");
+  assert.equal(observation.status, "DEGRADED");
+  assert.equal(observation.ready, false);
+  assert.equal(observation.capabilities.exec, false);
+  const evidence = observation.evidence as {
+    identityMatches?: boolean;
+    readiness?: boolean;
+    configuredIdentity?: { hostname?: string; user?: string };
+    observedIdentity?: { hostname?: string; user?: string };
+  };
+  assert.equal(evidence.identityMatches, false);
+  assert.equal(evidence.readiness, false);
+  assert.deepEqual(evidence.configuredIdentity && {
+    hostname: evidence.configuredIdentity.hostname,
+    user: evidence.configuredIdentity.user,
+  }, { hostname: "expected-host", user: "expected-user" });
+  assert.deepEqual(evidence.observedIdentity && {
+    hostname: evidence.observedIdentity.hostname,
+    user: evidence.observedIdentity.user,
+  }, { hostname: "other-host", user: "other-user" });
 });
 
 function sshTarget(displayName: string, aliases: string[]) {

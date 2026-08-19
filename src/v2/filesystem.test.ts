@@ -20,6 +20,10 @@ import test from "node:test";
 import { promisify } from "node:util";
 import { loadConfig } from "../config.js";
 import { ContextRegistry } from "./contexts.js";
+import {
+  createCapabilityCallContextFromTrustedPrincipal,
+  type CapabilityCallContext,
+} from "./capability-call-context.js";
 import type {
   UniversalExecutionPlane,
   UniversalProcessSnapshot,
@@ -28,6 +32,11 @@ import { UniversalBrokerError } from "./errors.js";
 import {
   UniversalFilesystemService,
 } from "./filesystem.js";
+import {
+  atomicCopyFile,
+  atomicWriteBuffer,
+  safeMoveFile,
+} from "./filesystem-atomic.js";
 import {
   REMOTE_WINDOWS_FILESYSTEM_RESULT_MARKER,
   windowsFilesystemCommand,
@@ -208,10 +217,59 @@ test("fs bounds read and search output and never publishes through a symlink", a
     hasCode("PERMISSION_DENIED"),
   );
   assert.equal(await readFile(target, "utf8"), "preserve\n");
+  const trashed = await fixture.filesystem.execute({ operation: "remove", path: target });
+  assert.equal(trashed.disposition, "trash");
+  assert.equal(trashed.recoverable, true);
+  await fixture.filesystem.execute({
+    operation: "restore",
+    trashId: String(trashed.trashId),
+  });
+  assert.equal(await readFile(target, "utf8"), "preserve\n");
+});
+
+test("atomic publication rejects a deterministic destination race and preserves the racer", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-v2-fs-race-test-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const destination = join(root, "destination.txt");
+  await writeFile(destination, "preimage\n");
   await assert.rejects(
-    fixture.filesystem.execute({ operation: "remove", path: target }),
+    atomicWriteBuffer(destination, Buffer.from("ours\n"), {
+      overwrite: true,
+      hooks: {
+        beforeDestinationRevalidation: async () => {
+          await writeFile(destination, "racer\n");
+        },
+      },
+    }),
     hasCode("PRECONDITION_FAILED"),
   );
+  assert.equal(await readFile(destination, "utf8"), "racer\n");
+  assert.equal(
+    (await readdir(root)).some((name) => name.startsWith(".devspace-v2-")),
+    false,
+  );
+});
+
+test("verified EXDEV fallback never deletes the source after destination corruption", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-v2-fs-exdev-test-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const source = join(root, "source.txt");
+  const destination = join(root, "destination.txt");
+  await writeFile(source, "source-must-survive\n");
+  await assert.rejects(
+    safeMoveFile(source, destination, {
+      overwrite: false,
+      hooks: {
+        forceCrossDevice: true,
+        afterCrossDevicePublication: async () => {
+          await writeFile(destination, "corrupt-after-copy\n");
+        },
+      },
+    }),
+    hasCode("PRECONDITION_FAILED"),
+  );
+  assert.equal(await readFile(source, "utf8"), "source-must-survive\n");
+  assert.equal(await readFile(destination, "utf8"), "corrupt-after-copy\n");
 });
 
 test("remote POSIX fs uses framed helper execution and SFTP atomic publication", async (t) => {
@@ -270,6 +328,22 @@ test("remote POSIX fs uses framed helper execution and SFTP atomic publication",
   });
   assert.ok(fixture.executionCalls >= 7);
   assert.equal(fixture.forgottenProcesses, fixture.executionCalls);
+});
+
+test("remote filesystem helper processes preserve the authenticated owner context", async (t) => {
+  const fixture = await createRemoteFixture(t);
+  const path = join(fixture.root, "owner-context.txt");
+  await writeFile(path, "owner-context\n");
+  const callContext = createCapabilityCallContextFromTrustedPrincipal({
+    principalKeyFingerprint: "a".repeat(64),
+  });
+  await fixture.filesystem.execute({
+    operation: "hash",
+    target: "remote",
+    path,
+  }, callContext);
+  assert.ok(fixture.processCallContexts.length >= 2);
+  assert.ok(fixture.processCallContexts.every((observed) => observed === callContext));
 });
 
 test("remote file patch rechecks the original hash before atomic publication", async (t) => {
@@ -457,6 +531,7 @@ interface RemoteFixture extends Fixture {
   forgottenProcesses: number;
   sftpPuts: number;
   sftpGets: number;
+  processCallContexts: Array<CapabilityCallContext | undefined>;
 }
 
 interface WindowsRemoteFixture extends RemoteFixture {}
@@ -552,9 +627,16 @@ async function createRemoteFixture(
   });
   let executionCalls = 0;
   let forgottenProcesses = 0;
+  const processCallContexts: Array<CapabilityCallContext | undefined> = [];
   const execution = {
-    async execute(input: { command: string }): Promise<UniversalProcessSnapshot> {
+    async execute(
+      input: { command: string },
+      _binding?: unknown,
+      _dispatch?: unknown,
+      callContext?: CapabilityCallContext,
+    ): Promise<UniversalProcessSnapshot> {
       executionCalls += 1;
+      processCallContexts.push(callContext);
       const started = Date.now();
       try {
         const result = await execFileAsync("/bin/sh", ["-lc", input.command], {
@@ -570,9 +652,14 @@ async function createRemoteFixture(
         );
       }
     },
-    async operate(input: { operation: string }): Promise<Record<string, unknown>> {
+    async operate(
+      input: { operation: string },
+      _dispatch?: unknown,
+      callContext?: CapabilityCallContext,
+    ): Promise<Record<string, unknown>> {
       assert.equal(input.operation, "forget");
       forgottenProcesses += 1;
+      processCallContexts.push(callContext);
       return { forgotten: true };
     },
   } as unknown as UniversalExecutionPlane;
@@ -603,6 +690,7 @@ async function createRemoteFixture(
     get forgottenProcesses() { return forgottenProcesses; },
     get sftpPuts() { return sftpPuts; },
     get sftpGets() { return sftpGets; },
+    get processCallContexts() { return processCallContexts; },
   };
 }
 
@@ -664,9 +752,16 @@ async function createWindowsRemoteFixture(
   await mkdir(join(driveRoot, "Users", "Test", "AppData", "Local", "Temp"), { recursive: true });
   let executionCalls = 0;
   let forgottenProcesses = 0;
+  const processCallContexts: Array<CapabilityCallContext | undefined> = [];
   const execution = {
-    async execute(input: { command: string }): Promise<UniversalProcessSnapshot> {
+    async execute(
+      input: { command: string },
+      _binding?: unknown,
+      _dispatch?: unknown,
+      callContext?: CapabilityCallContext,
+    ): Promise<UniversalProcessSnapshot> {
       executionCalls += 1;
+      processCallContexts.push(callContext);
       const started = Date.now();
       const cleanupPath = input.command.match(/Remove-Item\s+-LiteralPath\s+'((?:''|[^'])+)'/u)?.[1]
         ?.replaceAll("''", "'");
@@ -698,9 +793,14 @@ async function createWindowsRemoteFixture(
         started,
       );
     },
-    async operate(input: { operation: string }): Promise<Record<string, unknown>> {
+    async operate(
+      input: { operation: string },
+      _dispatch?: unknown,
+      callContext?: CapabilityCallContext,
+    ): Promise<Record<string, unknown>> {
       assert.equal(input.operation, "forget");
       forgottenProcesses += 1;
+      processCallContexts.push(callContext);
       return { forgotten: true };
     },
   } as unknown as UniversalExecutionPlane;
@@ -733,6 +833,7 @@ async function createWindowsRemoteFixture(
     get forgottenProcesses() { return forgottenProcesses; },
     get sftpPuts() { return sftpPuts; },
     get sftpGets() { return sftpGets; },
+    get processCallContexts() { return processCallContexts; },
   };
 }
 
@@ -859,7 +960,13 @@ async function executeFakeWindowsFilesystemRequest(
       const existing = await fixtureExistingHash(required);
       verifyFixtureWrite(existing, options, remotePath!);
       await mkdir(join(required, ".."), { recursive: true });
-      return { path: remotePath, existing: existing !== undefined, mode: 0 };
+      return {
+        path: remotePath,
+        preimage: existing === undefined
+          ? { exists: false }
+          : { exists: true, type: "file", sha256: existing },
+        mode: 0,
+      };
     }
     case "publish_write": {
       const required = requireFixturePath(path, remotePath);
@@ -867,9 +974,21 @@ async function executeFakeWindowsFilesystemRequest(
       const temporary = mapWindowsFixturePath(temporaryRemote, driveRoot);
       const existing = await fixtureExistingHash(required);
       verifyFixtureWrite(existing, options, remotePath!);
-      await rm(required, { force: true });
-      await rename(temporary, required);
-      return fixturePublishedResult(remotePath!, required, existing !== undefined);
+      const expectedPreimage = request.preimage as { exists?: boolean; sha256?: string } | undefined;
+      if (
+        expectedPreimage?.exists !== (existing !== undefined)
+        || (existing !== undefined && expectedPreimage.sha256 !== existing)
+      ) {
+        throw fixtureError("PRECONDITION_FAILED", `Destination preimage changed: ${remotePath}`);
+      }
+      const published = await atomicCopyFile(temporary, required, {
+        overwrite: options.overwrite === true,
+        expectedSha256: typeof options.expectedSha256 === "string"
+          ? options.expectedSha256
+          : undefined,
+      });
+      await rm(temporary, { force: true });
+      return { ...published, path: remotePath };
     }
     case "cleanup": {
       const temporaryRemote = String(request.temporary ?? "");
@@ -884,14 +1003,17 @@ async function executeFakeWindowsFilesystemRequest(
       if (existing && options.overwrite !== true) {
         throw fixtureError("PRECONDITION_FAILED", `Destination exists: ${remoteDestination}`);
       }
-      await rm(requiredDestination, { recursive: true, force: true });
       await mkdir(join(requiredDestination, ".."), { recursive: true });
-      await copyFile(required, requiredDestination);
+      const published = await atomicCopyFile(required, requiredDestination, {
+        overwrite: options.overwrite === true,
+      });
       return {
         source: remotePath,
         destination: remoteDestination,
         copied: true,
         overwritten: Boolean(existing),
+        size: published.size,
+        sha256: published.sha256,
         ...(operation === "sync" ? { synchronized: true } : {}),
       };
     }
@@ -902,10 +1024,16 @@ async function executeFakeWindowsFilesystemRequest(
       if (existing && options.overwrite !== true) {
         throw fixtureError("PRECONDITION_FAILED", `Destination exists: ${remoteDestination}`);
       }
-      await rm(requiredDestination, { recursive: true, force: true });
       await mkdir(join(requiredDestination, ".."), { recursive: true });
-      await rename(required, requiredDestination);
-      return { source: remotePath, destination: remoteDestination, moved: true };
+      const published = await safeMoveFile(required, requiredDestination, {
+        overwrite: options.overwrite === true,
+      });
+      return {
+        source: remotePath,
+        destination: remoteDestination,
+        moved: true,
+        crossDevice: published.crossDevice,
+      };
     }
     case "remove": {
       const required = requireFixturePath(path, remotePath);
@@ -1005,7 +1133,14 @@ function processSnapshot(
     outputTruncated: false,
     outputBytes: Buffer.byteLength(output),
     outputFileTruncated: false,
+    outputOffsets: {
+      global: Buffer.byteLength(output),
+      stdout: Buffer.byteLength(output),
+      stderr: 0,
+      pty: 0,
+    },
     resourceUri: "devspace://process/proc_fixture/output/0/1048576",
+    durable: false,
     exitCode,
   };
 }

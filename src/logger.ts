@@ -1,4 +1,5 @@
 import type { Request } from "express";
+import { createHash } from "node:crypto";
 
 export type LogLevel = "silent" | "error" | "warn" | "info" | "debug";
 export type LogFormat = "json" | "pretty";
@@ -39,7 +40,7 @@ export function logEvent(
     ts: new Date().toISOString(),
     level,
     event,
-    ...fields,
+    ...redactLogFields(fields),
   };
 
   const line = config.format === "pretty" ? formatPretty(entry) : JSON.stringify(entry);
@@ -61,12 +62,48 @@ export function requestPath(req: Request): string {
 }
 
 export function sessionIdPrefix(sessionId: string | undefined): string | undefined {
-  return sessionId ? sessionId.slice(0, 8) : undefined;
+  return sessionId ? `sha256:${shortHash(sessionId)}` : undefined;
 }
 
 export function commandPreview(command: string): string {
   const normalized = command.replace(/\s+/g, " ").trim();
-  return normalized.length > 120 ? `${normalized.slice(0, 117)}...` : normalized;
+  return `[command sha256:${shortHash(normalized)} chars=${normalized.length}]`;
+}
+
+export function redactLogFields(fields: LogFields): LogFields {
+  return redactValue(fields, "", 0) as LogFields;
+}
+
+function redactValue(value: unknown, key: string, depth: number): unknown {
+  if (isSecretKey(key)) return "[REDACTED]";
+  if (depth >= 8) return "[DEPTH_LIMIT]";
+  if (typeof value === "string") return redactString(value);
+  if (typeof value === "number" || typeof value === "boolean" || value === null) return value;
+  if (value instanceof Error) {
+    return { name: value.name, message: redactString(value.message) };
+  }
+  if (Array.isArray(value)) return value.slice(0, 100).map((child) => redactValue(child, key, depth + 1));
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+      .slice(0, 200)
+      .map(([childKey, child]) => [childKey, redactValue(child, childKey, depth + 1)]));
+  }
+  return value === undefined ? undefined : String(value);
+}
+
+function isSecretKey(key: string): boolean {
+  return /(?:authorization|cookie|credential|password|private.?key|secret|token)$/iu.test(key);
+}
+
+function redactString(value: string): string {
+  const bounded = value.length > 4_096 ? `${value.slice(0, 4_096)}…` : value;
+  return bounded
+    .replace(/\bBearer\s+[A-Za-z0-9._~+\/-]+=*/giu, "Bearer [REDACTED]")
+    .replace(/\b(access|refresh|id)[_-]?token\s*[=:]\s*[^\s,;]+/giu, "$1_token=[REDACTED]");
+}
+
+function shortHash(value: string): string {
+  return createHash("sha256").update(value).digest("hex").slice(0, 16);
 }
 
 function formatPretty(entry: LogFields): string {

@@ -6,6 +6,7 @@ import { inspectUniversalBrokerBudgets } from "./budgets.js";
 import { loadUniversalBrokerNextConfig } from "./config.js";
 import { UniversalMcpRouteRegistry } from "./mcp-routes.js";
 import { UniversalEnvProfileRegistry } from "./env-profiles.js";
+import { createRuntimeIdentity } from "./runtime-identity.js";
 import { TargetRegistry } from "./targets.js";
 
 const execFileAsync = promisify(execFile);
@@ -62,16 +63,25 @@ export async function collectUniversalBrokerDoctor(
     safePathMetadata(config.mcpRouteConfigPath),
     safePathMetadata(config.envProfileConfigPath),
   ]);
+  const runtimeIdentity = createRuntimeIdentity({
+    config,
+    sourceRevision: sourceCommit ?? config.sourceRevision,
+    runtimeRevision: config.runtimeRevision,
+    ...(config.buildDigest ? { buildDigest: config.buildDigest } : {}),
+  });
   return {
     generatedAt: new Date().toISOString(),
     sourceCommit,
+    runtimeIdentity,
     platform: { platform: process.platform, architecture: process.arch, node: process.version },
     endpoint: {
       deploymentMode: config.deploymentMode,
       local: `http://${config.host}:${config.port}${config.endpointPath}`,
       public: config.publicMcpUrl,
       health: `http://${config.host}:${config.port}${config.healthPath}`,
-      metrics: `http://${config.host}:${config.port}${config.metricsPath}`,
+      managementHealth: `http://${config.managementHost}:${config.managementPort}/healthz`,
+      readiness: `http://${config.managementHost}:${config.managementPort}${config.readyPath}`,
+      metrics: `http://${config.managementHost}:${config.managementPort}${config.metricsPath}`,
       stateDir: config.stateDir,
       oauthStateReused: config.oauthStateDir === config.serverConfig.stateDir,
       granularScopesOnly: true,
@@ -124,6 +134,7 @@ export async function collectUniversalBrokerDoctor(
       contextIdleTtlMs: config.contextIdleTtlMs,
       contextDiffTtlMs: config.contextDiffTtlMs,
       processes: config.maxRunningProcesses,
+      processRecords: config.maximumProcessRecords,
       processesPerTarget: config.maxRunningProcessesPerTarget,
       processOutputBytes: config.processOutputMaxBytes,
       completedProcessTtlMs: config.completedProcessTtlMs,

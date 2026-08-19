@@ -1,6 +1,13 @@
 import { randomUUID } from "node:crypto";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import type { UniversalErrorCode } from "./contracts.js";
+import type { DispatchState, RuntimeIdentity, UniversalErrorCode } from "./contracts.js";
+
+type EnvelopeIdentity = Pick<RuntimeIdentity, "schemaGeneration">;
+let envelopeIdentity: EnvelopeIdentity | undefined;
+
+export function configureResultEnvelopeIdentity(identity: EnvelopeIdentity): void {
+  envelopeIdentity = Object.freeze({ schemaGeneration: identity.schemaGeneration });
+}
 
 export interface UniversalErrorDetails {
   evidence?: Record<string, unknown>;
@@ -47,6 +54,16 @@ export function successfulToolResult(
       ok: true,
       operationId,
       data,
+      ...(Array.isArray(data.warnings) ? { warnings: data.warnings } : {}),
+      ...(typeof data.resourceUri === "string" ? { resourceUri: data.resourceUri } : {}),
+      ...(typeof data.nextCursor === "string" ? { nextCursor: data.nextCursor } : {}),
+      observedSchemaGeneration: observedSchemaGeneration(),
+      ...(typeof data.targetGeneration === "string"
+        ? { observedTargetGeneration: data.targetGeneration }
+        : {}),
+      ...(typeof data.routeGeneration === "string"
+        ? { observedRouteGeneration: data.routeGeneration }
+        : {}),
     },
   };
 }
@@ -63,11 +80,48 @@ export function failedToolResult(error: unknown): CallToolResult {
         code: normalized.code,
         message: normalized.message,
         retryable: normalized.retryable,
+        dispatchState: errorDispatchState(normalized),
+        ...(typeof normalized.evidence?.resourceKey === "string"
+          ? { resourceKey: normalized.evidence.resourceKey }
+          : {}),
         ...(normalized.evidence ? { evidence: normalized.evidence } : {}),
-        ...(normalized.suggestions ? { suggestions: normalized.suggestions } : {}),
+        ...(normalized.suggestions ? {
+          suggestions: normalized.suggestions,
+          recovery: normalized.suggestions,
+        } : {}),
       },
+      observedSchemaGeneration: observedSchemaGeneration(),
+      ...(typeof normalized.evidence?.targetGeneration === "string"
+        ? { observedTargetGeneration: normalized.evidence.targetGeneration }
+        : {}),
+      ...(typeof normalized.evidence?.routeGeneration === "string"
+        ? { observedRouteGeneration: normalized.evidence.routeGeneration }
+        : {}),
     },
   };
+}
+
+function observedSchemaGeneration(): string {
+  return envelopeIdentity?.schemaGeneration ?? `sha256:${"0".repeat(64)}`;
+}
+
+function errorDispatchState(error: UniversalBrokerError): DispatchState {
+  const declared = error.evidence?.dispatchState;
+  if (
+    declared === "NOT_DISPATCHED"
+    || declared === "CLAIMED"
+    || declared === "DISPATCHED"
+    || declared === "ACKNOWLEDGED"
+    || declared === "UNKNOWN"
+  ) return declared;
+  if ([
+    "AUTHORITY_STATE_UNCERTAIN",
+    "DISPATCH_STATE_UNKNOWN",
+    "MCP_RESULT_UNKNOWN",
+    "EXECUTION_STATE_UNKNOWN",
+    "TRANSPORT_INTERRUPTED",
+  ].includes(error.code)) return "UNKNOWN";
+  return "NOT_DISPATCHED";
 }
 
 export async function executeUniversalTool(

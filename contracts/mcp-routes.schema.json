@@ -38,6 +38,15 @@
         },
         "url": { "type": "string", "format": "uri" },
         "envProfile": { "type": "string", "minLength": 1 },
+        "riskPolicy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode", "policyFile"],
+          "properties": {
+            "mode": { "const": "broker-owned" },
+            "policyFile": { "type": "string", "minLength": 1, "maxLength": 4096 }
+          }
+        },
         "startupTimeoutMs": { "type": "integer", "minimum": 100, "maximum": 300000 },
         "callTimeoutMs": { "type": "integer", "minimum": 100, "maximum": 300000 },
         "idleTimeoutMs": { "type": "integer", "minimum": 1000, "maximum": 3600000 }

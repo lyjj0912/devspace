@@ -8,10 +8,25 @@ import {
   GUI_NODE_RESULT_MARKER,
 } from "./gui-node.js";
 import { UniversalBrokerError } from "./errors.js";
-import type { TargetDefinition, TargetRegistry } from "./targets.js";
+import {
+  assertTargetCapability,
+  type TargetDefinition,
+  type TargetRegistry,
+} from "./targets.js";
+import {
+  createCapabilityCallContextFromTrustedPrincipal,
+  requireCapabilityCallContext,
+  type CapabilityCallContext,
+  type CapabilityCallContextProvider,
+} from "./capability-call-context.js";
+import { SynchronousQuotaReservations } from "./quota-reservations.js";
+import {
+  RESOURCE_DEFAULT_GUI_SESSIONS,
+  RESOURCE_DEFAULT_GUI_TTL_MS,
+} from "./resource-defaults.js";
 
-const DEFAULT_MAXIMUM_SESSIONS = 32;
-const DEFAULT_SESSION_TTL_MS = 5 * 60_000;
+const DEFAULT_MAXIMUM_SESSIONS = RESOURCE_DEFAULT_GUI_SESSIONS;
+const DEFAULT_SESSION_TTL_MS = RESOURCE_DEFAULT_GUI_TTL_MS;
 const DEFAULT_MAXIMUM_ELEMENTS = 50;
 const MAXIMUM_ELEMENTS = 1_000;
 const DEFAULT_WAIT_MS = 5_000;
@@ -29,6 +44,7 @@ export interface UniversalGuiInput {
   action?: Record<string, unknown>;
   timeoutMs?: number;
   maxElements?: number;
+  focusPolicy?: "preserve" | "allow";
   authorityId?: string;
 }
 
@@ -90,7 +106,11 @@ export interface GuiNodeRequest {
 }
 
 export interface GuiNodeRunner {
-  call(target: TargetDefinition, request: GuiNodeRequest): Promise<Record<string, unknown>>;
+  call(
+    target: TargetDefinition,
+    request: GuiNodeRequest,
+    callContext?: CapabilityCallContext,
+  ): Promise<Record<string, unknown>>;
 }
 
 export interface UniversalGuiServiceOptions {
@@ -100,11 +120,15 @@ export interface UniversalGuiServiceOptions {
   payloadBudgetCharacters?: number;
   now?: () => number;
   sleep?: (milliseconds: number) => Promise<void>;
+  ownerProvider?: CapabilityCallContextProvider;
 }
 
 interface GuiSession {
   sessionId: string;
+  principalKeyFingerprint: string;
   targetId: string;
+  targetGeneration: string;
+  focusPolicy: "preserve" | "allow";
   generation: string;
   observation: GuiObservation;
   maxElements: number;
@@ -128,6 +152,8 @@ export class UniversalGuiService {
   private readonly payloadBudgetCharacters: number;
   private readonly now: () => number;
   private readonly sleep: (milliseconds: number) => Promise<void>;
+  private readonly ownerProvider: CapabilityCallContextProvider;
+  private readonly reservations: SynchronousQuotaReservations;
   private readonly sessions = new Map<string, GuiSession>();
   private closed = false;
 
@@ -164,30 +190,47 @@ export class UniversalGuiService {
     this.sleep = options.sleep ?? ((milliseconds) => new Promise((resolve) => {
       setTimeout(resolve, milliseconds);
     }));
+    const compatibilityOwner = createCapabilityCallContextFromTrustedPrincipal({
+      principalKeyFingerprint: createHash("sha256")
+        .update(JSON.stringify({ authority: "legacy-single-owner-gui-service" }))
+        .digest("hex"),
+    });
+    this.ownerProvider = options.ownerProvider ?? (() => compatibilityOwner);
+    this.reservations = new SynchronousQuotaReservations("gui-session", {
+      entries: this.maximumSessions,
+    });
   }
 
-  async execute(input: UniversalGuiInput): Promise<Record<string, unknown>> {
+  async execute(
+    input: UniversalGuiInput,
+    callContext?: CapabilityCallContext,
+  ): Promise<Record<string, unknown>> {
     this.assertOpen();
     this.pruneExpired();
+    const owner = this.owner(callContext);
     switch (input.operation) {
       case "capabilities":
-        return this.capabilities(input.target);
+        return this.capabilities(input.target, owner);
       case "observe":
-        return this.observe(input);
+        return this.observe(input, owner);
       case "act":
-        return this.act(input);
+        return this.act(input, owner);
       case "wait":
-        return this.wait(input);
+        return this.wait(input, owner);
     }
   }
 
-  async authorityTarget(input: Pick<UniversalGuiInput, "target" | "sessionId">): Promise<{
+  async authorityTarget(
+    input: Pick<UniversalGuiInput, "target" | "sessionId">,
+    callContext?: CapabilityCallContext,
+  ): Promise<{
     generation: string;
     target: TargetDefinition;
   }> {
     this.assertOpen();
     this.pruneExpired();
-    const session = input.sessionId ? this.requireSession(input.sessionId) : undefined;
+    const owner = this.owner(callContext);
+    const session = input.sessionId ? this.requireSession(input.sessionId, owner) : undefined;
     const binding = await this.targets.resolveWithGeneration(
       input.target ?? session?.targetId ?? "local",
     );
@@ -195,6 +238,14 @@ export class UniversalGuiService {
       throw new UniversalBrokerError(
         "PRECONDITION_FAILED",
         `GUI session ${session.sessionId} belongs to ${session.targetId}, not ${binding.target.id}.`,
+      );
+    }
+    if (session && session.targetGeneration !== binding.generation) {
+      throw guiStateChanged(
+        session,
+        session.generation,
+        session.generation,
+        "target generation changed",
       );
     }
     return binding;
@@ -216,7 +267,10 @@ export class UniversalGuiService {
     };
   }
 
-  private async capabilities(selector: string | undefined): Promise<Record<string, unknown>> {
+  private async capabilities(
+    selector: string | undefined,
+    owner: CapabilityCallContext,
+  ): Promise<Record<string, unknown>> {
     const target = await this.targets.resolve(selector ?? "local");
     if (target.platform !== "macos") {
       return {
@@ -240,7 +294,7 @@ export class UniversalGuiService {
     }
     let node: Record<string, unknown>;
     try {
-      node = await this.runner.call(target, { operation: "capabilities" });
+      node = await this.runner.call(target, { operation: "capabilities" }, owner);
     } catch (error) {
       if (error instanceof UniversalBrokerError && error.code === "CAPABILITY_UNAVAILABLE") {
         return {
@@ -272,9 +326,13 @@ export class UniversalGuiService {
     };
   }
 
-  private async observe(input: UniversalGuiInput): Promise<Record<string, unknown>> {
-    const existing = input.sessionId ? this.requireSession(input.sessionId) : undefined;
-    const target = await this.resolveSessionTarget(input.target, existing);
+  private async observe(
+    input: UniversalGuiInput,
+    owner: CapabilityCallContext,
+  ): Promise<Record<string, unknown>> {
+    const existing = input.sessionId ? this.requireSession(input.sessionId, owner) : undefined;
+    const binding = await this.resolveSessionTarget(input.target, existing);
+    const target = binding.target;
     this.assertGuiTarget(target);
     const maxElements = boundedInteger(
       input.maxElements,
@@ -283,51 +341,78 @@ export class UniversalGuiService {
       MAXIMUM_ELEMENTS,
       "maxElements",
     );
-    const observation = normalizeObservation(
-      await this.runner.call(target, { operation: "observe", maxElements }),
+    const focusPolicy = normalizeFocusPolicy(input.focusPolicy ?? existing?.focusPolicy);
+    if (existing && focusPolicy !== existing.focusPolicy) {
+      throw new UniversalBrokerError(
+        "PRECONDITION_FAILED",
+        `GUI session ${existing.sessionId} focus policy cannot be changed after creation.`,
+        { evidence: { sessionId: existing.sessionId, providerDispatchCount: 0 } },
+      );
+    }
+    const reservation = existing ? undefined : this.reservations.reserve(
+      { entries: this.sessions.size },
+      { entries: 1 },
     );
-    const generation = observationGeneration(target.id, observation);
-    const now = this.now();
-    const session: GuiSession = existing ?? {
-      sessionId: `gui_${randomUUID()}`,
-      targetId: target.id,
-      generation,
-      observation,
-      maxElements,
-      createdAt: now,
-      lastUsedAt: now,
-    };
-    session.targetId = target.id;
-    session.generation = generation;
-    session.observation = observation;
-    session.maxElements = maxElements;
-    session.lastUsedAt = now;
-    this.sessions.set(session.sessionId, session);
-    this.touch(session.sessionId);
-    this.enforceSessionLimit();
-    return this.presentObservation(session, false);
+    try {
+      const observation = normalizeObservation(
+        await this.runner.call(target, { operation: "observe", maxElements }, owner),
+      );
+      const generation = observationGeneration(target.id, observation);
+      const now = this.now();
+      const session: GuiSession = existing ?? {
+        sessionId: `gui_${randomUUID()}`,
+        principalKeyFingerprint: owner.principalKeyFingerprint,
+        targetId: target.id,
+        targetGeneration: binding.generation,
+        focusPolicy,
+        generation,
+        observation,
+        maxElements,
+        createdAt: now,
+        lastUsedAt: now,
+      };
+      session.targetId = target.id;
+      session.targetGeneration = binding.generation;
+      session.generation = generation;
+      session.observation = observation;
+      session.maxElements = maxElements;
+      session.lastUsedAt = now;
+      if (reservation) reservation.commit(() => this.sessions.set(session.sessionId, session));
+      else this.sessions.set(session.sessionId, session);
+      this.touch(session.sessionId);
+      return this.presentObservation(session, false);
+    } finally {
+      reservation?.release();
+    }
   }
 
-  private async act(input: UniversalGuiInput): Promise<Record<string, unknown>> {
-    const session = this.requireSession(requiredText(input.sessionId, "gui.act requires sessionId."));
+  private async act(
+    input: UniversalGuiInput,
+    owner: CapabilityCallContext,
+  ): Promise<Record<string, unknown>> {
+    const session = this.requireSession(
+      requiredText(input.sessionId, "gui.act requires sessionId."),
+      owner,
+    );
     const expectedGeneration = requiredText(input.generation, "gui.act requires generation.");
     if (session.generation !== expectedGeneration) {
       throw guiStateChanged(session, expectedGeneration, session.generation, "session generation changed");
     }
-    const target = await this.resolveSessionTarget(input.target, session);
+    const binding = await this.resolveSessionTarget(input.target, session);
+    const target = binding.target;
     this.assertGuiTarget(target);
+    const action = normalizeAction(input.action);
     const current = normalizeObservation(
       await this.runner.call(target, {
         operation: "observe",
         maxElements: session.maxElements,
-      }),
+      }, owner),
     );
     const currentGeneration = observationGeneration(target.id, current);
     if (currentGeneration !== expectedGeneration) {
       throw guiStateChanged(session, expectedGeneration, currentGeneration, "GUI changed after observation");
     }
 
-    const action = normalizeAction(input.action);
     const element = action.elementId
       ? current.elements.find((candidate) => candidate.elementId === action.elementId)
       : undefined;
@@ -341,32 +426,65 @@ export class UniversalGuiService {
         { evidence: { elementId: element.elementId, actions: element.actions } },
       );
     }
+    const focusBefore = focusEvidence(current);
+    const unavoidableFocusChange = actionRequiresFocusChange(action, element);
+    if (session.focusPolicy === "preserve" && unavoidableFocusChange) {
+      throw new UniversalBrokerError(
+        "PRECONDITION_FAILED",
+        "GUI action would unavoidably change focus under focusPolicy=preserve.",
+        {
+          evidence: {
+            sessionId: session.sessionId,
+            targetId: session.targetId,
+            focusPolicy: session.focusPolicy,
+            actionType: action.type,
+            providerDispatchCount: 0,
+            focusBefore,
+          },
+        },
+      );
+    }
 
-    const performed = await this.runner.call(target, {
-      operation: "act",
-      elementIndex: element?.index ?? -1,
-      actionType: action.type,
-      actionName: action.actionName,
-      value: action.value,
-      modifiers: action.modifiers,
-      keyCode: action.keyCode,
-      expected: {
-        pid: current.application.pid,
-        windowTitle: current.window?.title ?? "",
-        role: element?.role ?? "",
-        subrole: element?.subrole ?? "",
-        name: element?.name ?? "",
-        description: element?.description ?? "",
-      },
-    });
+    let performed: Record<string, unknown>;
+    try {
+      performed = await this.runner.call(target, {
+        operation: "act",
+        elementIndex: element?.index ?? -1,
+        actionType: action.type,
+        actionName: action.actionName,
+        value: action.value,
+        modifiers: action.modifiers,
+        keyCode: action.keyCode,
+        expected: {
+          pid: current.application.pid,
+          windowTitle: current.window?.title ?? "",
+          role: element?.role ?? "",
+          subrole: element?.subrole ?? "",
+          name: element?.name ?? "",
+          description: element?.description ?? "",
+        },
+      }, owner);
+    } catch (error) {
+      if (
+        error instanceof UniversalBrokerError
+        && ["GUI_STATE_CHANGED", "CAPABILITY_UNAVAILABLE", "PRECONDITION_FAILED"].includes(error.code)
+      ) throw error;
+      throw guiActionResultUnknown(session, action, focusBefore, error, "action provider failed");
+    }
 
     await this.sleep(100);
-    const next = normalizeObservation(
-      await this.runner.call(target, {
-        operation: "observe",
-        maxElements: session.maxElements,
-      }),
-    );
+    let next: GuiObservation;
+    try {
+      next = normalizeObservation(
+        await this.runner.call(target, {
+          operation: "observe",
+          maxElements: session.maxElements,
+        }, owner),
+      );
+    } catch (error) {
+      throw guiActionResultUnknown(session, action, focusBefore, error, "post-action readback failed");
+    }
+    const focusAfter = focusEvidence(next);
     session.observation = next;
     session.generation = observationGeneration(target.id, next);
     session.lastUsedAt = this.now();
@@ -378,14 +496,28 @@ export class UniversalGuiService {
         ...(action.elementId ? { elementId: action.elementId } : {}),
         ...(action.actionName ? { actionName: action.actionName } : {}),
       },
+      focus: {
+        policy: session.focusPolicy,
+        before: focusBefore,
+        after: focusAfter,
+        changed: !sameFocus(focusBefore, focusAfter),
+        unavoidable: unavoidableFocusChange,
+      },
       observation: this.presentObservation(session, false),
     };
   }
 
-  private async wait(input: UniversalGuiInput): Promise<Record<string, unknown>> {
-    const session = this.requireSession(requiredText(input.sessionId, "gui.wait requires sessionId."));
+  private async wait(
+    input: UniversalGuiInput,
+    owner: CapabilityCallContext,
+  ): Promise<Record<string, unknown>> {
+    const session = this.requireSession(
+      requiredText(input.sessionId, "gui.wait requires sessionId."),
+      owner,
+    );
     const expectedGeneration = requiredText(input.generation, "gui.wait requires generation.");
-    const target = await this.resolveSessionTarget(input.target, session);
+    const binding = await this.resolveSessionTarget(input.target, session);
+    const target = binding.target;
     this.assertGuiTarget(target);
     const timeoutMs = boundedInteger(
       input.timeoutMs,
@@ -400,7 +532,7 @@ export class UniversalGuiService {
         await this.runner.call(target, {
           operation: "observe",
           maxElements: session.maxElements,
-        }),
+        }, owner),
       );
       const generation = observationGeneration(target.id, current);
       if (generation !== expectedGeneration) {
@@ -429,18 +561,30 @@ export class UniversalGuiService {
   private async resolveSessionTarget(
     selector: string | undefined,
     session: GuiSession | undefined,
-  ): Promise<TargetDefinition> {
-    const target = await this.targets.resolve(selector ?? session?.targetId ?? "local");
-    if (session && session.targetId !== target.id) {
+  ): Promise<{ target: TargetDefinition; generation: string }> {
+    const binding = await this.targets.resolveWithGeneration(
+      selector ?? session?.targetId ?? "local",
+    );
+    if (session && session.targetId !== binding.target.id) {
       throw new UniversalBrokerError(
         "PRECONDITION_FAILED",
-        `GUI session ${session.sessionId} belongs to ${session.targetId}, not ${target.id}.`,
+        `GUI session ${session.sessionId} belongs to ${session.targetId}, not ${binding.target.id}.`,
+        { evidence: { sessionId: session.sessionId, providerDispatchCount: 0 } },
       );
     }
-    return target;
+    if (session && session.targetGeneration !== binding.generation) {
+      throw guiStateChanged(
+        session,
+        session.generation,
+        session.generation,
+        "target generation changed",
+      );
+    }
+    return binding;
   }
 
   private assertGuiTarget(target: TargetDefinition): void {
+    assertTargetCapability(target, "gui");
     if (target.platform !== "macos") {
       throw new UniversalBrokerError(
         "CAPABILITY_UNAVAILABLE",
@@ -467,13 +611,20 @@ export class UniversalGuiService {
     }
   }
 
-  private requireSession(sessionId: string): GuiSession {
+  private requireSession(sessionId: string, owner: CapabilityCallContext): GuiSession {
     const session = this.sessions.get(sessionId);
     if (!session || session.lastUsedAt + this.sessionTtlMs <= this.now()) {
       if (session) this.sessions.delete(sessionId);
       throw new UniversalBrokerError(
         "PATH_NOT_FOUND",
         `GUI session is unknown or expired: ${sessionId}`,
+      );
+    }
+    if (session.principalKeyFingerprint !== owner.principalKeyFingerprint) {
+      throw new UniversalBrokerError(
+        "AUTHORITY_PRINCIPAL_MISMATCH",
+        `GUI session ${sessionId} belongs to a different authenticated principal.`,
+        { evidence: { sessionId, providerDispatchCount: 0 } },
       );
     }
     return session;
@@ -486,6 +637,10 @@ export class UniversalGuiService {
     const base: Record<string, unknown> = {
       sessionId: session.sessionId,
       targetId: session.targetId,
+      targetGeneration: session.targetGeneration,
+      focusPolicy: session.focusPolicy,
+      createdAt: new Date(session.createdAt).toISOString(),
+      expiresAt: new Date(session.lastUsedAt + this.sessionTtlMs).toISOString(),
       generation: session.generation,
       changed,
       application: session.observation.application,
@@ -529,14 +684,6 @@ export class UniversalGuiService {
     }
   }
 
-  private enforceSessionLimit(): void {
-    while (this.sessions.size > this.maximumSessions) {
-      const oldest = this.sessions.keys().next().value as string | undefined;
-      if (!oldest) break;
-      this.sessions.delete(oldest);
-    }
-  }
-
   private touch(sessionId: string): void {
     const session = this.sessions.get(sessionId);
     if (!session) return;
@@ -548,6 +695,10 @@ export class UniversalGuiService {
     if (this.closed) {
       throw new UniversalBrokerError("TRANSPORT_UNAVAILABLE", "The GUI service is closed.");
     }
+  }
+
+  private owner(callContext?: CapabilityCallContext): CapabilityCallContext {
+    return requireCapabilityCallContext(callContext, this.ownerProvider);
   }
 }
 
@@ -563,14 +714,18 @@ export class MacOsGuiNodeRunner implements GuiNodeRunner {
     private readonly execution: UniversalExecutionPlane,
   ) {}
 
-  async call(target: TargetDefinition, request: GuiNodeRequest): Promise<Record<string, unknown>> {
+  async call(
+    target: TargetDefinition,
+    request: GuiNodeRequest,
+    callContext?: CapabilityCallContext,
+  ): Promise<Record<string, unknown>> {
     if (target.platform !== "macos") {
       throw new UniversalBrokerError(
         "CAPABILITY_UNAVAILABLE",
         `The built-in GUI node supports macOS only: ${target.id}`,
       );
     }
-    const scriptPath = await this.ensureInstalled(target);
+    const scriptPath = await this.ensureInstalled(target, callContext);
     const args = guiNodeArguments(request);
     let process = await this.execution.execute({
       internalPolicy: { kind: "gui", scriptPath, scriptSha256: this.sourceSha256 },
@@ -580,14 +735,14 @@ export class MacOsGuiNodeRunner implements GuiNodeRunner {
       mode: "foreground",
       yieldMs: 30_000,
       maxOutputChars: 1_000_000,
-    });
+    }, undefined, undefined, callContext);
     if (process.state === "RUNNING" || process.state === "STARTING") {
       process = await this.execution.operate({
         operation: "wait",
         processId: process.processId,
         waitMs: NODE_TIMEOUT_MS,
         maxOutputChars: 1_000_000,
-      }) as UniversalProcessSnapshot;
+      }, undefined, callContext) as UniversalProcessSnapshot;
     }
     if (process.state !== "EXITED" || process.exitCode !== 0) {
       throw new UniversalBrokerError(
@@ -635,7 +790,10 @@ export class MacOsGuiNodeRunner implements GuiNodeRunner {
     );
   }
 
-  private async ensureInstalled(target: TargetDefinition): Promise<string> {
+  private async ensureInstalled(
+    target: TargetDefinition,
+    callContext?: CapabilityCallContext,
+  ): Promise<string> {
     const scriptPath = target.gui.command ?? await this.defaultScriptPath(target);
     const cacheKey = `${target.id}:${scriptPath}:${this.sourceSha256}`;
     if (this.installed.has(cacheKey)) return scriptPath;
@@ -644,14 +802,14 @@ export class MacOsGuiNodeRunner implements GuiNodeRunner {
       target: target.id,
       path: dirnameForTarget(scriptPath, target),
       recursive: true,
-    });
+    }, callContext);
     let existingSha256: string | undefined;
     try {
       const result = await this.filesystem.execute({
         operation: "hash",
         target: target.id,
         path: scriptPath,
-      });
+      }, callContext);
       existingSha256 = typeof result.sha256 === "string" ? result.sha256 : undefined;
     } catch (error) {
       if (!(error instanceof UniversalBrokerError) || error.code !== "PATH_NOT_FOUND") throw error;
@@ -664,7 +822,7 @@ export class MacOsGuiNodeRunner implements GuiNodeRunner {
         content: GUI_NODE_APPLESCRIPT_SOURCE,
         overwrite: existingSha256 !== undefined,
         expectedSha256: existingSha256,
-      });
+      }, callContext);
     }
     this.installed.add(cacheKey);
     return scriptPath;
@@ -865,6 +1023,68 @@ function observationGeneration(targetId: string, observation: GuiObservation): s
     .slice(0, 24);
 }
 
+interface GuiFocusEvidence {
+  applicationPid: number;
+  applicationName: string;
+  windowTitle: string;
+  focusedElementId?: string;
+}
+
+function focusEvidence(observation: GuiObservation): GuiFocusEvidence {
+  const focusedElementId = observation.elements.find((element) => element.focused)?.elementId;
+  return {
+    applicationPid: observation.application.pid,
+    applicationName: observation.application.name,
+    windowTitle: observation.window?.title ?? "",
+    ...(focusedElementId ? { focusedElementId } : {}),
+  };
+}
+
+function sameFocus(left: GuiFocusEvidence, right: GuiFocusEvidence): boolean {
+  return left.applicationPid === right.applicationPid
+    && left.windowTitle === right.windowTitle
+    && left.focusedElementId === right.focusedElementId;
+}
+
+function actionRequiresFocusChange(
+  action: NormalizedGuiAction,
+  element: GuiElementObservation | undefined,
+): boolean {
+  if (action.type === "focus") return element?.focused !== true;
+  if (action.type === "keystroke" && element) return element.focused !== true;
+  return false;
+}
+
+function normalizeFocusPolicy(value: "preserve" | "allow" | undefined): "preserve" | "allow" {
+  return value ?? "preserve";
+}
+
+function guiActionResultUnknown(
+  session: GuiSession,
+  action: NormalizedGuiAction,
+  focusBefore: GuiFocusEvidence,
+  error: unknown,
+  phase: string,
+): UniversalBrokerError {
+  return new UniversalBrokerError(
+    "GUI_STATE_CHANGED",
+    `GUI action result is unknown because ${phase}; the action was not retried.`,
+    {
+      evidence: {
+        sessionId: session.sessionId,
+        targetId: session.targetId,
+        generation: session.generation,
+        actionType: action.type,
+        dispatchState: "UNKNOWN",
+        providerDispatchCount: 1,
+        replayed: false,
+        focusBefore,
+        cause: errorMessage(error).slice(0, 300),
+      },
+    },
+  );
+}
+
 function guiStateChanged(
   session: GuiSession,
   expectedGeneration: string,
@@ -880,6 +1100,7 @@ function guiStateChanged(
         targetId: session.targetId,
         expectedGeneration,
         actualGeneration,
+        providerDispatchCount: 0,
       },
     },
   );

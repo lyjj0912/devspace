@@ -136,15 +136,16 @@ switch to a different immutable release.
 ```bash
 curl -fsS http://127.0.0.1:7678/healthz
 curl -fsS https://home-ai.tail733d38.ts.net/healthz
-curl -fsS -H 'Host: 127.0.0.1:7678' http://127.0.0.1:7678/metrics
+curl -fsS http://127.0.0.1:8678/readyz
+curl -fsS http://127.0.0.1:8678/metrics
 ```
 
 Expected boundaries:
 
 - local and public health: 200;
 - unauthenticated MCP initialize: 401;
-- local metrics with local Host: 200;
-- public metrics: 403.
+- private readiness and metrics on the separate management listener: 200;
+- the public data plane has no metrics route: 404.
 
 ## Production upgrade transaction
 

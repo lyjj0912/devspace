@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -60,6 +60,67 @@ test("checked-in MCP route example satisfies the runtime registry", async () => 
   );
 });
 
+test("broker-owned MCP risk policy content is validated and changes route generation", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-v2-mcp-policy-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const path = join(root, "routes.json");
+  const policyFile = join(root, "fixture-policy.json");
+  await writeRiskPolicy(policyFile, "R0", "a".repeat(64));
+  await writeRoutes(path, {
+    fixture: {
+      ...localRoute("Fixture", []),
+      riskPolicy: { mode: "broker-owned", policyFile },
+    },
+  });
+
+  const registry = new UniversalMcpRouteRegistry(path);
+  const first = await registry.inspect();
+  assert.equal(first.routes[0]?.riskPolicy?.mode, "broker-owned");
+  assert.equal(typeof first.routes[0]?.riskPolicy?.policyDigest, "string");
+
+  await writeRiskPolicy(policyFile, "R3", "a".repeat(64));
+  const second = await registry.inspect();
+  assert.notEqual(second.generation, first.generation);
+  assert.notEqual(
+    second.routes[0]?.riskPolicy?.policyDigest,
+    first.routes[0]?.riskPolicy?.policyDigest,
+  );
+});
+
+test("configured MCP policy fails closed for malformed, writable, missing, and symlink files", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-v2-mcp-policy-invalid-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const routePath = join(root, "routes.json");
+  const policyFile = join(root, "policy.json");
+  const configure = async (configuredPath: string) => {
+    await writeRoutes(routePath, {
+      fixture: {
+        ...localRoute("Fixture", []),
+        riskPolicy: { mode: "broker-owned", policyFile: configuredPath },
+      },
+    });
+    return new UniversalMcpRouteRegistry(routePath);
+  };
+
+  await writeFile(policyFile, "{not-json", { mode: 0o600 });
+  await assert.rejects((await configure(policyFile)).inspect(), hasCode("PRECONDITION_FAILED"));
+
+  await writeRiskPolicy(policyFile, "R0", "b".repeat(64));
+  await chmod(policyFile, 0o622);
+  await assert.rejects((await configure(policyFile)).inspect(), hasCode("PRECONDITION_FAILED"));
+
+  await chmod(policyFile, 0o000);
+  await assert.rejects((await configure(policyFile)).inspect(), hasCode("PRECONDITION_FAILED"));
+
+  const missing = join(root, "missing-policy.json");
+  await assert.rejects((await configure(missing)).inspect(), hasCode("PRECONDITION_FAILED"));
+
+  await chmod(policyFile, 0o600);
+  const policyLink = join(root, "policy-link.json");
+  await symlink(policyFile, policyLink);
+  await assert.rejects((await configure(policyLink)).inspect(), hasCode("PRECONDITION_FAILED"));
+});
+
 function localRoute(displayName: string, aliases: string[]) {
   return {
     displayName,
@@ -72,6 +133,21 @@ function localRoute(displayName: string, aliases: string[]) {
 
 async function writeRoutes(path: string, routes: Record<string, unknown>): Promise<void> {
   await writeFile(path, JSON.stringify({ version: 1, routes }, null, 2));
+}
+
+async function writeRiskPolicy(
+  path: string,
+  risk: "R0" | "R2" | "R3",
+  toolContractSha256: string,
+): Promise<void> {
+  await writeFile(path, JSON.stringify({
+    version: 1,
+    routeId: "fixture",
+    tools: {
+      read_exact: { risk, toolContractSha256 },
+    },
+  }, null, 2), { mode: 0o600 });
+  await chmod(path, 0o600);
 }
 
 function hasCode(code: string) {

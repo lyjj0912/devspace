@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { lstat, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, resolve } from "node:path";
@@ -23,6 +24,7 @@ const profileFileSchema = z.strictObject({
 
 export interface UniversalEnvProfile {
   id: string;
+  generation: string;
   description?: string;
   targets: string[];
   environment: Record<string, string>;
@@ -32,6 +34,7 @@ export interface UniversalEnvProfile {
 
 export interface ResolvedEnvProfile {
   id: string;
+  generation: string;
   environment: Record<string, string>;
   sourceFile?: string;
   headers: Record<string, string>;
@@ -42,7 +45,7 @@ export interface UniversalEnvProfileRegistryOptions {
 }
 
 export class UniversalEnvProfileRegistry {
-  private cached?: { mtimeMs: number; size: number; profiles: Map<string, UniversalEnvProfile> };
+  private cached?: { contentSha256: string; profiles: Map<string, UniversalEnvProfile> };
 
   constructor(private readonly options: UniversalEnvProfileRegistryOptions) {}
 
@@ -81,6 +84,7 @@ export class UniversalEnvProfileRegistry {
     }
     return {
       id: profile.id,
+      generation: profile.generation,
       environment: { ...profile.environment },
       ...(profile.sourceFile ? { sourceFile: profile.sourceFile } : {}),
       headers: { ...profile.headers },
@@ -112,12 +116,21 @@ export class UniversalEnvProfileRegistry {
         { evidence: { path: this.options.configPath, mode: metadata.mode & 0o777, uid: metadata.uid } },
       );
     }
-    if (this.cached && this.cached.mtimeMs === metadata.mtimeMs && this.cached.size === metadata.size) {
-      return this.cached.profiles;
+    let content: string;
+    try {
+      content = await readFile(this.options.configPath, "utf8");
+    } catch (error) {
+      throw new UniversalBrokerError(
+        "PRECONDITION_FAILED",
+        "Environment profile registry could not be read.",
+        { evidence: { error: errorMessage(error) } },
+      );
     }
+    const contentSha256 = sha256(content);
+    if (this.cached?.contentSha256 === contentSha256) return this.cached.profiles;
     let parsed: unknown;
     try {
-      parsed = JSON.parse(await readFile(this.options.configPath, "utf8"));
+      parsed = JSON.parse(content);
     } catch (error) {
       throw new UniversalBrokerError(
         "PRECONDITION_FAILED",
@@ -158,22 +171,49 @@ export class UniversalEnvProfileRegistry {
           `Environment profile ${id} sourceFile must be absolute or begin with ~/.`,
         );
       }
-      profiles.set(id, {
+      const normalized = {
         id,
         description: value.description,
         targets: [...(value.targets ?? [])],
         environment,
         ...(value.sourceFile ? { sourceFile: value.sourceFile } : {}),
         headers,
+      };
+      profiles.set(id, {
+        ...normalized,
+        generation: sha256(stableJson(normalized)),
       });
     }
-    this.cached = { mtimeMs: metadata.mtimeMs, size: metadata.size, profiles };
+    this.cached = { contentSha256, profiles };
     return profiles;
   }
 }
 
 export function resolveLocalProfileSourceFile(path: string): string {
   return path === "~" ? homedir() : path.startsWith("~/") ? resolve(homedir(), path.slice(2)) : path;
+}
+
+export async function resolvedEnvProfileExecutionGeneration(
+  profile: ResolvedEnvProfile,
+  sourceLocation: "local" | "remote",
+): Promise<string> {
+  if (!profile.sourceFile || sourceLocation === "remote") return profile.generation;
+  const sourcePath = resolveLocalProfileSourceFile(profile.sourceFile);
+  let sourceContent: Buffer;
+  try {
+    sourceContent = await readFile(sourcePath);
+  } catch (error) {
+    throw new UniversalBrokerError(
+      "PRECONDITION_FAILED",
+      `Environment profile ${profile.id} source file could not be read for generation binding.`,
+      { evidence: { profileId: profile.id, error: errorMessage(error) } },
+    );
+  }
+  return sha256(stableJson({
+    profileGeneration: profile.generation,
+    sourceFile: profile.sourceFile,
+    sourceContentSha256: sha256(sourceContent),
+  }));
 }
 
 function isAbsoluteOrTilde(path: string): boolean {
@@ -186,4 +226,17 @@ function isNodeError(error: unknown, code: string): error is NodeJS.ErrnoExcepti
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${stableJson(record[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
+function sha256(value: string | Uint8Array): string {
+  return createHash("sha256").update(value).digest("hex");
 }

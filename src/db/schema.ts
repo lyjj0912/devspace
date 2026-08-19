@@ -74,6 +74,11 @@ export const oauthAccessTokens = sqliteTable(
     scopesJson: text("scopes_json").notNull(),
     expiresAt: integer("expires_at").notNull(),
     resource: text("resource"),
+    familyId: text("family_id"),
+    connectorBindingId: text("connector_binding_id"),
+    connectorDrainEpoch: integer("connector_drain_epoch"),
+    installationEpoch: integer("installation_epoch"),
+    rotationSequence: integer("rotation_sequence").notNull().default(0),
   },
 );
 
@@ -87,7 +92,56 @@ export const oauthRefreshTokens = sqliteTable(
     scopesJson: text("scopes_json").notNull(),
     expiresAt: integer("expires_at").notNull(),
     resource: text("resource"),
+    familyId: text("family_id"),
+    connectorBindingId: text("connector_binding_id"),
+    connectorDrainEpoch: integer("connector_drain_epoch"),
+    installationEpoch: integer("installation_epoch"),
+    rotationSequence: integer("rotation_sequence").notNull().default(0),
   },
+);
+
+export const oauthConnectorBindings = sqliteTable(
+  "oauth_connector_bindings",
+  {
+    bindingId: text("binding_id").primaryKey(),
+    canonicalName: text("canonical_name").notNull(),
+    clientId: text("client_id")
+      .notNull()
+      .references(() => oauthClients.clientId, { onDelete: "cascade" }),
+    installationEpoch: integer("installation_epoch").notNull(),
+    schemaGeneration: text("schema_generation").notNull(),
+    drainEpoch: integer("drain_epoch").notNull().default(0),
+    state: text("state").notNull(),
+    refCount: integer("ref_count").notNull().default(0),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (table) => [
+    index("oauth_connector_bindings_client_idx").on(table.clientId, table.state),
+  ],
+);
+
+export const oauthTokenFamilies = sqliteTable(
+  "oauth_token_families",
+  {
+    familyId: text("family_id").primaryKey(),
+    clientId: text("client_id")
+      .notNull()
+      .references(() => oauthClients.clientId, { onDelete: "cascade" }),
+    connectorBindingId: text("connector_binding_id")
+      .references(() => oauthConnectorBindings.bindingId, { onDelete: "restrict" }),
+    installationEpoch: integer("installation_epoch"),
+    drainEpoch: integer("drain_epoch"),
+    status: text("status").notNull(),
+    rotationSequence: integer("rotation_sequence").notNull().default(0),
+    createdAt: text("created_at").notNull(),
+    rotatedAt: text("rotated_at"),
+    revokedAt: text("revoked_at"),
+  },
+  (table) => [
+    index("oauth_token_families_client_idx").on(table.clientId, table.status),
+    index("oauth_token_families_binding_idx").on(table.connectorBindingId, table.status),
+  ],
 );
 
 export const localAgentSessions = sqliteTable(

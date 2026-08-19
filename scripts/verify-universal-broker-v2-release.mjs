@@ -4,12 +4,29 @@ import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { relative, resolve } from "node:path";
+import { createReleasePackage, verifyReleasePackage as verifyImmutableReleasePackage } from "./lib/release-artifacts.mjs";
 
 const root = process.cwd();
 const requireClean = process.argv.includes("--require-clean");
+const createPackageAt = optionValue("--create-package");
+const verifyPackageAt = optionValue("--verify-package");
+if (createPackageAt || verifyPackageAt) {
+  if (createPackageAt && verifyPackageAt) fail("Choose only one immutable package operation.");
+  const sourceRevision = optionValue("--source-revision");
+  const runtimeRevision = optionValue("--runtime-revision");
+  const result = createPackageAt
+    ? createReleasePackage({ sourceRoot: root, outputRoot: createPackageAt, sourceRevision, runtimeRevision })
+    : verifyImmutableReleasePackage(verifyPackageAt, {
+        expectedSourceRevision: sourceRevision,
+        expectedRuntimeRevision: runtimeRevision,
+      });
+  console.log(JSON.stringify(result, null, 2));
+  process.exit(0);
+}
 
 run("npm", ["run", "typecheck"]);
 run("npm", ["run", "test"]);
+run(process.execPath, ["scripts/release-finalization.test.mjs"]);
 run("npm", ["audit", "--omit=dev", "--audit-level=low"]);
 run("npm", ["run", "build"]);
 run("npm", ["run", "v2:budget"]);
@@ -27,12 +44,16 @@ for (const script of [
   "scripts/configure-devspace-log-rotation.sh",
   "scripts/upgrade-universal-broker-v2-production.sh",
   "scripts/status-universal-broker-v2-upgrade.sh",
+  "scripts/deploy-universal-broker-v2-parallel.sh",
 ]) {
   run("/bin/bash", ["-n", script]);
 }
 for (const script of [
   "scripts/verify-universal-broker-v2-live.mjs",
   "scripts/verify-universal-broker-v2-load.mjs",
+  "scripts/release-artifacts.mjs",
+  "scripts/finalize-universal-broker-v2.mjs",
+  "scripts/finalization-live-driver.mjs",
 ]) {
   run(process.execPath, ["--check", script]);
 }
@@ -44,6 +65,7 @@ verifySelfManagementSources();
 verifyMetricsIsolationSources();
 verifyP1OperabilitySources();
 verifyDeploymentSources();
+verifyReleaseArtifactSources();
 verifyGranularOAuthSources();
 verifyLiveVerifierSources();
 verifyTestComposition();
@@ -137,6 +159,7 @@ function verifyNoPrivilegeElevationSources() {
     "src/v2/authority-policy.ts",
     "src/v2/no-elevation.ts",
     "scripts/verify-universal-broker-v2-live.mjs",
+    "scripts/lib/release-artifacts.mjs",
   ]);
   for (const path of productionPaths) {
     const absolute = resolve(root, path);
@@ -231,6 +254,7 @@ function verifyGranularOAuthSources() {
 function verifyOperationAuthoritySources() {
   const contracts = text("src/v2/contracts.ts");
   const authority = text("src/v2/authority.ts");
+  const principal = text("src/v2/authority-principal.ts");
   const store = text("src/v2/authority-store.ts");
   const policy = text("src/v2/authority-policy.ts");
   const server = text("src/v2/server.ts");
@@ -253,35 +277,52 @@ function verifyOperationAuthoritySources() {
   }
   for (const marker of [
     "OperationAuthorityRegistry",
+    "OperationAuthorityDispatchController",
     "preview(actionsInput",
     "planFingerprint",
     "assertUniqueActionFingerprints",
+    "taskInstanceId",
     "correctionEpoch",
     "maximumUses",
     "consumedUses",
-    "authorityScope",
-    "scopeKeyFor",
+    "requiredPrincipalFingerprint",
     "persistentActionKey",
-    "this.store.reserveUse",
-    "this.store.finalizeUse",
+    "this.requireStore().claimAction",
+    "markClaimDispatched",
+    "cancelClaimNotDispatched",
+    "terminalizeClaim",
   ]) {
-    if (!authority.includes(marker) && !server.includes(marker)) {
+    if (!authority.includes(marker) && !server.includes(marker) && !principal.includes(marker)) {
       fail(`Operation-authority implementation is missing: ${marker}`);
     }
   }
   for (const marker of [
-    "task_id_sha256",
+    "resolveAuthorityPrincipal",
+    "principalKeyFingerprint",
+    "ownerInstanceId",
+    "AUTHENTICATION_FAILED",
+  ]) {
+    if (!principal.includes(marker)) fail(`Stable authority principal implementation is missing: ${marker}`);
+  }
+  for (const marker of [
     "authority_text_sha256",
-    "scope_key",
+    "principal_key_fingerprint",
+    "task_instance_id",
     "owner_instance_id",
-    "PENDING",
+    "operation_authority_claims",
+    "operation_authority_resource_fences",
+    "operation_authority_resource_leases",
+    "CLAIMED",
+    "DISPATCHED",
+    "CANCELLED_NOT_DISPATCHED",
     "UNCERTAIN",
     "PROCESS_RESTARTED",
-    "PENDING_RESERVATION_RECOVERED",
     "synchronous = FULL",
-    "reserveUse(input",
-    "finalizeUse(input",
-    "incrementCorrectionEpoch",
+    "claimAction(input",
+    "markClaimDispatched(input",
+    "cancelClaimNotDispatched(input",
+    "terminalizeClaim(input",
+    "incrementTaskCorrectionEpoch",
     "releaseAuthority",
   ]) {
     if (!store.includes(marker)) fail(`Durable operation-authority store is missing: ${marker}`);
@@ -318,19 +359,25 @@ function verifyOperationAuthoritySources() {
     "authority.preview",
     'case "authorize"',
     "authority.create",
-    "authority.require",
-    "authority.record",
+    "authority.prepareDispatch",
+    "dispatch.claim",
+    "dispatch.markDispatched",
+    "dispatch.cancelNotDispatched",
+    "dispatch.complete",
   ]) {
     if (!server.includes(marker)) fail(`Operation-authority server gate is missing: ${marker}`);
   }
   for (const marker of [
     "authority preview classifies exact actions",
     "R3 authority is one-shot",
-    "correction invalidates every authority",
+    "task-local correction invalidates Task A without invalidating Task B",
     "R0 actions cannot be wrapped",
-    "PENDING reservation recovers as UNCERTAIN and consumed without persisting raw payload",
-    "restart after authority expiry still preserves UNCERTAIN consumed evidence without replay",
+    "verified-dead CLAIMED action recovers as cancelled and reclaimed without persisting raw payload",
+    "restart after authority expiry still cancels a verified-zero CLAIMED use without replay",
     "stale overlapping workers cannot reserve the same R3 action twice",
+    "atomic claim, use, and resource lease admit one writer and advance the fence after release",
+    "persistent terminal SQL fault rolls back receipt and lease, then restart freezes without replay",
+    "stale fencing token cannot terminalize or release the current writer",
     "correction preserves an in-flight receipt and epochs remain monotonic across workers",
   ]) {
     if (!tests.includes(marker)) fail(`Operation-authority regression test is missing: ${marker}`);
@@ -366,7 +413,9 @@ function verifyRuntimeNoElevationSources() {
   }
   for (const marker of [
     "assertNoElevationCommand",
-    "ELEVATION_PATTERNS",
+    "containsElevationCommand",
+    "structuralCommandRisk",
+    "EXEC_RISK_CLASSIFIER_GENERATION",
     "ELEVATION_BLOCKED",
   ]) {
     if (!policy.includes(marker)) fail(`No-elevation command policy is missing: ${marker}`);
@@ -641,18 +690,21 @@ function verifyMetricsIsolationSources() {
   const http = text("src/v2/http-server.ts");
   const tests = text("src/v2/http-server.test.ts");
   for (const marker of [
-    "isLoopbackRequest",
-    'hostname === "localhost"',
-    'hostname === "127.0.0.1"',
-    'metrics are loopback-only',
+    "const managementApp = express()",
+    "managementApp.get(config.readyPath",
+    "managementApp.get(config.metricsPath",
+    "managementApp,",
   ]) {
     if (!http.includes(marker)) fail(`Metrics isolation source is missing: ${marker}`);
   }
   for (const marker of [
-    'requestStatus(`${origin}${config.metricsPath}`, "home-ai.example.test")',
-    "403",
+    "const managementServer = running.managementApp.listen",
+    "await requestStatus(`${origin}${config.metricsPath}`",
+    "const localMetrics = await fetch(`${managementOrigin}${config.metricsPath}`)",
+    "assert.equal(localMetrics.status, 200)",
+    "const readiness = await fetch(`${managementOrigin}${config.readyPath}`)",
   ]) {
-    if (!tests.includes(marker)) fail(`Metrics reverse-proxy regression test is missing: ${marker}`);
+    if (!tests.includes(marker)) fail(`Management-plane isolation regression test is missing: ${marker}`);
   }
 }
 
@@ -696,7 +748,9 @@ function verifyP1OperabilitySources() {
     "normalizeRequestedAuthorityActions",
     "requireAuthorityPlanningInputScopes",
     "requireAuthorityPlanningScopes",
-    "targets.probe(targetId ?? selector, { refresh })",
+    "targets.resolveWithGeneration(targetId ?? selector)",
+    "assertTargetGeneration(requestMeta, binding.generation",
+    "targets.probe(binding.target.id, { refresh })",
   ]) {
     if (!server.includes(marker)) fail(`P1 server wiring is missing: ${marker}`);
   }
@@ -862,19 +916,41 @@ function verifyDeploymentSources() {
   }
   for (const marker of [
     "prepare|seal",
-    "production-reconnect",
-    "post-rotation",
-    "keepClientId",
-    "ownerCredentialRotated",
-    "DELETE FROM oauth_access_tokens",
-    "DELETE FROM oauth_refresh_tokens",
-    "DELETE FROM oauth_clients",
-    "legacyConnectorRemoved",
-    "legacyRuntimeRemoved",
-    'PARALLEL_PATH" != "$PUBLIC_PATH',
-    "FINAL_PASS",
+    "finalize-universal-broker-v2.mjs",
+    "--evidence",
+    "--driver",
+    "interrupt-after-action",
+    "driver is intentionally unreachable until seal",
   ]) {
     if (!finalize.includes(marker)) fail(`Production finalizer source is missing: ${marker}`);
+  }
+  const finalizationState = text("scripts/lib/finalization-state.mjs");
+  for (const marker of [
+    "PREPARED",
+    "POST_ROTATION_VERIFIED",
+    "APPLYING",
+    "Completed destructive stage drifted and will not be repeated",
+    "Stale token family cannot seal",
+    "FINAL_PASS",
+    "SHA256SUMS",
+  ]) {
+    if (!finalizationState.includes(marker)) fail(`Finalization state machine source is missing: ${marker}`);
+  }
+}
+
+function verifyReleaseArtifactSources() {
+  const artifacts = text("scripts/lib/release-artifacts.mjs");
+  for (const marker of [
+    "BUILD-MANIFEST.json",
+    "SBOM.spdx.json",
+    "SBOM.cyclonedx.json",
+    "SBOM.json",
+    "SHA256SUMS",
+    "config/config.schema.json",
+    "payloadDigest",
+    "verifyRuntimeTree",
+  ]) {
+    if (!artifacts.includes(marker)) fail(`Immutable release artifact source is missing: ${marker}`);
   }
 }
 
@@ -917,6 +993,13 @@ function verifyPackage() {
     /(^|\/)(src|fixtures?|test|tests|privileged|preservation|tmp|temp|scratch|canary|backup)(\/|$)|\.test\.|peer-gate|privileged-client|(?:install|uninstall)[^/]*(?:privileged|remote)[^/]*helper|\.orig$|\.rej$|\.bak$|\.patch$|\.log$/i.test(path)
   );
   const required = [
+    "config/config.schema.json",
+    "contracts/capabilities.schema.json",
+    "contracts/errors.schema.json",
+    "contracts/mcp-risk-policy.schema.json",
+    "contracts/mcp-routes.schema.json",
+    "contracts/targets.schema.json",
+    "contracts/tools-v2.schema.json",
     "docs/UNIVERSAL_BROKER_V2_1_P1_PLAN.md",
     "scripts/deploy-universal-broker-v2-production.sh",
     "scripts/cutover-universal-broker-v2-production.sh",
@@ -928,6 +1011,14 @@ function verifyPackage() {
     "scripts/undeploy-universal-broker-v2-pm2.sh",
     "scripts/upgrade-universal-broker-v2-production.sh",
     "scripts/status-universal-broker-v2-upgrade.sh",
+    "scripts/deploy-universal-broker-v2-parallel.sh",
+    "scripts/release-artifacts.mjs",
+    "scripts/lib/release-artifacts.mjs",
+    "scripts/lib/finalization-state.mjs",
+    "scripts/lib/owner-instance-id.mjs",
+    "scripts/finalize-universal-broker-v2.mjs",
+    "scripts/finalization-live-driver.mjs",
+    "scripts/ensure-owner-instance-id.mjs",
     "scripts/verify-universal-broker-v2-live.mjs",
   ];
   const missing = required.filter((path) => !files.includes(path));
@@ -1079,4 +1170,12 @@ function run(command, args) {
 function fail(message) {
   console.error(message);
   process.exit(1);
+}
+
+function optionValue(name) {
+  const index = process.argv.indexOf(name);
+  if (index < 0) return undefined;
+  const value = process.argv[index + 1];
+  if (!value || value.startsWith("--")) fail(`${name} requires a value.`);
+  return value;
 }

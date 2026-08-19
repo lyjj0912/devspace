@@ -167,8 +167,8 @@ both an exact one-shot authority record and a fresh observed generation.
 ### Management plane
 
 Health and OAuth discovery are public as required. Metrics are management data:
-they require both a loopback socket and a local Host header. A reverse proxy that
-connects from loopback cannot make a public Host eligible for metrics.
+they are served only by a distinct loopback management listener together with
+private readiness. The public data-plane application has no metrics route.
 
 ## Error and retry contract
 
@@ -181,10 +181,10 @@ its authority use; it is never replayed automatically.
 
 ```text
 top-level tools                         8
-combined tool descriptors              <= 12,000 characters
+combined tool descriptors              <= 9,000 characters
 server instructions                    <= 2,000 characters
 initial context model-visible payload  <= 4,000 characters
-reused context payload                 <= 800 characters
+reused context payload                 <= 512 characters
 ```
 
 Sessions, authority records, restart transactions, processes, contexts,

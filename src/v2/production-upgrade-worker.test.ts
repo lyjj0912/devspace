@@ -1,5 +1,6 @@
 import { spawnSync } from "node:child_process";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import {
   chmod,
@@ -239,6 +240,13 @@ test("production upgrade worker switches one PM2 process and commits canonical p
     runtimeCommit?: string;
     runtimeSourceTree?: string;
     runtimeDist?: { files: number; sha256: string };
+    manifestSha256?: string;
+    manifestIdentity?: Record<string, unknown>;
+    managementReadyUrl?: string;
+    managementReadyStatus?: number;
+    runtimeIdentity?: Record<string, unknown>;
+    runtimeIdentityConfirmed?: boolean;
+    configSchemaIdentity?: string;
   };
   assert.equal(status.state, "PASS");
   assert.equal(typeof status.acceptedAt, "string");
@@ -253,7 +261,14 @@ test("production upgrade worker switches one PM2 process and commits canonical p
   assert.equal(status.runtimeCommit, fixture.nextCommit);
   assert.equal(status.runtimeSourceTree, fixture.nextSourceTree);
   assert.deepEqual(status.runtimeDist, fixture.nextDist);
-  assert.equal(await readFile(fixture.productionEnvPath, "utf8"), "NEXT_ENV=1\n");
+  assert.equal(status.manifestSha256, fixture.manifestSha256);
+  assert.deepEqual(status.manifestIdentity, fixture.manifestIdentity);
+  assert.equal(status.managementReadyUrl, fixture.managementReadyUrl);
+  assert.equal(status.managementReadyStatus, 200);
+  assert.deepEqual(status.runtimeIdentity, fixture.runtimeIdentity);
+  assert.equal(status.runtimeIdentityConfirmed, true);
+  assert.equal(status.configSchemaIdentity, fixture.manifestIdentity.configSchemaIdentity);
+  assert.equal(await readFile(fixture.productionEnvPath, "utf8"), fixture.nextEnvContent);
   assert.match(await readFile(fixture.startScriptPath, "utf8"), new RegExp(escapeRegExp(fixture.nextScript), "u"));
   assert.equal(await readlink(fixture.currentAuditLink), fixture.auditDirectory);
   assert.equal((await readFile(fixture.pm2State.pid, "utf8")).trim(), "222");
@@ -261,15 +276,74 @@ test("production upgrade worker switches one PM2 process and commits canonical p
   assert.equal((await readFile(fixture.pm2State.script, "utf8")).trim(), fixture.nextScript);
 });
 
+test("production upgrade worker fails closed before switching when request manifest identity is stale", async (t) => {
+  const fixture = await createFixture(t, {
+    publicMetricsStatus: 403,
+    requestManifestOverride: { configSchemaIdentity: `sha256:${"9".repeat(64)}` },
+  });
+  await assert.rejects(
+    runProductionUpgradeWorker(fixture.requestPath),
+    /Immutable manifest configSchemaIdentity mismatch/u,
+  );
+  const status = JSON.parse(await readFile(fixture.statusPath, "utf8")) as {
+    state: string;
+    history?: Array<{ state: string }>;
+    failure?: { code?: string; phase?: string };
+    rollback?: { attempted?: boolean; verified?: boolean; outcome?: string };
+  };
+  assert.equal(status.state, "FAIL");
+  assert.deepEqual(status.history?.map((entry) => entry.state), ["PREPARED", "ACCEPTED", "FAIL"]);
+  assert.equal(status.failure?.code, "MANIFEST_MISMATCH");
+  assert.equal(status.failure?.phase, "PREFLIGHT");
+  assert.equal(status.rollback?.attempted, false);
+  assert.equal(status.rollback?.verified, false);
+  assert.equal(status.rollback?.outcome, "NOT_REQUIRED_SWITCH_NOT_STARTED");
+  assert.equal(await readFile(fixture.productionEnvPath, "utf8"), "OLD_ENV=1\n");
+  assert.equal(await readFile(fixture.startScriptPath, "utf8"), "#!/bin/bash\nexec old\n");
+  assert.equal(await readlink(fixture.currentAuditLink), fixture.previousAudit);
+  assert.equal((await readFile(fixture.pm2State.pid, "utf8")).trim(), "111");
+  assert.equal((await readFile(fixture.pm2State.cwd, "utf8")).trim(), fixture.previousRelease);
+  assert.equal((await readFile(fixture.pm2State.script, "utf8")).trim(), fixture.previousScript);
+});
+
+test("production upgrade worker rejects private readiness identity drift and proves rollback", async (t) => {
+  const fixture = await createFixture(t, {
+    publicMetricsStatus: 403,
+    timeoutMs: 250,
+    runtimeIdentityOverride: { runtimeRevision: "f".repeat(40) },
+  });
+  await assert.rejects(
+    runProductionUpgradeWorker(fixture.requestPath),
+    /Private readiness identity mismatch for runtimeRevision/u,
+  );
+  const status = JSON.parse(await readFile(fixture.statusPath, "utf8")) as {
+    state: string;
+    failure?: { code?: string; phase?: string };
+    rollback?: { restored?: boolean; verified?: boolean; outcome?: string };
+  };
+  assert.equal(status.state, "FAIL");
+  assert.equal(status.failure?.code, "RUNTIME_IDENTITY_MISMATCH");
+  assert.equal(status.failure?.phase, "VERIFYING");
+  assert.equal(status.rollback?.restored, true);
+  assert.equal(status.rollback?.verified, true);
+  assert.equal(status.rollback?.outcome, "RESTORED_PREVIOUS_RUNTIME");
+  assert.equal(await readFile(fixture.productionEnvPath, "utf8"), "OLD_ENV=1\n");
+  assert.equal((await readFile(fixture.pm2State.cwd, "utf8")).trim(), fixture.previousRelease);
+});
+
 test("production upgrade worker rolls back env, process, start path, and audit link on public-boundary failure", async (t) => {
   const fixture = await createFixture(t, { publicMetricsStatus: 200, timeoutMs: 250 });
   await assert.rejects(runProductionUpgradeWorker(fixture.requestPath), /Public metrics returned 200/u);
   const status = JSON.parse(await readFile(fixture.statusPath, "utf8")) as {
     state: string;
-    rollback?: { restored?: boolean; healthStatus?: number };
+    failure?: { code?: string };
+    rollback?: { restored?: boolean; verified?: boolean; outcome?: string; healthStatus?: number };
   };
   assert.equal(status.state, "FAIL");
+  assert.equal(status.failure?.code, "PUBLIC_BOUNDARY_FAILED");
   assert.equal(status.rollback?.restored, true);
+  assert.equal(status.rollback?.verified, true);
+  assert.equal(status.rollback?.outcome, "RESTORED_PREVIOUS_RUNTIME");
   assert.equal(status.rollback?.healthStatus, 200);
   assert.equal(await readFile(fixture.productionEnvPath, "utf8"), "OLD_ENV=1\n");
   assert.equal(await readFile(fixture.startScriptPath, "utf8"), "#!/bin/bash\nexec old\n");
@@ -288,18 +362,45 @@ test("production upgrade worker records UNKNOWN when rollback cannot establish t
   const status = JSON.parse(await readFile(fixture.statusPath, "utf8")) as {
     state: string;
     history?: Array<{ state: string }>;
-    rollback?: { restored?: boolean; error?: string };
+    failure?: { code?: string };
+    rollback?: {
+      restored?: boolean;
+      verified?: boolean;
+      outcome?: string;
+      error?: string;
+      failure?: { code?: string };
+    };
   };
   assert.equal(status.state, "UNKNOWN");
   assert.equal(status.history?.at(-1)?.state, "UNKNOWN");
+  assert.equal(status.failure?.code, "PUBLIC_BOUNDARY_FAILED");
   assert.equal(status.rollback?.restored, false);
+  assert.equal(status.rollback?.verified, false);
+  assert.equal(status.rollback?.outcome, "RESTORATION_UNVERIFIED");
+  assert.equal(status.rollback?.failure?.code, "ROLLBACK_FAILED");
   assert.equal(typeof status.rollback?.error, "string");
 });
 
-async function createFixture(
-  t: TestContext,
-  options: { publicMetricsStatus: number; timeoutMs?: number; rollbackFails?: boolean },
-) {
+interface FixtureRuntimeIdentity {
+  productVersion: string;
+  schemaGeneration: string;
+  authorityContractGeneration: string;
+  configDigest: string;
+  sourceRevision: string;
+  runtimeRevision: string;
+  buildDigest: string;
+  startedAt: string;
+}
+
+interface FixtureOptions {
+  publicMetricsStatus: number;
+  timeoutMs?: number;
+  rollbackFails?: boolean;
+  requestManifestOverride?: Partial<ProductionUpgradeRequest["next"]["manifest"]>;
+  runtimeIdentityOverride?: Partial<FixtureRuntimeIdentity>;
+}
+
+async function createFixture(t: TestContext, options: FixtureOptions) {
   const root = await mkdtemp(join(tmpdir(), "devspace-production-upgrade-worker-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const auditDirectory = join(root, "audit-next");
@@ -323,6 +424,64 @@ async function createFixture(
   const nextDist = await directoryEvidence(join(nextRelease, "dist"));
   const nextCommit = "a".repeat(40);
   const nextSourceTree = "b".repeat(40);
+  const manifestIdentity = {
+    sourceRevision: nextCommit,
+    runtimeRevision: "c".repeat(40),
+    buildDigest: await releaseTreeDigest(nextRelease, ["dist/runtime.js"]),
+    schemaGeneration: `sha256:${"d".repeat(64)}`,
+    authorityContractGeneration: `sha256:${"e".repeat(64)}`,
+    configSchemaIdentity: `sha256:${"f".repeat(64)}`,
+  };
+  const manifestPath = join(nextRelease, "BUILD-MANIFEST.json");
+  await writeFile(manifestPath, `${JSON.stringify({
+    manifestVersion: 2,
+    ...manifestIdentity,
+    payloadDigest: `sha256:${"8".repeat(64)}`,
+    files: 1,
+    payloadFiles: ["dist/runtime.js"],
+    runtimeFiles: ["dist/runtime.js"],
+    createdAt: "2026-08-19T00:00:00.000Z",
+    nodeVersion: "v22.23.0",
+    platform: "darwin-arm64",
+    forbiddenArtifactScan: "PASS",
+  }, null, 2)}\n`, { mode: 0o444 });
+  const manifestSha256 = `sha256:${createHash("sha256").update(await readFile(manifestPath)).digest("hex")}`;
+  const runtimeIdentity: FixtureRuntimeIdentity = {
+    productVersion: "2.1.0",
+    schemaGeneration: manifestIdentity.schemaGeneration,
+    authorityContractGeneration: manifestIdentity.authorityContractGeneration,
+    configDigest: `sha256:${"7".repeat(64)}`,
+    sourceRevision: manifestIdentity.sourceRevision,
+    runtimeRevision: manifestIdentity.runtimeRevision,
+    buildDigest: manifestIdentity.buildDigest,
+    startedAt: "2026-08-19T00:00:01.000Z",
+    ...options.runtimeIdentityOverride,
+  };
+  const managementServer = createServer((request, response) => {
+    if (request.url === "/readyz") {
+      response.setHeader("content-type", "application/json");
+      response.end(JSON.stringify({
+        status: "ready",
+        identity: runtimeIdentity,
+        checks: {
+          nonRoot: true,
+          targetRegistry: manifestIdentity.schemaGeneration,
+          routeRegistry: manifestIdentity.schemaGeneration,
+          authorityStore: true,
+          principalMode: "single-owner",
+          authorityDeployment: "in-process",
+          canonicalConnectorName: "devspace-production",
+        },
+      }));
+      return;
+    }
+    response.statusCode = 404;
+    response.end();
+  });
+  await listen(managementServer);
+  t.after(() => close(managementServer));
+  const managementPort = (managementServer.address() as AddressInfo).port;
+  const managementReadyUrl = `http://127.0.0.1:${managementPort}/readyz`;
   const git = join(root, "git-fixture.sh");
   await writeFile(git, [
     "#!/bin/sh",
@@ -342,7 +501,23 @@ async function createFixture(
   const startScriptBackupPath = join(auditDirectory, "canonical-start.before");
   await writeFile(productionEnvPath, "OLD_ENV=1\n", { mode: 0o600 });
   await writeFile(productionEnvBackupPath, "OLD_ENV=1\n", { mode: 0o600 });
-  await writeFile(nextEnvPath, "NEXT_ENV=1\n", { mode: 0o600 });
+  const nextEnvContent = [
+    "NEXT_ENV=1",
+    "DEVSPACE_NEXT_MANAGEMENT_HOST=127.0.0.1",
+    `DEVSPACE_NEXT_MANAGEMENT_PORT=${managementPort}`,
+    `DEVSPACE_RELEASE_MANIFEST=${manifestPath}`,
+    `DEVSPACE_EXPECTED_SOURCE_REVISION=${manifestIdentity.sourceRevision}`,
+    `DEVSPACE_EXPECTED_RUNTIME_REVISION=${manifestIdentity.runtimeRevision}`,
+    `DEVSPACE_EXPECTED_BUILD_DIGEST=${manifestIdentity.buildDigest}`,
+    `DEVSPACE_EXPECTED_SCHEMA_GENERATION=${manifestIdentity.schemaGeneration}`,
+    `DEVSPACE_EXPECTED_AUTHORITY_CONTRACT_GENERATION=${manifestIdentity.authorityContractGeneration}`,
+    `DEVSPACE_EXPECTED_CONFIG_SCHEMA_IDENTITY=${manifestIdentity.configSchemaIdentity}`,
+    `DEVSPACE_SOURCE_REVISION=${manifestIdentity.sourceRevision}`,
+    `DEVSPACE_RUNTIME_REVISION=${manifestIdentity.runtimeRevision}`,
+    `DEVSPACE_BUILD_DIGEST=${manifestIdentity.buildDigest}`,
+    "",
+  ].join("\n");
+  await writeFile(nextEnvPath, nextEnvContent, { mode: 0o600 });
   await writeFile(startScriptPath, "#!/bin/bash\nexec old\n", { mode: 0o700 });
   await writeFile(startScriptBackupPath, "#!/bin/bash\nexec old\n", { mode: 0o700 });
   const currentAuditLink = join(root, "current-audit");
@@ -442,6 +617,15 @@ async function createFixture(
       release: nextRelease,
       script: nextScript,
       dist: nextDist,
+      manifest: {
+        path: manifestPath,
+        buildDigest: manifestIdentity.buildDigest,
+        runtimeRevision: manifestIdentity.runtimeRevision,
+        schemaGeneration: manifestIdentity.schemaGeneration,
+        authorityContractGeneration: manifestIdentity.authorityContractGeneration,
+        configSchemaIdentity: manifestIdentity.configSchemaIdentity,
+        ...options.requestManifestOverride,
+      },
     },
     productionEnvPath,
     productionEnvBackupPath,
@@ -475,6 +659,11 @@ async function createFixture(
     nextCommit,
     nextSourceTree,
     nextDist,
+    nextEnvContent,
+    manifestSha256,
+    manifestIdentity,
+    managementReadyUrl,
+    runtimeIdentity,
     pm2State,
   };
 }
@@ -497,4 +686,16 @@ function shellQuote(value: string): string {
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+}
+
+async function releaseTreeDigest(root: string, files: string[]): Promise<string> {
+  const digest = createHash("sha256");
+  for (const path of [...files].sort()) {
+    const content = await readFile(join(root, path));
+    digest.update(path);
+    digest.update("\0");
+    digest.update(createHash("sha256").update(content).digest("hex"));
+    digest.update("\n");
+  }
+  return `sha256:${digest.digest("hex")}`;
 }

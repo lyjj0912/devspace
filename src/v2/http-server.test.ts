@@ -139,6 +139,7 @@ test("granular scopes are mandatory and legacy compatibility cannot be re-enable
   });
   const production = loadUniversalBrokerNextConfig(base, {
     DEVSPACE_V2_DEPLOYMENT_MODE: "production",
+    DEVSPACE_NEXT_AUTHORITY_OWNER_INSTANCE_ID: "granular-scope-owner",
   });
   assert.equal(authenticatedBrokerScopes(["devspace"], production), undefined);
   assert.equal(
@@ -153,6 +154,7 @@ test("granular scopes are mandatory and legacy compatibility cannot be re-enable
     () => loadUniversalBrokerNextConfig(base, {
       DEVSPACE_V2_DEPLOYMENT_MODE: "production",
       DEVSPACE_V2_LEGACY_SCOPE_COMPATIBILITY: "true",
+      DEVSPACE_NEXT_AUTHORITY_OWNER_INSTANCE_ID: "legacy-compatibility-owner",
     }),
     /removed in Universal Broker v2\.1/u,
   );
@@ -175,9 +177,11 @@ test("production HTTP rejects legacy-scope tokens and accepts granular tokens", 
   const config = loadUniversalBrokerNextConfig(base, {
     DEVSPACE_V2_DEPLOYMENT_MODE: "production",
     DEVSPACE_NEXT_STATE_DIR: join(root, "v2-production-state"),
+    DEVSPACE_NEXT_AUTHORITY_OWNER_INSTANCE_ID: "http-production-test-owner",
   });
   const legacyToken = `legacy-${randomUUID()}`;
   const granularToken = `granular-${randomUUID()}`;
+  const refreshedToken = `refreshed-${randomUUID()}`;
   const readOnlyToken = `read-only-${randomUUID()}`;
   const otherClientToken = `other-client-${randomUUID()}`;
   const store = new SqliteOAuthStore(config.oauthStateDir);
@@ -198,6 +202,7 @@ test("production HTTP rejects legacy-scope tokens and accepts granular tokens", 
   for (const [token, scopes] of [
     [legacyToken, ["devspace"]],
     [granularToken, [...config.oauth.scopes]],
+    [refreshedToken, [...config.oauth.scopes]],
     [readOnlyToken, ["devspace.read"]],
   ] as const) {
     store.saveAccessToken(createHash("sha256").update(token).digest("base64url"), {
@@ -346,7 +351,7 @@ test("production HTTP rejects legacy-scope tokens and accepts granular tokens", 
     await acceptedClient.close();
 
     const nextSessionTransport = new StreamableHTTPClientTransport(endpoint, {
-      requestInit: { headers: { Authorization: `Bearer ${granularToken}` } },
+      requestInit: { headers: { Authorization: `Bearer ${refreshedToken}` } },
     });
     const nextSessionClient = new Client({ name: "same-oauth-new-session-test", version: "1" });
     await nextSessionClient.connect(nextSessionTransport);
@@ -370,7 +375,7 @@ test("production HTTP rejects legacy-scope tokens and accepts granular tokens", 
     assert.equal(crossClientWrite.isError, true);
     assert.equal(
       (crossClientWrite.structuredContent as { error?: { code?: string } } | undefined)?.error?.code,
-      "AUTHORITY_MISMATCH",
+      "AUTHORITY_PRINCIPAL_MISMATCH",
     );
     await otherClient.close();
 
@@ -379,6 +384,42 @@ test("production HTTP rejects legacy-scope tokens and accepts granular tokens", 
     });
     const readOnlyClient = new Client({ name: "authority-preview-scope-test", version: "1" });
     await readOnlyClient.connect(readOnlyTransport);
+    const authorityStatusBeforeScopeFailure = await readOnlyClient.callTool({
+      name: "context",
+      arguments: { operation: "authority_status", authorityId: crossSessionAuthorityId },
+    });
+    assert.notEqual(
+      authorityStatusBeforeScopeFailure.isError,
+      true,
+      JSON.stringify(authorityStatusBeforeScopeFailure.structuredContent),
+    );
+    assert.equal(
+      ((authorityStatusBeforeScopeFailure.structuredContent as {
+        data?: { actions?: Array<{ consumedUses?: number }> };
+      } | undefined)?.data?.actions?.[0]?.consumedUses),
+      1,
+    );
+    const scopeReducedWrite = await readOnlyClient.callTool({
+      name: "fs",
+      arguments: { ...crossSessionArguments, authorityId: crossSessionAuthorityId },
+    });
+    assert.equal(scopeReducedWrite.isError, true);
+    assert.equal(
+      (scopeReducedWrite.structuredContent as {
+        error?: { code?: string; evidence?: { requiredScope?: string } };
+      } | undefined)?.error?.code,
+      "SCOPE_INSUFFICIENT",
+    );
+    const authorityStatusAfterScopeFailure = await readOnlyClient.callTool({
+      name: "context",
+      arguments: { operation: "authority_status", authorityId: crossSessionAuthorityId },
+    });
+    assert.equal(
+      ((authorityStatusAfterScopeFailure.structuredContent as {
+        data?: { actions?: Array<{ consumedUses?: number }> };
+      } | undefined)?.data?.actions?.[0]?.consumedUses),
+      1,
+    );
     const readPreview = await readOnlyClient.callTool({
       name: "context",
       arguments: {
@@ -403,7 +444,7 @@ test("production HTTP rejects legacy-scope tokens and accepts granular tokens", 
     assert.equal(execPreview.isError, true);
     assert.equal(
       (execPreview.structuredContent as { error?: { code?: string; evidence?: { requiredScope?: string } } } | undefined)?.error?.code,
-      "PERMISSION_DENIED",
+      "SCOPE_INSUFFICIENT",
     );
     assert.equal(
       (execPreview.structuredContent as { error?: { evidence?: { requiredScope?: string } } } | undefined)?.error?.evidence?.requiredScope,
@@ -458,6 +499,7 @@ test("parallel v2 HTTP service has an independent health endpoint and protected 
   });
   const config = loadUniversalBrokerNextConfig(base, {
     DEVSPACE_NEXT_PUBLIC_BASE_URL: "http://127.0.0.1:17677/v2",
+    DEVSPACE_NEXT_AUTHORITY_OWNER_INSTANCE_ID: "http-parallel-test-owner",
     DEVSPACE_NEXT_MCP_ROUTES_FILE: mcpRoutes,
     DEVSPACE_NEXT_TARGETS_FILE: targetsFile,
   });
@@ -518,26 +560,28 @@ test("parallel v2 HTTP service has an independent health endpoint and protected 
     selfManagement,
   });
   const httpServer = running.app.listen(0, "127.0.0.1");
-  await new Promise<void>((resolve, reject) => {
-    httpServer.once("listening", resolve);
-    httpServer.once("error", reject);
-  });
+  const managementServer = running.managementApp.listen(0, "127.0.0.1");
+  await Promise.all([httpServer, managementServer].map((server) => (
+    new Promise<void>((resolve, reject) => {
+      server.once("listening", resolve);
+      server.once("error", reject);
+    })
+  )));
   t.after(async () => {
     await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+    await new Promise<void>((resolve) => managementServer.close(() => resolve()));
     await running.close();
   });
 
   const address = httpServer.address() as AddressInfo;
+  const managementAddress = managementServer.address() as AddressInfo;
   const origin = `http://127.0.0.1:${address.port}`;
+  const managementOrigin = `http://127.0.0.1:${managementAddress.port}`;
   assert.equal(
     await requestStatus(`${origin}${config.metricsPath}`, `127.0.0.1:${address.port}`),
-    200,
+    404,
   );
-  assert.equal(
-    await requestStatus(`${origin}${config.metricsPath}`, "home-ai.example.test"),
-    403,
-  );
-  const localMetrics = await fetch(`${origin}${config.metricsPath}`);
+  const localMetrics = await fetch(`${managementOrigin}${config.metricsPath}`);
   assert.equal(localMetrics.status, 200);
   const localMetricsText = await localMetrics.text();
   assert.match(localMetricsText, /devspace_authority_previews 0/u);
@@ -549,25 +593,20 @@ test("parallel v2 HTTP service has an independent health endpoint and protected 
   const health = await fetch(`${origin}/healthz-next`);
   assert.equal(health.status, 200);
   const healthBody = await health.json() as {
-    ok: boolean;
-    name: string;
-    phase: string;
-    targetGeneration: string;
-    targetCount: number;
-    mcpRouteGeneration: string;
-    mcpRouteCount: number;
+    status: string;
+    productVersion: string;
+    schemaGeneration: string;
+    authorityContractGeneration: string;
+    runtimeRevision: string;
+    startedAt: string;
   };
-  assert.equal(healthBody.ok, true);
-  assert.equal(healthBody.name, "devspace-universal-broker");
-  assert.equal(healthBody.phase, "universal-broker-v2");
-  assert.equal(healthBody.targetCount, 1);
-  assert.equal(healthBody.mcpRouteCount, 1);
-  assert.equal(typeof healthBody.targetGeneration, "string");
-  assert.equal(typeof healthBody.mcpRouteGeneration, "string");
-  assert.deepEqual({ ok: healthBody.ok, name: healthBody.name }, {
-    ok: true,
-    name: "devspace-universal-broker",
-  });
+  assert.equal(healthBody.status, "ok");
+  assert.match(healthBody.schemaGeneration, /^sha256:/u);
+  assert.match(healthBody.authorityContractGeneration, /^sha256:/u);
+  assert.equal("targetGeneration" in healthBody, false);
+  assert.equal("mcpRouteGeneration" in healthBody, false);
+  const readiness = await fetch(`${managementOrigin}${config.readyPath}`);
+  assert.equal(readiness.status, 200);
 
   const authorizationMetadata = await fetch(
     `${origin}/.well-known/oauth-authorization-server`,
@@ -667,7 +706,7 @@ test("parallel v2 HTTP service has an independent health endpoint and protected 
       (deniedMcpPreview.structuredContent as {
         error?: { code?: string; evidence?: { requiredScope?: string } };
       } | undefined)?.error?.code,
-      "PERMISSION_DENIED",
+      "SCOPE_INSUFFICIENT",
     );
     assert.equal(
       (deniedMcpPreview.structuredContent as {
@@ -741,7 +780,7 @@ test("parallel v2 HTTP service has an independent health endpoint and protected 
     assert.equal(staleGeneration.isError, true);
     assert.equal(
       (staleGeneration.structuredContent as { error?: { code?: string } } | undefined)?.error?.code,
-      "AUTHORITY_MISMATCH",
+      "AUTHORITY_ACTION_MISMATCH",
     );
     await assert.rejects(readFile(generationBoundPath, "utf8"), { code: "ENOENT" });
     await writeFile(targetsFile, JSON.stringify({
@@ -829,13 +868,13 @@ test("parallel v2 HTTP service has an independent health endpoint and protected 
       };
     } | undefined)?.data;
     assert.equal(typeof previewData?.planFingerprint, "string");
-    assert.equal(previewData?.authorityActionCount, 2);
-    assert.equal(previewData?.r0ActionCount, 1);
+    assert.equal(previewData?.authorityActionCount, 3);
+    assert.equal(previewData?.r0ActionCount, 0);
     assert.deepEqual(
       previewData?.actions?.map(({ id, minimumRisk, authorityRequired }) => ({ id, minimumRisk, authorityRequired })),
       [
         { id: "local-write", minimumRisk: "R1", authorityRequired: true },
-        { id: "provider-read", minimumRisk: "R0", authorityRequired: false },
+        { id: "provider-read", minimumRisk: "R2", authorityRequired: true },
         { id: "provider-write", minimumRisk: "R2", authorityRequired: true },
       ],
     );
@@ -847,11 +886,11 @@ test("parallel v2 HTTP service has an independent health endpoint and protected 
     assert.equal(previewData?.actions?.[1]?.resource, "fixture");
     assert.deepEqual(
       previewData?.actions?.[1]?.parameterKeys,
-      ["arguments", "name", "readOnly", "routeFingerprint"],
+      ["arguments", "name", "riskDecision", "riskPolicyGeneration", "routeGeneration", "toolContractSha256"],
     );
     assert.deepEqual(
       previewData?.actions?.[2]?.parameterKeys,
-      ["arguments", "name", "routeFingerprint"],
+      ["arguments", "name", "riskDecision", "riskPolicyGeneration", "routeGeneration", "toolContractSha256"],
     );
     const unapprovedWrite = await client.callTool({
       name: "fs",
@@ -926,7 +965,7 @@ test("parallel v2 HTTP service has an independent health endpoint and protected 
       risk: "R2",
     });
     assert.notEqual(mcpWrite.isError, true);
-    const mcpRead = await client.callTool({
+    const unapprovedMcpRead = await client.callTool({
       name: "mcp",
       arguments: {
         operation: "invoke",
@@ -935,26 +974,24 @@ test("parallel v2 HTTP service has an independent health endpoint and protected 
         arguments: { key: "http" },
       },
     });
-    assert.match(JSON.stringify(mcpRead.structuredContent), /proxied/);
-    const unnecessaryReadAuthority = await client.callTool({
-      name: "context",
+    assert.equal(unapprovedMcpRead.isError, true);
+    assert.equal(
+      (unapprovedMcpRead.structuredContent as { error?: { code?: string } } | undefined)?.error?.code,
+      "AUTHORITY_REQUIRED",
+    );
+    const mcpRead = await callAuthorized(client, {
+      taskId: "http-mcp-read-without-owner-policy",
+      authorityText: "Read this exact fixture key under the conservative generic-invoke policy.",
+      tool: "mcp",
       arguments: {
-        operation: "authorize",
-        taskId: "unnecessary-read-only-mcp-authority",
-        authorityText: "This read-only provider call must not require mutation authority.",
-        actions: [{
-          tool: "mcp",
-          arguments: {
-            operation: "invoke",
-            route: "fixture",
-            name: "read_value",
-            arguments: { key: "http" },
-          },
-        }],
+        operation: "invoke",
+        route: "fixture",
+        name: "read_value",
+        arguments: { key: "http" },
       },
+      risk: "R2",
     });
-    assert.equal(unnecessaryReadAuthority.isError, true);
-    assert.match(JSON.stringify(unnecessaryReadAuthority.structuredContent), /must run without task authority/u);
+    assert.match(JSON.stringify(mcpRead.structuredContent), /proxied/);
 
     const routeArgs = {
       operation: "invoke",
@@ -988,7 +1025,7 @@ test("parallel v2 HTTP service has an independent health endpoint and protected 
     assert.equal(changedRouteResult.isError, true);
     assert.equal(
       (changedRouteResult.structuredContent as { error?: { code?: string } } | undefined)?.error?.code,
-      "AUTHORITY_MISMATCH",
+      "AUTHORITY_ACTION_MISMATCH",
     );
     await writeFile(mcpRoutes, JSON.stringify({
       version: 1,
@@ -1037,8 +1074,10 @@ test("parallel v2 HTTP service has an independent health endpoint and protected 
     });
     assert.match(JSON.stringify(mcpPrompt.structuredContent), /Inspect HTTP proxy/);
 
-    const mcpLarge = await client.callTool({
-      name: "mcp",
+    const mcpLarge = await callAuthorized(client, {
+      taskId: "http-mcp-large-without-owner-policy",
+      authorityText: "Return this exact bounded large fixture result under the conservative generic-invoke policy.",
+      tool: "mcp",
       arguments: {
         operation: "invoke",
         route: "fixture",
@@ -1046,6 +1085,7 @@ test("parallel v2 HTTP service has an independent health endpoint and protected 
         arguments: { characters: 20_000 },
         responsePolicy: { maxCharacters: 500, preserveFullResult: true },
       },
+      risk: "R2",
     });
     const largeData = (mcpLarge.structuredContent as {
       data?: { result?: { resourceUri?: string; truncated?: boolean } };
@@ -1143,10 +1183,18 @@ test("parallel v2 HTTP service has an independent health endpoint and protected 
     });
     assert.notEqual(artifactPublish.isError, true);
     const publishedData = (artifactPublish.structuredContent as {
-      data?: { resourceUri?: string; oneTime?: boolean };
+      data?: { resourceUri?: string; downloadUrl?: string; immutable?: boolean };
     } | undefined)?.data;
-    assert.equal(publishedData?.oneTime, true);
-    assert.equal(typeof publishedData?.resourceUri, "string");
+    assert.equal(publishedData?.immutable, true);
+    assert.match(publishedData?.resourceUri ?? "", /^devspace:\/\/artifact\/[0-9a-f-]{36}$/u);
+    assert.match(publishedData?.downloadUrl ?? "", /^http:\/\/127\.0\.0\.1:17677\/v2\/artifacts-next\//u);
+    const artifactResource = await client.readResource({ uri: publishedData!.resourceUri! });
+    const artifactContent = artifactResource.contents[0];
+    assert.ok(artifactContent && "blob" in artifactContent);
+    assert.equal(
+      Buffer.from(artifactContent.blob, "base64").toString("utf8"),
+      "native-http-artifact\n",
+    );
     const artifactPublishContent = artifactPublish.content as Array<{
       type?: string;
       name?: string;
@@ -1157,6 +1205,7 @@ test("parallel v2 HTTP service has an independent health endpoint and protected 
     );
     assert.ok(resourceLink && resourceLink.type === "resource_link");
     assert.equal(resourceLink.name, "published-http-artifact.txt");
+    assert.equal(resourceLink.uri, publishedData?.resourceUri);
 
     for (const path of [receivedPath, copiedPath]) {
       const removed = await callAuthorized(client, {
@@ -1259,7 +1308,7 @@ test("parallel v2 HTTP service has an independent health endpoint and protected 
         command: "sleep 0.1; printf 'http-background-v2'",
         mode: "background",
       },
-      risk: "R1",
+      risk: "R2",
     });
     const backgroundData = (background.structuredContent as {
       data?: { processId?: string; state?: string };
@@ -1278,6 +1327,49 @@ test("parallel v2 HTTP service has an independent health endpoint and protected 
     } | undefined)?.data;
     assert.equal(waitedData?.state, "EXITED");
     assert.match(waitedData?.output ?? "", /http-background-v2/);
+
+    const writableProcess = await callAuthorized(client, {
+      taskId: "http-writable-process",
+      authorityText: "Start this exact bounded local stdin echo process.",
+      tool: "exec",
+      arguments: {
+        target: "local",
+        cwd: root,
+        command: "cat",
+        mode: "background",
+      },
+      risk: "R1",
+    });
+    const writableProcessId = (writableProcess.structuredContent as {
+      data?: { processId?: string };
+    } | undefined)?.data?.processId;
+    assert.equal(typeof writableProcessId, "string");
+    const processWritten = await callAuthorized(client, {
+      taskId: "http-process-write-binding",
+      authorityText: "Write this exact text to the exact managed local process.",
+      tool: "process",
+      arguments: {
+        operation: "write",
+        processId: writableProcessId,
+        chars: "process-binding-v2\n",
+        waitMs: 100,
+      },
+      risk: "R2",
+    });
+    assert.match(JSON.stringify(processWritten.structuredContent), /process-binding-v2/u);
+    const processSignalled = await callAuthorized(client, {
+      taskId: "http-process-signal-binding",
+      authorityText: "Terminate this exact managed local process once.",
+      tool: "process",
+      arguments: {
+        operation: "signal",
+        processId: writableProcessId,
+        signal: "SIGTERM",
+        waitMs: 2_000,
+      },
+      risk: "R3",
+    });
+    assert.match(JSON.stringify(processSignalled.structuredContent), /SIGNALED/u);
 
     const restartRequested = await callAuthorized(client, {
       taskId: "http-self-restart",

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { chmod, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,11 +12,15 @@ import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { createFixtureMcpServer } from "./fixtures/mcp-fixture-core.js";
 import { UniversalEnvProfileRegistry } from "./env-profiles.js";
 import {
+  downstreamMcpToolContractSha256,
   type DownstreamMcpSession,
   UniversalMcpProxy,
 } from "./mcp-proxy.js";
 import { UniversalMcpRouteRegistry } from "./mcp-routes.js";
+import { OperationAuthorityRegistry, actionFingerprint } from "./authority.js";
+import { mcpAction, minimumAuthorityRisk } from "./authority-policy.js";
 import { TargetRegistry } from "./targets.js";
+import { createCapabilityCallContextFromTrustedPrincipal } from "./capability-call-context.js";
 
 test("generic local-stdio proxy discovers, invokes, mutates, and pages downstream MCP", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "devspace-v2-mcp-proxy-"));
@@ -257,6 +261,13 @@ test("post-dispatch transport failure is never retried", async (t) => {
         route,
         routeFingerprint: JSON.stringify(route),
         client: {
+          listTools: async () => ({
+            tools: [{
+              name: "write_value",
+              description: "Mutate the fixture value.",
+              inputSchema: { type: "object" },
+            }],
+          }),
           callTool: async () => {
             calls += 1;
             throw new Error("connection lost after dispatch");
@@ -280,7 +291,7 @@ test("post-dispatch transport failure is never retried", async (t) => {
   assert.equal(calls, 1);
 });
 
-test("downstream MCP LRU never evicts an in-flight session", async (t) => {
+test("downstream MCP quota never evicts an unexpired or in-flight session", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "devspace-v2-mcp-lru-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const routePath = join(root, "routes.json");
@@ -330,11 +341,482 @@ test("downstream MCP LRU never evicts an in-flight session", async (t) => {
   now = 1;
   await proxy.execute({ operation: "search_tools", route: "b", query: "read" });
   now = 2;
-  await proxy.execute({ operation: "search_tools", route: "c", query: "read" });
-  assert.equal(closed.includes("client:b"), true);
+  await assert.rejects(
+    proxy.execute({ operation: "search_tools", route: "c", query: "read" }),
+    hasCode("RESOURCE_QUOTA_EXCEEDED"),
+  );
+  assert.equal(closed.includes("client:b"), false);
   assert.equal(closed.includes("client:a"), false);
   releaseA?.();
   await inFlight;
+});
+
+test("MCP connections key by stable principal and exact not-connected reconnect is single-flight", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-v2-mcp-principal-reconnect-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const routePath = join(root, "routes.json");
+  await writeRouteFile(routePath, {
+    fixture: {
+      displayName: "Fixture",
+      transport: "local-stdio",
+      command: process.execPath,
+      args: ["--version"],
+    },
+  });
+  let constructions = 0;
+  const transports: Array<{ close(): Promise<void>; onclose?: () => void }> = [];
+  const proxy = new UniversalMcpProxy(
+    new UniversalMcpRouteRegistry(routePath),
+    new TargetRegistry({ configPath: join(root, "targets.json") }),
+    {
+      sshControlDir: join(root, "ssh"),
+      clientFactory: async (route) => {
+        constructions += 1;
+        const construction = constructions;
+        const transport = { close: async () => undefined };
+        transports.push(transport);
+        return {
+          route,
+          routeFingerprint: route.generation,
+          client: {
+            listTools: async () => {
+              if (construction === 1) throw new Error("Not connected");
+              return { tools: [{ name: "read_value", description: "read value" }] };
+            },
+            close: async () => undefined,
+          } as unknown as Client,
+          transport: transport as DownstreamMcpSession["transport"],
+          connectedAt: Date.now(),
+          lastUsedAt: Date.now(),
+          activeCalls: 0,
+        };
+      },
+    },
+  );
+  t.after(() => proxy.close());
+  const ownerA1 = owner("mcp-owner-a");
+  const ownerA2 = owner("mcp-owner-a");
+  const ownerB = owner("mcp-owner-b");
+  const calls = await Promise.all(Array.from({ length: 20 }, () => proxy.execute({
+    operation: "search_tools",
+    route: "fixture",
+    query: "read",
+  }, ownerA1)));
+  assert.equal(constructions, 2);
+  assert.equal(calls.every((result) => result.livenessVerified === true), true);
+  await proxy.execute({ operation: "search_tools", route: "fixture", query: "read" }, ownerA2);
+  assert.equal(constructions, 2);
+  await proxy.execute({ operation: "search_tools", route: "fixture", query: "read" }, ownerB);
+  assert.equal(constructions, 3);
+
+  transports[0]?.onclose?.();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal((await proxy.stats()).sessions, 2);
+});
+
+test("broker-owned exact tool policy is the only provider-corroborated R0 downgrade", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-v2-mcp-risk-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const routePath = join(root, "routes.json");
+  const policyPath = join(root, "policy.json");
+  const baseTool = {
+    name: "read_exact",
+    title: "Read exact fixture",
+    description: "A deterministic downstream tool contract.",
+    inputSchema: {
+      type: "object",
+      additionalProperties: false,
+      properties: { key: { type: "string" } },
+      required: ["key"],
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false },
+  };
+  let providerTool: Record<string, unknown> = structuredClone(baseTool);
+  let providerDispatches = 0;
+  let providerConstructions = 0;
+  await writePolicyRoute(routePath, policyPath);
+  await writeRiskPolicy(
+    policyPath,
+    "R0",
+    downstreamMcpToolContractSha256(baseTool),
+  );
+  const proxy = new UniversalMcpProxy(
+    new UniversalMcpRouteRegistry(routePath),
+    new TargetRegistry({ configPath: join(root, "targets.json") }),
+    {
+      sshControlDir: join(root, "ssh"),
+      clientFactory: async (route) => {
+        providerConstructions += 1;
+        return {
+          route,
+          routeFingerprint: route.generation,
+          client: {
+            listTools: async () => ({ tools: [structuredClone(providerTool)] }),
+            callTool: async () => {
+              providerDispatches += 1;
+              return { content: [{ type: "text", text: "ok" }] };
+            },
+            close: async () => undefined,
+          } as unknown as Client,
+          transport: { close: async () => undefined } as DownstreamMcpSession["transport"],
+          connectedAt: Date.now(),
+          lastUsedAt: Date.now(),
+          activeCalls: 0,
+        };
+      },
+    },
+  );
+  t.after(() => proxy.close());
+
+  const exact = await proxy.prepareInvocation({
+    operation: "invoke",
+    route: "fixture",
+    name: "read_exact",
+    arguments: { key: "one" },
+  });
+  assert.equal(exact.binding.risk, "R0");
+  assert.equal(exact.binding.toolContractSha256, downstreamMcpToolContractSha256(baseTool));
+  assert.equal(providerDispatches, 0);
+  const exactGeneration = exact.binding.routeGeneration;
+  const exactAction = mcpAction(
+    { operation: "invoke", route: "fixture", name: "read_exact", arguments: { key: "one" } },
+    exact.binding,
+  );
+  await exact.execute();
+  assert.equal(providerDispatches, 1);
+
+  const policyStale = await proxy.prepareInvocation({
+    operation: "invoke",
+    route: "fixture",
+    name: "read_exact",
+  });
+  assert.equal(policyStale.binding.risk, "R0");
+  await writeRiskPolicy(policyPath, "R3", downstreamMcpToolContractSha256(baseTool));
+  await assert.rejects(policyStale.execute(), hasCode("AUTHORITY_STALE"));
+  assert.equal(providerDispatches, 1);
+  await writeRiskPolicy(policyPath, "R0", downstreamMcpToolContractSha256(baseTool));
+
+  const contractStale = await proxy.prepareInvocation({
+    operation: "invoke",
+    route: "fixture",
+    name: "read_exact",
+  });
+  providerTool = { ...structuredClone(baseTool), title: "Changed after preparation" };
+  await assert.rejects(contractStale.execute(), hasCode("AUTHORITY_STALE"));
+  assert.equal(providerDispatches, 1);
+  providerTool = structuredClone(baseTool);
+
+  await writeRiskPolicy(policyPath, "R2", downstreamMcpToolContractSha256(baseTool));
+  const policyChanged = await proxy.prepareInvocation({
+    operation: "invoke",
+    route: "fixture",
+    name: "read_exact",
+    arguments: { key: "one" },
+  });
+  assert.equal(policyChanged.binding.risk, "R2");
+  assert.notEqual(policyChanged.binding.routeGeneration, exactGeneration);
+  assert.notEqual(
+    actionFingerprint(mcpAction(
+      { operation: "invoke", route: "fixture", name: "read_exact", arguments: { key: "one" } },
+      policyChanged.binding,
+    )),
+    actionFingerprint(exactAction),
+  );
+  policyChanged.release();
+
+  await writeRiskPolicy(policyPath, "R3", "e".repeat(64));
+  const brokerHighRisk = await proxy.prepareInvocation({
+    operation: "invoke",
+    route: "fixture",
+    name: "read_exact",
+  });
+  assert.equal(brokerHighRisk.binding.risk, "R3");
+  brokerHighRisk.release();
+
+  await writeRiskPolicy(policyPath, "R0", "f".repeat(64));
+  const mismatched = await proxy.prepareInvocation({ operation: "invoke", route: "fixture", name: "read_exact" });
+  assert.equal(mismatched.binding.risk, "R2");
+  mismatched.release();
+
+  await writeRouteFile(routePath, {
+    fixture: {
+      displayName: "Fixture",
+      transport: "local-stdio",
+      command: process.execPath,
+      args: ["--version"],
+    },
+  });
+  const omitted = await proxy.prepareInvocation({ operation: "invoke", route: "fixture", name: "read_exact" });
+  assert.equal(omitted.binding.risk, "R2");
+  omitted.release();
+
+  await writePolicyRoute(routePath, policyPath);
+  await writeRiskPolicy(policyPath, "R0", downstreamMcpToolContractSha256(baseTool));
+  providerTool = { ...structuredClone(baseTool), annotations: { destructiveHint: false } };
+  const uncorroborated = await proxy.prepareInvocation({ operation: "invoke", route: "fixture", name: "read_exact" });
+  assert.equal(uncorroborated.binding.risk, "R2");
+  uncorroborated.release();
+
+  providerTool = {
+    ...structuredClone(baseTool),
+    annotations: { readOnlyHint: true, destructiveHint: true },
+  };
+  const destructive = await proxy.prepareInvocation({ operation: "invoke", route: "fixture", name: "read_exact" });
+  assert.equal(destructive.binding.risk, "R3");
+  destructive.release();
+  assert.equal(providerDispatches, 1);
+  assert.ok(providerConstructions >= 1);
+});
+
+test("prepared MCP invocation persists DISPATCHED immediately before callTool and cancels stale contracts", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-v2-mcp-dispatch-barrier-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const routePath = join(root, "routes.json");
+  await writeRouteFile(routePath, {
+    fixture: {
+      displayName: "Fixture",
+      transport: "local-stdio",
+      command: process.execPath,
+      args: ["--version"],
+    },
+  });
+  const baseTool = {
+    name: "mutate_exact",
+    title: "Mutate exact fixture",
+    description: "A deterministic mutation contract.",
+    inputSchema: { type: "object", additionalProperties: false },
+    annotations: { readOnlyHint: false, destructiveHint: false },
+  };
+  let providerTool: Record<string, unknown> = structuredClone(baseTool);
+  let providerCalls = 0;
+  let boundaryAuthorityId: string | undefined;
+  const principal = "mcp-dispatch-boundary-principal";
+  const authority = new OperationAuthorityRegistry({
+    minimumRisk: minimumAuthorityRisk,
+    storePath: join(root, "authority.sqlite"),
+    instanceId: "mcp-dispatch-boundary-owner",
+  });
+  t.after(() => authority.close());
+  const proxy = new UniversalMcpProxy(
+    new UniversalMcpRouteRegistry(routePath),
+    new TargetRegistry({ configPath: join(root, "targets.json") }),
+    {
+      sshControlDir: join(root, "ssh"),
+      clientFactory: async (route) => ({
+        route,
+        routeFingerprint: route.generation,
+        client: {
+          listTools: async () => ({ tools: [structuredClone(providerTool)] }),
+          callTool: async () => {
+            assert.ok(boundaryAuthorityId);
+            const status = authority.status(boundaryAuthorityId, principal) as {
+              receipts: Array<{ state: string; leaseState: string }>;
+            };
+            assert.equal(status.receipts.at(-1)?.state, "DISPATCHED");
+            assert.equal(status.receipts.at(-1)?.leaseState, "ACTIVE");
+            providerCalls += 1;
+            return { content: [{ type: "text", text: "mutated" }] };
+          },
+          close: async () => undefined,
+        } as unknown as Client,
+        transport: { close: async () => undefined } as DownstreamMcpSession["transport"],
+        connectedAt: Date.now(),
+        lastUsedAt: Date.now(),
+        activeCalls: 0,
+      }),
+    },
+  );
+  t.after(() => proxy.close());
+
+  const input = {
+    operation: "invoke" as const,
+    route: "fixture",
+    name: "mutate_exact",
+    arguments: { key: "one" },
+  };
+  const prepared = await proxy.prepareInvocation(input);
+  assert.equal(prepared.binding.risk, "R2");
+  const descriptor = mcpAction(input, prepared.binding);
+  const created = authority.create({
+    taskId: "mcp-dispatch-boundary-pass",
+    authorityText: "Dispatch the exact downstream mutation once.",
+    actions: [{ descriptor, risk: prepared.binding.risk, uses: 1 }],
+  }, principal);
+  boundaryAuthorityId = String(created.authorityId);
+  const dispatch = authority.prepareDispatch(
+    boundaryAuthorityId,
+    principal,
+    descriptor,
+    prepared.binding.risk,
+  );
+  await prepared.execute(dispatch);
+  assert.equal(providerCalls, 1);
+  dispatch.complete("PASS");
+
+  providerTool = structuredClone(baseTool);
+  const stale = await proxy.prepareInvocation(input);
+  const staleDescriptor = mcpAction(input, stale.binding);
+  const staleCreated = authority.create({
+    taskId: "mcp-dispatch-boundary-stale",
+    authorityText: "Do not dispatch if the provider contract changes.",
+    actions: [{ descriptor: staleDescriptor, risk: stale.binding.risk, uses: 1 }],
+  }, principal);
+  const staleAuthorityId = String(staleCreated.authorityId);
+  const staleDispatch = authority.prepareDispatch(
+    staleAuthorityId,
+    principal,
+    staleDescriptor,
+    stale.binding.risk,
+  );
+  providerTool = { ...structuredClone(baseTool), title: "Changed after preparation" };
+  await assert.rejects(stale.execute(staleDispatch), hasCode("AUTHORITY_STALE"));
+  assert.equal(providerCalls, 1);
+  assert.equal(staleDispatch.phase, "CLAIMED");
+  staleDispatch.cancelNotDispatched({
+    providerCallCount: 0,
+    proof: "MCP_CONTRACT_REVALIDATION_PROVIDER_CALL_ZERO",
+  });
+  const cancelled = authority.status(staleAuthorityId, principal) as {
+    actions: Array<{ consumedUses: number }>;
+    receipts: Array<{ state: string; leaseState: string }>;
+  };
+  assert.equal(cancelled.actions[0]?.consumedUses, 0);
+  assert.equal(cancelled.receipts[0]?.state, "CANCELLED_NOT_DISPATCHED");
+  assert.equal(cancelled.receipts[0]?.leaseState, "RELEASED");
+});
+
+test("unsafe configured MCP policy rejects before provider construction or dispatch", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-v2-mcp-policy-predispatch-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const routePath = join(root, "routes.json");
+  const policyPath = join(root, "policy.json");
+  await writePolicyRoute(routePath, policyPath);
+  await writeRiskPolicy(policyPath, "R0", "a".repeat(64));
+  await chmod(policyPath, 0o622);
+  let constructions = 0;
+  let dispatches = 0;
+  const proxy = new UniversalMcpProxy(
+    new UniversalMcpRouteRegistry(routePath),
+    new TargetRegistry({ configPath: join(root, "targets.json") }),
+    {
+      sshControlDir: join(root, "ssh"),
+      clientFactory: async () => {
+        constructions += 1;
+        dispatches += 1;
+        throw new Error("unsafe policy must fail before provider construction");
+      },
+    },
+  );
+  t.after(() => proxy.close());
+  await assert.rejects(
+    proxy.prepareInvocation({ operation: "invoke", route: "fixture", name: "read_exact" }),
+    hasCode("PRECONDITION_FAILED"),
+  );
+  await chmod(policyPath, 0o600);
+  await writeFile(policyPath, "{not-json", { mode: 0o600 });
+  await assert.rejects(
+    proxy.prepareInvocation({ operation: "invoke", route: "fixture", name: "read_exact" }),
+    hasCode("PRECONDITION_FAILED"),
+  );
+  const realPolicyPath = join(root, "real-policy.json");
+  await writeRiskPolicy(realPolicyPath, "R0", "a".repeat(64));
+  await rm(policyPath);
+  await symlink(realPolicyPath, policyPath);
+  await assert.rejects(
+    proxy.prepareInvocation({ operation: "invoke", route: "fixture", name: "read_exact" }),
+    hasCode("PRECONDITION_FAILED"),
+  );
+  assert.equal(constructions, 0);
+  assert.equal(dispatches, 0);
+});
+
+test("prepared MCP invocation fences target and environment-profile generations", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-v2-mcp-runtime-generation-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const routePath = join(root, "routes.json");
+  const targetPath = join(root, "targets.json");
+  const profilePath = join(root, "profiles.json");
+  const writeTarget = async (platform: "macos" | "linux", shell: "zsh" | "sh") => {
+    await writeFile(targetPath, JSON.stringify({
+      version: 1,
+      targets: {
+        local: {
+          displayName: "Local",
+          aliases: ["local"],
+          transport: "local",
+          platform,
+          shell,
+        },
+      },
+    }, null, 2));
+  };
+  const writeProfile = async (value: string) => {
+    await writeFile(profilePath, JSON.stringify({
+      version: 1,
+      profiles: {
+        developer: {
+          targets: ["local"],
+          environment: { DEVSPACE_PROFILE_VALUE: value },
+        },
+      },
+    }, null, 2), { mode: 0o600 });
+    await chmod(profilePath, 0o600);
+  };
+  await writeTarget("macos", "zsh");
+  await writeProfile("one");
+  await writeRouteFile(routePath, {
+    fixture: {
+      displayName: "Fixture",
+      transport: "local-stdio",
+      command: process.execPath,
+      args: ["--version"],
+      envProfile: "developer",
+    },
+  });
+  let providerDispatches = 0;
+  const proxy = new UniversalMcpProxy(
+    new UniversalMcpRouteRegistry(routePath),
+    new TargetRegistry({ configPath: targetPath }),
+    {
+      sshControlDir: join(root, "ssh"),
+      envProfiles: new UniversalEnvProfileRegistry({ configPath: profilePath }),
+      clientFactory: async (route) => ({
+        route,
+        routeFingerprint: route.generation,
+        client: {
+          listTools: async () => ({ tools: [{ name: "read_exact", inputSchema: { type: "object" } }] }),
+          callTool: async () => {
+            providerDispatches += 1;
+            return { content: [{ type: "text", text: "ok" }] };
+          },
+          close: async () => undefined,
+        } as unknown as Client,
+        transport: { close: async () => undefined } as DownstreamMcpSession["transport"],
+        connectedAt: Date.now(),
+        lastUsedAt: Date.now(),
+        activeCalls: 0,
+      }),
+    },
+  );
+  t.after(() => proxy.close());
+
+  const targetStale = await proxy.prepareInvocation({
+    operation: "invoke",
+    route: "fixture",
+    name: "read_exact",
+  });
+  await writeTarget("linux", "sh");
+  await assert.rejects(targetStale.execute(), hasCode("AUTHORITY_STALE"));
+  assert.equal(providerDispatches, 0);
+
+  const profileStale = await proxy.prepareInvocation({
+    operation: "invoke",
+    route: "fixture",
+    name: "read_exact",
+  });
+  await writeProfile("two");
+  await assert.rejects(profileStale.execute(), hasCode("AUTHORITY_STALE"));
+  assert.equal(providerDispatches, 0);
 });
 
 async function startHttpFixture(
@@ -390,6 +872,37 @@ async function writeRouteFile(path: string, routes: Record<string, unknown>): Pr
   await writeFile(path, JSON.stringify({ version: 1, routes }, null, 2));
 }
 
+async function writePolicyRoute(routePath: string, policyPath: string): Promise<void> {
+  await writeRouteFile(routePath, {
+    fixture: {
+      displayName: "Fixture",
+      transport: "local-stdio",
+      command: process.execPath,
+      args: ["--version"],
+      riskPolicy: { mode: "broker-owned", policyFile: policyPath },
+    },
+  });
+}
+
+async function writeRiskPolicy(
+  path: string,
+  risk: "R0" | "R2" | "R3",
+  toolContractSha256: string,
+): Promise<void> {
+  await writeFile(path, JSON.stringify({
+    version: 1,
+    routeId: "fixture",
+    tools: { read_exact: { risk, toolContractSha256 } },
+  }, null, 2), { mode: 0o600 });
+  await chmod(path, 0o600);
+}
+
 function hasCode(code: string) {
   return (error: unknown) => error instanceof Error && "code" in error && error.code === code;
+}
+
+function owner(label: string) {
+  return createCapabilityCallContextFromTrustedPrincipal({
+    principalKeyFingerprint: createHash("sha256").update(label).digest("hex"),
+  });
 }

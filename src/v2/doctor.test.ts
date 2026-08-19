@@ -20,11 +20,16 @@ test("doctor JSON reports contracts, registries, targets, and quotas without cre
   });
   const report = await collectUniversalBrokerDoctor(base, {
     DEVSPACE_NEXT_STATE_DIR: join(root, "next"),
+    DEVSPACE_NEXT_AUTHORITY_OWNER_INSTANCE_ID: "doctor-test-owner",
     DEVSPACE_NEXT_TARGET_CONFIG: join(root, "missing-targets.json"),
     DEVSPACE_NEXT_MCP_ROUTE_CONFIG: join(root, "missing-routes.json"),
     DEVSPACE_NEXT_PUBLIC_BASE_URL: "http://127.0.0.1:17677",
   });
   assert.equal((report.contracts as { passed: boolean }).passed, true);
+  assert.match(
+    (report.runtimeIdentity as { schemaGeneration: string }).schemaGeneration,
+    /^sha256:[a-f0-9]{64}$/u,
+  );
   assert.equal(Array.isArray(report.targets), true);
   for (const observation of report.targets as Array<{
     targetId?: string;
@@ -79,7 +84,9 @@ test("doctor JSON reports contracts, registries, targets, and quotas without cre
       local: "http://127.0.0.1:7677/mcp-next",
       public: "http://127.0.0.1:17677/mcp-next",
       health: "http://127.0.0.1:7677/healthz-next",
-      metrics: "http://127.0.0.1:7677/metrics-next",
+      managementHealth: "http://127.0.0.1:8677/healthz",
+      readiness: "http://127.0.0.1:8677/readyz",
+      metrics: "http://127.0.0.1:8677/metrics",
       stateDir: join(root, "next"),
       oauthStateReused: false,
       granularScopesOnly: true,

@@ -30,7 +30,21 @@ import {
   UNIVERSAL_BROKER_BUDGETS,
   type UniversalErrorCode,
 } from "./contracts.js";
+import {
+  createCapabilityCallContextFromTrustedPrincipal,
+  requireCapabilityCallContext,
+  type CapabilityCallContext,
+  type CapabilityCallContextProvider,
+} from "./capability-call-context.js";
 import { UniversalBrokerError } from "./errors.js";
+import {
+  SynchronousQuotaReservations,
+  type QuotaReservation,
+} from "./quota-reservations.js";
+import {
+  RESOURCE_DEFAULT_CONTEXTS,
+  RESOURCE_DEFAULT_CONTEXT_TTL_MS,
+} from "./resource-defaults.js";
 import { UniversalTextResourceStore } from "./text-resource-store.js";
 import {
   type TargetDefinition,
@@ -42,14 +56,14 @@ const CONTEXT_FILE_NAMES = ["AGENTS.md", "CLAUDE.md"] as const;
 const MAX_SUGGESTED_SKILLS = 5;
 const MAX_INITIAL_INSTRUCTION_REFERENCES = 10;
 const MAX_SEARCH_RESULTS = 50;
-const MAX_CONTEXTS = 256;
-const DEFAULT_CONTEXT_IDLE_TTL_MS = 30 * 60_000;
+const MAX_CONTEXTS = RESOURCE_DEFAULT_CONTEXTS;
+const DEFAULT_CONTEXT_IDLE_TTL_MS = RESOURCE_DEFAULT_CONTEXT_TTL_MS;
 const DEFAULT_MAXIMUM_WORKTREES = 8;
 const DEFAULT_MAXIMUM_WORKTREE_BYTES = 8 * 1024 * 1024 * 1024;
 const MAXIMUM_DIFF_CHARACTERS = 50_000_000;
 const MAX_NESTED_SEARCH_DEPTH = 6;
 const MAX_NESTED_SEARCH_ENTRIES = 5_000;
-const STORE_VERSION = 1;
+const STORE_VERSION = 2;
 const SKILL_CATALOG_TTL_MS = 60_000;
 
 export type ContextMode = "existing" | "worktree";
@@ -78,7 +92,9 @@ export interface ContextGitSummary {
 
 export interface ContextRecord {
   contextId: string;
+  principalKeyFingerprint: string;
   targetId: string;
+  targetGeneration: string;
   root: string;
   mode: ContextMode;
   instructionSetHash: string;
@@ -91,11 +107,23 @@ export interface ContextRecord {
   dirtySource?: boolean;
   createdAt: string;
   lastUsedAt: string;
+  expiresAt: string;
 }
 
 interface ContextStoreFile {
-  version: 1;
+  version: 2;
   contexts: ContextRecord[];
+  tombstones: ContextTombstone[];
+}
+
+interface ContextTombstone {
+  contextId: string;
+  principalKeyFingerprint: string;
+  targetId: string;
+  targetGeneration: string;
+  expiredAt: string;
+  tombstonedAt: string;
+  removeAfter: string;
 }
 
 export interface ContextRegistryOptions {
@@ -109,11 +137,14 @@ export interface ContextRegistryOptions {
   maximumWorktrees?: number;
   maximumWorktreeBytes?: number;
   diffStore?: UniversalTextResourceStore;
+  ownerProvider?: CapabilityCallContextProvider;
+  tombstoneTtlMs?: number;
   execute?: typeof execFileAsync;
 }
 
 export class ContextRegistry {
   private readonly contexts = new Map<string, ContextRecord>();
+  private readonly tombstones = new Map<string, ContextTombstone>();
   private readonly contextIdByKey = new Map<string, string>();
   private readonly pendingOpen = new Map<string, Promise<ContextOpenResult>>();
   private readonly skillCatalogCache = new Map<string, {
@@ -126,7 +157,11 @@ export class ContextRegistry {
   private readonly worktreeRoot: string;
   private readonly maximumWorktrees: number;
   private readonly maximumWorktreeBytes: number;
+  private readonly tombstoneTtlMs: number;
   private readonly diffStore: UniversalTextResourceStore;
+  private readonly ownerProvider: CapabilityCallContextProvider;
+  private readonly reservations: SynchronousQuotaReservations;
+  private readonly worktreeReservations: SynchronousQuotaReservations;
   private readonly execute: typeof execFileAsync;
   private loaded = false;
   private loadPromise?: Promise<void>;
@@ -145,11 +180,36 @@ export class ContextRegistry {
     this.worktreeRoot = resolve(options.worktreeRoot ?? join(dirname(options.storePath), "worktrees"));
     this.maximumWorktrees = options.maximumWorktrees ?? DEFAULT_MAXIMUM_WORKTREES;
     this.maximumWorktreeBytes = options.maximumWorktreeBytes ?? DEFAULT_MAXIMUM_WORKTREE_BYTES;
+    this.tombstoneTtlMs = boundedContextInteger(
+      options.tombstoneTtlMs,
+      RESOURCE_DEFAULT_CONTEXT_TTL_MS,
+      1_000,
+      7 * 24 * 60 * 60_000,
+      "tombstoneTtlMs",
+    );
+    const compatibilityOwner = createCapabilityCallContextFromTrustedPrincipal({
+      principalKeyFingerprint: createHash("sha256")
+        .update(JSON.stringify({
+          authority: "legacy-single-owner-context-registry",
+          publicBaseUrl: options.serverConfig.publicBaseUrl,
+          stateDir: options.serverConfig.stateDir,
+          storePath: resolve(options.storePath),
+        }))
+        .digest("hex"),
+    });
+    this.ownerProvider = options.ownerProvider ?? (() => compatibilityOwner);
     this.diffStore = options.diffStore ?? new UniversalTextResourceStore({
       authority: "context-diff",
       maximumEntries: 64,
       maximumTotalCharacters: MAXIMUM_DIFF_CHARACTERS,
       ttlMs: 15 * 60_000,
+      ownerProvider: this.ownerProvider,
+    });
+    this.reservations = new SynchronousQuotaReservations("context", {
+      entries: this.maximumContexts,
+    });
+    this.worktreeReservations = new SynchronousQuotaReservations("managed-worktree", {
+      entries: this.maximumWorktrees,
     });
     this.execute = options.execute ?? execFileAsync;
   }
@@ -160,10 +220,12 @@ export class ContextRegistry {
     mode?: ContextMode;
     task?: string;
     baseRef?: string;
-  }): Promise<ContextOpenResult> {
+  }, callContext?: CapabilityCallContext): Promise<ContextOpenResult> {
     await this.ensureLoaded();
     await this.pruneExpiredContexts();
-    const target = await this.options.targets.resolve(input.target);
+    const owner = this.owner(callContext);
+    const { target, generation: targetGeneration } =
+      await this.options.targets.resolveWithGeneration(input.target);
     const mode = input.mode ?? "existing";
     const requestedPath = input.path ?? target.defaultCwd;
     if (!requestedPath) {
@@ -173,14 +235,21 @@ export class ContextRegistry {
       );
     }
     if (mode === "worktree") {
-      return this.openWorktree(target, requestedPath, input.task, input.baseRef);
+      return this.openWorktree(
+        target,
+        targetGeneration,
+        requestedPath,
+        input.task,
+        input.baseRef,
+        owner,
+      );
     }
     const root = await this.resolveExistingDirectory(target, requestedPath);
-    const key = contextKey(target.id, root, mode);
+    const key = contextKey(owner.principalKeyFingerprint, target.id, targetGeneration, root, mode);
     const pending = this.pendingOpen.get(key);
     if (pending) return pending;
 
-    const operation = this.openResolved(target, root, mode, input.task)
+    const operation = this.openResolved(target, targetGeneration, root, mode, input.task, owner)
       .finally(() => this.pendingOpen.delete(key));
     this.pendingOpen.set(key, operation);
     return operation;
@@ -191,9 +260,10 @@ export class ContextRegistry {
     query?: string;
     cursor?: string;
     limit?: number;
-  }): Promise<Record<string, unknown>> {
+  }, callContext?: CapabilityCallContext): Promise<Record<string, unknown>> {
     await this.ensureLoaded();
     await this.pruneExpiredContexts();
+    const owner = this.owner(callContext);
     const query = input.query?.trim();
     if (!query) {
       throw new UniversalBrokerError(
@@ -201,7 +271,9 @@ export class ContextRegistry {
         "context.search requires a non-empty query.",
       );
     }
-    const record = input.contextId ? this.requireContext(input.contextId) : undefined;
+    const record = input.contextId
+      ? await this.requireFreshContext(input.contextId, owner)
+      : undefined;
     if (record) await this.touch(record);
     const target = record
       ? await this.options.targets.resolve(record.targetId)
@@ -230,17 +302,18 @@ export class ContextRegistry {
   async diff(input: {
     contextId: string;
     maxCharacters?: number;
-  }): Promise<Record<string, unknown>> {
+  }, callContext?: CapabilityCallContext): Promise<Record<string, unknown>> {
     await this.ensureLoaded();
     await this.pruneExpiredContexts();
-    const record = this.requireContext(input.contextId);
+    const owner = this.owner(callContext);
+    const record = await this.requireFreshContext(input.contextId, owner);
     await this.touch(record);
     const target = await this.options.targets.resolve(record.targetId);
     const generated = target.transport === "local"
       ? await localContextDiff(record.root)
       : await this.remoteContextDiff(target, record.root);
     const maximumPreview = Math.min(Math.max(input.maxCharacters ?? 12_000, 100), 100_000);
-    const stored = this.diffStore.put(generated.text, "text/x-diff");
+    const stored = this.diffStore.put(generated.text, "text/x-diff", owner);
     return {
       contextId: record.contextId,
       targetId: record.targetId,
@@ -252,28 +325,34 @@ export class ContextRegistry {
     };
   }
 
-  readDiffResource(uri: string): Record<string, unknown> {
-    return this.diffStore.readByUri(uri);
+  readDiffResource(uri: string, callContext?: CapabilityCallContext): Record<string, unknown> {
+    return this.diffStore.readByUri(uri, this.owner(callContext));
   }
 
   stats(): Record<string, unknown> {
     const managed = [...this.contexts.values()].filter((record) => record.managed === true);
     return {
       contexts: this.contexts.size,
+      tombstones: this.tombstones.size,
       managedWorktrees: managed.length,
       idleTtlMs: this.idleTtlMs,
       diffResources: this.diffStore.stats(),
     };
   }
 
-  async close(contextId: string): Promise<Record<string, unknown>> {
+  async close(
+    contextId: string,
+    callContext?: CapabilityCallContext,
+  ): Promise<Record<string, unknown>> {
     await this.ensureLoaded();
-    const record = this.requireContext(contextId);
+    await this.pruneExpiredContexts();
+    const owner = this.owner(callContext);
+    const record = await this.requireFreshContext(contextId, owner);
     const worktree = record.managed
       ? await this.closeManagedWorktree(record)
       : undefined;
     if (worktree?.retained === true) {
-      record.lastUsedAt = new Date(this.now()).toISOString();
+      this.refreshExpiry(record);
       await this.persist();
       return {
         contextId,
@@ -284,7 +363,13 @@ export class ContextRegistry {
       };
     }
     this.contexts.delete(contextId);
-    this.contextIdByKey.delete(contextKey(record.targetId, record.root, record.mode));
+    this.contextIdByKey.delete(contextKey(
+      record.principalKeyFingerprint,
+      record.targetId,
+      record.targetGeneration,
+      record.root,
+      record.mode,
+    ));
     await this.persist();
     return {
       contextId,
@@ -304,36 +389,43 @@ export class ContextRegistry {
     return this.pruneExpiredContexts();
   }
 
-  async get(contextId: string): Promise<ContextRecord> {
+  async get(
+    contextId: string,
+    callContext?: CapabilityCallContext,
+  ): Promise<ContextRecord> {
     await this.ensureLoaded();
     await this.pruneExpiredContexts();
-    const record = this.requireContext(contextId);
+    const owner = this.owner(callContext);
+    const record = await this.requireFreshContext(contextId, owner);
     await this.touch(record);
     return structuredClone(record);
   }
 
   private async openResolved(
     target: TargetDefinition,
+    targetGeneration: string,
     root: string,
     mode: ContextMode,
     task: string | undefined,
+    owner: CapabilityCallContext,
   ): Promise<ContextOpenResult> {
-    const key = contextKey(target.id, root, mode);
+    const key = contextKey(owner.principalKeyFingerprint, target.id, targetGeneration, root, mode);
     const existingId = this.contextIdByKey.get(key);
+    const reservation = existingId ? undefined : this.reserveContext();
+    try {
     const instructions = await this.discoverInitialInstructions(target, root);
     const instructionSetHash = hashInstructionSet(instructions);
     if (existingId) {
-      const existing = this.requireContext(existingId);
+      const existing = this.requireOwnedContext(existingId, owner);
       const changed = existing.instructionSetHash !== instructionSetHash;
       existing.instructions = instructions;
       existing.instructionSetHash = instructionSetHash;
-      existing.lastUsedAt = new Date(this.now()).toISOString();
+      this.refreshExpiry(existing);
       await this.persist();
       const result: ContextOpenResult = {
         contextId: existing.contextId,
         targetId: existing.targetId,
-        root: existing.root,
-        mode: existing.mode,
+        targetGeneration: existing.targetGeneration,
         reused: true,
         changed,
         instructionSetHash,
@@ -346,74 +438,78 @@ export class ContextRegistry {
       return result;
     }
 
-    if (this.contexts.size >= this.maximumContexts) {
-      throw new UniversalBrokerError(
-        "RESOURCE_QUOTA_EXCEEDED",
-        `Context limit reached: ${this.maximumContexts}`,
-        { evidence: { maximumContexts: this.maximumContexts } },
-      );
+      const timestampMs = this.now();
+      const timestamp = new Date(timestampMs).toISOString();
+      const record: ContextRecord = {
+        contextId: `ctx_${randomUUID()}`,
+        principalKeyFingerprint: owner.principalKeyFingerprint,
+        targetId: target.id,
+        targetGeneration,
+        root,
+        mode,
+        instructionSetHash,
+        instructions,
+        git: target.transport === "local" ? await gitSummary(root) : undefined,
+        createdAt: timestamp,
+        lastUsedAt: timestamp,
+        expiresAt: new Date(timestampMs + this.idleTtlMs).toISOString(),
+      };
+      reservation!.commit(() => {
+        this.contexts.set(record.contextId, record);
+        this.contextIdByKey.set(key, record.contextId);
+      });
+      await this.persist();
+      return fitInitialContextPayload({
+        contextId: record.contextId,
+        targetId: record.targetId,
+        targetGeneration: record.targetGeneration,
+        root: record.root,
+        mode: record.mode,
+        reused: false,
+        instructionSetHash,
+        instructions: instructions.slice(0, MAX_INITIAL_INSTRUCTION_REFERENCES),
+        suggestedSkills: task
+          ? this.suggestSkills(target.transport === "local" ? root : homedir(), task, MAX_SUGGESTED_SKILLS)
+          : [],
+        ...(record.git ? { git: record.git } : {}),
+      });
+    } catch (error) {
+      reservation?.release();
+      throw error;
     }
-    const timestamp = new Date(this.now()).toISOString();
-    const record: ContextRecord = {
-      contextId: `ctx_${randomUUID()}`,
-      targetId: target.id,
-      root,
-      mode,
-      instructionSetHash,
-      instructions,
-      git: target.transport === "local" ? await gitSummary(root) : undefined,
-      createdAt: timestamp,
-      lastUsedAt: timestamp,
-    };
-    this.contexts.set(record.contextId, record);
-    this.contextIdByKey.set(key, record.contextId);
-    await this.persist();
-    const result = fitInitialContextPayload({
-      contextId: record.contextId,
-      targetId: record.targetId,
-      root: record.root,
-      mode: record.mode,
-      reused: false,
-      instructionSetHash,
-      instructions: instructions.slice(0, MAX_INITIAL_INSTRUCTION_REFERENCES),
-      suggestedSkills: task
-        ? this.suggestSkills(target.transport === "local" ? root : homedir(), task, MAX_SUGGESTED_SKILLS)
-        : [],
-      ...(record.git ? { git: record.git } : {}),
-    });
-    return result;
   }
 
   private async openWorktree(
     target: TargetDefinition,
+    targetGeneration: string,
     requestedPath: string,
     task: string | undefined,
     requestedBaseRef: string | undefined,
+    owner: CapabilityCallContext,
   ): Promise<ContextOpenResult> {
     await this.ensureLoaded();
-    if (this.contexts.size >= this.maximumContexts) {
-      throw new UniversalBrokerError(
-        "RESOURCE_QUOTA_EXCEEDED",
-        `Context limit reached: ${this.maximumContexts}`,
-      );
-    }
+    const contextReservation = this.reserveContext();
     const managedCount = [...this.contexts.values()].filter((record) => record.managed).length;
-    if (managedCount >= this.maximumWorktrees) {
-      throw new UniversalBrokerError(
-        "RESOURCE_QUOTA_EXCEEDED",
-        `Managed worktree limit reached: ${this.maximumWorktrees}`,
-        { evidence: { maximumWorktrees: this.maximumWorktrees } },
+    let worktreeReservation: QuotaReservation;
+    try {
+      worktreeReservation = this.worktreeReservations.reserve(
+        { entries: managedCount },
+        { entries: 1 },
       );
+    } catch (error) {
+      contextReservation.release();
+      throw error;
     }
+    let created: CreatedWorktree | undefined;
+    let persisted = false;
+    try {
     const sourcePath = await this.resolveExistingDirectory(target, requestedPath);
     const baseRef = requestedBaseRef?.trim() || "HEAD";
-    const created = target.transport === "local"
+    created = target.transport === "local"
       ? await this.createLocalWorktree(sourcePath, baseRef)
       : target.platform === "windows"
         ? await this.createWindowsRemoteWorktree(target, sourcePath, baseRef)
         : await this.createPosixRemoteWorktree(target, sourcePath, baseRef);
-    let persisted = false;
-    try {
       const createdBytes = target.transport === "local"
         ? await localDirectoryBytes(created.root)
         : await this.remoteDirectoryBytes(target, created.root);
@@ -428,10 +524,13 @@ export class ContextRegistry {
       }
       const instructions = await this.discoverInitialInstructions(target, created.root);
       const instructionSetHash = hashInstructionSet(instructions);
-      const timestamp = new Date(this.now()).toISOString();
+      const timestampMs = this.now();
+      const timestamp = new Date(timestampMs).toISOString();
       const record: ContextRecord = {
         contextId: `ctx_${randomUUID()}`,
+        principalKeyFingerprint: owner.principalKeyFingerprint,
         targetId: target.id,
+        targetGeneration,
         root: created.root,
         mode: "worktree",
         instructionSetHash,
@@ -448,14 +547,24 @@ export class ContextRegistry {
         },
         createdAt: timestamp,
         lastUsedAt: timestamp,
+        expiresAt: new Date(timestampMs + this.idleTtlMs).toISOString(),
       };
-      this.contexts.set(record.contextId, record);
-      this.contextIdByKey.set(contextKey(record.targetId, record.root, record.mode), record.contextId);
+      contextReservation.commit(() => worktreeReservation!.commit(() => {
+        this.contexts.set(record.contextId, record);
+        this.contextIdByKey.set(contextKey(
+          record.principalKeyFingerprint,
+          record.targetId,
+          record.targetGeneration,
+          record.root,
+          record.mode,
+        ), record.contextId);
+      }));
       await this.persist();
       persisted = true;
       return fitInitialContextPayload({
         contextId: record.contextId,
         targetId: record.targetId,
+        targetGeneration: record.targetGeneration,
         root: record.root,
         mode: record.mode,
         reused: false,
@@ -472,7 +581,9 @@ export class ContextRegistry {
         dirtySource: record.dirtySource,
       });
     } catch (error) {
-      if (!persisted) {
+      contextReservation.release();
+      worktreeReservation.release();
+      if (!persisted && created) {
         await this.removeCreatedWorktree(target, created).catch(() => undefined);
       }
       throw error;
@@ -480,9 +591,15 @@ export class ContextRegistry {
   }
 
   private async pruneExpiredContexts(): Promise<Record<string, unknown>> {
-    const cutoff = this.now() - this.idleTtlMs;
+    const now = this.now();
+    let tombstonesRemoved = 0;
+    for (const tombstone of this.tombstones.values()) {
+      if (Date.parse(tombstone.removeAfter) > now) continue;
+      this.tombstones.delete(tombstone.contextId);
+      tombstonesRemoved += 1;
+    }
     const expired = [...this.contexts.values()]
-      .filter((record) => Date.parse(record.lastUsedAt) <= cutoff)
+      .filter((record) => Date.parse(record.expiresAt) <= now)
       .sort((left, right) => left.contextId.localeCompare(right.contextId));
     let removed = 0;
     let retained = 0;
@@ -493,18 +610,18 @@ export class ContextRegistry {
         if (record.managed) {
           const worktree = await this.closeManagedWorktree(record);
           if (worktree.retained === true) {
+            this.refreshExpiry(record);
             retained += 1;
             continue;
           }
         }
-        this.contexts.delete(record.contextId);
-        this.contextIdByKey.delete(contextKey(record.targetId, record.root, record.mode));
+        this.expireContext(record, now);
         removed += 1;
       } catch {
         errors += 1;
       }
     }
-    if (removed > 0) await this.persist();
+    if (removed > 0 || retained > 0 || tombstonesRemoved > 0) await this.persist();
     return {
       expired: expired.length,
       removed,
@@ -1069,20 +1186,120 @@ export class ContextRegistry {
     return results.sort((left, right) => left.path.localeCompare(right.path));
   }
 
-  private requireContext(contextId: string): ContextRecord {
+  private owner(explicit?: CapabilityCallContext): CapabilityCallContext {
+    return requireCapabilityCallContext(explicit, this.ownerProvider);
+  }
+
+  private requireOwnedContext(
+    contextId: string,
+    owner: CapabilityCallContext,
+  ): ContextRecord {
     const record = this.contexts.get(contextId);
     if (!record) {
+      const tombstone = this.tombstones.get(contextId);
+      if (tombstone) {
+        this.assertContextOwner(tombstone.principalKeyFingerprint, owner, contextId);
+        throw new UniversalBrokerError(
+          "PRECONDITION_FAILED",
+          `Context expired: ${contextId}`,
+          {
+            evidence: {
+              reasonCode: "RESOURCE_EXPIRED",
+              contextId,
+              expiredAt: tombstone.expiredAt,
+            },
+          },
+        );
+      }
       throw new UniversalBrokerError(
         "PATH_NOT_FOUND",
         `Unknown context: ${contextId}`,
         { evidence: { contextId } },
       );
     }
+    this.assertContextOwner(record.principalKeyFingerprint, owner, contextId);
     return record;
   }
 
+  private async requireFreshContext(
+    contextId: string,
+    owner: CapabilityCallContext,
+  ): Promise<ContextRecord> {
+    const record = this.requireOwnedContext(contextId, owner);
+    const current = await this.options.targets.resolveWithGeneration(record.targetId);
+    if (current.generation !== record.targetGeneration) {
+      throw new UniversalBrokerError(
+        "AUTHORITY_STALE",
+        `Context target binding is stale: ${contextId}`,
+        {
+          evidence: {
+            reasonCode: "CONTEXT_TARGET_GENERATION_STALE",
+            contextId,
+            targetId: record.targetId,
+            expectedTargetGeneration: record.targetGeneration,
+            observedTargetGeneration: current.generation,
+          },
+        },
+      );
+    }
+    return record;
+  }
+
+  private assertContextOwner(
+    expected: string,
+    owner: CapabilityCallContext,
+    contextId: string,
+  ): void {
+    if (expected === owner.principalKeyFingerprint) return;
+    throw new UniversalBrokerError(
+      "AUTHORITY_PRINCIPAL_MISMATCH",
+      `Context belongs to a different stable principal: ${contextId}`,
+      { evidence: { reasonCode: "CONTEXT_OWNER_MISMATCH", contextId } },
+    );
+  }
+
+  private reserveContext() {
+    return this.reservations.reserve(
+      { entries: this.contexts.size },
+      { entries: 1 },
+    );
+  }
+
+  private refreshExpiry(record: ContextRecord): void {
+    const now = this.now();
+    record.lastUsedAt = new Date(now).toISOString();
+    record.expiresAt = new Date(now + this.idleTtlMs).toISOString();
+  }
+
+  private expireContext(record: ContextRecord, now: number): void {
+    this.contexts.delete(record.contextId);
+    this.contextIdByKey.delete(contextKey(
+      record.principalKeyFingerprint,
+      record.targetId,
+      record.targetGeneration,
+      record.root,
+      record.mode,
+    ));
+    this.tombstones.set(record.contextId, {
+      contextId: record.contextId,
+      principalKeyFingerprint: record.principalKeyFingerprint,
+      targetId: record.targetId,
+      targetGeneration: record.targetGeneration,
+      expiredAt: record.expiresAt,
+      tombstonedAt: new Date(now).toISOString(),
+      removeAfter: new Date(now + this.tombstoneTtlMs).toISOString(),
+    });
+    const maximumTombstones = Math.max(128, this.maximumContexts * 4);
+    if (this.tombstones.size > maximumTombstones) {
+      const oldest = [...this.tombstones.values()]
+        .sort((left, right) => left.tombstonedAt.localeCompare(right.tombstonedAt)
+          || left.contextId.localeCompare(right.contextId))[0];
+      if (oldest) this.tombstones.delete(oldest.contextId);
+    }
+  }
+
   private async touch(record: ContextRecord): Promise<void> {
-    record.lastUsedAt = new Date(this.now()).toISOString();
+    this.refreshExpiry(record);
     await this.persist();
   }
 
@@ -1093,7 +1310,7 @@ export class ContextRegistry {
   }
 
   private async loadFromStore(): Promise<void> {
-    let parsed: ContextStoreFile = { version: STORE_VERSION, contexts: [] };
+    let parsed: ContextStoreFile = { version: STORE_VERSION, contexts: [], tombstones: [] };
     try {
       parsed = parseContextStore(await readFile(this.options.storePath, "utf8"));
     } catch (error) {
@@ -1105,10 +1322,23 @@ export class ContextRegistry {
         );
       }
     }
+    if (parsed.contexts.length > this.maximumContexts) {
+      throw new UniversalBrokerError(
+        "PRECONDITION_FAILED",
+        "Context store exceeds the configured active context quota.",
+        { evidence: { contexts: parsed.contexts.length, maximumContexts: this.maximumContexts } },
+      );
+    }
     const keys = new Set<string>();
     for (const record of parsed.contexts) {
       validateContextRecord(record);
-      const key = contextKey(record.targetId, record.root, record.mode);
+      const key = contextKey(
+        record.principalKeyFingerprint,
+        record.targetId,
+        record.targetGeneration,
+        record.root,
+        record.mode,
+      );
       if (this.contexts.has(record.contextId) || keys.has(key)) {
         throw new UniversalBrokerError(
           "PRECONDITION_FAILED",
@@ -1120,6 +1350,16 @@ export class ContextRegistry {
       this.contexts.set(record.contextId, record);
       this.contextIdByKey.set(key, record.contextId);
     }
+    for (const tombstone of parsed.tombstones) {
+      validateContextTombstone(tombstone);
+      if (this.contexts.has(tombstone.contextId) || this.tombstones.has(tombstone.contextId)) {
+        throw new UniversalBrokerError(
+          "PRECONDITION_FAILED",
+          `Context store contains duplicate tombstone identity: ${tombstone.contextId}`,
+        );
+      }
+      this.tombstones.set(tombstone.contextId, tombstone);
+    }
     this.loaded = true;
   }
 
@@ -1130,6 +1370,8 @@ export class ContextRegistry {
       const payload: ContextStoreFile = {
         version: STORE_VERSION,
         contexts: [...this.contexts.values()]
+          .sort((left, right) => left.contextId.localeCompare(right.contextId)),
+        tombstones: [...this.tombstones.values()]
           .sort((left, right) => left.contextId.localeCompare(right.contextId)),
       };
       await writeFile(temporary, `${JSON.stringify(payload, null, 2)}\n`, { mode: 0o600 });
@@ -1160,8 +1402,11 @@ interface GeneratedContextDiff {
 export interface ContextOpenResult extends Record<string, unknown> {
   contextId: string;
   targetId: string;
-  root: string;
-  mode: ContextMode;
+  targetGeneration: string;
+  /** Present on a newly opened context; omitted from the compact reuse envelope. */
+  root?: string;
+  /** Present on a newly opened context; omitted from the compact reuse envelope. */
+  mode?: ContextMode;
   reused: boolean;
   changed?: boolean;
   instructionSetHash: string;
@@ -1505,8 +1750,14 @@ function deduplicateInstructions(
   });
 }
 
-function contextKey(targetId: string, root: string, mode: ContextMode): string {
-  return `${targetId}\0${root}\0${mode}`;
+function contextKey(
+  principalKeyFingerprint: string,
+  targetId: string,
+  targetGeneration: string,
+  root: string,
+  mode: ContextMode,
+): string {
+  return `${principalKeyFingerprint}\0${targetId}\0${targetGeneration}\0${root}\0${mode}`;
 }
 
 function assertPayloadBudget(
@@ -1614,10 +1865,18 @@ function boundedContextInteger(
 
 function parseContextStore(content: string): ContextStoreFile {
   const parsed = JSON.parse(content) as Partial<ContextStoreFile>;
-  if (parsed.version !== STORE_VERSION || !Array.isArray(parsed.contexts)) {
+  if (
+    parsed.version !== STORE_VERSION
+    || !Array.isArray(parsed.contexts)
+    || !Array.isArray(parsed.tombstones)
+  ) {
     throw new Error("unsupported context store format");
   }
-  return { version: STORE_VERSION, contexts: parsed.contexts };
+  return {
+    version: STORE_VERSION,
+    contexts: parsed.contexts,
+    tombstones: parsed.tombstones,
+  };
 }
 
 function validateContextRecord(record: ContextRecord): void {
@@ -1625,8 +1884,10 @@ function validateContextRecord(record: ContextRecord): void {
     record
     && typeof record.contextId === "string"
     && record.contextId.startsWith("ctx_")
+    && /^[a-f0-9]{64}$/.test(record.principalKeyFingerprint)
     && typeof record.targetId === "string"
     && record.targetId.length > 0
+    && /^[a-f0-9]{64}$/.test(record.targetGeneration)
     && typeof record.root === "string"
     && record.root.length > 0
     && (record.mode === "existing" || record.mode === "worktree")
@@ -1634,6 +1895,7 @@ function validateContextRecord(record: ContextRecord): void {
     && Array.isArray(record.instructions)
     && Number.isFinite(Date.parse(record.createdAt))
     && Number.isFinite(Date.parse(record.lastUsedAt))
+    && Number.isFinite(Date.parse(record.expiresAt))
   );
   if (!valid) {
     throw new UniversalBrokerError(
@@ -1660,6 +1922,31 @@ function validateContextRecord(record: ContextRecord): void {
         `Context store contains an invalid instruction reference: ${record.contextId}`,
       );
     }
+  }
+}
+
+function validateContextTombstone(tombstone: ContextTombstone): void {
+  const valid = Boolean(
+    tombstone
+    && typeof tombstone.contextId === "string"
+    && tombstone.contextId.startsWith("ctx_")
+    && /^[a-f0-9]{64}$/.test(tombstone.principalKeyFingerprint)
+    && typeof tombstone.targetId === "string"
+    && /^[a-f0-9]{64}$/.test(tombstone.targetGeneration)
+    && Number.isFinite(Date.parse(tombstone.expiredAt))
+    && Number.isFinite(Date.parse(tombstone.tombstonedAt))
+    && Number.isFinite(Date.parse(tombstone.removeAfter))
+  );
+  if (!valid) {
+    throw new UniversalBrokerError(
+      "PRECONDITION_FAILED",
+      "Context store contains an invalid expiry tombstone.",
+      {
+        evidence: {
+          contextId: typeof tombstone?.contextId === "string" ? tombstone.contextId : undefined,
+        },
+      },
+    );
   }
 }
 

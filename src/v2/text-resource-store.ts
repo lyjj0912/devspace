@@ -1,5 +1,12 @@
 import { randomUUID } from "node:crypto";
+import {
+  requireCapabilityCallContext,
+  type CapabilityCallContext,
+  type CapabilityCallContextProvider,
+} from "./capability-call-context.js";
 import { UniversalBrokerError } from "./errors.js";
+import { SynchronousQuotaReservations } from "./quota-reservations.js";
+import { RESOURCE_DEFAULT_CONTEXT_TTL_MS } from "./resource-defaults.js";
 
 interface TextResourceRecord {
   id: string;
@@ -8,6 +15,15 @@ interface TextResourceRecord {
   createdAt: number;
   expiresAt: number;
   lastUsedAt: number;
+  principalKeyFingerprint: string;
+}
+
+interface TextResourceTombstone {
+  id: string;
+  principalKeyFingerprint: string;
+  expiredAt: number;
+  tombstonedAt: number;
+  removeAfter: number;
 }
 
 export interface UniversalTextResourceStoreOptions {
@@ -16,17 +32,23 @@ export interface UniversalTextResourceStoreOptions {
   maximumTotalCharacters?: number;
   ttlMs?: number;
   defaultPageCharacters?: number;
+  tombstoneTtlMs?: number;
+  ownerProvider?: CapabilityCallContextProvider;
   now?: () => number;
 }
 
 export class UniversalTextResourceStore {
   private readonly records = new Map<string, TextResourceRecord>();
+  private readonly tombstones = new Map<string, TextResourceTombstone>();
   private readonly authority: string;
   private readonly maximumEntries: number;
   private readonly maximumTotalCharacters: number;
   private readonly ttlMs: number;
   private readonly defaultPageCharacters: number;
+  private readonly tombstoneTtlMs: number;
+  private readonly ownerProvider?: CapabilityCallContextProvider;
   private readonly now: () => number;
+  private readonly reservations: SynchronousQuotaReservations;
   private totalCharacters = 0;
 
   constructor(options: UniversalTextResourceStoreOptions) {
@@ -45,32 +67,36 @@ export class UniversalTextResourceStore {
       1,
       100_000,
     );
+    this.tombstoneTtlMs = boundedInteger(
+      options.tombstoneTtlMs,
+      RESOURCE_DEFAULT_CONTEXT_TTL_MS,
+      1_000,
+      7 * 86_400_000,
+    );
+    this.ownerProvider = options.ownerProvider;
     this.now = options.now ?? Date.now;
+    this.reservations = new SynchronousQuotaReservations(this.authority, {
+      entries: this.maximumEntries,
+      characters: this.maximumTotalCharacters,
+    });
   }
 
-  put(text: string, mimeType = "text/plain"): {
+  put(
+    text: string,
+    mimeType = "text/plain",
+    callContext?: CapabilityCallContext,
+  ): {
     resourceId: string;
     resourceUri: string;
     characters: number;
     expiresAt: string;
   } {
-    if (text.length > this.maximumTotalCharacters) {
-      throw new UniversalBrokerError(
-        "RESOURCE_QUOTA_EXCEEDED",
-        `One ${this.authority} resource exceeds the total character quota.`,
-        { evidence: { characters: text.length, maximum: this.maximumTotalCharacters } },
-      );
-    }
+    const owner = this.owner(callContext);
     this.pruneExpired();
-    while (
-      this.records.size >= this.maximumEntries
-      || this.totalCharacters + text.length > this.maximumTotalCharacters
-    ) {
-      const oldest = [...this.records.values()]
-        .sort((left, right) => left.lastUsedAt - right.lastUsedAt)[0];
-      if (!oldest) break;
-      this.delete(oldest.id);
-    }
+    const reservation = this.reservations.reserve(
+      { entries: this.records.size, characters: this.totalCharacters },
+      { entries: 1, characters: text.length },
+    );
     const now = this.now();
     const id = randomUUID();
     const record: TextResourceRecord = {
@@ -80,9 +106,12 @@ export class UniversalTextResourceStore {
       createdAt: now,
       expiresAt: now + this.ttlMs,
       lastUsedAt: now,
+      principalKeyFingerprint: owner.principalKeyFingerprint,
     };
-    this.records.set(id, record);
-    this.totalCharacters += text.length;
+    reservation.commit(() => {
+      this.records.set(id, record);
+      this.totalCharacters += text.length;
+    });
     return {
       resourceId: id,
       resourceUri: this.uri(id, 0, this.defaultPageCharacters),
@@ -91,9 +120,9 @@ export class UniversalTextResourceStore {
     };
   }
 
-  readByUri(uri: string): Record<string, unknown> {
+  readByUri(uri: string, callContext?: CapabilityCallContext): Record<string, unknown> {
     const { id, offset, limit } = this.parseUri(uri);
-    return this.read(id, offset, limit, uri);
+    return this.read(id, offset, limit, uri, callContext);
   }
 
   read(
@@ -101,15 +130,33 @@ export class UniversalTextResourceStore {
     offset = 0,
     maximumCharacters = this.defaultPageCharacters,
     uri = this.uri(id, offset, maximumCharacters),
+    callContext?: CapabilityCallContext,
   ): Record<string, unknown> {
+    const owner = this.owner(callContext);
     this.pruneExpired();
     const record = this.records.get(id);
     if (!record) {
+      const tombstone = this.tombstones.get(id);
+      if (tombstone) {
+        this.assertOwner(tombstone.principalKeyFingerprint, owner, id);
+        throw new UniversalBrokerError(
+          "PRECONDITION_FAILED",
+          `${this.authority} resource expired: ${id}`,
+          {
+            evidence: {
+              reasonCode: "RESOURCE_EXPIRED",
+              resourceId: id,
+              expiredAt: new Date(tombstone.expiredAt).toISOString(),
+            },
+          },
+        );
+      }
       throw new UniversalBrokerError(
         "PATH_NOT_FOUND",
         `${this.authority} resource is unknown or expired: ${id}`,
       );
     }
+    this.assertOwner(record.principalKeyFingerprint, owner, id);
     if (!Number.isSafeInteger(offset) || offset < 0 || offset > record.text.length) {
       throw new UniversalBrokerError("PRECONDITION_FAILED", `${this.authority} offset is invalid.`);
     }
@@ -135,12 +182,17 @@ export class UniversalTextResourceStore {
 
   clear(): void {
     this.records.clear();
+    this.tombstones.clear();
     this.totalCharacters = 0;
   }
 
-  stats(): { entries: number; totalCharacters: number } {
+  stats(): { entries: number; totalCharacters: number; tombstones: number } {
     this.pruneExpired();
-    return { entries: this.records.size, totalCharacters: this.totalCharacters };
+    return {
+      entries: this.records.size,
+      totalCharacters: this.totalCharacters,
+      tombstones: this.tombstones.size,
+    };
   }
 
   private uri(id: string, offset: number, limit: number): string {
@@ -175,16 +227,47 @@ export class UniversalTextResourceStore {
 
   private pruneExpired(): void {
     const now = this.now();
+    for (const tombstone of this.tombstones.values()) {
+      if (tombstone.removeAfter <= now) this.tombstones.delete(tombstone.id);
+    }
     for (const record of this.records.values()) {
-      if (record.expiresAt <= now) this.delete(record.id);
+      if (record.expiresAt <= now) this.expire(record, now);
     }
   }
 
-  private delete(id: string): void {
-    const record = this.records.get(id);
-    if (!record) return;
-    this.records.delete(id);
+  private expire(record: TextResourceRecord, now: number): void {
+    this.records.delete(record.id);
     this.totalCharacters -= record.text.length;
+    this.tombstones.set(record.id, {
+      id: record.id,
+      principalKeyFingerprint: record.principalKeyFingerprint,
+      expiredAt: record.expiresAt,
+      tombstonedAt: now,
+      removeAfter: now + this.tombstoneTtlMs,
+    });
+    const maximumTombstones = Math.max(64, this.maximumEntries * 4);
+    if (this.tombstones.size > maximumTombstones) {
+      const oldest = [...this.tombstones.values()]
+        .sort((left, right) => left.tombstonedAt - right.tombstonedAt || left.id.localeCompare(right.id))[0];
+      if (oldest) this.tombstones.delete(oldest.id);
+    }
+  }
+
+  private owner(explicit?: CapabilityCallContext): CapabilityCallContext {
+    return requireCapabilityCallContext(explicit, this.ownerProvider);
+  }
+
+  private assertOwner(
+    expected: string,
+    actual: CapabilityCallContext,
+    resourceId: string,
+  ): void {
+    if (expected === actual.principalKeyFingerprint) return;
+    throw new UniversalBrokerError(
+      "AUTHORITY_PRINCIPAL_MISMATCH",
+      `${this.authority} resource belongs to a different stable principal.`,
+      { evidence: { reasonCode: "RESOURCE_OWNER_MISMATCH", resourceId } },
+    );
   }
 }
 

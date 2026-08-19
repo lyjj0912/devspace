@@ -9,6 +9,7 @@ import {
   UNIVERSAL_TOOL_CONTRACTS,
   UNIVERSAL_TOOL_NAMES,
   UNIVERSAL_TOOL_OPERATIONS,
+  universalRequestMetaSchema,
 } from "./contracts.js";
 
 test("checked-in contract manifests match the TypeScript authority", async () => {
@@ -65,6 +66,42 @@ test("every fixed tool contract has operations and no service-specific top-level
   }
 });
 
+test("common request metadata is strict and stays out of repeated tool argument schemas", () => {
+  const fields = [
+    "requestId",
+    "transactionId",
+    "taskInstanceId",
+    "authorityId",
+    "expectedSchemaGeneration",
+    "expectedTargetGeneration",
+    "expectedRouteGeneration",
+    "humanApprovalAttestation",
+  ];
+  assert.deepEqual(Object.keys(universalRequestMetaSchema.shape), fields);
+  assert.deepEqual(universalRequestMetaSchema.parse({
+    requestId: "request-1",
+    transactionId: "transaction-1",
+    taskInstanceId: "task-1",
+    authorityId: "authority-1",
+    expectedSchemaGeneration: `sha256:${"a".repeat(64)}`,
+    expectedTargetGeneration: "target-generation",
+    expectedRouteGeneration: "route-generation",
+    humanApprovalAttestation: "opaque-compact-attestation",
+  }).requestId, "request-1");
+  assert.equal(universalRequestMetaSchema.safeParse({ unexpected: true }).success, false);
+  for (const contract of Object.values(UNIVERSAL_TOOL_CONTRACTS)) {
+    for (const field of [
+      "requestId",
+      "expectedSchemaGeneration",
+      "expectedTargetGeneration",
+      "expectedRouteGeneration",
+      "humanApprovalAttestation",
+    ]) {
+      assert.equal(field in contract.inputSchema, false, field);
+    }
+  }
+});
+
 test("contracts expose only user-account authority", async () => {
   assert.deepEqual(UNIVERSAL_OWNER_SCOPES, [
     "devspace.read",
@@ -85,6 +122,7 @@ test("contracts expose only user-account authority", async () => {
     "action",
     "timeoutMs",
     "maxElements",
+    "focusPolicy",
     "authorityId",
   ]);
   for (const path of [
@@ -112,7 +150,10 @@ test("target capability contract is closed and requires complete observed capabi
   };
   assert.deepEqual(schema.required, [
     "targetId",
+    "endpointId",
+    "targetGeneration",
     "status",
+    "ready",
     "observedAt",
     "expiresAt",
     "platform",
@@ -131,7 +172,15 @@ test("target capability contract is closed and requires complete observed capabi
     "durableProcess",
   ]);
   assert.equal(schema.properties?.capabilities?.additionalProperties, false);
-  assert.deepEqual(schema.properties?.evidence?.required, ["transport"]);
+  assert.deepEqual(schema.properties?.evidence?.required, [
+    "transport",
+    "endpointId",
+    "endpointFingerprint",
+    "configuredIdentity",
+    "observedIdentity",
+    "identityMatches",
+    "readiness",
+  ]);
   assert.equal(schema.properties?.evidence?.additionalProperties, false);
   assert.deepEqual(schema.properties?.evidence?.properties?.cache?.enum, ["hit", "miss", "shared"]);
 });
@@ -141,6 +190,7 @@ test("all JSON contract files parse", async () => {
     "../../contracts/tools-v2.schema.json",
     "../../contracts/targets.schema.json",
     "../../contracts/mcp-routes.schema.json",
+    "../../contracts/mcp-risk-policy.schema.json",
     "../../contracts/errors.schema.json",
     "../../contracts/capabilities.schema.json",
     "../../contracts/universal-broker-v2-baseline.json",

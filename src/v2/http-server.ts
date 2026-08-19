@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { join } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { hostHeaderValidation } from "@modelcontextprotocol/sdk/server/middleware/hostHeaderValidation.js";
 import { mcpAuthRouter, getOAuthProtectedResourceMetadataUrl } from "@modelcontextprotocol/sdk/server/auth/router.js";
@@ -43,6 +44,12 @@ import { createUniversalBrokerMcpServer } from "./server.js";
 import { UniversalSelfManagementService } from "./self-management.js";
 import { TargetRegistry } from "./targets.js";
 import { UniversalTextResourceStore } from "./text-resource-store.js";
+import { configureResultEnvelopeIdentity } from "./errors.js";
+import {
+  createRuntimeIdentity,
+  publicRuntimeHealth,
+} from "./runtime-identity.js";
+import type { RuntimeIdentity } from "./contracts.js";
 import {
   joinPublicUrl,
   loadUniversalBrokerNextConfig,
@@ -80,7 +87,9 @@ function isOpenAiSessionlessDiscoveryRequest(
 
 export interface RunningUniversalBrokerNextServer {
   app: Express;
+  managementApp: Express;
   config: UniversalBrokerNextConfig;
+  runtimeIdentity: RuntimeIdentity;
   targets: TargetRegistry;
   contexts: ContextRegistry;
   execution: UniversalExecutionPlane;
@@ -109,12 +118,21 @@ export function createUniversalBrokerNextServer(
     ? undefined
     : Array.from(new Set([config.host, ...config.allowedHosts]));
   const app = express();
+  const managementApp = express();
+  managementApp.disable("x-powered-by");
   app.use(express.json({ limit: MAXIMUM_HTTP_JSON_BYTES }));
   if (allowedHosts) app.use(hostHeaderValidation(allowedHosts));
   const transports = new McpSessionRegistry<NextTransport>({
     maximumSessions: config.maximumMcpSessions,
   });
   const metrics = new UniversalBrokerMetrics();
+  const runtimeIdentity = createRuntimeIdentity({
+    config,
+    sourceRevision: config.sourceRevision,
+    runtimeRevision: config.runtimeRevision,
+    ...(config.buildDigest ? { buildDigest: config.buildDigest } : {}),
+  });
+  configureResultEnvelopeIdentity(runtimeIdentity);
   const authority = new OperationAuthorityRegistry({
     minimumRisk: minimumAuthorityRisk,
     storePath: config.authorityStorePath,
@@ -146,11 +164,13 @@ export function createUniversalBrokerNextServer(
     contexts,
     outputDir: config.processOutputDir,
     sshControlDir: config.sshControlDir,
+    maxProcessRecords: config.maximumProcessRecords,
     maxRunningProcesses: config.maxRunningProcesses,
     maxRunningProcessesPerTarget: config.maxRunningProcessesPerTarget,
     processBufferCharacters: config.processBufferCharacters,
     processOutputMaxBytes: config.processOutputMaxBytes,
     completedProcessTtlMs: config.completedProcessTtlMs,
+    processStateDir: join(config.stateDir, "processes"),
     envProfiles,
   });
   const filesystem = new UniversalFilesystemService(
@@ -200,15 +220,23 @@ export function createUniversalBrokerNextServer(
   const selfManagement = options.selfManagement ?? new UniversalSelfManagementService({
     stateDir: config.selfManagementDir,
     pm2ProcessName: config.selfRestartPm2ProcessName,
-    localHealthUrl: `http://${managementHost(config.host)}:${config.port}${config.healthPath}`,
+    localHealthUrl: `http://${config.managementHost}:${config.managementPort}${config.readyPath}`,
     publicHealthUrl: joinPublicUrl(config.publicBaseUrl, config.healthPath),
     expectedCwd: process.cwd(),
     expectedScript: config.selfRestartExpectedScript,
     defaultDelayMs: config.selfRestartDelayMs,
     timeoutMs: config.selfRestartTimeoutMs,
+    runtimeIdentity,
   });
   const mcpUrl = new URL(config.publicMcpUrl);
   const resourceServerUrl = resourceUrlFromServerUrl(mcpUrl);
+  const authorityPrincipal = {
+    environment: config.deploymentMode === "production" ? "production" as const : "development" as const,
+    mode: config.authorityPrincipalMode,
+    issuer: new URL(`${config.publicBaseUrl}/`).href,
+    resource: resourceServerUrl.href,
+    ownerInstanceId: config.authorityOwnerInstanceId,
+  };
   const resourceMetadataUrl = prefixedResourceMetadataUrl(
     config.publicBaseUrl,
     resourceServerUrl,
@@ -327,34 +355,44 @@ export function createUniversalBrokerNextServer(
     }),
   );
 
-  app.get(config.healthPath, async (_req, res) => {
+  app.get(config.healthPath, (_req, res) => {
+    res.json(publicRuntimeHealth(runtimeIdentity));
+  });
+
+  managementApp.get("/healthz", (_req, res) => {
+    res.json({ ...publicRuntimeHealth(runtimeIdentity), buildDigest: runtimeIdentity.buildDigest });
+  });
+
+  managementApp.get(config.readyPath, async (_req, res) => {
     try {
-      const snapshot = await targets.inspect();
-      const routeSnapshot = await mcpRoutes.inspect();
+      const [targetSnapshot, routeSnapshot] = await Promise.all([
+        targets.inspect(),
+        mcpRoutes.inspect(),
+      ]);
+      const authorityStats = authority.stats();
       res.json({
-        ok: true,
-        name: "devspace-universal-broker",
-        phase: "universal-broker-v2",
-        targetGeneration: snapshot.generation,
-        targetCount: snapshot.targets.length,
-        mcpRouteGeneration: routeSnapshot.generation,
-        mcpRouteCount: routeSnapshot.routes.length,
+        status: "ready",
+        identity: runtimeIdentity,
+        checks: {
+          nonRoot: typeof process.getuid !== "function" || process.getuid() !== 0,
+          targetRegistry: targetSnapshot.generation,
+          routeRegistry: routeSnapshot.generation,
+          authorityStore: numeric(authorityStats.authorities) >= 0,
+          principalMode: config.authorityPrincipalMode,
+          authorityDeployment: config.authorityDeployment,
+          canonicalConnectorName: config.canonicalConnectorName,
+        },
       });
     } catch (error) {
       res.status(503).json({
-        ok: false,
-        name: "devspace-universal-broker",
-        phase: "universal-broker-v2",
+        status: "not_ready",
+        identity: runtimeIdentity,
         error: error instanceof Error ? error.message : String(error),
       });
     }
   });
 
-  app.get(config.metricsPath, async (req, res) => {
-    if (!isLoopbackRequest(req)) {
-      res.status(403).type("text/plain").send("metrics are loopback-only\n");
-      return;
-    }
+  managementApp.get(config.metricsPath, async (_req, res) => {
     const [contextStats, executionStats, mcpStats, selfManagementStats] = await Promise.all([
       Promise.resolve(contexts.stats()),
       Promise.resolve(execution.stats()),
@@ -488,7 +526,10 @@ export function createUniversalBrokerNextServer(
           artifacts,
           gui,
           authority,
+          authorityPrincipal,
           selfManagement,
+          runtimeIdentity,
+          metrics,
         });
         await server.connect(transport);
       } else if (isOpenAiSessionlessDiscoveryRequest(req.header("user-agent"), messageMethods)) {
@@ -510,7 +551,10 @@ export function createUniversalBrokerNextServer(
           artifacts,
           gui,
           authority,
+          authorityPrincipal,
           selfManagement,
+          runtimeIdentity,
+          metrics,
         });
         await ephemeralServer.connect(transport);
       } else {
@@ -545,7 +589,9 @@ export function createUniversalBrokerNextServer(
   let closePromise: Promise<void> | undefined;
   return {
     app,
+    managementApp,
     config,
+    runtimeIdentity,
     targets,
     contexts,
     execution,
@@ -647,27 +693,6 @@ function sendJsonRpcError(
     error: { code, message },
     id: null,
   });
-}
-
-function managementHost(host: string): string {
-  if (host === "0.0.0.0" || host === "::" || host === "[::]") return "127.0.0.1";
-  return host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
-}
-
-function isLoopbackRequest(req: Request): boolean {
-  const address = req.socket.remoteAddress ?? "";
-  const socketIsLoopback = address === "127.0.0.1"
-    || address === "::1"
-    || address === "::ffff:127.0.0.1";
-  if (!socketIsLoopback) return false;
-  const host = req.header("host")?.trim();
-  if (!host) return false;
-  try {
-    const hostname = new URL(`http://${host}`).hostname;
-    return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]" || hostname === "::1";
-  } catch {
-    return false;
-  }
 }
 
 function gauge(help: string, value: number): { help: string; value: number } {

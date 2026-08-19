@@ -69,7 +69,7 @@
           "const": 8
         },
         "maximumToolDescriptorCharacters": {
-          "const": 12000
+          "const": 9000
         },
         "maximumServerInstructionCharacters": {
           "const": 2000
@@ -78,7 +78,7 @@
           "const": 4000
         },
         "maximumReusedContextCharacters": {
-          "const": 800
+          "const": 512
         },
         "maximumMetaCharacters": {
           "const": 8000
@@ -166,6 +166,7 @@
                 "copy",
                 "move",
                 "remove",
+                "restore",
                 "hash",
                 "sync"
               ]

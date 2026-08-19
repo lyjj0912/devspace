@@ -1,3 +1,6 @@
+import { createHash } from "node:crypto";
+import { chmodSync, closeSync, existsSync, fsyncSync, openSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { basename, dirname } from "node:path";
 import type Database from "better-sqlite3";
 
 interface Migration {
@@ -27,9 +30,15 @@ const migrations: Migration[] = [
     name: "workspace-conversation-bindings",
     up: migrateWorkspaceConversationBindings,
   },
+  {
+    version: 5,
+    name: "oauth-token-families-and-connector-bindings",
+    up: migrateOAuthTokenFamiliesAndConnectorBindings,
+  },
 ];
 
 export function migrateDatabase(sqlite: Database.Database): void {
+  preservePendingOAuthMigrationPreimage(sqlite);
   const migrate = sqlite.transaction(() => {
     sqlite.exec(`
       create table if not exists devspace_schema_migrations (
@@ -58,6 +67,50 @@ export function migrateDatabase(sqlite: Database.Database): void {
   });
 
   migrate.immediate();
+}
+
+function preservePendingOAuthMigrationPreimage(sqlite: Database.Database): void {
+  const migrationTable = sqlite.prepare(
+    "select 1 as present from sqlite_master where type = 'table' and name = 'devspace_schema_migrations'",
+  ).get() as { present: number } | undefined;
+  if (!migrationTable) return;
+  const versions = new Set((sqlite.prepare("select version from devspace_schema_migrations").all() as Array<{ version: number }>).map((row) => row.version));
+  if (!versions.has(2) || versions.has(5) || sqlite.name === ":memory:") return;
+  const image = sqlite.serialize();
+  const digest = createHash("sha256").update(image).digest("hex");
+  const backupPath = `${sqlite.name}.migration-v5.${digest}.sqlite`;
+  const checksumPath = `${backupPath}.sha256`;
+  if (!existsSync(backupPath)) writeAtomic(backupPath, image);
+  if (createHash("sha256").update(readFileSync(backupPath)).digest("hex") !== digest) {
+    throw new Error(`OAuth migration backup checksum mismatch: ${backupPath}`);
+  }
+  const checksum = `${digest}  ${basename(backupPath)}\n`;
+  if (!existsSync(checksumPath)) writeAtomic(checksumPath, Buffer.from(checksum, "utf8"));
+  else if (readFileSync(checksumPath, "utf8") !== checksum) {
+    throw new Error(`OAuth migration backup checksum receipt mismatch: ${checksumPath}`);
+  }
+}
+
+function writeAtomic(path: string, value: Buffer): void {
+  const temporary = `${path}.tmp-${process.pid}`;
+  const descriptor = openSync(temporary, "wx", 0o600);
+  try {
+    writeFileSync(descriptor, value);
+    fsyncSync(descriptor);
+  } finally {
+    closeSync(descriptor);
+  }
+  chmodSync(temporary, 0o600);
+  renameSync(temporary, path);
+  let directoryDescriptor: number | undefined;
+  try {
+    directoryDescriptor = openSync(dirname(path), "r");
+    fsyncSync(directoryDescriptor);
+  } catch (error) {
+    if (!new Set(["EINVAL", "ENOTSUP", "EISDIR", "EPERM"]).has((error as NodeJS.ErrnoException).code ?? "")) throw error;
+  } finally {
+    if (directoryDescriptor !== undefined) closeSync(directoryDescriptor);
+  }
 }
 
 function migrateWorkspaceState(sqlite: Database.Database): void {
@@ -198,9 +251,101 @@ function migrateWorkspaceConversationBindings(sqlite: Database.Database): void {
   `);
 }
 
+function migrateOAuthTokenFamiliesAndConnectorBindings(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table if not exists oauth_connector_bindings (
+      binding_id text primary key,
+      canonical_name text not null,
+      client_id text not null,
+      installation_epoch integer not null,
+      schema_generation text not null,
+      drain_epoch integer not null default 0,
+      state text not null check (state in ('ACTIVE', 'DEPRECATED', 'DRAINED')),
+      ref_count integer not null default 0 check (ref_count >= 0),
+      created_at text not null,
+      updated_at text not null,
+      foreign key (client_id) references oauth_clients(client_id) on delete cascade,
+      unique (canonical_name, installation_epoch, schema_generation)
+    );
+
+    create unique index if not exists oauth_connector_bindings_one_active_name_idx
+      on oauth_connector_bindings(canonical_name)
+      where state = 'ACTIVE';
+
+    create index if not exists oauth_connector_bindings_client_idx
+      on oauth_connector_bindings(client_id, state);
+
+    create table if not exists oauth_token_families (
+      family_id text primary key,
+      client_id text not null,
+      connector_binding_id text,
+      installation_epoch integer,
+      drain_epoch integer,
+      status text not null check (status in ('ACTIVE', 'ROTATING', 'REVOKED')),
+      rotation_sequence integer not null default 0,
+      created_at text not null,
+      rotated_at text,
+      revoked_at text,
+      foreign key (client_id) references oauth_clients(client_id) on delete cascade,
+      foreign key (connector_binding_id) references oauth_connector_bindings(binding_id) on delete restrict
+    );
+
+    create index if not exists oauth_token_families_client_idx
+      on oauth_token_families(client_id, status);
+
+    create index if not exists oauth_token_families_binding_idx
+      on oauth_token_families(connector_binding_id, status);
+  `);
+
+  addColumnIfMissing(sqlite, "oauth_access_tokens", "family_id", "text");
+  addColumnIfMissing(sqlite, "oauth_access_tokens", "connector_binding_id", "text");
+  addColumnIfMissing(sqlite, "oauth_access_tokens", "connector_drain_epoch", "integer");
+  addColumnIfMissing(sqlite, "oauth_access_tokens", "installation_epoch", "integer");
+  addColumnIfMissing(sqlite, "oauth_access_tokens", "rotation_sequence", "integer not null default 0");
+  addColumnIfMissing(sqlite, "oauth_refresh_tokens", "family_id", "text");
+  addColumnIfMissing(sqlite, "oauth_refresh_tokens", "connector_binding_id", "text");
+  addColumnIfMissing(sqlite, "oauth_refresh_tokens", "connector_drain_epoch", "integer");
+  addColumnIfMissing(sqlite, "oauth_refresh_tokens", "installation_epoch", "integer");
+  addColumnIfMissing(sqlite, "oauth_refresh_tokens", "rotation_sequence", "integer not null default 0");
+
+  sqlite.exec(`
+    create index if not exists oauth_access_tokens_family_idx
+      on oauth_access_tokens(family_id);
+    create index if not exists oauth_refresh_tokens_family_idx
+      on oauth_refresh_tokens(family_id);
+  `);
+
+  const legacyClients = sqlite.prepare(`
+    select distinct client_id from (
+      select client_id from oauth_access_tokens where family_id is null
+      union
+      select client_id from oauth_refresh_tokens where family_id is null
+    ) order by client_id
+  `).pluck().all() as string[];
+  const createdAt = new Date().toISOString();
+  const insertFamily = sqlite.prepare(`
+    insert or ignore into oauth_token_families
+      (family_id, client_id, connector_binding_id, installation_epoch, drain_epoch,
+       status, rotation_sequence, created_at)
+    values (?, ?, null, null, null, 'ACTIVE', 0, ?)
+  `);
+  const bindAccess = sqlite.prepare(
+    "update oauth_access_tokens set family_id = ?, rotation_sequence = 0 where client_id = ? and family_id is null",
+  );
+  const bindRefresh = sqlite.prepare(
+    "update oauth_refresh_tokens set family_id = ?, rotation_sequence = 0 where client_id = ? and family_id is null",
+  );
+  for (const clientId of legacyClients) {
+    const familyId = `family-legacy-${createHash("sha256").update(clientId).digest("hex").slice(0, 32)}`;
+    insertFamily.run(familyId, clientId, createdAt);
+    bindAccess.run(familyId, clientId);
+    bindRefresh.run(familyId, clientId);
+  }
+}
+
 function addColumnIfMissing(
   sqlite: Database.Database,
-  table: "workspace_sessions" | "local_agent_sessions",
+  table: "workspace_sessions" | "local_agent_sessions" | "oauth_access_tokens" | "oauth_refresh_tokens",
   column: string,
   definition: string,
 ): void {

@@ -13,7 +13,7 @@ import {
   symlink,
   writeFile,
 } from "node:fs/promises";
-import { basename, delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const PRODUCTION_UPGRADE_STATES = [
@@ -28,6 +28,32 @@ export const PRODUCTION_UPGRADE_STATES = [
 ] as const;
 
 export type ProductionUpgradeState = (typeof PRODUCTION_UPGRADE_STATES)[number];
+
+export const PRODUCTION_UPGRADE_FAILURE_CODES = [
+  "MANIFEST_INVALID",
+  "MANIFEST_MISMATCH",
+  "SWITCH_FAILED",
+  "RUNTIME_EQUIVALENCE_FAILED",
+  "MANAGEMENT_NOT_READY",
+  "RUNTIME_IDENTITY_MISMATCH",
+  "PUBLIC_BOUNDARY_FAILED",
+  "ROLLBACK_FAILED",
+] as const;
+
+export type ProductionUpgradeFailureCode = (typeof PRODUCTION_UPGRADE_FAILURE_CODES)[number];
+export type ProductionUpgradeFailurePhase =
+  | "PREFLIGHT"
+  | "SWITCHING"
+  | "VERIFYING"
+  | "ROLLING_BACK";
+
+export interface ProductionUpgradeFailure {
+  code: ProductionUpgradeFailureCode;
+  phase: ProductionUpgradeFailurePhase;
+  message: string;
+  retryable: boolean;
+  evidence?: Record<string, unknown>;
+}
 
 export interface ProductionUpgradeRequest {
   version: 1;
@@ -52,6 +78,14 @@ export interface ProductionUpgradeRequest {
     dist: {
       files: number;
       sha256: string;
+    };
+    manifest: {
+      path: string;
+      buildDigest: string;
+      runtimeRevision: string;
+      schemaGeneration: string;
+      authorityContractGeneration: string;
+      configSchemaIdentity: string;
     };
   };
   productionEnvPath: string;
@@ -96,8 +130,66 @@ export interface ProductionUpgradeStatus extends Record<string, unknown> {
   runtimeCommit?: string;
   runtimeSourceTree?: string;
   runtimeDist?: { files: number; sha256: string };
+  manifestSha256?: string;
+  manifestIdentity?: ReleaseIdentity;
+  managementReadyUrl?: string;
+  managementReadyStatus?: number;
+  runtimeIdentity?: RuntimeIdentityEvidence;
+  runtimeIdentityConfirmed?: boolean;
+  configSchemaIdentity?: string;
+  failure?: ProductionUpgradeFailure;
   rollback?: Record<string, unknown>;
   error?: string;
+}
+
+interface ImmutableBuildManifest extends ReleaseIdentity {
+  manifestVersion: 2;
+  payloadDigest: string;
+  files: number;
+  payloadFiles: string[];
+  runtimeFiles: string[];
+  createdAt: string;
+  nodeVersion: string;
+  platform: string;
+  forbiddenArtifactScan: "PASS";
+}
+
+interface ReleaseIdentity {
+  sourceRevision: string;
+  runtimeRevision: string;
+  buildDigest: string;
+  schemaGeneration: string;
+  authorityContractGeneration: string;
+  configSchemaIdentity: string;
+}
+
+interface RuntimeIdentityEvidence {
+  productVersion: string;
+  schemaGeneration: string;
+  authorityContractGeneration: string;
+  configDigest: string;
+  sourceRevision: string;
+  runtimeRevision: string;
+  buildDigest: string;
+  startedAt: string;
+}
+
+interface ManifestBindingEvidence {
+  manifest: ImmutableBuildManifest;
+  manifestPath: string;
+  manifestSha256: string;
+  identity: ReleaseIdentity;
+  managementReadyUrl: string;
+}
+
+class ProductionUpgradeFailureError extends Error {
+  readonly failure: ProductionUpgradeFailure;
+
+  constructor(failure: ProductionUpgradeFailure) {
+    super(failure.message);
+    this.name = "ProductionUpgradeFailureError";
+    this.failure = failure;
+  }
 }
 
 interface Pm2ProcessSnapshot {
@@ -132,13 +224,19 @@ export async function runProductionUpgradeWorker(requestPath: string): Promise<v
     ],
   };
   await writeStatus(request.statusPath, status);
+  let phase: ProductionUpgradeFailurePhase = "PREFLIGHT";
+  let switchAttempted = false;
   try {
+    const manifestBinding = await verifyManifestBinding(request);
     await sleep(request.delayMs);
+    phase = "SWITCHING";
     status = await transition(request, status, "SWITCHING");
+    switchAttempted = true;
     await installFile(request.nextEnvPath, request.productionEnvPath, 0o600);
     replacePm2Process(request, request.next.script, request.next.release);
+    phase = "VERIFYING";
     status = await transition(request, status, "VERIFYING");
-    const evidence = await verifyNextRuntime(request);
+    const evidence = await verifyNextRuntime(request, manifestBinding);
 
     await installStartScript(request);
     await replaceSymlink(request.currentAuditLink, request.auditDirectory);
@@ -152,16 +250,40 @@ export async function runProductionUpgradeWorker(requestPath: string): Promise<v
     };
     await writeStatus(request.statusPath, status);
   } catch (error) {
-    const failure = error instanceof Error ? error.message : String(error);
-    status = await transition(request, { ...status, error: failure }, "ROLLING_BACK");
+    const failure = normalizeFailure(error, phase);
+    if (!switchAttempted) {
+      const failedAt = new Date().toISOString();
+      status = {
+        ...status,
+        state: "FAIL",
+        updatedAt: failedAt,
+        error: failure.message,
+        failure,
+        rollback: {
+          attempted: false,
+          restored: false,
+          verified: false,
+          outcome: "NOT_REQUIRED_SWITCH_NOT_STARTED",
+        },
+        history: [...(status.history ?? []), { state: "FAIL", at: failedAt }],
+      };
+      await writeStatus(request.statusPath, status);
+      throw error;
+    }
+    status = await transition(request, {
+      ...status,
+      error: failure.message,
+      failure,
+    }, "ROLLING_BACK");
     const rollback = await rollbackRuntime(request);
     const terminalAt = new Date().toISOString();
-    const terminalState: ProductionUpgradeState = rollback.restored === true ? "FAIL" : "UNKNOWN";
+    const terminalState: ProductionUpgradeState = rollback.verified === true ? "FAIL" : "UNKNOWN";
     status = {
       ...status,
       state: terminalState,
       updatedAt: terminalAt,
-      error: failure,
+      error: failure.message,
+      failure,
       rollback,
       history: [...(status.history ?? []), { state: terminalState, at: terminalAt }],
     };
@@ -174,6 +296,7 @@ export async function runProductionUpgradeWorker(requestPath: string): Promise<v
 
 async function verifyNextRuntime(
   request: ProductionUpgradeRequest,
+  manifestBinding: ManifestBindingEvidence,
 ): Promise<Pick<ProductionUpgradeStatus,
   | "pidAfter"
   | "pm2Status"
@@ -187,42 +310,113 @@ async function verifyNextRuntime(
   | "runtimeCommit"
   | "runtimeSourceTree"
   | "runtimeDist"
+  | "manifestSha256"
+  | "manifestIdentity"
+  | "managementReadyUrl"
+  | "managementReadyStatus"
+  | "runtimeIdentity"
+  | "runtimeIdentityConfirmed"
+  | "configSchemaIdentity"
 >> {
-  const runtimeCommit = gitValue(request, ["-C", request.next.release, "rev-parse", "HEAD"]);
-  const runtimeSourceTree = gitValue(request, ["-C", request.next.release, "rev-parse", "HEAD^{tree}"]);
-  const runtimeDist = await directoryEvidence(join(request.next.release, "dist"));
+  let runtimeCommit: string;
+  let runtimeSourceTree: string;
+  let runtimeDist: { files: number; sha256: string };
+  try {
+    runtimeCommit = gitValue(request, ["-C", request.next.release, "rev-parse", "HEAD"]);
+    runtimeSourceTree = gitValue(request, ["-C", request.next.release, "rev-parse", "HEAD^{tree}"]);
+    runtimeDist = await directoryEvidence(join(request.next.release, "dist"));
+  } catch (error) {
+    throw upgradeFailure(
+      "RUNTIME_EQUIVALENCE_FAILED",
+      "VERIFYING",
+      `Runtime source evidence could not be read: ${errorMessage(error)}`,
+      false,
+    );
+  }
   if (runtimeCommit !== request.next.commit) {
-    throw new Error(`Runtime commit mismatch: expected ${request.next.commit}, actual ${runtimeCommit}.`);
+    throw upgradeFailure(
+      "RUNTIME_EQUIVALENCE_FAILED",
+      "VERIFYING",
+      `Runtime commit mismatch: expected ${request.next.commit}, actual ${runtimeCommit}.`,
+      false,
+      { expected: request.next.commit, observed: runtimeCommit },
+    );
   }
   if (runtimeSourceTree !== request.next.sourceTree) {
-    throw new Error(`Runtime source tree mismatch: expected ${request.next.sourceTree}, actual ${runtimeSourceTree}.`);
+    throw upgradeFailure(
+      "RUNTIME_EQUIVALENCE_FAILED",
+      "VERIFYING",
+      `Runtime source tree mismatch: expected ${request.next.sourceTree}, actual ${runtimeSourceTree}.`,
+      false,
+      { expected: request.next.sourceTree, observed: runtimeSourceTree },
+    );
   }
   if (
     runtimeDist.files !== request.next.dist.files
     || runtimeDist.sha256 !== request.next.dist.sha256
   ) {
-    throw new Error(
+    throw upgradeFailure(
+      "RUNTIME_EQUIVALENCE_FAILED",
+      "VERIFYING",
       `Runtime dist fingerprint mismatch: expected ${JSON.stringify(request.next.dist)}, actual ${JSON.stringify(runtimeDist)}.`,
+      false,
+      { expected: request.next.dist, observed: runtimeDist },
     );
   }
   const deadline = Date.now() + request.timeoutMs;
-  let lastError = "Production upgrade verification did not run.";
+  let lastError = upgradeFailure(
+    "MANAGEMENT_NOT_READY",
+    "VERIFYING",
+    "Production upgrade verification did not run.",
+    true,
+  );
   while (Date.now() < deadline) {
     try {
       const process = pm2Process(request);
-      if (!process) throw new Error(`PM2 process is missing: ${request.pm2ProcessName}`);
+      if (!process) {
+        throw upgradeFailure(
+          "MANAGEMENT_NOT_READY",
+          "VERIFYING",
+          `PM2 process is missing: ${request.pm2ProcessName}`,
+          true,
+        );
+      }
       if (process.pm2_env?.status !== "online") {
-        throw new Error(`PM2 status is ${process.pm2_env?.status ?? "unknown"}.`);
+        throw upgradeFailure(
+          "MANAGEMENT_NOT_READY",
+          "VERIFYING",
+          `PM2 status is ${process.pm2_env?.status ?? "unknown"}.`,
+          true,
+        );
       }
-      if (resolve(process.pm2_env?.pm_cwd ?? "/") !== resolve(request.next.release)) {
-        throw new Error(`PM2 cwd mismatch: ${process.pm2_env?.pm_cwd ?? "missing"}`);
+      const processCwd = process.pm2_env.pm_cwd;
+      const processScript = process.pm2_env.pm_exec_path;
+      if (!processCwd || resolve(processCwd) !== resolve(request.next.release)) {
+        throw upgradeFailure(
+          "RUNTIME_IDENTITY_MISMATCH",
+          "VERIFYING",
+          `PM2 cwd mismatch: ${processCwd ?? "missing"}`,
+          false,
+        );
       }
-      if (resolve(process.pm2_env?.pm_exec_path ?? "/") !== resolve(request.next.script)) {
-        throw new Error(`PM2 script mismatch: ${process.pm2_env?.pm_exec_path ?? "missing"}`);
+      if (!processScript || resolve(processScript) !== resolve(request.next.script)) {
+        throw upgradeFailure(
+          "RUNTIME_IDENTITY_MISMATCH",
+          "VERIFYING",
+          `PM2 script mismatch: ${processScript ?? "missing"}`,
+          false,
+        );
       }
-      if (process.pid === request.previous.pid) {
-        throw new Error(`PM2 PID did not change: ${process.pid}`);
+      const processPid = process.pid;
+      if (typeof processPid !== "number" || !Number.isInteger(processPid) || processPid === request.previous.pid) {
+        throw upgradeFailure(
+          "RUNTIME_IDENTITY_MISMATCH",
+          "VERIFYING",
+          `PM2 PID did not change: ${processPid ?? "missing"}`,
+          false,
+        );
       }
+      const ready = await readManagementReady(manifestBinding);
       const localHealthStatus = await httpStatus(request.localHealthUrl);
       const publicHealthStatus = await httpStatus(request.publicHealthUrl);
       const publicMetricsStatus = await httpStatus(request.publicMetricsUrl);
@@ -245,23 +439,40 @@ async function verifyNextRuntime(
       const oauthScopes = Array.isArray(metadata.scopes_supported)
         ? metadata.scopes_supported.filter((scope): scope is string => typeof scope === "string")
         : [];
-      if (localHealthStatus !== 200) throw new Error(`Local health returned ${localHealthStatus}.`);
-      if (publicHealthStatus !== 200) throw new Error(`Public health returned ${publicHealthStatus}.`);
-      if (publicMetricsStatus !== 403) throw new Error(`Public metrics returned ${publicMetricsStatus}.`);
+      if (localHealthStatus !== 200) {
+        throw publicBoundaryFailure(`Local health returned ${localHealthStatus}.`);
+      }
+      if (publicHealthStatus !== 200) {
+        throw publicBoundaryFailure(`Public health returned ${publicHealthStatus}.`);
+      }
+      if (publicMetricsStatus !== 403) {
+        throw publicBoundaryFailure(`Public metrics returned ${publicMetricsStatus}.`);
+      }
       if (unauthenticatedMcpStatus !== 401) {
-        throw new Error(`Unauthenticated public MCP returned ${unauthenticatedMcpStatus}.`);
+        throw publicBoundaryFailure(`Unauthenticated public MCP returned ${unauthenticatedMcpStatus}.`);
       }
       if (JSON.stringify(oauthScopes) !== JSON.stringify(request.expectedScopes)) {
-        throw new Error(`OAuth scopes mismatch: ${JSON.stringify(oauthScopes)}`);
+        throw publicBoundaryFailure(`OAuth scopes mismatch: ${JSON.stringify(oauthScopes)}`);
       }
       if (oauthScopes.includes("devspace")) {
-        throw new Error("Legacy blanket OAuth scope remains advertised.");
+        throw publicBoundaryFailure("Legacy blanket OAuth scope remains advertised.");
       }
+      const confirmedReady = await readManagementReady(manifestBinding);
+      if (!sameRuntimeIdentity(ready.identity, confirmedReady.identity)) {
+        throw upgradeFailure(
+          "RUNTIME_IDENTITY_MISMATCH",
+          "VERIFYING",
+          "Private readiness runtime identity changed during production verification.",
+          false,
+          { first: ready.identity, confirmed: confirmedReady.identity },
+        );
+      }
+      await assertManifestUnchanged(manifestBinding);
       return {
-        pidAfter: process.pid,
-        pm2Status: process.pm2_env?.status,
-        cwd: process.pm2_env?.pm_cwd,
-        script: process.pm2_env?.pm_exec_path,
+        pidAfter: processPid,
+        pm2Status: process.pm2_env.status,
+        cwd: processCwd,
+        script: processScript,
         localHealthStatus,
         publicHealthStatus,
         publicMetricsStatus,
@@ -270,13 +481,592 @@ async function verifyNextRuntime(
         runtimeCommit,
         runtimeSourceTree,
         runtimeDist,
+        manifestSha256: manifestBinding.manifestSha256,
+        manifestIdentity: manifestBinding.identity,
+        managementReadyUrl: manifestBinding.managementReadyUrl,
+        managementReadyStatus: confirmedReady.status,
+        runtimeIdentity: confirmedReady.identity,
+        runtimeIdentityConfirmed: true,
+        configSchemaIdentity: manifestBinding.identity.configSchemaIdentity,
       };
     } catch (error) {
-      lastError = error instanceof Error ? error.message : String(error);
-      await sleep(500);
+      lastError = normalizeFailureError(error, "VERIFYING");
+      const remaining = deadline - Date.now();
+      if (remaining > 0) await sleep(Math.min(500, remaining));
     }
   }
-  throw new Error(lastError);
+  throw lastError;
+}
+
+async function verifyManifestBinding(
+  request: ProductionUpgradeRequest,
+): Promise<ManifestBindingEvidence> {
+  const manifestPath = resolve(request.next.manifest.path);
+  let manifestBytes: Buffer;
+  try {
+    const metadata = await lstat(manifestPath);
+    if (!metadata.isFile() || metadata.isSymbolicLink()) {
+      throw new Error("manifest is not a regular file");
+    }
+    if ((metadata.mode & 0o022) !== 0) {
+      throw new Error(`manifest mode is writable by group or other: ${(metadata.mode & 0o777).toString(8)}`);
+    }
+    const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+    if (uid !== undefined && metadata.uid !== uid) {
+      throw new Error(`manifest owner uid ${metadata.uid} does not match worker uid ${uid}`);
+    }
+    manifestBytes = await readFile(manifestPath);
+  } catch (error) {
+    throw upgradeFailure(
+      "MANIFEST_INVALID",
+      "PREFLIGHT",
+      `Immutable build manifest cannot be trusted: ${errorMessage(error)}`,
+      false,
+      { path: manifestPath },
+    );
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(manifestBytes.toString("utf8"));
+  } catch (error) {
+    throw upgradeFailure(
+      "MANIFEST_INVALID",
+      "PREFLIGHT",
+      `Immutable build manifest is not valid JSON: ${errorMessage(error)}`,
+      false,
+      { path: manifestPath },
+    );
+  }
+  const manifest = validateBuildManifest(parsed, manifestPath);
+  const requestIdentity = request.next.manifest;
+  const exactBindings: Array<[keyof ReleaseIdentity, string, string]> = [
+    ["sourceRevision", request.next.commit, manifest.sourceRevision],
+    ["runtimeRevision", requestIdentity.runtimeRevision, manifest.runtimeRevision],
+    ["buildDigest", requestIdentity.buildDigest, manifest.buildDigest],
+    ["schemaGeneration", requestIdentity.schemaGeneration, manifest.schemaGeneration],
+    [
+      "authorityContractGeneration",
+      requestIdentity.authorityContractGeneration,
+      manifest.authorityContractGeneration,
+    ],
+    ["configSchemaIdentity", requestIdentity.configSchemaIdentity, manifest.configSchemaIdentity],
+  ];
+  for (const [field, expected, observed] of exactBindings) {
+    if (expected !== observed) {
+      throw upgradeFailure(
+        "MANIFEST_MISMATCH",
+        "PREFLIGHT",
+        `Immutable manifest ${field} mismatch: expected ${expected}, observed ${observed}.`,
+        false,
+        { field, expected, observed, path: manifestPath },
+      );
+    }
+  }
+  if (manifest.runtimeFiles.length !== request.next.dist.files) {
+    throw upgradeFailure(
+      "MANIFEST_MISMATCH",
+      "PREFLIGHT",
+      `Immutable manifest runtime file count mismatch: expected ${request.next.dist.files}, observed ${manifest.runtimeFiles.length}.`,
+      false,
+      { expected: request.next.dist.files, observed: manifest.runtimeFiles.length },
+    );
+  }
+
+  let runtimeBuild: { files: number; sha256: string };
+  try {
+    runtimeBuild = await manifestRuntimeEvidence(request.next.release, manifest.runtimeFiles);
+  } catch (error) {
+    if (error instanceof ProductionUpgradeFailureError) throw error;
+    throw upgradeFailure(
+      "MANIFEST_MISMATCH",
+      "PREFLIGHT",
+      `Immutable manifest runtime tree cannot be verified: ${errorMessage(error)}`,
+      false,
+    );
+  }
+  if (runtimeBuild.sha256 !== manifest.buildDigest) {
+    throw upgradeFailure(
+      "MANIFEST_MISMATCH",
+      "PREFLIGHT",
+      `Immutable manifest build digest mismatch: expected ${manifest.buildDigest}, observed ${runtimeBuild.sha256}.`,
+      false,
+      { expected: manifest.buildDigest, observed: runtimeBuild.sha256 },
+    );
+  }
+
+  const environment = await readManagedEnvironment(request.nextEnvPath);
+  assertEnvironmentBinding(environment, "DEVSPACE_RELEASE_MANIFEST", manifestPath);
+  assertEnvironmentBinding(environment, "DEVSPACE_EXPECTED_SOURCE_REVISION", manifest.sourceRevision);
+  assertEnvironmentBinding(environment, "DEVSPACE_EXPECTED_RUNTIME_REVISION", manifest.runtimeRevision);
+  assertEnvironmentBinding(environment, "DEVSPACE_EXPECTED_BUILD_DIGEST", manifest.buildDigest);
+  assertEnvironmentBinding(environment, "DEVSPACE_EXPECTED_SCHEMA_GENERATION", manifest.schemaGeneration);
+  assertEnvironmentBinding(
+    environment,
+    "DEVSPACE_EXPECTED_AUTHORITY_CONTRACT_GENERATION",
+    manifest.authorityContractGeneration,
+  );
+  assertEnvironmentBinding(
+    environment,
+    "DEVSPACE_EXPECTED_CONFIG_SCHEMA_IDENTITY",
+    manifest.configSchemaIdentity,
+  );
+  assertEnvironmentBinding(environment, "DEVSPACE_SOURCE_REVISION", manifest.sourceRevision);
+  assertEnvironmentBinding(environment, "DEVSPACE_RUNTIME_REVISION", manifest.runtimeRevision);
+  assertEnvironmentBinding(environment, "DEVSPACE_BUILD_DIGEST", manifest.buildDigest);
+
+  const managementHost = environment.DEVSPACE_NEXT_MANAGEMENT_HOST ?? "127.0.0.1";
+  if (!["127.0.0.1", "::1", "localhost"].includes(managementHost)) {
+    throw upgradeFailure(
+      "MANIFEST_MISMATCH",
+      "PREFLIGHT",
+      `Next management host is not loopback-only: ${managementHost}`,
+      false,
+    );
+  }
+  const managementPort = Number(environment.DEVSPACE_NEXT_MANAGEMENT_PORT);
+  if (!Number.isInteger(managementPort) || managementPort < 1 || managementPort > 65_535) {
+    throw upgradeFailure(
+      "MANIFEST_MISMATCH",
+      "PREFLIGHT",
+      `Next management port is invalid: ${environment.DEVSPACE_NEXT_MANAGEMENT_PORT ?? "missing"}`,
+      false,
+    );
+  }
+  const hostForUrl = managementHost === "::1" ? "[::1]" : managementHost;
+  const identity: ReleaseIdentity = {
+    sourceRevision: manifest.sourceRevision,
+    runtimeRevision: manifest.runtimeRevision,
+    buildDigest: manifest.buildDigest,
+    schemaGeneration: manifest.schemaGeneration,
+    authorityContractGeneration: manifest.authorityContractGeneration,
+    configSchemaIdentity: manifest.configSchemaIdentity,
+  };
+  return {
+    manifest,
+    manifestPath,
+    manifestSha256: `sha256:${createHash("sha256").update(manifestBytes).digest("hex")}`,
+    identity,
+    managementReadyUrl: `http://${hostForUrl}:${managementPort}/readyz`,
+  };
+}
+
+async function assertManifestUnchanged(binding: ManifestBindingEvidence): Promise<void> {
+  let observed: string;
+  try {
+    observed = `sha256:${createHash("sha256").update(await readFile(binding.manifestPath)).digest("hex")}`;
+  } catch (error) {
+    throw upgradeFailure(
+      "MANIFEST_MISMATCH",
+      "VERIFYING",
+      `Immutable build manifest could not be re-read: ${errorMessage(error)}`,
+      false,
+      { path: binding.manifestPath },
+    );
+  }
+  if (observed !== binding.manifestSha256) {
+    throw upgradeFailure(
+      "MANIFEST_MISMATCH",
+      "VERIFYING",
+      `Immutable build manifest changed during production switch: expected ${binding.manifestSha256}, observed ${observed}.`,
+      false,
+      { path: binding.manifestPath, expected: binding.manifestSha256, observed },
+    );
+  }
+}
+
+function validateBuildManifest(value: unknown, path: string): ImmutableBuildManifest {
+  if (!isRecord(value) || value.manifestVersion !== 2) {
+    throw upgradeFailure(
+      "MANIFEST_INVALID",
+      "PREFLIGHT",
+      `Unsupported immutable build manifest version: ${path}`,
+      false,
+    );
+  }
+  const requiredText = [
+    "sourceRevision",
+    "runtimeRevision",
+    "buildDigest",
+    "payloadDigest",
+    "schemaGeneration",
+    "authorityContractGeneration",
+    "configSchemaIdentity",
+    "createdAt",
+    "nodeVersion",
+    "platform",
+  ] as const;
+  for (const field of requiredText) {
+    if (typeof value[field] !== "string" || value[field].length === 0) {
+      throw upgradeFailure(
+        "MANIFEST_INVALID",
+        "PREFLIGHT",
+        `Immutable build manifest field is invalid: ${field}`,
+        false,
+      );
+    }
+  }
+  for (const field of [
+    "buildDigest",
+    "payloadDigest",
+    "schemaGeneration",
+    "authorityContractGeneration",
+    "configSchemaIdentity",
+  ] as const) {
+    if (!isSha256Digest(value[field])) {
+      throw upgradeFailure(
+        "MANIFEST_INVALID",
+        "PREFLIGHT",
+        `Immutable build manifest digest is invalid: ${field}`,
+        false,
+      );
+    }
+  }
+  if (!Number.isInteger(value.files) || (value.files as number) < 1) {
+    throw upgradeFailure("MANIFEST_INVALID", "PREFLIGHT", "Immutable manifest file count is invalid.", false);
+  }
+  if (!isSafeManifestFileList(value.payloadFiles)) {
+    throw upgradeFailure("MANIFEST_INVALID", "PREFLIGHT", "Immutable manifest payload file list is invalid.", false);
+  }
+  const payloadFiles = value.payloadFiles;
+  if (
+    !isSafeManifestFileList(value.runtimeFiles)
+    || value.runtimeFiles.length < 1
+    || value.runtimeFiles.some((runtimePath) => (
+      !runtimePath.startsWith("dist/") || !payloadFiles.includes(runtimePath)
+    ))
+  ) {
+    throw upgradeFailure("MANIFEST_INVALID", "PREFLIGHT", "Immutable manifest runtime file list is invalid.", false);
+  }
+  if (payloadFiles.length !== value.files || value.forbiddenArtifactScan !== "PASS") {
+    throw upgradeFailure("MANIFEST_INVALID", "PREFLIGHT", "Immutable manifest package gate is invalid.", false);
+  }
+  return value as unknown as ImmutableBuildManifest;
+}
+
+async function manifestRuntimeEvidence(
+  releaseRoot: string,
+  runtimeFiles: string[],
+): Promise<{ files: number; sha256: string }> {
+  const root = resolve(releaseRoot);
+  const digest = createHash("sha256");
+  for (const manifestPath of [...runtimeFiles].sort()) {
+    const absolute = resolve(root, manifestPath);
+    const contained = relative(root, absolute);
+    if (
+      contained === ""
+      || contained === ".."
+      || contained.startsWith(`..${sep}`)
+      || isAbsolute(contained)
+    ) {
+      throw new Error(`runtime path escapes release root: ${manifestPath}`);
+    }
+    const metadata = await lstat(absolute);
+    if (!metadata.isFile() || metadata.isSymbolicLink()) {
+      throw new Error(`runtime path is not a regular file: ${manifestPath}`);
+    }
+    const content = await readFile(absolute);
+    digest.update(manifestPath);
+    digest.update("\0");
+    digest.update(createHash("sha256").update(content).digest("hex"));
+    digest.update("\n");
+  }
+  return { files: runtimeFiles.length, sha256: `sha256:${digest.digest("hex")}` };
+}
+
+async function readManagedEnvironment(path: string): Promise<Record<string, string>> {
+  const tracked = new Set([
+    "DEVSPACE_NEXT_MANAGEMENT_HOST",
+    "DEVSPACE_NEXT_MANAGEMENT_PORT",
+    "DEVSPACE_RELEASE_MANIFEST",
+    "DEVSPACE_EXPECTED_SOURCE_REVISION",
+    "DEVSPACE_EXPECTED_RUNTIME_REVISION",
+    "DEVSPACE_EXPECTED_BUILD_DIGEST",
+    "DEVSPACE_EXPECTED_SCHEMA_GENERATION",
+    "DEVSPACE_EXPECTED_AUTHORITY_CONTRACT_GENERATION",
+    "DEVSPACE_EXPECTED_CONFIG_SCHEMA_IDENTITY",
+    "DEVSPACE_SOURCE_REVISION",
+    "DEVSPACE_RUNTIME_REVISION",
+    "DEVSPACE_BUILD_DIGEST",
+  ]);
+  let content: string;
+  try {
+    const metadata = await lstat(path);
+    if (!metadata.isFile() || metadata.isSymbolicLink() || (metadata.mode & 0o077) !== 0) {
+      throw new Error("next environment must be an owner-only regular file");
+    }
+    content = await readFile(path, "utf8");
+  } catch (error) {
+    throw upgradeFailure(
+      "MANIFEST_INVALID",
+      "PREFLIGHT",
+      `Next production environment cannot be trusted: ${errorMessage(error)}`,
+      false,
+      { path },
+    );
+  }
+  const values: Record<string, string> = {};
+  for (const line of content.split(/\r?\n/u)) {
+    const match = /^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/u.exec(line);
+    if (!match || !tracked.has(match[1])) continue;
+    const key = match[1];
+    if (Object.hasOwn(values, key)) {
+      throw upgradeFailure(
+        "MANIFEST_INVALID",
+        "PREFLIGHT",
+        `Next production environment contains duplicate ${key}.`,
+        false,
+      );
+    }
+    values[key] = decodeShellWord(match[2], key);
+  }
+  return values;
+}
+
+function decodeShellWord(value: string, key: string): string {
+  let output = "";
+  let quote: "plain" | "single" | "double" = "plain";
+  for (let index = 0; index < value.length; index += 1) {
+    const character = value[index];
+    if (quote === "single") {
+      if (character === "'") quote = "plain";
+      else output += character;
+      continue;
+    }
+    if (quote === "double") {
+      if (character === '"') {
+        quote = "plain";
+      } else if (character === "\\") {
+        index += 1;
+        if (index >= value.length) break;
+        output += value[index];
+      } else if (character === "$" || character === "`") {
+        throw invalidEnvironmentWord(key);
+      } else {
+        output += character;
+      }
+      continue;
+    }
+    if (character === "'") {
+      quote = "single";
+    } else if (character === '"') {
+      quote = "double";
+    } else if (character === "\\") {
+      index += 1;
+      if (index >= value.length) break;
+      output += value[index];
+    } else if (/\s/u.test(character) || /[;&|<>()`$]/u.test(character)) {
+      throw invalidEnvironmentWord(key);
+    } else {
+      output += character;
+    }
+  }
+  if (quote !== "plain" || (value.endsWith("\\") && !value.endsWith("\\\\"))) {
+    throw invalidEnvironmentWord(key);
+  }
+  return output;
+}
+
+function invalidEnvironmentWord(key: string): ProductionUpgradeFailureError {
+  return upgradeFailure(
+    "MANIFEST_INVALID",
+    "PREFLIGHT",
+    `Next production environment value is not a supported literal: ${key}`,
+    false,
+  );
+}
+
+function assertEnvironmentBinding(
+  environment: Record<string, string>,
+  key: string,
+  expected: string,
+): void {
+  const observed = environment[key];
+  const normalizedExpected = key === "DEVSPACE_RELEASE_MANIFEST" ? resolve(expected) : expected;
+  const normalizedObserved = key === "DEVSPACE_RELEASE_MANIFEST" && observed ? resolve(observed) : observed;
+  if (normalizedObserved !== normalizedExpected) {
+    throw upgradeFailure(
+      "MANIFEST_MISMATCH",
+      "PREFLIGHT",
+      `Next production environment ${key} mismatch: expected ${normalizedExpected}, observed ${normalizedObserved ?? "missing"}.`,
+      false,
+      { key, expected: normalizedExpected, observed: normalizedObserved ?? null },
+    );
+  }
+}
+
+async function readManagementReady(
+  manifestBinding: ManifestBindingEvidence,
+): Promise<{ status: 200; identity: RuntimeIdentityEvidence }> {
+  let response: Response;
+  let payload: unknown;
+  try {
+    response = await fetchWithTimeout(manifestBinding.managementReadyUrl);
+    const body = await response.text();
+    if (body.length > 64 * 1024) throw new Error("readiness payload exceeds 64 KiB");
+    payload = JSON.parse(body);
+  } catch (error) {
+    throw upgradeFailure(
+      "MANAGEMENT_NOT_READY",
+      "VERIFYING",
+      `Private management readiness could not be read: ${errorMessage(error)}`,
+      true,
+      { url: manifestBinding.managementReadyUrl },
+    );
+  }
+  if (response.status !== 200 || !isRecord(payload) || payload.status !== "ready") {
+    throw upgradeFailure(
+      "MANAGEMENT_NOT_READY",
+      "VERIFYING",
+      `Private management readiness is not ready: HTTP ${response.status}.`,
+      true,
+      { url: manifestBinding.managementReadyUrl, status: response.status },
+    );
+  }
+  if (!isRecord(payload.identity)) {
+    throw upgradeFailure(
+      "RUNTIME_IDENTITY_MISMATCH",
+      "VERIFYING",
+      "Private readiness runtime identity is missing.",
+      false,
+    );
+  }
+  const identity = payload.identity;
+  for (const field of [
+    "sourceRevision",
+    "runtimeRevision",
+    "buildDigest",
+    "schemaGeneration",
+    "authorityContractGeneration",
+  ] as const) {
+    const expected = manifestBinding.identity[field];
+    const observed = identity[field];
+    if (observed !== expected) {
+      throw upgradeFailure(
+        "RUNTIME_IDENTITY_MISMATCH",
+        "VERIFYING",
+        `Private readiness identity mismatch for ${field}: expected ${expected}, observed ${String(observed)}.`,
+        false,
+        { field, expected, observed: observed ?? null },
+      );
+    }
+  }
+  if (identity.configSchemaIdentity !== undefined
+    && identity.configSchemaIdentity !== manifestBinding.identity.configSchemaIdentity) {
+    throw upgradeFailure(
+      "RUNTIME_IDENTITY_MISMATCH",
+      "VERIFYING",
+      `Private readiness identity mismatch for configSchemaIdentity: expected ${manifestBinding.identity.configSchemaIdentity}, observed ${String(identity.configSchemaIdentity)}.`,
+      false,
+    );
+  }
+  if (
+    typeof identity.productVersion !== "string"
+    || identity.productVersion.length === 0
+    || !isSha256Digest(identity.configDigest)
+    || typeof identity.startedAt !== "string"
+    || !Number.isFinite(Date.parse(identity.startedAt))
+  ) {
+    throw upgradeFailure(
+      "RUNTIME_IDENTITY_MISMATCH",
+      "VERIFYING",
+      "Private readiness product/config/start identity is missing or invalid.",
+      false,
+    );
+  }
+  if (
+    !isRecord(payload.checks)
+    || payload.checks.nonRoot !== true
+    || payload.checks.authorityStore !== true
+    || typeof payload.checks.canonicalConnectorName !== "string"
+    || payload.checks.canonicalConnectorName.length === 0
+  ) {
+    throw upgradeFailure(
+      "MANAGEMENT_NOT_READY",
+      "VERIFYING",
+      "Private readiness safety checks are incomplete.",
+      true,
+    );
+  }
+  return { status: 200, identity: identity as unknown as RuntimeIdentityEvidence };
+}
+
+function sameRuntimeIdentity(left: RuntimeIdentityEvidence, right: RuntimeIdentityEvidence): boolean {
+  return [
+    "productVersion",
+    "schemaGeneration",
+    "authorityContractGeneration",
+    "configDigest",
+    "sourceRevision",
+    "runtimeRevision",
+    "buildDigest",
+    "startedAt",
+  ].every((field) => (
+    left[field as keyof RuntimeIdentityEvidence] === right[field as keyof RuntimeIdentityEvidence]
+  ));
+}
+
+function publicBoundaryFailure(message: string): ProductionUpgradeFailureError {
+  return upgradeFailure("PUBLIC_BOUNDARY_FAILED", "VERIFYING", message, true);
+}
+
+function upgradeFailure(
+  code: ProductionUpgradeFailureCode,
+  phase: ProductionUpgradeFailurePhase,
+  message: string,
+  retryable: boolean,
+  evidence?: Record<string, unknown>,
+): ProductionUpgradeFailureError {
+  return new ProductionUpgradeFailureError({
+    code,
+    phase,
+    message,
+    retryable,
+    ...(evidence ? { evidence } : {}),
+  });
+}
+
+function normalizeFailureError(
+  error: unknown,
+  phase: ProductionUpgradeFailurePhase,
+): ProductionUpgradeFailureError {
+  if (error instanceof ProductionUpgradeFailureError) return error;
+  const code: ProductionUpgradeFailureCode = phase === "PREFLIGHT"
+    ? "MANIFEST_INVALID"
+    : phase === "SWITCHING"
+      ? "SWITCH_FAILED"
+      : "PUBLIC_BOUNDARY_FAILED";
+  return upgradeFailure(code, phase, errorMessage(error), phase === "VERIFYING");
+}
+
+function normalizeFailure(
+  error: unknown,
+  phase: ProductionUpgradeFailurePhase,
+): ProductionUpgradeFailure {
+  return normalizeFailureError(error, phase).failure;
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function isSha256Digest(value: unknown): value is string {
+  return typeof value === "string" && /^sha256:[a-f0-9]{64}$/u.test(value);
+}
+
+function isSafeManifestFileList(value: unknown): value is string[] {
+  if (!Array.isArray(value) || value.length < 1 || value.some((path) => (
+    typeof path !== "string"
+    || path.length === 0
+    || path.includes("\\")
+    || path.startsWith("/")
+    || path.split("/").some((segment) => segment === "" || segment === "." || segment === "..")
+  ))) return false;
+  return new Set(value).size === value.length;
 }
 
 function replacePm2Process(
@@ -408,7 +1198,15 @@ function pm2ExecutablePath(
   return [...new Set(entries)].join(delimiter);
 }
 
-async function rollbackRuntime(request: ProductionUpgradeRequest): Promise<Record<string, unknown>> {
+async function rollbackRuntime(request: ProductionUpgradeRequest): Promise<{
+  attempted: true;
+  restored: boolean;
+  verified: boolean;
+  outcome: "RESTORED_PREVIOUS_RUNTIME" | "RESTORATION_UNVERIFIED";
+  healthStatus?: number;
+  error?: string;
+  failure?: ProductionUpgradeFailure;
+}> {
   let restored = false;
   let healthStatus: number | undefined;
   let error: string | undefined;
@@ -439,11 +1237,22 @@ async function rollbackRuntime(request: ProductionUpgradeRequest): Promise<Recor
   } catch (rollbackError) {
     error = rollbackError instanceof Error ? rollbackError.message : String(rollbackError);
   }
+  const failure = error
+    ? {
+        code: "ROLLBACK_FAILED" as const,
+        phase: "ROLLING_BACK" as const,
+        message: error,
+        retryable: false,
+      }
+    : undefined;
   return {
     attempted: true,
     restored,
-    healthStatus,
+    verified: restored,
+    outcome: restored ? "RESTORED_PREVIOUS_RUNTIME" : "RESTORATION_UNVERIFIED",
+    ...(healthStatus !== undefined ? { healthStatus } : {}),
     ...(error ? { error } : {}),
+    ...(failure ? { failure } : {}),
   };
 }
 
@@ -506,6 +1315,16 @@ async function readRequest(path: string): Promise<ProductionUpgradeRequest> {
     || !Number.isInteger(request.next?.dist?.files)
     || request.next.dist.files < 1
     || !/^[0-9a-f]{64}$/u.test(request.next?.dist?.sha256 ?? "")
+    || !request.next?.manifest
+    || typeof request.next.manifest.path !== "string"
+    || request.next.manifest.path.length < 1
+    || !isSha256Digest(request.next.manifest.buildDigest)
+    || typeof request.next.manifest.runtimeRevision !== "string"
+    || request.next.manifest.runtimeRevision.length < 1
+    || request.next.manifest.runtimeRevision.length > 256
+    || !isSha256Digest(request.next.manifest.schemaGeneration)
+    || !isSha256Digest(request.next.manifest.authorityContractGeneration)
+    || !isSha256Digest(request.next.manifest.configSchemaIdentity)
   ) {
     throw new Error(`Malformed production upgrade request: ${path}`);
   }
@@ -516,6 +1335,7 @@ async function readRequest(path: string): Promise<ProductionUpgradeRequest> {
     request.previous.script,
     request.next.release,
     request.next.script,
+    request.next.manifest.path,
     request.productionEnvPath,
     request.productionEnvBackupPath,
     request.nextEnvPath,

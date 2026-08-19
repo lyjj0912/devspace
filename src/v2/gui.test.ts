@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,6 +14,7 @@ import {
 import { UniversalBrokerError } from "./errors.js";
 import { GUI_NODE_APPLESCRIPT_SOURCE } from "./gui-node.js";
 import { TargetRegistry, type TargetDefinition } from "./targets.js";
+import { createCapabilityCallContextFromTrustedPrincipal } from "./capability-call-context.js";
 
 test("GUI node uses bounded traversal instead of materializing entire accessibility trees", () => {
   assert.doesNotMatch(GUI_NODE_APPLESCRIPT_SOURCE, /entire contents/u);
@@ -184,11 +186,120 @@ test("gui capabilities include a reason when the node reports accessibility=fals
   assert.match(String(capabilities.reason), /Accessibility/i);
 });
 
+test("GUI sessions are stable-principal owned across transport contexts", async (t) => {
+  const fixture = await createFixture(t);
+  const ownerA1 = owner("gui-owner-a");
+  const ownerA2 = owner("gui-owner-a");
+  const ownerB = owner("gui-owner-b");
+  const observed = await fixture.gui.execute({ operation: "observe" }, ownerA1);
+  const samePrincipal = await fixture.gui.execute({
+    operation: "observe",
+    sessionId: String(observed.sessionId),
+  }, ownerA2);
+  assert.equal(samePrincipal.sessionId, observed.sessionId);
+  const actionCalls = fixture.runner.actions.length;
+  await assert.rejects(
+    fixture.gui.execute({
+      operation: "act",
+      sessionId: String(observed.sessionId),
+      generation: String(samePrincipal.generation),
+      action: { type: "press", elementId: "e1" },
+    }, ownerB),
+    hasCode("AUTHORITY_PRINCIPAL_MISMATCH"),
+  );
+  assert.equal(fixture.runner.actions.length, actionCalls);
+});
+
+test("stale GUI target generation rejects before observation or action dispatch", async (t) => {
+  const fixture = await createFixture(t);
+  const observed = await fixture.gui.execute({ operation: "observe" });
+  const providerObservations = fixture.runner.observeCalls;
+  await writeFile(fixture.targetsPath, JSON.stringify({
+    version: 1,
+    targets: {
+      local: {
+        displayName: "Local changed",
+        aliases: ["local"],
+        transport: "local",
+        platform: "macos",
+        gui: { mode: "local-ipc" },
+      },
+    },
+  }));
+  await assert.rejects(
+    fixture.gui.execute({
+      operation: "act",
+      sessionId: String(observed.sessionId),
+      generation: String(observed.generation),
+      action: { type: "press", elementId: "e1" },
+    }),
+    hasCode("GUI_STATE_CHANGED"),
+  );
+  assert.equal(fixture.runner.observeCalls, providerObservations);
+  assert.equal(fixture.runner.actions.length, 0);
+});
+
+test("GUI session quota reserves before provider observation and never evicts live sessions", async (t) => {
+  const fixture = await createFixture(t, { maximumSessions: 1 });
+  await fixture.gui.execute({ operation: "observe" });
+  const providerCalls = fixture.runner.observeCalls;
+  await assert.rejects(
+    fixture.gui.execute({ operation: "observe" }),
+    hasCode("RESOURCE_QUOTA_EXCEEDED"),
+  );
+  assert.equal(fixture.runner.observeCalls, providerCalls);
+  assert.equal(fixture.gui.stats().sessions, 1);
+});
+
+test("focusPolicy preserve rejects unavoidable focus changes before action dispatch", async (t) => {
+  const fixture = await createFixture(t);
+  const preserved = await fixture.gui.execute({ operation: "observe" });
+  await assert.rejects(
+    fixture.gui.execute({
+      operation: "act",
+      sessionId: String(preserved.sessionId),
+      generation: String(preserved.generation),
+      action: { type: "focus", elementId: "e1" },
+    }),
+    hasCode("PRECONDITION_FAILED"),
+  );
+  assert.equal(fixture.runner.actions.length, 0);
+
+  const allowed = await fixture.gui.execute({ operation: "observe", focusPolicy: "allow" });
+  const result = await fixture.gui.execute({
+    operation: "act",
+    sessionId: String(allowed.sessionId),
+    generation: String(allowed.generation),
+    action: { type: "focus", elementId: "e1" },
+  });
+  assert.equal(fixture.runner.actions.length, 1);
+  assert.equal((result.focus as { policy: string }).policy, "allow");
+});
+
+test("GUI post-action readback failure is unknown and never retries the action", async (t) => {
+  const fixture = await createFixture(t);
+  const observed = await fixture.gui.execute({ operation: "observe", focusPolicy: "allow" });
+  fixture.runner.failPostActionReadback = true;
+  await assert.rejects(
+    fixture.gui.execute({
+      operation: "act",
+      sessionId: String(observed.sessionId),
+      generation: String(observed.generation),
+      action: { type: "press", elementId: "e1" },
+    }),
+    (error: unknown) => hasCode("GUI_STATE_CHANGED")(error)
+      && (error as UniversalBrokerError).evidence?.dispatchState === "UNKNOWN",
+  );
+  assert.equal(fixture.runner.actions.length, 1);
+});
+
 class FixtureGuiRunner implements GuiNodeRunner {
   state = observation("Initial", "AXPress");
   readonly actions: GuiNodeRequest[] = [];
   readonly unavailableTargets = new Set<string>();
   readonly disabledTargets = new Set<string>();
+  observeCalls = 0;
+  failPostActionReadback = false;
 
   async call(target: TargetDefinition, request: GuiNodeRequest): Promise<Record<string, unknown>> {
     if (request.operation === "capabilities") {
@@ -205,7 +316,13 @@ class FixtureGuiRunner implements GuiNodeRunner {
         frontmostProcess: { name: this.state.application.name, pid: this.state.application.pid },
       };
     }
-    if (request.operation === "observe") return structuredClone(this.state);
+    if (request.operation === "observe") {
+      this.observeCalls += 1;
+      if (this.failPostActionReadback && this.actions.length > 0) {
+        throw new Error("post-action readback unavailable");
+      }
+      return structuredClone(this.state);
+    }
     this.actions.push(structuredClone(request));
     this.state = observation("After Action", "AXPress");
     return { performed: true, actionType: request.actionType };
@@ -215,6 +332,7 @@ class FixtureGuiRunner implements GuiNodeRunner {
 interface Fixture {
   gui: UniversalGuiService;
   runner: FixtureGuiRunner;
+  targetsPath: string;
 }
 
 async function createFixture(
@@ -224,6 +342,7 @@ async function createFixture(
     sleep?: (milliseconds: number) => Promise<void>;
     sessionTtlMs?: number;
     payloadBudgetCharacters?: number;
+    maximumSessions?: number;
   } = {},
 ): Promise<Fixture> {
   const root = await mkdtemp(join(tmpdir(), "devspace-v2-gui-test-"));
@@ -266,7 +385,7 @@ async function createFixture(
     { runner, ...options },
   );
   t.after(() => gui.close());
-  return { gui, runner };
+  return { gui, runner, targetsPath };
 }
 
 function observation(applicationName: string, action: string) {
@@ -321,4 +440,10 @@ function observation(applicationName: string, action: string) {
 
 function hasCode(code: string) {
   return (error: unknown) => error instanceof Error && "code" in error && error.code === code;
+}
+
+function owner(label: string) {
+  return createCapabilityCallContextFromTrustedPrincipal({
+    principalKeyFingerprint: createHash("sha256").update(label).digest("hex"),
+  });
 }

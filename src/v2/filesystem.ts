@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
-import { constants as fsConstants, createReadStream } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { constants as fsConstants } from "node:fs";
 import {
   copyFile,
   cp,
@@ -11,6 +11,7 @@ import {
   readdir,
   readFile,
   readlink,
+  realpath,
   rename,
   rm,
   stat,
@@ -26,15 +27,23 @@ import {
   resolve,
   win32,
 } from "node:path";
-import { pipeline } from "node:stream/promises";
 import { applyPatch, parsePatch } from "../apply-patch.js";
 import { expandHomePath } from "../roots.js";
+import type { CapabilityCallContext } from "./capability-call-context.js";
 import type { ContextRegistry } from "./contexts.js";
 import type {
   UniversalExecutionPlane,
   UniversalProcessSnapshot,
 } from "./execution.js";
 import { UniversalBrokerError } from "./errors.js";
+import {
+  atomicCopyFile,
+  atomicWriteBuffer,
+  safeMoveFile,
+  sha256File,
+  type AtomicPublicationHooks,
+} from "./filesystem-atomic.js";
+import { RecoverableFilesystemTrash } from "./filesystem-trash.js";
 import { prepareSshControlPath } from "./ssh-control.js";
 import {
   REMOTE_FILESYSTEM_HELPER_SOURCE,
@@ -44,7 +53,11 @@ import {
   REMOTE_WINDOWS_FILESYSTEM_RESULT_MARKER,
   windowsFilesystemScript as buildWindowsFilesystemScript,
 } from "./remote-windows-filesystem-helper.js";
-import type { TargetDefinition, TargetRegistry } from "./targets.js";
+import {
+  assertTargetCapability,
+  type TargetDefinition,
+  type TargetRegistry,
+} from "./targets.js";
 
 const DEFAULT_READ_BYTES = 12_000;
 const MAX_READ_BYTES = 1_000_000;
@@ -79,6 +92,7 @@ export type UniversalFilesystemOperation =
   | "copy"
   | "move"
   | "remove"
+  | "restore"
   | "hash"
   | "sync";
 
@@ -95,6 +109,9 @@ export interface UniversalFilesystemInput {
   overwrite?: boolean;
   expectedSha256?: string;
   disposition?: "trash" | "permanent";
+  trashId?: string;
+  /** Final-component behavior. Mutations default to reject; reads default to follow. */
+  finalSymlink?: "follow" | "preserve" | "replace" | "reject";
   authorityId?: string;
   cursor?: string;
   limit?: number;
@@ -104,6 +121,8 @@ export interface UniversalFilesystemOptions {
   sshControlDir: string;
   sftpExecutable?: string;
   remoteTimeoutMs?: number;
+  trashRoot?: string;
+  atomicHooks?: AtomicPublicationHooks;
   sftpPut?: (input: SftpTransferInput) => Promise<void>;
   sftpGet?: (input: SftpTransferInput) => Promise<void>;
 }
@@ -128,18 +147,28 @@ interface RemoteResponse {
 }
 
 export class UniversalFilesystemService {
+  private readonly trash: RecoverableFilesystemTrash;
+
   constructor(
     private readonly targets: TargetRegistry,
     private readonly contexts: ContextRegistry,
     private readonly execution: UniversalExecutionPlane,
     private readonly options: UniversalFilesystemOptions,
-  ) {}
+  ) {
+    this.trash = new RecoverableFilesystemTrash(
+      options.trashRoot ?? join(dirname(options.sshControlDir), "filesystem-trash"),
+      options.atomicHooks,
+    );
+  }
 
-  async execute(input: UniversalFilesystemInput): Promise<Record<string, unknown>> {
+  async execute(
+    input: UniversalFilesystemInput,
+    callContext?: CapabilityCallContext,
+  ): Promise<Record<string, unknown>> {
     try {
-      const resolved = await this.resolveRequest(input);
+      const resolved = await this.resolveRequest(input, callContext);
       if (resolved.target.transport === "ssh") {
-        return await this.executeRemote(input, resolved);
+        return await this.executeRemote(input, resolved, callContext);
       }
       return await this.executeLocal(input, resolved);
     } catch (error) {
@@ -155,7 +184,7 @@ export class UniversalFilesystemService {
     localPath: string;
     overwrite?: boolean;
     expectedSha256?: string;
-  }): Promise<Record<string, unknown>> {
+  }, callContext?: CapabilityCallContext): Promise<Record<string, unknown>> {
     const source = await requiredLstat(input.localPath);
     if (!source.isFile()) throw pathTypeError(input.localPath, "file");
     const resolved = await this.resolveRequest({
@@ -165,7 +194,7 @@ export class UniversalFilesystemService {
       path: input.path,
       overwrite: input.overwrite,
       expectedSha256: input.expectedSha256,
-    });
+    }, callContext);
     if (resolved.target.transport === "local") {
       return publishLocalFile(
         requirePath(resolved.path, "artifact destination"),
@@ -173,6 +202,7 @@ export class UniversalFilesystemService {
         {
           overwrite: input.overwrite === true,
           expectedSha256: input.expectedSha256,
+          hooks: this.options.atomicHooks,
         },
       );
     }
@@ -185,6 +215,7 @@ export class UniversalFilesystemService {
         overwrite: input.overwrite === true,
         expectedSha256: input.expectedSha256,
       },
+      callContext,
     );
   }
 
@@ -194,13 +225,13 @@ export class UniversalFilesystemService {
     contextId?: string;
     path: string;
     localPath: string;
-  }): Promise<{ localPath: string; size: number; sha256: string }> {
+  }, callContext?: CapabilityCallContext): Promise<{ localPath: string; size: number; sha256: string }> {
     const resolved = await this.resolveRequest({
       operation: "read",
       target: input.target,
       contextId: input.contextId,
       path: input.path,
-    });
+    }, callContext);
     await mkdir(dirname(input.localPath), { recursive: true, mode: 0o700 });
     if (resolved.target.transport === "local") {
       const sourcePath = requirePath(resolved.path, "artifact source");
@@ -213,6 +244,7 @@ export class UniversalFilesystemService {
       const metadata = await this.remoteRequest(
         resolved.target,
         { op: "stat", path: remotePath },
+        callContext,
       ) as { type?: string };
       if (metadata.type !== "file") throw pathTypeError(remotePath, "file");
       await this.sftpGet({
@@ -233,84 +265,116 @@ export class UniversalFilesystemService {
     input: UniversalFilesystemInput,
     resolved: ResolvedFilesystemRequest,
   ): Promise<Record<string, unknown>> {
-    const path = resolved.path;
+    const requestedPath = resolved.path;
+    const path = requestedPath === undefined
+      ? undefined
+      : await resolveLocalFinalPath(requestedPath, input.operation, input.finalSymlink);
+    const requestedDestination = resolved.destination;
+    const destinationPath = requestedDestination === undefined
+      ? undefined
+      : await resolveLocalFinalPath(requestedDestination, "write", input.finalSymlink);
+    const withPathIdentity = (result: Record<string, unknown>): Record<string, unknown> => ({
+      ...result,
+      ...(requestedPath ? {
+        requestedPath,
+        resolvedPath: path,
+      } : {}),
+    });
     switch (input.operation) {
       case "stat":
-        return localStat(requirePath(path, "fs.stat"));
+        return withPathIdentity(await localStat(requirePath(path, "fs.stat")));
       case "list":
-        return localList(
+        return withPathIdentity(await localList(
           requirePath(path, "fs.list"),
           parseCursor(input.cursor),
           boundedLimit(input.limit, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT),
-        );
+        ));
       case "read":
-        return localRead(
+        return withPathIdentity(await localRead(
           requirePath(path, "fs.read"),
           parseCursor(input.cursor),
           boundedLimit(input.limit, DEFAULT_READ_BYTES, MAX_READ_BYTES),
-        );
+        ));
       case "search":
-        return localSearch(
+        return withPathIdentity(await localSearch(
           requirePath(path, "fs.search"),
           requireText(input.query, "fs.search requires query."),
           input.recursive !== false,
           boundedLimit(input.limit, DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT),
-        );
+        ));
       case "write":
         if (input.content === undefined) {
           throw new UniversalBrokerError("PRECONDITION_FAILED", "fs.write requires content.");
         }
-        return atomicLocalWrite(
+        return withPathIdentity(await atomicLocalWrite(
           requirePath(path, "fs.write"),
           Buffer.from(input.content, "utf8"),
           {
             overwrite: input.overwrite === true,
             expectedSha256: input.expectedSha256,
+            allowReplaceSymlink: input.finalSymlink === "replace",
+            hooks: this.options.atomicHooks,
           },
-        );
+        ));
       case "patch":
         return localPatch(
           requirePath(path, "fs.patch"),
           requireText(input.patch, "fs.patch requires patch."),
           input.expectedSha256,
+          this.options.atomicHooks,
         );
       case "mkdir":
         return localMkdir(requirePath(path, "fs.mkdir"), input.recursive === true);
       case "copy":
-        return localCopy(
+        return withPathIdentity(await localCopy(
           requirePath(path, "fs.copy"),
-          requirePath(resolved.destination, "fs.copy destination"),
+          requirePath(destinationPath, "fs.copy destination"),
           input.overwrite === true,
           input.recursive === true,
-        );
+          false,
+          this.options.atomicHooks,
+          input.finalSymlink === "replace",
+        ));
       case "move":
-        return localMove(
+        return withPathIdentity(await localMove(
           requirePath(path, "fs.move"),
-          requirePath(resolved.destination, "fs.move destination"),
+          requirePath(destinationPath, "fs.move destination"),
           input.overwrite === true,
-        );
+          this.options.atomicHooks,
+          input.finalSymlink === "replace",
+        ));
       case "remove":
-        return localRemove(
+        return withPathIdentity(await localRemove(
           requirePath(path, "fs.remove"),
           input.disposition,
           input.recursive === true,
-        );
+          this.trash,
+        ));
+      case "restore":
+        return this.trash.restore({
+          trashId: requireText(input.trashId, "fs.restore requires trashId."),
+          destination: destinationPath ?? path,
+          overwrite: input.overwrite === true,
+        });
       case "hash":
-        return localHash(requirePath(path, "fs.hash"));
+        return withPathIdentity(await localHash(requirePath(path, "fs.hash")));
       case "sync":
-        return localCopy(
+        return withPathIdentity(await localCopy(
           requirePath(path, "fs.sync"),
-          requirePath(resolved.destination, "fs.sync destination"),
+          requirePath(destinationPath, "fs.sync destination"),
           input.overwrite === true,
           input.recursive === true,
           true,
-        );
+          this.options.atomicHooks,
+          input.finalSymlink === "replace",
+        ));
     }
   }
 
   private async executeRemote(
     input: UniversalFilesystemInput,
     resolved: ResolvedFilesystemRequest,
+    callContext?: CapabilityCallContext,
   ): Promise<Record<string, unknown>> {
     const target = resolved.target;
     const path = resolved.path;
@@ -319,7 +383,7 @@ export class UniversalFilesystemService {
         return asRecord(await this.remoteRequest(target, {
           op: "stat",
           path: requirePath(path, "fs.stat"),
-        }));
+        }, callContext));
       case "list":
         return asRecord(await this.remoteRequest(target, {
           op: "list",
@@ -328,7 +392,7 @@ export class UniversalFilesystemService {
             offset: parseCursor(input.cursor),
             limit: boundedLimit(input.limit, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT),
           },
-        }));
+        }, callContext));
       case "read": {
         const result = asRecord(await this.remoteRequest(target, {
           op: "read",
@@ -337,7 +401,7 @@ export class UniversalFilesystemService {
             offset: parseCursor(input.cursor),
             maxBytes: boundedLimit(input.limit, DEFAULT_READ_BYTES, MAX_READ_BYTES),
           },
-        }));
+        }, callContext));
         const encoded = typeof result.contentBase64 === "string" ? result.contentBase64 : "";
         delete result.contentBase64;
         return presentBytes(result, Buffer.from(encoded, "base64"));
@@ -352,7 +416,7 @@ export class UniversalFilesystemService {
             limit: boundedLimit(input.limit, DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT),
             maxFileBytes: MAX_SEARCH_FILE_BYTES,
           },
-        }));
+        }, callContext));
       case "write": {
         if (input.content === undefined) {
           throw new UniversalBrokerError("PRECONDITION_FAILED", "fs.write requires content.");
@@ -362,6 +426,7 @@ export class UniversalFilesystemService {
         const options = {
           overwrite: input.overwrite === true,
           expectedSha256: input.expectedSha256,
+          finalSymlink: input.finalSymlink ?? "reject",
         };
         if (content.byteLength <= MAX_DIRECT_REMOTE_WRITE_BYTES) {
           return asRecord(await this.remoteRequest(target, {
@@ -369,14 +434,14 @@ export class UniversalFilesystemService {
             path: destination,
             contentBase64: content.toString("base64"),
             options,
-          }));
+          }, callContext));
         }
         await assertCachedSftpCapability(this.targets, target);
         const directory = await mkdtemp(join(tmpdir(), "devspace-v2-fs-write-"));
         const staged = join(directory, "payload");
         try {
           await writeFile(staged, content, { mode: 0o600 });
-          return await this.publishRemoteFile(target, destination, staged, options);
+          return await this.publishRemoteFile(target, destination, staged, options, callContext);
         } finally {
           await rm(directory, { recursive: true, force: true });
         }
@@ -388,13 +453,14 @@ export class UniversalFilesystemService {
           requirePath(path, "fs.patch"),
           requireText(input.patch, "fs.patch requires patch."),
           input.expectedSha256,
+          callContext,
         );
       case "mkdir":
         return asRecord(await this.remoteRequest(target, {
           op: "mkdir",
           path: requirePath(path, "fs.mkdir"),
           options: { recursive: input.recursive === true },
-        }));
+        }, callContext));
       case "copy":
       case "sync":
         return asRecord(await this.remoteRequest(target, {
@@ -404,37 +470,54 @@ export class UniversalFilesystemService {
           options: {
             overwrite: input.overwrite === true,
             recursive: input.recursive === true,
+            finalSymlink: input.finalSymlink ?? "reject",
           },
-        }));
+        }, callContext));
       case "move":
         return asRecord(await this.remoteRequest(target, {
           op: "move",
           path: requirePath(path, "fs.move"),
           destination: requirePath(resolved.destination, "fs.move destination"),
-          options: { overwrite: input.overwrite === true },
-        }));
+          options: {
+            overwrite: input.overwrite === true,
+            finalSymlink: input.finalSymlink ?? "reject",
+            allowCrossDevice: true,
+          },
+        }, callContext));
       case "remove":
         return asRecord(await this.remoteRequest(target, {
           op: "remove",
           path: requirePath(path, "fs.remove"),
           options: {
-            disposition: requirePermanentDisposition(input.disposition),
+            disposition: input.disposition ?? "trash",
             recursive: input.recursive === true,
+            finalSymlink: input.finalSymlink ?? "preserve",
           },
-        }));
+        }, callContext));
+      case "restore":
+        return asRecord(await this.remoteRequest(target, {
+          op: "restore",
+          path: resolved.destination ?? resolved.path,
+          trashId: requireText(input.trashId, "fs.restore requires trashId."),
+          options: { overwrite: input.overwrite === true },
+        }, callContext));
       case "hash":
         return asRecord(await this.remoteRequest(target, {
           op: "hash",
           path: requirePath(path, "fs.hash"),
-        }));
+        }, callContext));
     }
   }
 
   private async resolveRequest(
     input: UniversalFilesystemInput,
+    callContext?: CapabilityCallContext,
   ): Promise<ResolvedFilesystemRequest> {
-    const context = input.contextId ? await this.contexts.get(input.contextId) : undefined;
+    const context = input.contextId
+      ? await this.contexts.get(input.contextId, callContext)
+      : undefined;
     const target = await this.targets.resolve(input.target ?? context?.targetId ?? "local");
+    assertTargetCapability(target, "fs");
     if (context && context.targetId !== target.id) {
       throw new UniversalBrokerError(
         "PRECONDITION_FAILED",
@@ -459,9 +542,10 @@ export class UniversalFilesystemService {
   private async remoteRequest(
     target: TargetDefinition,
     request: Record<string, unknown>,
+    callContext?: CapabilityCallContext,
   ): Promise<unknown> {
     if (target.platform === "windows") {
-      return this.windowsRemoteRequest(target, request);
+      return this.windowsRemoteRequest(target, request, callContext);
     }
     const command = `python3 -c ${shellQuote(REMOTE_FILESYSTEM_HELPER_SOURCE)} ${shellQuote(
       Buffer.from(JSON.stringify(request), "utf8").toString("base64"),
@@ -470,12 +554,14 @@ export class UniversalFilesystemService {
       target,
       command,
       REMOTE_FILESYSTEM_RESULT_MARKER,
+      callContext,
     );
   }
 
   private async windowsRemoteRequest(
     target: TargetDefinition,
     request: Record<string, unknown>,
+    callContext?: CapabilityCallContext,
   ): Promise<unknown> {
     await assertCachedSftpCapability(this.targets, target);
     const observation = await this.targets.probe(target.id);
@@ -499,9 +585,10 @@ export class UniversalFilesystemService {
         target,
         `& powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ${powershellLiteral(remoteScript)}`,
         REMOTE_WINDOWS_FILESYSTEM_RESULT_MARKER,
+        callContext,
       );
     } finally {
-      await this.removeWindowsRemoteScript(target, remoteScript);
+      await this.removeWindowsRemoteScript(target, remoteScript, callContext);
       await rm(directory, { recursive: true, force: true });
     }
   }
@@ -509,6 +596,7 @@ export class UniversalFilesystemService {
   private async removeWindowsRemoteScript(
     target: TargetDefinition,
     remoteScript: string,
+    callContext?: CapabilityCallContext,
   ): Promise<void> {
     let result: UniversalProcessSnapshot | undefined;
     try {
@@ -520,20 +608,22 @@ export class UniversalFilesystemService {
         mode: "foreground",
         yieldMs: 30_000,
         maxOutputChars: 8_000,
-      });
+      }, undefined, undefined, callContext);
       if (result.state === "RUNNING" || result.state === "STARTING") {
         result = await this.execution.operate({
           operation: "wait",
           processId: result.processId,
           waitMs: 30_000,
           maxOutputChars: 8_000,
-        }) as typeof result;
+        }, undefined, callContext) as typeof result;
       }
     } catch {
       // The staged script is random, owner-level, and short-lived. The caller's
       // original filesystem error remains authoritative if cleanup also fails.
     } finally {
-      if (result) await this.forgetRemoteFilesystemProcess(result).catch(() => undefined);
+      if (result) {
+        await this.forgetRemoteFilesystemProcess(result, callContext).catch(() => undefined);
+      }
     }
   }
 
@@ -541,16 +631,17 @@ export class UniversalFilesystemService {
     target: TargetDefinition,
     command: string,
     responseMarker: string,
+    callContext?: CapabilityCallContext,
   ): Promise<unknown> {
     let result = await this.execution.execute({
-        internalPolicy: "filesystem",
+      internalPolicy: "filesystem",
       target: target.id,
       cwd: target.defaultCwd ?? "~",
       command,
       mode: "foreground",
       yieldMs: 30_000,
       maxOutputChars: 1_000_000,
-    });
+    }, undefined, undefined, callContext);
     try {
       if (result.state === "RUNNING" || result.state === "STARTING") {
         result = await this.execution.operate({
@@ -558,7 +649,7 @@ export class UniversalFilesystemService {
           processId: result.processId,
           waitMs: 60_000,
           maxOutputChars: 1_000_000,
-        }) as typeof result;
+        }, undefined, callContext) as typeof result;
       }
       if (result.state !== "EXITED" || result.exitCode !== 0) {
         throw new UniversalBrokerError(
@@ -604,12 +695,13 @@ export class UniversalFilesystemService {
         { evidence: { targetId: target.id, remoteCode: response.code } },
       );
     } finally {
-      await this.forgetRemoteFilesystemProcess(result);
+      await this.forgetRemoteFilesystemProcess(result, callContext);
     }
   }
 
   private async forgetRemoteFilesystemProcess(
     result: UniversalProcessSnapshot,
+    callContext?: CapabilityCallContext,
   ): Promise<void> {
     if (result.state === "RUNNING" || result.state === "STARTING") {
       result = await this.execution.operate({
@@ -618,12 +710,12 @@ export class UniversalFilesystemService {
         signal: "SIGTERM",
         waitMs: 2_000,
         maxOutputChars: 1_000,
-      }) as UniversalProcessSnapshot;
+      }, undefined, callContext) as UniversalProcessSnapshot;
     }
     await this.execution.operate({
       operation: "forget",
       processId: result.processId,
-    });
+    }, undefined, callContext);
   }
 
   private async publishRemoteFile(
@@ -639,13 +731,17 @@ export class UniversalFilesystemService {
       confinedRoot?: string;
       createParents?: boolean;
     },
+    callContext?: CapabilityCallContext,
   ): Promise<Record<string, unknown>> {
     await assertCachedSftpCapability(this.targets, target);
+    const sourceMetadata = await stat(localPath);
+    if (!sourceMetadata.isFile()) throw pathTypeError(localPath, "file");
+    const sourceSha256 = await sha256File(localPath);
     const prepared = asRecord(await this.remoteRequest(target, {
       op: "prepare_write",
       path,
       options,
-    }));
+    }, callContext));
     const resolvedPath = typeof prepared.path === "string" ? prepared.path : path;
     const temporary = remoteSiblingTemporaryPath(target, resolvedPath);
     try {
@@ -654,14 +750,19 @@ export class UniversalFilesystemService {
         op: "publish_write",
         path,
         temporary,
+        preimage: prepared.preimage,
+        expectedContent: {
+          size: sourceMetadata.size,
+          sha256: sourceSha256,
+        },
         options,
-      }));
+      }, callContext));
     } catch (error) {
       await this.remoteRequest(target, {
         op: "cleanup",
         path,
         temporary,
-      }).catch(() => undefined);
+      }, callContext).catch(() => undefined);
       throw error;
     }
   }
@@ -671,12 +772,13 @@ export class UniversalFilesystemService {
     path: string,
     patch: string,
     expectedSha256: string | undefined,
+    callContext?: CapabilityCallContext,
   ): Promise<Record<string, unknown>> {
     await assertCachedSftpCapability(this.targets, target);
     const metadata = asRecord(await this.remoteRequest(target, {
       op: "stat",
       path,
-    }));
+    }, callContext));
     if (metadata.type === "directory") {
       if (expectedSha256) {
         throw new UniversalBrokerError(
@@ -710,6 +812,7 @@ export class UniversalFilesystemService {
         path,
         staged,
         { overwrite: true, expectedSha256: originalSha256 },
+        callContext,
       );
       return {
         path,
@@ -878,136 +981,78 @@ async function localSearch(
 async function atomicLocalWrite(
   path: string,
   content: Buffer,
-  options: { overwrite: boolean; expectedSha256?: string },
+  options: {
+    overwrite: boolean;
+    expectedSha256?: string;
+    allowReplaceSymlink?: boolean;
+    hooks?: AtomicPublicationHooks;
+  },
 ): Promise<Record<string, unknown>> {
-  const parent = dirname(path);
-  const parentMetadata = await requiredStat(parent);
-  if (!parentMetadata.isDirectory()) throw pathTypeError(parent, "directory");
-  const existing = await optionalLstat(path);
-  if (existing?.isSymbolicLink()) {
-    throw new UniversalBrokerError(
-      "PERMISSION_DENIED",
-      `Refusing to publish through a symlink destination: ${path}`,
-    );
-  }
-  if (existing && !existing.isFile()) throw pathTypeError(path, "file");
-  if (existing && !options.overwrite) {
-    throw new UniversalBrokerError(
-      "PRECONDITION_FAILED",
-      `Destination already exists and overwrite is false: ${path}`,
-    );
-  }
-  if (options.expectedSha256) {
-    const actual = existing?.isFile() ? await sha256File(path) : undefined;
-    if (!actual || actual.toLowerCase() !== options.expectedSha256.toLowerCase()) {
-      throw new UniversalBrokerError(
-        "PRECONDITION_FAILED",
-        `SHA-256 precondition failed for ${path}.`,
-        { evidence: { path, expectedSha256: options.expectedSha256, actualSha256: actual } },
-      );
-    }
-  }
-  const temporary = join(parent, `.devspace-v2-${basename(path)}-${randomUUID()}.tmp`);
-  let handle;
-  try {
-    handle = await open(temporary, "wx", existing ? existing.mode & 0o777 : 0o600);
-    await handle.writeFile(content);
-    await handle.sync();
-    await handle.close();
-    handle = undefined;
-    await rename(temporary, path);
-    await syncDirectory(parent);
-  } finally {
-    await handle?.close().catch(() => undefined);
-    await rm(temporary, { force: true }).catch(() => undefined);
-  }
-  return {
-    path,
-    size: content.byteLength,
-    sha256: sha256(content),
-    overwritten: Boolean(existing),
-  };
+  return { ...await atomicWriteBuffer(path, content, options) };
 }
 
 async function publishLocalFile(
   path: string,
   localPath: string,
-  options: { overwrite: boolean; expectedSha256?: string },
+  options: {
+    overwrite: boolean;
+    expectedSha256?: string;
+    allowReplaceSymlink?: boolean;
+    hooks?: AtomicPublicationHooks;
+  },
 ): Promise<Record<string, unknown>> {
-  const parent = dirname(path);
-  const existing = await optionalLstat(path);
-  if (existing?.isSymbolicLink()) {
-    throw new UniversalBrokerError("PERMISSION_DENIED", `Refusing symlink destination: ${path}`);
-  }
-  if (existing && !existing.isFile()) throw pathTypeError(path, "file");
-  if (existing && !options.overwrite) {
-    throw new UniversalBrokerError("PRECONDITION_FAILED", `Destination exists: ${path}`);
-  }
-  if (options.expectedSha256) {
-    const actual = existing?.isFile() ? await sha256File(path) : undefined;
-    if (!actual || actual.toLowerCase() !== options.expectedSha256.toLowerCase()) {
-      throw new UniversalBrokerError("PRECONDITION_FAILED", `SHA-256 precondition failed: ${path}`);
-    }
-  }
-  const temporary = join(parent, `.devspace-v2-${basename(path)}-${randomUUID()}.tmp`);
-  try {
-    await copyFile(localPath, temporary, fsConstants.COPYFILE_EXCL);
-    const handle = await open(temporary, "r");
-    await handle.sync();
-    await handle.close();
-    await rename(temporary, path);
-    await syncDirectory(parent);
-  } finally {
-    await rm(temporary, { force: true }).catch(() => undefined);
-  }
-  const metadata = await stat(path);
-  return {
-    path,
-    size: metadata.size,
-    sha256: await sha256File(path),
-    overwritten: Boolean(existing),
-  };
+  return { ...await atomicCopyFile(localPath, path, options) };
 }
 
 async function localPatch(
   path: string,
   patch: string,
   expectedSha256: string | undefined,
+  hooks?: AtomicPublicationHooks,
 ): Promise<Record<string, unknown>> {
   const metadata = await requiredStat(path);
-  let root: string;
   if (metadata.isDirectory()) {
-    if (expectedSha256) {
-      throw new UniversalBrokerError(
-        "PRECONDITION_FAILED",
-        "expectedSha256 is valid only when fs.patch targets one file.",
-      );
-    }
-    root = path;
-  } else if (metadata.isFile()) {
-    root = dirname(path);
-    validateSingleFilePatch(patch, basename(path));
-    if (expectedSha256) {
-      const actual = await sha256File(path);
-      if (actual.toLowerCase() !== expectedSha256.toLowerCase()) {
-        throw new UniversalBrokerError(
-          "PRECONDITION_FAILED",
-          `SHA-256 precondition failed for ${path}.`,
-          { evidence: { path, expectedSha256, actualSha256: actual } },
-        );
-      }
-    }
-  } else {
+    throw new UniversalBrokerError(
+      "CAPABILITY_UNAVAILABLE",
+      "Atomic directory patch is unavailable; patch one file per exact action.",
+      { evidence: { path, sourcePreserved: true } },
+    );
+  }
+  if (!metadata.isFile()) {
     throw pathTypeError(path, "file or directory");
   }
-  const applied = await applyPatch(root, patch);
-  return {
-    root,
-    patched: true,
-    files: applied.files,
-    additions: applied.additions,
-    removals: applied.removals,
-  };
+  validateSingleFilePatch(patch, basename(path));
+  const originalSha256 = await sha256File(path);
+  if (expectedSha256 && originalSha256 !== expectedSha256.toLowerCase()) {
+    throw new UniversalBrokerError(
+      "PRECONDITION_FAILED",
+      `SHA-256 precondition failed for ${path}.`,
+      { evidence: { path, expectedSha256, actualSha256: originalSha256 } },
+    );
+  }
+  const directory = await mkdtemp(join(tmpdir(), "devspace-v2-local-patch-"));
+  const staged = join(directory, basename(path));
+  try {
+    await copyFile(path, staged, fsConstants.COPYFILE_EXCL);
+    const applied = await applyPatch(directory, patch);
+    const published = await atomicCopyFile(staged, path, {
+      overwrite: true,
+      expectedSha256: originalSha256,
+      hooks,
+    });
+    return {
+      root: dirname(path),
+      path,
+      patched: true,
+      files: applied.files,
+      additions: applied.additions,
+      removals: applied.removals,
+      previousSha256: originalSha256,
+      sha256: published.sha256,
+    };
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 }
 
 async function localMkdir(path: string, recursive: boolean): Promise<Record<string, unknown>> {
@@ -1022,13 +1067,15 @@ async function localCopy(
   overwrite: boolean,
   recursive: boolean,
   synchronized = false,
+  hooks?: AtomicPublicationHooks,
+  allowReplaceSymlink = false,
 ): Promise<Record<string, unknown>> {
   const sourceMetadata = await requiredLstat(source);
   const existing = await optionalLstat(destination);
   if (existing && !overwrite) {
     throw new UniversalBrokerError("PRECONDITION_FAILED", `Destination exists: ${destination}`);
   }
-  if (existing?.isSymbolicLink()) {
+  if (existing?.isSymbolicLink() && !allowReplaceSymlink) {
     throw new UniversalBrokerError("PERMISSION_DENIED", `Refusing symlink destination: ${destination}`);
   }
   if (sourceMetadata.isDirectory()) {
@@ -1038,15 +1085,52 @@ async function localCopy(
         `Directory copy requires recursive=true: ${source}`,
       );
     }
-    await cp(source, destination, {
-      recursive: true,
-      force: overwrite,
-      errorOnExist: !overwrite,
-      dereference: false,
-      preserveTimestamps: true,
-    });
+    if (existing) {
+      throw new UniversalBrokerError(
+        "CAPABILITY_UNAVAILABLE",
+        "Atomic overwrite of an existing directory is unavailable; trash or move it first.",
+        { evidence: { source, destination, sourceType: "directory" } },
+      );
+    }
+    const temporary = join(
+      dirname(destination),
+      `.devspace-v2-${basename(destination)}-${randomUUID()}.tmp`,
+    );
+    try {
+      await cp(source, temporary, {
+        recursive: true,
+        force: false,
+        errorOnExist: true,
+        dereference: false,
+        preserveTimestamps: true,
+      });
+      await hooks?.beforeDestinationRevalidation?.({ destination, temporary });
+      if (await optionalLstat(destination)) {
+        throw new UniversalBrokerError(
+          "PRECONDITION_FAILED",
+          `Destination changed while the directory was staged: ${destination}`,
+        );
+      }
+      await rename(temporary, destination);
+      await syncDirectory(dirname(destination));
+    } finally {
+      await rm(temporary, { recursive: true, force: true }).catch(() => undefined);
+    }
   } else if (sourceMetadata.isFile()) {
-    await copyFile(source, destination, overwrite ? 0 : fsConstants.COPYFILE_EXCL);
+    const published = await atomicCopyFile(source, destination, {
+      overwrite,
+      allowReplaceSymlink,
+      hooks,
+    });
+    return {
+      source,
+      destination,
+      copied: true,
+      synchronized,
+      overwritten: published.overwritten,
+      size: published.size,
+      sha256: published.sha256,
+    };
   } else {
     throw pathTypeError(source, "file or directory");
   }
@@ -1063,24 +1147,48 @@ async function localMove(
   source: string,
   destination: string,
   overwrite: boolean,
+  hooks?: AtomicPublicationHooks,
+  allowReplaceSymlink = false,
 ): Promise<Record<string, unknown>> {
-  await requiredLstat(source);
+  const sourceMetadata = await requiredLstat(source);
+  if (sourceMetadata.isFile()) {
+    const moved = await safeMoveFile(source, destination, {
+      overwrite,
+      allowReplaceSymlink,
+      hooks,
+    });
+    return {
+      source,
+      destination,
+      moved: true,
+      overwritten: moved.overwritten,
+      crossDevice: moved.crossDevice,
+      size: moved.size,
+      sha256: moved.sha256,
+    };
+  }
   const existing = await optionalLstat(destination);
   if (existing && !overwrite) {
     throw new UniversalBrokerError("PRECONDITION_FAILED", `Destination exists: ${destination}`);
   }
-  if (existing?.isSymbolicLink()) {
+  if (existing?.isSymbolicLink() && !allowReplaceSymlink) {
     throw new UniversalBrokerError("PERMISSION_DENIED", `Refusing symlink destination: ${destination}`);
   }
-  if (existing) await rm(destination, { recursive: true, force: true });
+  if (existing) {
+    throw new UniversalBrokerError(
+      "CAPABILITY_UNAVAILABLE",
+      "Atomic overwrite move is supported only for regular files.",
+      { evidence: { source, destination } },
+    );
+  }
   try {
     await rename(source, destination);
   } catch (error) {
     if (!isNodeError(error, "EXDEV")) throw error;
     throw new UniversalBrokerError(
-      "PRECONDITION_FAILED",
-      "Cross-device move is not implicit; use fs.sync followed by explicit fs.remove.",
-      { evidence: { source, destination } },
+      "CAPABILITY_UNAVAILABLE",
+      "Cross-device directory/symlink moves require recoverable trash or artifact copy.",
+      { evidence: { source, destination, sourcePreserved: true } },
     );
   }
   return { source, destination, moved: true, overwritten: Boolean(existing) };
@@ -1090,8 +1198,9 @@ async function localRemove(
   path: string,
   disposition: "trash" | "permanent" | undefined,
   recursive: boolean,
+  trash: RecoverableFilesystemTrash,
 ): Promise<Record<string, unknown>> {
-  requirePermanentDisposition(disposition);
+  if ((disposition ?? "trash") === "trash") return trash.trash(path, recursive);
   const metadata = await requiredLstat(path);
   if (metadata.isDirectory() && !metadata.isSymbolicLink() && !recursive) {
     throw new UniversalBrokerError(
@@ -1100,6 +1209,12 @@ async function localRemove(
     );
   }
   await rm(path, { recursive, force: false });
+  if (await optionalLstat(path)) {
+    throw new UniversalBrokerError(
+      "PRECONDITION_FAILED",
+      `Filesystem removal post-readback found the path still present: ${path}`,
+    );
+  }
   return { path, removed: true, disposition: "permanent" };
 }
 
@@ -1309,6 +1424,37 @@ function remoteSiblingTemporaryPath(target: TargetDefinition, path: string): str
   return posix.join(posix.dirname(path), name);
 }
 
+async function resolveLocalFinalPath(
+  requestedPath: string,
+  operation: UniversalFilesystemOperation,
+  requestedBehavior: UniversalFilesystemInput["finalSymlink"],
+): Promise<string> {
+  const value = await optionalLstat(requestedPath);
+  if (!value?.isSymbolicLink()) return requestedPath;
+  const behavior = requestedBehavior ?? defaultFinalSymlinkBehavior(operation);
+  switch (behavior) {
+    case "follow":
+      return realpath(requestedPath);
+    case "preserve":
+    case "replace":
+      return requestedPath;
+    case "reject":
+      throw new UniversalBrokerError(
+        "PERMISSION_DENIED",
+        `Final symlink semantics reject this operation: ${requestedPath}`,
+        { evidence: { requestedPath, operation, finalSymlink: behavior } },
+      );
+  }
+}
+
+function defaultFinalSymlinkBehavior(
+  operation: UniversalFilesystemOperation,
+): NonNullable<UniversalFilesystemInput["finalSymlink"]> {
+  if (["stat", "move", "remove", "restore"].includes(operation)) return "preserve";
+  if (["write", "mkdir"].includes(operation)) return "reject";
+  return "follow";
+}
+
 function presentBytes(
   data: Record<string, unknown>,
   content: Buffer,
@@ -1317,16 +1463,6 @@ function presentBytes(
   return binary
     ? { ...data, encoding: "base64", contentBase64: content.toString("base64") }
     : { ...data, encoding: "utf8", content: content.toString("utf8") };
-}
-
-async function sha256File(path: string): Promise<string> {
-  const digest = createHash("sha256");
-  await pipeline(createReadStream(path), digest);
-  return digest.digest("hex");
-}
-
-function sha256(value: Buffer): string {
-  return createHash("sha256").update(value).digest("hex");
 }
 
 async function requiredLstat(path: string) {
@@ -1385,19 +1521,6 @@ function requirePath(value: string | undefined, operation: string): string {
 function requireText(value: string | undefined, message: string): string {
   if (!value?.trim()) throw new UniversalBrokerError("PRECONDITION_FAILED", message);
   return value;
-}
-
-function requirePermanentDisposition(
-  disposition: "trash" | "permanent" | undefined,
-): "permanent" {
-  if (disposition !== "permanent") {
-    throw new UniversalBrokerError(
-      "PRECONDITION_FAILED",
-      "fs.remove requires disposition=permanent; trash support is not implicit.",
-      { evidence: { disposition: disposition ?? "missing" } },
-    );
-  }
-  return disposition;
 }
 
 function parseCursor(cursor: string | undefined): number {

@@ -1,16 +1,25 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { access, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { loadConfig } from "../config.js";
 import { UNIVERSAL_BROKER_BUDGETS } from "./contracts.js";
+import { createCapabilityCallContextFromTrustedPrincipal } from "./capability-call-context.js";
 import {
   ContextRegistry,
   contextErrorCode,
   contextPayloadCharacters,
 } from "./contexts.js";
 import { TargetRegistry } from "./targets.js";
+
+const OWNER_A = createCapabilityCallContextFromTrustedPrincipal({
+  principalKeyFingerprint: createHash("sha256").update("context-owner-a").digest("hex"),
+});
+const OWNER_B = createCapabilityCallContextFromTrustedPrincipal({
+  principalKeyFingerprint: createHash("sha256").update("context-owner-b").digest("hex"),
+});
 
 test("context.open requires an existing directory and never creates a guessed path", async (t) => {
   const fixture = await createFixture(t);
@@ -53,6 +62,8 @@ test("context.open returns only references and relevant Skills within payload bu
   const second = await fixture.contexts.open({ path: project, task: "unrelated" });
   assert.equal(second.contextId, first.contextId);
   assert.equal(second.reused, true);
+  assert.equal(second.root, undefined);
+  assert.equal(second.mode, undefined);
   assert.ok(
     contextPayloadCharacters(second)
       <= UNIVERSAL_BROKER_BUDGETS.maximumReusedContextCharacters,
@@ -72,6 +83,98 @@ test("context instruction hash changes without embedding instruction content", a
   assert.equal(second.reused, true);
   assert.equal(second.changed, true);
   assert.notEqual(second.instructionSetHash, first.instructionSetHash);
+});
+
+test("context reuse is owner-aware and cross-owner rejection reaches zero target providers", async (t) => {
+  const fixture = await createFixture(t);
+  const project = join(fixture.root, "owned-project");
+  await mkdir(project);
+  const first = await fixture.contexts.open({ path: project }, OWNER_A);
+  const reused = await fixture.contexts.open({ path: project }, OWNER_A);
+  const otherOwner = await fixture.contexts.open({ path: project }, OWNER_B);
+  assert.equal(reused.contextId, first.contextId);
+  assert.equal(reused.reused, true);
+  assert.notEqual(otherOwner.contextId, first.contextId);
+
+  let targetProviderCalls = 0;
+  const targets = fixture.targets as TargetRegistry & {
+    resolveWithGeneration: TargetRegistry["resolveWithGeneration"];
+  };
+  const original = targets.resolveWithGeneration.bind(targets);
+  targets.resolveWithGeneration = async (...args) => {
+    targetProviderCalls += 1;
+    return original(...args);
+  };
+  await assert.rejects(
+    fixture.contexts.get(first.contextId, OWNER_B),
+    (error: unknown) => contextErrorCode(error) === "AUTHORITY_PRINCIPAL_MISMATCH",
+  );
+  assert.equal(targetProviderCalls, 0);
+});
+
+test("the 129th context is rejected synchronously before context creation work", async (t) => {
+  const fixture = await createFixture(t, { maximumContexts: 128 });
+  let creationProviderCalls = 0;
+  const internals = fixture.contexts as unknown as {
+    discoverInitialInstructions: (...args: unknown[]) => Promise<unknown>;
+  };
+  const original = internals.discoverInitialInstructions.bind(fixture.contexts);
+  internals.discoverInitialInstructions = async (...args) => {
+    creationProviderCalls += 1;
+    return original(...args);
+  };
+  for (let index = 0; index < 128; index += 1) {
+    const project = join(fixture.root, `quota-project-${String(index).padStart(3, "0")}`);
+    await mkdir(project);
+    await fixture.contexts.open({ path: project }, OWNER_A);
+  }
+  assert.equal(creationProviderCalls, 128);
+  const rejected = join(fixture.root, "quota-project-129");
+  await mkdir(rejected);
+  await assert.rejects(
+    fixture.contexts.open({ path: rejected }, OWNER_A),
+    (error: unknown) => contextErrorCode(error) === "RESOURCE_QUOTA_EXCEEDED",
+  );
+  assert.equal(creationProviderCalls, 128);
+  assert.equal(fixture.contexts.stats().contexts, 128);
+});
+
+test("contexts retain unrelated-target stability and reject an exact-target generation change", async (t) => {
+  const fixture = await createFixture(t);
+  const project = join(fixture.root, "generation-project");
+  await mkdir(project);
+  const first = await fixture.contexts.open({ path: project }, OWNER_A);
+  assert.match(first.targetGeneration, /^[a-f0-9]{64}$/u);
+
+  const targetsPath = join(fixture.root, "targets.json");
+  await writeFile(targetsPath, JSON.stringify({
+    version: 1,
+    targets: {
+      unrelated: {
+        displayName: "Unrelated",
+        transport: "ssh",
+        sshHost: "unrelated",
+        platform: "linux",
+      },
+    },
+  }));
+  const reused = await fixture.contexts.open({ path: project }, OWNER_A);
+  assert.equal(reused.contextId, first.contextId);
+
+  await writeFile(targetsPath, JSON.stringify({
+    version: 1,
+    targets: {
+      local: {
+        displayName: "Changed local binding",
+        transport: "local",
+        platform: "unknown",
+      },
+    },
+  }));
+  await assert.rejects(
+    fixture.contexts.get(first.contextId, OWNER_A),
+    (error: unknown) => contextErrorCode(error) === "AUTHORITY_STALE",
+  );
 });
 
 test("context records persist and close explicitly", async (t) => {
@@ -163,9 +266,11 @@ test("context worktree creates an isolated checkout, exposes a paged diff, and r
   assert.equal(opened.mode, "worktree");
   assert.equal(opened.managed, true);
   assert.notEqual(opened.root, project);
-  await access(opened.root);
+  const openedRoot = opened.root;
+  assert.ok(openedRoot);
+  await access(openedRoot);
 
-  await writeFile(join(opened.root, "README.md"), "hello\nchanged\n");
+  await writeFile(join(openedRoot, "README.md"), "hello\nchanged\n");
   const diff = await fixture.contexts.diff({
     contextId: opened.contextId,
     maxCharacters: 100,
@@ -179,8 +284,8 @@ test("context worktree creates an isolated checkout, exposes a paged diff, and r
   assert.equal(closed.closed, false);
   assert.equal((closed.worktree as { retained: boolean }).retained, true);
   assert.equal((closed.worktree as { reason: string }).reason, "dirty");
-  await access(opened.root);
-  assert.equal((await fixture.contexts.get(opened.contextId)).root, opened.root);
+  await access(openedRoot);
+  assert.equal((await fixture.contexts.get(opened.contextId)).root, openedRoot);
 });
 
 test("context close removes a clean managed worktree and enforces the worktree quota", async (t) => {
@@ -190,13 +295,15 @@ test("context close removes a clean managed worktree and enforces the worktree q
   await gitInit(project);
 
   const opened = await fixture.contexts.open({ path: project, mode: "worktree" });
+  const openedRoot = opened.root;
+  assert.ok(openedRoot);
   await assert.rejects(
     fixture.contexts.open({ path: project, mode: "worktree" }),
     (error: unknown) => contextErrorCode(error) === "RESOURCE_QUOTA_EXCEEDED",
   );
   const closed = await fixture.contexts.close(opened.contextId);
   assert.equal((closed.worktree as { removed: boolean }).removed, true);
-  await assert.rejects(access(opened.root));
+  await assert.rejects(access(openedRoot));
 });
 
 test("context worktree byte quota removes the rejected checkout without recording it", async (t) => {
@@ -231,8 +338,10 @@ test("context idle TTL removes ordinary contexts and clean managed worktrees", a
   await mkdir(project);
   await gitInit(project);
 
-  await fixture.contexts.open({ path: project });
+  const ordinary = await fixture.contexts.open({ path: project });
   const worktree = await fixture.contexts.open({ path: project, mode: "worktree" });
+  const worktreeRoot = worktree.root;
+  assert.ok(worktreeRoot);
   now = 1_001;
   const cleanup = await fixture.contexts.cleanupExpired();
 
@@ -243,8 +352,16 @@ test("context idle TTL removes ordinary contexts and clean managed worktrees", a
     errors: 0,
     remaining: 0,
   });
-  await assert.rejects(access(worktree.root));
+  await assert.rejects(access(worktreeRoot));
   assert.equal(fixture.contexts.stats().contexts, 0);
+  await assert.rejects(
+    fixture.contexts.get(ordinary.contextId),
+    (error: unknown) => error instanceof Error
+      && "code" in error
+      && error.code === "PRECONDITION_FAILED"
+      && "evidence" in error
+      && (error.evidence as { reasonCode?: string } | undefined)?.reasonCode === "RESOURCE_EXPIRED",
+  );
   const stored = JSON.parse(await readFile(fixture.storePath, "utf8"));
   assert.deepEqual(stored.contexts, []);
 });
@@ -259,7 +376,9 @@ test("context idle TTL retains dirty managed worktrees instead of evicting user 
   await mkdir(project);
   await gitInit(project);
   const worktree = await fixture.contexts.open({ path: project, mode: "worktree" });
-  await writeFile(join(worktree.root, "README.md"), "dirty retained work\n");
+  const worktreeRoot = worktree.root;
+  assert.ok(worktreeRoot);
+  await writeFile(join(worktreeRoot, "README.md"), "dirty retained work\n");
 
   now = 1_001;
   const cleanup = await fixture.contexts.cleanupExpired();
@@ -270,7 +389,7 @@ test("context idle TTL retains dirty managed worktrees instead of evicting user 
     errors: 0,
     remaining: 1,
   });
-  await access(worktree.root);
+  await access(worktreeRoot);
   assert.equal(fixture.contexts.stats().managedWorktrees, 1);
 });
 
@@ -285,6 +404,7 @@ interface Fixture {
 async function createFixture(
   t: test.TestContext,
   options: {
+    maximumContexts?: number;
     maximumWorktrees?: number;
     maximumWorktreeBytes?: number;
     idleTtlMs?: number;
@@ -310,6 +430,7 @@ async function createFixture(
     targets,
     serverConfig,
     now: options.now,
+    maximumContexts: options.maximumContexts,
     idleTtlMs: options.idleTtlMs,
     worktreeRoot: join(root, "v2-state", "worktrees"),
     maximumWorktrees: options.maximumWorktrees,

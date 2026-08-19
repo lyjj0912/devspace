@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
-import { readFile } from "node:fs/promises";
-import { homedir, platform as nodePlatform, arch, tmpdir } from "node:os";
+import { access, readFile } from "node:fs/promises";
+import { homedir, platform as nodePlatform, arch, hostname, tmpdir, userInfo } from "node:os";
 import { promisify } from "node:util";
 import * as z from "zod/v4";
 import { UniversalBrokerError } from "./errors.js";
@@ -11,16 +11,30 @@ const execFileAsync = promisify(execFile);
 const TARGET_ID_PATTERN = /^[a-z][a-z0-9._-]{0,63}$/;
 const DEFAULT_PROBE_TTL_MS = 30_000;
 const DEFAULT_PROBE_TIMEOUT_MS = 7_000;
+const MAXIMUM_READY_CLOCK_SKEW_MS = 5 * 60_000;
 
 export type TargetTransport = "local" | "ssh";
 export type TargetPlatform = "macos" | "linux" | "windows" | "unknown";
+export type ConfiguredTargetCapability =
+  | "fs"
+  | "exec"
+  | "pty"
+  | "mcp"
+  | "artifact"
+  | "gui"
+  | "durableProcess";
+export type ConfiguredTargetCapabilities = Readonly<Record<ConfiguredTargetCapability, boolean>>;
 
 export interface TargetDefinition {
   id: string;
   displayName: string;
-  aliases: string[];
+  aliases: readonly string[];
+  endpointId: string;
   transport: TargetTransport;
   sshHost?: string;
+  sshHostKeyFingerprint?: string;
+  user?: string;
+  expectedHostname?: string;
   platform: TargetPlatform;
   shell: "auto" | "sh" | "bash" | "zsh" | "powershell" | "cmd";
   defaultCwd?: string;
@@ -33,6 +47,9 @@ export interface TargetDefinition {
     mode: "none" | "local-ipc" | "ssh-stdio";
     command?: string;
   };
+  configuredCapabilities: ConfiguredTargetCapabilities;
+  endpointFingerprint: string;
+  generation: string;
 }
 
 export interface TargetCapabilities {
@@ -49,7 +66,10 @@ export interface TargetCapabilities {
 
 export interface TargetObservation {
   targetId: string;
+  endpointId: string;
+  targetGeneration: string;
   status: "ONLINE" | "OFFLINE" | "DEGRADED" | "UNKNOWN";
+  ready: boolean;
   observedAt: string;
   expiresAt: string;
   platform: TargetPlatform;
@@ -63,7 +83,7 @@ export interface TargetObservation {
 
 export interface TargetRegistrySnapshot {
   generation: string;
-  targets: TargetDefinition[];
+  targets: readonly TargetDefinition[];
 }
 
 export interface TargetRegistryOptions {
@@ -78,8 +98,12 @@ export interface TargetRegistryOptions {
 const targetSchema = z.strictObject({
   displayName: z.string().min(1).max(128),
   aliases: z.array(z.string().min(1).max(128)).optional(),
+  endpointId: z.string().min(1).max(128).optional(),
   transport: z.enum(["local", "ssh"]),
   sshHost: z.string().min(1).optional(),
+  sshHostKeyFingerprint: z.string().min(1).max(256).optional(),
+  user: z.string().min(1).max(256).optional(),
+  expectedHostname: z.string().min(1).max(256).optional(),
   platform: z.enum(["macos", "linux", "windows", "unknown"]),
   shell: z.enum(["auto", "sh", "bash", "zsh", "powershell", "cmd"]).optional(),
   defaultCwd: z.string().min(1).optional(),
@@ -91,6 +115,15 @@ const targetSchema = z.strictObject({
   gui: z.strictObject({
     mode: z.enum(["none", "local-ipc", "ssh-stdio"]),
     command: z.string().min(1).optional(),
+  }).optional(),
+  capabilities: z.strictObject({
+    fs: z.boolean().optional(),
+    exec: z.boolean().optional(),
+    pty: z.boolean().optional(),
+    mcp: z.boolean().optional(),
+    artifact: z.boolean().optional(),
+    gui: z.boolean().optional(),
+    durableProcess: z.boolean().optional(),
   }).optional(),
 }).superRefine((target, context) => {
   if (target.transport === "ssh" && !target.sshHost) {
@@ -154,16 +187,21 @@ export class TargetRegistry {
       targets.unshift(defaultLocalTarget());
     }
     assertUniqueTargetIds(targets, this.options.configPath);
-    const generation = sha256(JSON.stringify(targets)).slice(0, 16);
-    this.snapshot = { generation, targets };
+    const generation = sha256(JSON.stringify(targets.map((target) => ({
+      targetId: target.id,
+      generation: target.generation,
+    }))));
+    this.snapshot = deepFreeze({ generation, targets });
     this.snapshotContentHash = contentHash;
-    this.pruneProbeCache(new Set(targets.map((target) => `${generation}:${target.id}`)));
+    this.pruneProbeCache(new Set(targets.map((target) => `${target.generation}:${target.id}`)));
     return this.snapshot;
   }
 
   async list(input: { cursor?: string; limit?: number } = {}): Promise<{
     generation: string;
     targets: Array<Record<string, unknown>>;
+    logicalTargetCount: number;
+    uniqueEndpointCount: number;
     nextCursor?: string;
   }> {
     const snapshot = await this.inspect();
@@ -174,6 +212,8 @@ export class TargetRegistry {
     return {
       generation: snapshot.generation,
       targets: page.map(targetSummary),
+      logicalTargetCount: snapshot.targets.length,
+      uniqueEndpointCount: new Set(snapshot.targets.map((target) => target.endpointId)).size,
       ...(nextOffset < snapshot.targets.length ? { nextCursor: String(nextOffset) } : {}),
     };
   }
@@ -188,9 +228,10 @@ export class TargetRegistry {
     target: TargetDefinition;
   }> {
     const snapshot = await this.inspect();
+    const target = resolveTargetFromSnapshot(snapshot, selector);
     return {
-      generation: snapshot.generation,
-      target: resolveTargetFromSnapshot(snapshot, selector),
+      generation: target.generation,
+      target,
     };
   }
 
@@ -252,9 +293,13 @@ export class TargetRegistry {
     key: string,
   ): Promise<TargetObservation> {
     const started = performance.now();
-    const observed = target.transport === "local"
+    const rawObservation = target.transport === "local"
       ? await this.probeLocal(target)
       : await this.probeSsh(target);
+    const observed = applyTargetIdentityReadiness(
+      target,
+      applyConfiguredCapabilities(target, rawObservation),
+    );
     const durationMs = Math.max(0, performance.now() - started);
     this.lastProbeDurationMs = durationMs;
     this.probeDurationMsTotal += durationMs;
@@ -268,9 +313,8 @@ export class TargetRegistry {
         probeDurationMs: roundedMilliseconds(durationMs),
       },
     };
-    const currentKey = this.snapshot
-      ? `${this.snapshot.generation}:${target.id}`
-      : undefined;
+    const currentTarget = this.snapshot?.targets.find((candidate) => candidate.id === target.id);
+    const currentKey = currentTarget ? `${currentTarget.generation}:${target.id}` : undefined;
     if (currentKey === key) this.probeCache.set(key, retained);
     return retained;
   }
@@ -298,7 +342,10 @@ export class TargetRegistry {
     ]);
     return {
       targetId: target.id,
+      endpointId: target.endpointId,
+      targetGeneration: target.generation,
       status: boundary.available ? "ONLINE" : "DEGRADED",
+      ready: boundary.available,
       observedAt: new Date(observedAtMs).toISOString(),
       expiresAt: new Date(observedAtMs + target.probeTtlMs).toISOString(),
       platform,
@@ -320,6 +367,14 @@ export class TargetRegistry {
       evidence: {
         transport: "local",
         userAccountBoundary: boundary.mechanism,
+        observedIdentity: {
+          hostname: hostname(),
+          user: userInfo().username,
+          platform,
+          homeDirectory: homedir(),
+          defaultShell: process.env.SHELL,
+        },
+        clockSkewMs: 0,
       },
     };
   }
@@ -336,21 +391,27 @@ export class TargetRegistry {
 
     const macosProfile = shellQuote(macosUserOnlyProfile());
     const script = [
+      "PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH",
       "printf '__DEVSPACE_TARGET_V1__\\n'",
       "printf 'kernel=%s\\n' \"$(uname -s 2>/dev/null || printf unknown)\"",
+      "printf 'hostname=%s\\n' \"$(hostname 2>/dev/null || printf unknown)\"",
+      "printf 'user=%s\\n' \"$(id -un 2>/dev/null || printf unknown)\"",
+      "printf 'shell=%s\\n' \"${SHELL:-unknown}\"",
       "printf 'architecture=%s\\n' \"$(uname -m 2>/dev/null || printf unknown)\"",
       "printf 'home=%s\\n' \"$HOME\"",
       "printf 'temporary=%s\\n' \"${TMPDIR:-/tmp}\"",
+      "printf 'epoch=%s\\n' \"$(date +%s 2>/dev/null || printf 0)\"",
       "command -v git >/dev/null 2>&1 && printf 'git=1\\n' || printf 'git=0\\n'",
       "command -v rsync >/dev/null 2>&1 && printf 'rsync=1\\n' || printf 'rsync=0\\n'",
-      "if command -v setpriv >/dev/null 2>&1 && setpriv --no-new-privs -- sh -c 'grep -Eq \"^NoNewPrivs:[[:space:]]*1\" /proc/self/status && grep -Eq \"^CapPrm:[[:space:]]*0+$\" /proc/self/status && grep -Eq \"^CapEff:[[:space:]]*0+$\" /proc/self/status && grep -Eq \"^CapAmb:[[:space:]]*0+$\" /proc/self/status' >/dev/null 2>&1; then printf 'setpriv_boundary=1\\n'; else printf 'setpriv_boundary=0\\n'; fi",
+      "setpriv_path=''; if [ -x /usr/bin/setpriv ] && [ ! -L /usr/bin/setpriv ]; then setpriv_path=/usr/bin/setpriv; elif [ -x /bin/setpriv ] && [ ! -L /bin/setpriv ]; then setpriv_path=/bin/setpriv; fi",
+      "if [ -n \"$setpriv_path\" ] && \"$setpriv_path\" --no-new-privs -- /bin/sh -c 'grep -Eq \"^NoNewPrivs:[[:space:]]*1\" /proc/self/status && grep -Eq \"^CapPrm:[[:space:]]*0+$\" /proc/self/status && grep -Eq \"^CapEff:[[:space:]]*0+$\" /proc/self/status && grep -Eq \"^CapAmb:[[:space:]]*0+$\" /proc/self/status' >/dev/null 2>&1; then printf 'setpriv_boundary=1\\n'; else printf 'setpriv_boundary=0\\n'; fi",
       `if [ -x /usr/bin/sandbox-exec ] && /usr/bin/sandbox-exec -p ${macosProfile} /bin/echo boundary-ok >/dev/null 2>&1 && ! /usr/bin/sandbox-exec -p ${macosProfile} /bin/ps -p $$ >/dev/null 2>&1; then printf 'sandbox_boundary=1\\n'; else printf 'sandbox_boundary=0\\n'; fi`,
     ].join("; ");
 
     try {
       const result = await this.execute(
         this.sshExecutable,
-        sshArguments(target.sshHost, this.probeTimeoutMs, `sh -lc ${shellQuote(script)}`),
+        sshArguments(target.sshHost, this.probeTimeoutMs, `/bin/sh -lc ${shellQuote(script)}`),
         {
           timeout: this.probeTimeoutMs + 1_000,
           encoding: "utf8",
@@ -369,7 +430,14 @@ export class TargetRegistry {
         : platform === "macos"
           ? { available: fields.sandbox_boundary === "1", mechanism: "verified sandbox-exec + authorization/set-id deny" }
           : { available: false, mechanism: "unsupported" };
-      const [pty, sftp] = boundary.available
+      const clockSkewMs = clockSkew(fields.epoch, observedAtMs);
+      const clockReady = clockSkewMs === undefined
+        || clockSkewMs <= MAXIMUM_READY_CLOCK_SKEW_MS;
+      const ready = boundary.available && clockReady;
+      const probeSuppressionReason = boundary.available
+        ? "not-probed-for-clock-skew"
+        : "not-probed-without-user-account-boundary";
+      const [pty, sftp] = ready
         ? await Promise.all([
             probePosixSshPty(
               target,
@@ -386,12 +454,15 @@ export class TargetRegistry {
             ),
           ])
         : [
-            unavailableCapabilityProbe("not-probed-without-user-account-boundary"),
-            unavailableCapabilityProbe("not-probed-without-user-account-boundary"),
+            unavailableCapabilityProbe(probeSuppressionReason),
+            unavailableCapabilityProbe(probeSuppressionReason),
           ];
       return {
         targetId: target.id,
-        status: boundary.available ? "ONLINE" : "DEGRADED",
+        endpointId: target.endpointId,
+        targetGeneration: target.generation,
+        status: ready ? "ONLINE" : "DEGRADED",
+        ready,
         observedAt: new Date(observedAtMs).toISOString(),
         expiresAt,
         platform,
@@ -399,24 +470,35 @@ export class TargetRegistry {
         homeDirectory: fields.home,
         temporaryDirectory: fields.temporary,
         capabilities: {
-          fs: boundary.available,
-          exec: boundary.available,
-          pty: boundary.available && pty.available,
-          sftp: boundary.available && sftp.available,
+          fs: ready,
+          exec: ready,
+          pty: ready && pty.available,
+          sftp: ready && sftp.available,
           rsync: fields.rsync === "1",
           git: fields.git === "1",
-          gui: boundary.available && target.gui.mode !== "none",
-          mcp: boundary.available,
-          durableProcess: boundary.available && target.durableProcess.mode !== "none",
+          gui: ready && target.gui.mode !== "none",
+          mcp: ready,
+          durableProcess: ready && target.durableProcess.mode !== "none",
         },
-        ...(!boundary.available ? {
-          reason: `Strict user-account execution boundary is unavailable: ${boundary.mechanism}.`,
+        ...(!ready ? {
+          reason: !boundary.available
+            ? `Strict user-account execution boundary is unavailable: ${boundary.mechanism}.`
+            : `Remote clock skew exceeds ${MAXIMUM_READY_CLOCK_SKEW_MS}ms.`,
         } : {}),
         evidence: {
           transport: "ssh",
           sshHost: target.sshHost,
           userAccountBoundary: boundary.mechanism,
           capabilityProbes: { pty, sftp },
+          ...(clockSkewMs === undefined ? {} : { clockSkewMs }),
+          observedIdentity: {
+            hostname: fields.hostname,
+            user: fields.user,
+            platform,
+            homeDirectory: fields.home,
+            defaultShell: fields.shell,
+            sshHostKeyFingerprint: sshHostKeyFingerprint(result.stderr),
+          },
         },
       };
     } catch (error) {
@@ -435,7 +517,7 @@ export class TargetRegistry {
         sshArguments(
           target.sshHost!,
           this.probeTimeoutMs,
-          "powershell -NoProfile -NonInteractive -Command \"Write-Output '__DEVSPACE_TARGET_V1__'; Write-Output ('architecture=' + $env:PROCESSOR_ARCHITECTURE); Write-Output ('home=' + $HOME); Write-Output ('temporary=' + [IO.Path]::GetTempPath()); if (Get-Command git -ErrorAction SilentlyContinue) { Write-Output 'git=1' } else { Write-Output 'git=0' }; $groups=(& whoami.exe /groups /fo csv /nh 2>$null | Out-String); if($groups -match 'S-1-16-(12288|16384)'){Write-Output 'elevated=1'}else{Write-Output 'elevated=0'}\"",
+          "powershell -NoProfile -NonInteractive -Command \"Write-Output '__DEVSPACE_TARGET_V1__'; Write-Output ('hostname=' + $env:COMPUTERNAME); Write-Output ('user=' + $env:USERNAME); Write-Output ('shell=' + $env:ComSpec); Write-Output ('architecture=' + $env:PROCESSOR_ARCHITECTURE); Write-Output ('home=' + $HOME); Write-Output ('temporary=' + [IO.Path]::GetTempPath()); Write-Output ('epoch=' + [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()); if (Get-Command git -ErrorAction SilentlyContinue) { Write-Output 'git=1' } else { Write-Output 'git=0' }; $groups=(& whoami.exe /groups /fo csv /nh 2>$null | Out-String); if($groups -match 'S-1-16-(12288|16384)'){Write-Output 'elevated=1'}else{Write-Output 'elevated=0'}\"",
         ),
         {
           timeout: this.probeTimeoutMs + 1_000,
@@ -448,10 +530,17 @@ export class TargetRegistry {
         throw new Error("Remote probe marker missing");
       }
       const elevated = fields.elevated !== "0";
-      const [pty, sftp] = elevated
+      const clockSkewMs = clockSkew(fields.epoch, observedAtMs);
+      const clockReady = clockSkewMs === undefined
+        || clockSkewMs <= MAXIMUM_READY_CLOCK_SKEW_MS;
+      const ready = !elevated && clockReady;
+      const probeSuppressionReason = elevated
+        ? "not-probed-for-elevated-token"
+        : "not-probed-for-clock-skew";
+      const [pty, sftp] = !ready
         ? [
-            unavailableCapabilityProbe("not-probed-for-elevated-token"),
-            unavailableCapabilityProbe("not-probed-for-elevated-token"),
+            unavailableCapabilityProbe(probeSuppressionReason),
+            unavailableCapabilityProbe(probeSuppressionReason),
           ]
         : await Promise.all([
             probeWindowsSshPty(
@@ -469,7 +558,10 @@ export class TargetRegistry {
           ]);
       return {
         targetId: target.id,
-        status: elevated ? "DEGRADED" : "ONLINE",
+        endpointId: target.endpointId,
+        targetGeneration: target.generation,
+        status: ready ? "ONLINE" : "DEGRADED",
+        ready,
         observedAt: new Date(observedAtMs).toISOString(),
         expiresAt,
         platform: "windows",
@@ -477,24 +569,35 @@ export class TargetRegistry {
         homeDirectory: fields.home,
         temporaryDirectory: fields.temporary,
         capabilities: {
-          fs: !elevated && sftp.available,
-          exec: !elevated,
-          pty: !elevated && pty.available,
-          sftp: !elevated && sftp.available,
+          fs: ready && sftp.available,
+          exec: ready,
+          pty: ready && pty.available,
+          sftp: ready && sftp.available,
           rsync: false,
           git: fields.git === "1",
-          gui: !elevated && target.gui.mode !== "none",
-          mcp: !elevated,
-          durableProcess: !elevated && target.durableProcess.mode !== "none",
+          gui: ready && target.gui.mode !== "none",
+          mcp: ready,
+          durableProcess: ready && target.durableProcess.mode !== "none",
         },
-        ...(elevated ? {
-          reason: "Strict user-account execution boundary rejected a high-integrity or unverifiable Windows token.",
+        ...(!ready ? {
+          reason: elevated
+            ? "Strict user-account execution boundary rejected a high-integrity or unverifiable Windows token."
+            : `Remote clock skew exceeds ${MAXIMUM_READY_CLOCK_SKEW_MS}ms.`,
         } : {}),
         evidence: {
           transport: "ssh",
           sshHost: target.sshHost,
           userAccountBoundary: elevated ? "blocked-elevated-token" : "medium-or-lower-integrity-token",
           capabilityProbes: { pty, sftp },
+          ...(clockSkewMs === undefined ? {} : { clockSkewMs }),
+          observedIdentity: {
+            hostname: fields.hostname,
+            user: fields.user,
+            platform: "windows",
+            homeDirectory: fields.home,
+            defaultShell: fields.shell,
+            sshHostKeyFingerprint: sshHostKeyFingerprint(result.stderr),
+          },
         },
       };
     } catch (error) {
@@ -560,20 +663,35 @@ function normalizeTargets(
           `Invalid target ID: ${id}`,
         );
       }
-      return {
+      const sshHost = target.sshHost?.trim();
+      const configuredUser = target.user?.trim() || userFromSshHost(sshHost);
+      const durableProcess = target.durableProcess ?? { mode: "none" as const };
+      const gui = target.gui ?? { mode: "none" as const };
+      return bindTarget({
         id,
         displayName: target.displayName.trim(),
         aliases: Array.from(new Set((target.aliases ?? []).map((alias) => alias.trim()))),
+        endpointId: target.endpointId?.trim()
+          || (target.transport === "local" ? "local-primary" : `ssh:${sshHost}`),
         transport: target.transport,
-        sshHost: target.sshHost,
+        sshHost,
+        sshHostKeyFingerprint: target.sshHostKeyFingerprint?.trim(),
+        user: target.transport === "local" ? (configuredUser ?? userInfo().username) : configuredUser,
+        expectedHostname: target.expectedHostname?.trim()
+          || (target.transport === "local" ? hostname() : undefined),
         platform: target.platform,
         shell: target.shell ?? "auto",
         defaultCwd: target.defaultCwd,
         envProfile: target.envProfile,
         probeTtlMs: target.probeTtlMs ?? DEFAULT_PROBE_TTL_MS,
-        durableProcess: target.durableProcess ?? { mode: "none" },
-        gui: target.gui ?? { mode: "none" },
-      } satisfies TargetDefinition;
+        durableProcess,
+        gui,
+        configuredCapabilities: normalizeConfiguredCapabilities(
+          target.capabilities,
+          gui.mode !== "none",
+          durableProcess.mode !== "none",
+        ),
+      });
     })
     .sort((left, right) => {
       if (left.id === "local") return -1;
@@ -582,18 +700,49 @@ function normalizeTargets(
     });
 }
 
+type UnboundTargetDefinition = Omit<TargetDefinition, "endpointFingerprint" | "generation">;
+
+function bindTarget(target: UnboundTargetDefinition): TargetDefinition {
+  const endpointFingerprint = sha256(JSON.stringify({
+    endpointId: target.endpointId,
+    transport: target.transport,
+    sshHost: target.sshHost,
+    sshHostKeyFingerprint: target.sshHostKeyFingerprint,
+    user: target.user,
+    expectedHostname: target.expectedHostname,
+    platform: target.platform,
+  }));
+  const generation = sha256(JSON.stringify({ ...target, endpointFingerprint }));
+  return deepFreeze({ ...target, endpointFingerprint, generation });
+}
+
+function userFromSshHost(sshHost: string | undefined): string | undefined {
+  if (!sshHost) return undefined;
+  const separator = sshHost.indexOf("@");
+  return separator > 0 ? sshHost.slice(0, separator) : undefined;
+}
+
+function stripSshUser(sshHost: string): string {
+  const separator = sshHost.indexOf("@");
+  return separator >= 0 ? sshHost.slice(separator + 1) : sshHost;
+}
+
 function defaultLocalTarget(): TargetDefinition {
-  return {
+  return bindTarget({
     id: "local",
     displayName: "Local machine",
     aliases: ["local", "localhost", "로컬", "내 맥", "개인 Mac"],
+    endpointId: "local-primary",
     transport: "local",
+    user: userInfo().username,
+    expectedHostname: hostname(),
     platform: currentPlatform(),
     shell: "auto",
     probeTtlMs: DEFAULT_PROBE_TTL_MS,
     durableProcess: { mode: "none" },
     gui: { mode: "none" },
-  };
+    configuredCapabilities: normalizeConfiguredCapabilities(undefined, false, false),
+  });
 }
 
 function assertUniqueTargetIds(targets: TargetDefinition[], path: string): void {
@@ -615,11 +764,82 @@ export function targetSummary(target: TargetDefinition): Record<string, unknown>
     targetId: target.id,
     displayName: target.displayName,
     aliases: target.aliases,
+    endpointId: target.endpointId,
+    endpointFingerprint: target.endpointFingerprint,
+    generation: target.generation,
     transport: target.transport,
+    ...(target.sshHost ? { sshHost: target.sshHost } : {}),
+    ...(target.sshHostKeyFingerprint
+      ? { sshHostKeyFingerprint: target.sshHostKeyFingerprint }
+      : {}),
+    ...(target.user ? { user: target.user } : {}),
     platform: target.platform,
     guiMode: target.gui.mode,
     durableProcessMode: target.durableProcess.mode,
+    capabilities: { ...target.configuredCapabilities },
     envProfileConfigured: Boolean(target.envProfile),
+  };
+}
+
+export function assertTargetCapability(
+  target: TargetDefinition,
+  capability: ConfiguredTargetCapability,
+): void {
+  if (target.configuredCapabilities[capability]) return;
+  throw new UniversalBrokerError(
+    "CAPABILITY_UNAVAILABLE",
+    `Target ${target.id} has ${capability} disabled by configuration.`,
+    {
+      evidence: {
+        targetId: target.id,
+        targetGeneration: target.generation,
+        capability,
+        providerDispatchCount: 0,
+      },
+    },
+  );
+}
+
+function normalizeConfiguredCapabilities(
+  configured: Partial<Record<ConfiguredTargetCapability, boolean>> | undefined,
+  guiConfigured: boolean,
+  durableProcessConfigured: boolean,
+): ConfiguredTargetCapabilities {
+  const exec = configured?.exec ?? true;
+  return Object.freeze({
+    fs: configured?.fs ?? true,
+    exec,
+    pty: (configured?.pty ?? true) && exec,
+    mcp: configured?.mcp ?? true,
+    artifact: configured?.artifact ?? true,
+    gui: configured?.gui ?? guiConfigured,
+    durableProcess: configured?.durableProcess ?? durableProcessConfigured,
+  });
+}
+
+function applyConfiguredCapabilities(
+  target: TargetDefinition,
+  observation: TargetObservation,
+): TargetObservation {
+  const configured = target.configuredCapabilities;
+  return {
+    ...observation,
+    capabilities: {
+      ...observation.capabilities,
+      fs: observation.capabilities.fs && configured.fs,
+      exec: observation.capabilities.exec && configured.exec,
+      pty: observation.capabilities.pty && configured.pty,
+      sftp: observation.capabilities.sftp && configured.fs,
+      rsync: observation.capabilities.rsync && configured.fs,
+      git: observation.capabilities.git && (configured.fs || configured.exec),
+      gui: observation.capabilities.gui && configured.gui,
+      mcp: observation.capabilities.mcp && configured.mcp,
+      durableProcess: observation.capabilities.durableProcess && configured.durableProcess,
+    },
+    evidence: {
+      ...(observation.evidence ?? {}),
+      configuredCapabilities: { ...configured },
+    },
   };
 }
 
@@ -627,6 +847,9 @@ function targetSelectors(target: TargetDefinition): Set<string> {
   return new Set([
     target.id,
     target.displayName,
+    target.endpointId,
+    ...(target.sshHost ? [target.sshHost] : []),
+    ...(target.sshHost && target.user ? [`${target.user}@${stripSshUser(target.sshHost)}`] : []),
     ...target.aliases,
   ].map(normalizeSelector));
 }
@@ -675,6 +898,96 @@ interface CapabilityProbeResult {
   available: boolean;
   mechanism: string;
   reason?: string;
+}
+
+interface ObservedTargetIdentity {
+  hostname?: string;
+  user?: string;
+  platform?: TargetPlatform;
+  homeDirectory?: string;
+  defaultShell?: string;
+  sshHostKeyFingerprint?: string;
+}
+
+function applyTargetIdentityReadiness(
+  target: TargetDefinition,
+  observation: TargetObservation,
+): TargetObservation {
+  const observedIdentity = asObservedTargetIdentity(observation.evidence?.observedIdentity);
+  const configuredIdentity = {
+    endpointId: target.endpointId,
+    transport: target.transport,
+    ...(target.sshHost ? { sshHost: target.sshHost } : {}),
+    ...(target.sshHostKeyFingerprint
+      ? { sshHostKeyFingerprint: target.sshHostKeyFingerprint }
+      : {}),
+    ...(target.user ? { user: target.user } : {}),
+    ...(target.expectedHostname ? { hostname: target.expectedHostname } : {}),
+    platform: target.platform,
+    endpointFingerprint: target.endpointFingerprint,
+  };
+  const identityMatches = observation.status !== "OFFLINE"
+    && (!target.user || normalizeIdentity(target.user) === normalizeIdentity(observedIdentity.user))
+    && (!target.expectedHostname
+      || normalizeIdentity(target.expectedHostname) === normalizeIdentity(observedIdentity.hostname))
+    && (!target.sshHostKeyFingerprint
+      || target.sshHostKeyFingerprint === observedIdentity.sshHostKeyFingerprint)
+    && (target.platform === "unknown" || target.platform === observedIdentity.platform);
+  const ready = observation.status === "ONLINE" && identityMatches;
+  const capabilities = identityMatches
+    ? observation.capabilities
+    : unavailableCapabilities();
+  return deepFreeze({
+    ...observation,
+    status: observation.status === "ONLINE" && !identityMatches ? "DEGRADED" : observation.status,
+    ready,
+    capabilities,
+    ...(!identityMatches && observation.status !== "OFFLINE"
+      ? { reason: "Target identity does not match the configured endpoint identity." }
+      : {}),
+    evidence: {
+      ...(observation.evidence ?? {}),
+      endpointId: target.endpointId,
+      endpointFingerprint: target.endpointFingerprint,
+      configuredIdentity,
+      observedIdentity,
+      identityMatches,
+      readiness: ready,
+    },
+  });
+}
+
+function asObservedTargetIdentity(value: unknown): ObservedTargetIdentity {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const record = value as Record<string, unknown>;
+  return {
+    ...(typeof record.hostname === "string" ? { hostname: record.hostname } : {}),
+    ...(typeof record.user === "string" ? { user: record.user } : {}),
+    ...(typeof record.platform === "string" ? { platform: record.platform as TargetPlatform } : {}),
+    ...(typeof record.homeDirectory === "string" ? { homeDirectory: record.homeDirectory } : {}),
+    ...(typeof record.defaultShell === "string" ? { defaultShell: record.defaultShell } : {}),
+    ...(typeof record.sshHostKeyFingerprint === "string"
+      ? { sshHostKeyFingerprint: record.sshHostKeyFingerprint }
+      : {}),
+  };
+}
+
+function normalizeIdentity(value: string | undefined): string {
+  return value?.normalize("NFKC").trim().toLocaleLowerCase("en-US") ?? "";
+}
+
+function unavailableCapabilities(): TargetCapabilities {
+  return {
+    fs: false,
+    exec: false,
+    pty: false,
+    sftp: false,
+    rsync: false,
+    git: false,
+    gui: false,
+    mcp: false,
+    durableProcess: false,
+  };
 }
 
 async function probePosixSshPty(
@@ -805,7 +1118,7 @@ function observationWithProbeMetadata(
   generation: string,
   cache: "hit" | "miss" | "shared",
 ): TargetObservation {
-  return {
+  return deepFreeze({
     ...observation,
     capabilities: { ...observation.capabilities },
     evidence: {
@@ -813,7 +1126,7 @@ function observationWithProbeMetadata(
       targetGeneration: generation,
       cache,
     },
-  };
+  });
 }
 
 function roundedMilliseconds(value: number): number {
@@ -822,6 +1135,7 @@ function roundedMilliseconds(value: number): number {
 
 function sshArguments(host: string, timeoutMs: number, command: string): string[] {
   return [
+    "-v",
     "-T",
     "-o", "BatchMode=yes",
     "-o", `ConnectTimeout=${Math.max(1, Math.ceil(timeoutMs / 1_000))}`,
@@ -829,6 +1143,10 @@ function sshArguments(host: string, timeoutMs: number, command: string): string[
     host,
     command,
   ];
+}
+
+function sshHostKeyFingerprint(stderr: string): string | undefined {
+  return /Server host key:\s+\S+\s+(SHA256:[A-Za-z0-9+/=]+)/u.exec(stderr)?.[1];
 }
 
 function shellQuote(value: string): string {
@@ -843,6 +1161,12 @@ function parseKeyValueOutput(output: string): Record<string, string> {
     fields[line.slice(0, separator)] = line.slice(separator + 1);
   }
   return fields;
+}
+
+function clockSkew(epochSeconds: string | undefined, observedAtMs: number): number | undefined {
+  const epoch = Number(epochSeconds);
+  if (!Number.isSafeInteger(epoch) || epoch <= 0) return undefined;
+  return Math.abs(epoch * 1_000 - observedAtMs);
 }
 
 async function probeLocalUserAccountBoundary(
@@ -884,10 +1208,11 @@ async function probeLocalUserAccountBoundary(
   }
   if (platform === "linux") {
     try {
-      await execute("setpriv", [
+      const setpriv = await firstExecutable(["/usr/bin/setpriv", "/bin/setpriv"]);
+      await execute(setpriv, [
         "--no-new-privs",
         "--",
-        "sh",
+        "/bin/sh",
         "-c",
         "grep -Eq '^NoNewPrivs:[[:space:]]*1' /proc/self/status && grep -Eq '^CapPrm:[[:space:]]*0+$' /proc/self/status && grep -Eq '^CapEff:[[:space:]]*0+$' /proc/self/status && grep -Eq '^CapAmb:[[:space:]]*0+$' /proc/self/status",
       ], {
@@ -940,7 +1265,7 @@ async function commandAvailable(
   execute: typeof execFileAsync,
 ): Promise<boolean> {
   try {
-    await execute("sh", ["-lc", `command -v ${shellQuote(command)} >/dev/null 2>&1`], {
+    await execute("/bin/sh", ["-lc", `PATH=/usr/bin:/bin:/usr/sbin:/sbin; export PATH; command -v ${shellQuote(command)} >/dev/null 2>&1`], {
       timeout: 2_000,
       encoding: "utf8",
     });
@@ -948,6 +1273,18 @@ async function commandAvailable(
   } catch {
     return false;
   }
+}
+
+async function firstExecutable(paths: readonly string[]): Promise<string> {
+  for (const path of paths) {
+    try {
+      await access(path);
+      return path;
+    } catch {
+      // Try the next broker-owned system location.
+    }
+  }
+  throw new Error(`Required system executable is unavailable: ${paths.join(", ")}`);
 }
 
 function offlineObservation(
@@ -958,21 +1295,14 @@ function offlineObservation(
 ): TargetObservation {
   return {
     targetId: target.id,
+    endpointId: target.endpointId,
+    targetGeneration: target.generation,
     status: "OFFLINE",
+    ready: false,
     observedAt: new Date(observedAtMs).toISOString(),
     expiresAt,
     platform: target.platform,
-    capabilities: {
-      fs: false,
-      exec: false,
-      pty: false,
-      sftp: false,
-      rsync: false,
-      git: false,
-      gui: false,
-      mcp: false,
-      durableProcess: false,
-    },
+    capabilities: unavailableCapabilities(),
     reason,
     evidence: {
       transport: target.transport,
@@ -996,4 +1326,12 @@ function errorMessage(error: unknown): string {
 
 function isNodeError(error: unknown, code: string): boolean {
   return error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === code;
+}
+
+function deepFreeze<T>(value: T): T {
+  if (value && typeof value === "object" && !Object.isFrozen(value)) {
+    for (const nested of Object.values(value as Record<string, unknown>)) deepFreeze(nested);
+    Object.freeze(value);
+  }
+  return value;
 }
