@@ -151,7 +151,9 @@ test("live verifier defaults to parallel v2 and creates only a temporary user to
   assert.match(source, /readOnlyHint === true/u);
   assert.match(source, /destructiveHint !== true/u);
   assert.match(source, /MCP_PROVIDER_ERROR.*MCP_TRANSPORT_ERROR/u);
-  assert.match(source, /unexpectedly requires mutation authority/u);
+  assert.match(source, /const result = await callWithAuthority\(client, "mcp", args, \["R2"\]\)/u);
+  assert.match(source, /allowedRisks\.includes\(requiredRisk\)/u);
+  assert.doesNotMatch(source, /unexpectedly requires mutation authority/u);
   assert.match(source, /authority preview unexpectedly created its remote fixture path/u);
   assert.match(source, /skipCompanyGates: false/u);
   assert.match(source, /argument === "--skip-company-gates"/u);

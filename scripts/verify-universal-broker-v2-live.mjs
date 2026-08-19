@@ -865,13 +865,12 @@ async function callReadOnlyMcpWhenReady(
     assert(tool.annotations?.readOnlyHint === true, `${args.route}.${args.name} is not explicitly read-only`);
     assert(tool.annotations?.destructiveHint !== true, `${args.route}.${args.name} is marked destructive`);
 
-    const result = await client.callTool({ name: "mcp", arguments: args });
+    const result = await callWithAuthority(client, "mcp", args, ["R2"]);
     if (result.isError !== true && result.structuredContent?.ok !== false) {
       return { result, attempts: attempt };
     }
     lastResult = result;
     const code = errorCode(result);
-    assert(code !== "AUTHORITY_REQUIRED", `${args.route}.${args.name} unexpectedly requires mutation authority`);
     if (!new Set(["MCP_PROVIDER_ERROR", "MCP_TRANSPORT_ERROR"]).has(code) || attempt === maximumAttempts) {
       break;
     }
@@ -890,11 +889,12 @@ async function call(client, name, args) {
   return result;
 }
 
-async function callWithAuthority(client, name, args) {
+async function callWithAuthority(client, name, args, allowedRisks = ["R1", "R2", "R3"]) {
   let result = await client.callTool({ name, arguments: args });
   if (errorCode(result) !== "AUTHORITY_REQUIRED") return result;
   const requiredRisk = result.structuredContent?.error?.evidence?.requiredRisk;
   assert(["R1", "R2", "R3"].includes(requiredRisk), `invalid required authority risk: ${requiredRisk}`);
+  assert(allowedRisks.includes(requiredRisk), `authority risk ${requiredRisk} is not allowed for this canary`);
   const authority = await prepareExactAuthority(
     client,
     name,
