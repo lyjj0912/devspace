@@ -9,6 +9,7 @@ PRODUCTION_PORT=7678
 CANDIDATE_PORT=7679
 SSH_LOAD_TARGET="company"
 SKIP_COMPANY_GATES=0
+SKIP_COMPANY_CHROME_GATE=0
 WINDOWS_LIVE_TARGET=""
 RELEASE_ROOT="${HOME}/.devspace/releases/universal-broker-v2"
 DEPLOYMENT_ROOT="${HOME}/.devspace/deployments/universal-broker-v2"
@@ -28,6 +29,7 @@ Options:
   --candidate-port PORT      Isolated candidate port (default: 7679)
   --ssh-load-target ID       Required real POSIX SSH load/live target (default: company)
   --skip-company-gates       Skip every company target/route gate for this transaction only
+  --skip-company-chrome-gate Skip only the company Chrome readiness/mutation canary
   --windows-live-target ID   Optional Windows target; when supplied its live canary is mandatory
   --release-root PATH        Immutable release root
   --deployment-root PATH     Upgrade audit root
@@ -45,6 +47,7 @@ while [[ $# -gt 0 ]]; do
     --candidate-port) CANDIDATE_PORT="$2"; shift 2 ;;
     --ssh-load-target) SSH_LOAD_TARGET="$2"; shift 2 ;;
     --skip-company-gates) SKIP_COMPANY_GATES=1; shift ;;
+    --skip-company-chrome-gate) SKIP_COMPANY_CHROME_GATE=1; shift ;;
     --windows-live-target) WINDOWS_LIVE_TARGET="$2"; shift 2 ;;
     --release-root) RELEASE_ROOT="$2"; shift 2 ;;
     --deployment-root) DEPLOYMENT_ROOT="$2"; CURRENT_AUDIT_LINK="$2/current"; shift 2 ;;
@@ -482,6 +485,9 @@ if [[ "$SKIP_COMPANY_GATES" == 1 ]]; then
   LIVE_ARGUMENTS+=(--skip-company-gates)
 else
   LIVE_ARGUMENTS+=(--company-target "$SSH_LOAD_TARGET")
+  if [[ "$SKIP_COMPANY_CHROME_GATE" == 1 ]]; then
+    LIVE_ARGUMENTS+=(--skip-company-chrome-gate)
+  fi
 fi
 if [[ -n "$WINDOWS_LIVE_TARGET" ]]; then
   LIVE_ARGUMENTS+=(--windows-target "$WINDOWS_LIVE_TARGET")

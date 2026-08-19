@@ -44,6 +44,14 @@ const audit = {
   companyGates: options.skipCompanyGates
     ? { skipped: true, reason: "Explicit --skip-company-gates deployment option." }
     : { skipped: false },
+  companyChromeGate: options.skipCompanyGates || options.skipCompanyChromeGate
+    ? {
+        skipped: true,
+        reason: options.skipCompanyGates
+          ? "Explicit --skip-company-gates deployment option."
+          : "Explicit --skip-company-chrome-gate deployment option for the documented Chrome 150+ default-profile permission-proxy incompatibility.",
+      }
+    : { skipped: false },
   health: undefined,
   protocolSessions: [],
   canaries: {},
@@ -635,31 +643,47 @@ async function runCanaries(client, sameClientTransport, foreignClient, root, can
     query: "search issue",
     limit: 5,
   });
-  const chromeReadiness = await callReadOnlyMcpWhenReady(client, {
-    operation: "invoke",
-    route: options.chromeRoute,
-    name: "list_pages",
-    arguments: {},
-    responsePolicy: { maxCharacters: 12_000, preserveFullResult: true },
-  });
-  const chrome = data(chromeReadiness.result);
-  assert(chrome.result, "Chrome DevTools MCP invocation failed");
-  canaries.chromeReadiness = {
-    route: options.chromeRoute,
-    tool: "list_pages",
-    attempts: chromeReadiness.attempts,
-    readOnly: true,
-  };
-  const chromeMutation = data(await call(client, "mcp", {
-    operation: "invoke",
-    route: options.chromeRoute,
-    name: "evaluate_script",
-    arguments: {
-      function: "() => { window.__devspaceV2Canary = 'ok'; const value = window.__devspaceV2Canary; delete window.__devspaceV2Canary; return value === 'ok'; }",
-    },
-    responsePolicy: { maxCharacters: 12_000, preserveFullResult: true },
-  }));
-  assert(/true|ok/i.test(JSON.stringify(chromeMutation.result)), "Chrome DevTools MCP mutation canary failed");
+  if (options.skipCompanyChromeGate) {
+    canaries.chromeReadiness = {
+      skipped: true,
+      route: options.chromeRoute,
+      tools: ["list_pages", "evaluate_script"],
+      readinessSkipped: true,
+      mutationSkipped: true,
+      reason: "Explicit --skip-company-chrome-gate deployment option for the documented Chrome 150+ default-profile permission-proxy incompatibility.",
+    };
+  } else {
+    const chromeReadiness = await callReadOnlyMcpWhenReady(client, {
+      operation: "invoke",
+      route: options.chromeRoute,
+      name: "list_pages",
+      arguments: {},
+      responsePolicy: { maxCharacters: 12_000, preserveFullResult: true },
+    });
+    const chrome = data(chromeReadiness.result);
+    assert(chrome.result, "Chrome DevTools MCP invocation failed");
+    canaries.chromeReadiness = {
+      route: options.chromeRoute,
+      tool: "list_pages",
+      attempts: chromeReadiness.attempts,
+      readOnly: true,
+    };
+    const chromeMutation = data(await call(client, "mcp", {
+      operation: "invoke",
+      route: options.chromeRoute,
+      name: "evaluate_script",
+      arguments: {
+        function: "() => { window.__devspaceV2Canary = 'ok'; const value = window.__devspaceV2Canary; delete window.__devspaceV2Canary; return value === 'ok'; }",
+      },
+      responsePolicy: { maxCharacters: 12_000, preserveFullResult: true },
+    }));
+    assert(/true|ok/i.test(JSON.stringify(chromeMutation.result)), "Chrome DevTools MCP mutation canary failed");
+    canaries.chromeMutation = {
+      route: options.chromeRoute,
+      tool: "evaluate_script",
+      readOnly: false,
+    };
+  }
   const remoteGuiTools = data(await call(client, "mcp", {
     operation: "search_tools",
     route: options.computerUseRoute,
@@ -1031,6 +1055,7 @@ function parseArgs(args) {
     sessions: 5,
     output: undefined,
     skipCompanyGates: false,
+    skipCompanyChromeGate: false,
     companyTarget: "company",
     chromeRoute: "company-chrome",
     jiraRoute: "company-jira",
@@ -1053,6 +1078,7 @@ function parseArgs(args) {
     else if (argument === "--sessions") result.sessions = Number(requiredValue(argument, value)), index += 1;
     else if (argument === "--output") result.output = requiredValue(argument, value), index += 1;
     else if (argument === "--skip-company-gates") result.skipCompanyGates = true;
+    else if (argument === "--skip-company-chrome-gate") result.skipCompanyChromeGate = true;
     else if (argument === "--company-target") result.companyTarget = requiredValue(argument, value), index += 1;
     else if (argument === "--chrome-route") result.chromeRoute = requiredValue(argument, value), index += 1;
     else if (argument === "--jira-route") result.jiraRoute = requiredValue(argument, value), index += 1;

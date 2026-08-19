@@ -128,6 +128,15 @@ test("live verifier defaults to parallel v2 and creates only a temporary user to
   cleaned.close();
 
   const source = await readFile("scripts/verify-universal-broker-v2-live.mjs", "utf8");
+  const upgradeSource = await readFile("scripts/upgrade-universal-broker-v2-production.sh", "utf8");
+  const fullLoadStart = upgradeSource.indexOf('(\n  cd "$RELEASE"');
+  const fullLoadEnd = upgradeSource.indexOf('\n)\nif [[ -d "$IMMUTABLE_RELEASE"', fullLoadStart);
+  assert.ok(fullLoadStart >= 0 && fullLoadEnd > fullLoadStart, "full-load execution block anchors are missing");
+  const fullLoadSource = upgradeSource.slice(fullLoadStart, fullLoadEnd);
+  const liveArgumentsStart = upgradeSource.indexOf("LIVE_ARGUMENTS=(");
+  const liveArgumentsEnd = upgradeSource.indexOf('\nif [[ -n "$WINDOWS_LIVE_TARGET"', liveArgumentsStart);
+  assert.ok(liveArgumentsStart >= 0 && liveArgumentsEnd > liveArgumentsStart, "live argument block anchors are missing");
+  const liveArgumentsSource = upgradeSource.slice(liveArgumentsStart, liveArgumentsEnd);
   assert.match(source, /baseUrl: "http:\/\/127\.0\.0\.1:7677"/u);
   assert.match(source, /audit\.health\?\.status === "ok"/u);
   assert.doesNotMatch(source, /audit\.health\?\.ok === true/u);
@@ -156,10 +165,19 @@ test("live verifier defaults to parallel v2 and creates only a temporary user to
   assert.doesNotMatch(source, /unexpectedly requires mutation authority/u);
   assert.match(source, /authority preview unexpectedly created its remote fixture path/u);
   assert.match(source, /skipCompanyGates: false/u);
+  assert.match(source, /skipCompanyChromeGate: false/u);
   assert.match(source, /argument === "--skip-company-gates"/u);
+  assert.match(source, /argument === "--skip-company-chrome-gate"/u);
   assert.match(source, /Explicit --skip-company-gates deployment option\./u);
+  assert.match(source, /documented Chrome 150\+ default-profile permission-proxy incompatibility/u);
   assert.match(source, /companyGateSkipped: options\.skipCompanyGates/u);
   assert.match(source, /if \(!options\.skipCompanyGates\)/u);
+  assert.match(source, /if \(options\.skipCompanyChromeGate\)/u);
+  assert.match(source, /route: options\.jiraRoute,[\s\S]*if \(options\.skipCompanyChromeGate\) \{[\s\S]*tools: \["list_pages", "evaluate_script"\],[\s\S]*\} else \{[\s\S]*name: "list_pages"[\s\S]*name: "evaluate_script"[\s\S]*\}\n  const remoteGuiTools/u);
+  assert.match(source, /const remoteGuiTools[\s\S]*route: options\.computerUseRoute/u);
+  assert.match(liveArgumentsSource, /^LIVE_ARGUMENTS=\([\s\S]*\n\)\nif \[\[ "\$SKIP_COMPANY_GATES" == 1 \]\]; then\n  LIVE_ARGUMENTS\+=\(--skip-company-gates\)\nelse\n  LIVE_ARGUMENTS\+=\(--company-target "\$SSH_LOAD_TARGET"\)\n  if \[\[ "\$SKIP_COMPANY_CHROME_GATE" == 1 \]\]; then\n    LIVE_ARGUMENTS\+=\(--skip-company-chrome-gate\)\n  fi\nfi$/u);
+  assert.match(fullLoadSource, /if \[\[ "\$SKIP_COMPANY_GATES" == 1 \]\]; then[\s\S]*else[\s\S]*DEVSPACE_V2_LOAD_REQUIRE_REAL_SSH=1[\s\S]*npm run v2:load/u);
+  assert.doesNotMatch(fullLoadSource, /SKIP_COMPANY_CHROME_GATE/u);
   assert.match(source, /id: "r2-local-remove"[\s\S]*disposition: "trash"/u);
   assert.doesNotMatch(source, /templateDatabasePath|--template-database|JSON\.stringify\(\["devspace"/u);
 });
