@@ -281,6 +281,7 @@ export class UniversalExecutionPlane {
   private readonly reservations: SynchronousQuotaReservations;
   private readonly stateStore: ProcessStateStore;
   private readonly pendingStateWrites = new Set<Promise<void>>();
+  private readonly pendingStateWritesByProcess = new Map<string, Set<Promise<void>>>();
   private recoveryPromise?: Promise<void>;
   private readonly nonDurableAfterRestart = new Map<string, string>();
   private closed = false;
@@ -1096,6 +1097,8 @@ export class UniversalExecutionPlane {
   private async forgetEntry(entry: ProcessEntry): Promise<void> {
     if (entry.cleanupTimer) clearTimeout(entry.cleanupTimer);
     this.entries.delete(entry.processId);
+    const pendingWrites = this.pendingStateWritesByProcess.get(entry.processId);
+    if (pendingWrites) await Promise.allSettled([...pendingWrites]);
     await entry.output.close();
     await Promise.all([
       rm(entry.output.path, { force: true }),
@@ -1232,6 +1235,9 @@ export class UniversalExecutionPlane {
   }
 
   private persistEntry(entry: ProcessEntry): Promise<void> {
+    // Removing an entry is the durable forget fence. Exit callbacks and other
+    // already-scheduled lifecycle work must not resurrect its state afterward.
+    if (this.entries.get(entry.processId) !== entry) return Promise.resolve();
     const record: Omit<PersistentProcessRecord, "schemaVersion" | "checksum"> = {
       processId: entry.processId,
       principalKeyFingerprint: entry.principalKeyFingerprint,
@@ -1252,11 +1258,16 @@ export class UniversalExecutionPlane {
       durable: entry.durable,
       durableIdentity: entry.durableIdentity,
     };
+    const processWrites = this.pendingStateWritesByProcess.get(entry.processId) ?? new Set<Promise<void>>();
+    this.pendingStateWritesByProcess.set(entry.processId, processWrites);
     let tracked: Promise<void>;
     tracked = this.stateStore.save(record).finally(() => {
       this.pendingStateWrites.delete(tracked);
+      processWrites.delete(tracked);
+      if (processWrites.size === 0) this.pendingStateWritesByProcess.delete(entry.processId);
     });
     this.pendingStateWrites.add(tracked);
+    processWrites.add(tracked);
     return tracked;
   }
 

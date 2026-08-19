@@ -44,6 +44,7 @@ import type {
   DurableProcessHandle,
   DurableProcessIdentity,
 } from "./durable-process-adapter.js";
+import type { PersistentProcessRecord, ProcessStateStore } from "./process-state.js";
 
 test("exec auto returns a completed local result and preserves resource output", async (t) => {
   const fixture = await createFixture(t);
@@ -194,6 +195,51 @@ test("process record quota rejects synchronously before a second provider spawn"
     (error: unknown) => brokerCode(error) === "RESOURCE_QUOTA_EXCEEDED",
   );
   assert.equal(spawnCalls, 1);
+});
+
+test("forget waits for in-flight state writes and fences later persistence", async (t) => {
+  const stateStore = new ControllableProcessStateStore();
+  const fixture = await createFixture(t, { processStateStore: stateStore });
+  const completed = await fixture.execution.execute({
+    cwd: fixture.root,
+    command: "printf forgotten",
+    mode: "foreground",
+    yieldMs: 2_000,
+  });
+  assert.equal(completed.state, "EXITED");
+
+  type TestEntry = Parameters<ProcessStateStore["save"]>[0] & { output: unknown };
+  const internals = fixture.execution as unknown as {
+    entries: Map<string, TestEntry>;
+    persistEntry(entry: TestEntry): Promise<void>;
+    drainPendingStateWrites(): Promise<void>;
+  };
+  await internals.drainPendingStateWrites();
+  const entry = internals.entries.get(completed.processId);
+  assert.ok(entry);
+
+  const blocked = stateStore.blockNextSave();
+  const lateSave = internals.persistEntry(entry);
+  await blocked.started;
+  let forgetSettled = false;
+  const forgetting = fixture.execution.operate({
+    operation: "forget",
+    processId: completed.processId,
+  }).then(() => {
+    forgetSettled = true;
+  });
+  await new Promise<void>((resolvePromise) => setImmediate(resolvePromise));
+  assert.equal(forgetSettled, false);
+
+  blocked.release();
+  await Promise.all([lateSave, forgetting]);
+  assert.equal(stateStore.records.has(completed.processId), false);
+  assert.equal(stateStore.events.at(-1), `delete:${completed.processId}`);
+
+  const saveCallsAfterForget = stateStore.saveCalls;
+  await internals.persistEntry(entry);
+  assert.equal(stateStore.saveCalls, saveCallsAfterForget);
+  assert.equal(stateStore.records.has(completed.processId), false);
 });
 
 test("durable process reattaches by manager handle plus PID/start token without replay", async (t) => {
@@ -930,6 +976,7 @@ async function createFixture(
     spawnProcess: NonNullable<ExecutionPlaneOptions["spawnProcess"]>;
     envProfiles: UniversalEnvProfileRegistry;
     durableAdapter: DurableProcessAdapter;
+    processStateStore: ProcessStateStore;
   }> = {},
 ): Promise<Fixture> {
   const root = await mkdtemp(join(tmpdir(), "devspace-v2-exec-test-"));
@@ -1033,8 +1080,63 @@ async function createFixture(
     spawnProcess: overrides.spawnProcess,
     envProfiles: overrides.envProfiles,
     durableAdapter: overrides.durableAdapter,
+    processStateStore: overrides.processStateStore,
   });
   return { root, targetsPath, targets, contexts, execution: fixtureExecution };
+}
+
+class ControllableProcessStateStore implements ProcessStateStore {
+  readonly records = new Map<
+    string,
+    Omit<PersistentProcessRecord, "schemaVersion" | "checksum">
+  >();
+  readonly events: string[] = [];
+  saveCalls = 0;
+  private nextSaveBlock?: {
+    started: () => void;
+    release: Promise<void>;
+  };
+
+  async loadAll(): Promise<PersistentProcessRecord[]> {
+    return [...this.records.values()].map((record) => ({
+      schemaVersion: 1,
+      ...record,
+      checksum: "fixture-checksum",
+    }));
+  }
+
+  async save(
+    record: Omit<PersistentProcessRecord, "schemaVersion" | "checksum">,
+  ): Promise<void> {
+    this.saveCalls += 1;
+    this.events.push(`save:start:${record.processId}`);
+    const block = this.nextSaveBlock;
+    this.nextSaveBlock = undefined;
+    if (block) {
+      block.started();
+      await block.release;
+    }
+    this.records.set(record.processId, { ...record });
+    this.events.push(`save:finish:${record.processId}`);
+  }
+
+  async delete(processId: string): Promise<void> {
+    this.records.delete(processId);
+    this.events.push(`delete:${processId}`);
+  }
+
+  blockNextSave(): { started: Promise<void>; release: () => void } {
+    let markStarted!: () => void;
+    let release!: () => void;
+    const started = new Promise<void>((resolvePromise) => {
+      markStarted = resolvePromise;
+    });
+    const releasePromise = new Promise<void>((resolvePromise) => {
+      release = resolvePromise;
+    });
+    this.nextSaveBlock = { started: markStarted, release: releasePromise };
+    return { started, release };
+  }
 }
 
 function sshTarget(sshHost: string) {
