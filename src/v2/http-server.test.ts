@@ -231,6 +231,95 @@ test("production HTTP rejects legacy-scope tokens and accepts granular tokens", 
     await assert.rejects(rejectedClient.connect(rejectedTransport));
     await Promise.allSettled([rejectedClient.close(), rejectedTransport.close()]);
 
+    const sessionlessHeaders = {
+      Accept: "application/json, text/event-stream",
+      Authorization: `Bearer ${granularToken}`,
+      "Content-Type": "application/json",
+      "User-Agent": "openai-mcp/1.0.0",
+    };
+    const sessionlessToolsList = await fetch(endpoint, {
+      method: "POST",
+      headers: sessionlessHeaders,
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: "chatgpt-action-refresh",
+        method: "tools/list",
+        params: {},
+      }),
+    });
+    assert.equal(sessionlessToolsList.status, 200);
+    const sessionlessToolsListBody = await sessionlessToolsList.json() as {
+      result?: { tools?: Array<{ name?: string }> };
+    };
+    assert.deepEqual(
+      sessionlessToolsListBody.result?.tools?.map((tool) => tool.name),
+      [...UNIVERSAL_TOOL_NAMES],
+    );
+
+    const sessionlessInitialized = await fetch(endpoint, {
+      method: "POST",
+      headers: sessionlessHeaders,
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        method: "notifications/initialized",
+      }),
+    });
+    assert.equal(sessionlessInitialized.status, 202);
+
+    const sessionlessDiscoveryBatch = await fetch(endpoint, {
+      method: "POST",
+      headers: sessionlessHeaders,
+      body: JSON.stringify([
+        {
+          jsonrpc: "2.0",
+          method: "notifications/initialized",
+        },
+        {
+          jsonrpc: "2.0",
+          id: "chatgpt-batched-action-refresh",
+          method: "tools/list",
+          params: {},
+        },
+      ]),
+    });
+    assert.equal(sessionlessDiscoveryBatch.status, 200);
+    const sessionlessDiscoveryBatchBody = await sessionlessDiscoveryBatch.json() as {
+      result?: { tools?: Array<{ name?: string }> };
+    } | Array<{
+      result?: { tools?: Array<{ name?: string }> };
+    }>;
+    const sessionlessDiscoveryBatchResponses = Array.isArray(sessionlessDiscoveryBatchBody)
+      ? sessionlessDiscoveryBatchBody
+      : [sessionlessDiscoveryBatchBody];
+    assert.deepEqual(
+      sessionlessDiscoveryBatchResponses[0]?.result?.tools?.map((tool) => tool.name),
+      [...UNIVERSAL_TOOL_NAMES],
+    );
+
+    const sessionlessExecution = await fetch(endpoint, {
+      method: "POST",
+      headers: sessionlessHeaders,
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: "must-remain-session-bound",
+        method: "tools/call",
+        params: { name: "target", arguments: { operation: "list" } },
+      }),
+    });
+    assert.equal(sessionlessExecution.status, 400);
+
+    const nonOpenAiSessionlessToolsList = await fetch(endpoint, {
+      method: "POST",
+      headers: { ...sessionlessHeaders, "User-Agent": "generic-mcp-client/1.0.0" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: "generic-client-must-initialize",
+        method: "tools/list",
+        params: {},
+      }),
+    });
+    assert.equal(nonOpenAiSessionlessToolsList.status, 400);
+
     const acceptedTransport = new StreamableHTTPClientTransport(endpoint, {
       requestInit: { headers: { Authorization: `Bearer ${granularToken}` } },
     });

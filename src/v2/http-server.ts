@@ -51,6 +51,32 @@ import {
 
 type NextTransport = StreamableHTTPServerTransport;
 const MAXIMUM_HTTP_JSON_BYTES = 2 * 1024 * 1024;
+const OPENAI_MCP_USER_AGENT = /^openai-mcp\//u;
+const OPENAI_SESSIONLESS_DISCOVERY_METHODS = new Set([
+  "notifications/initialized",
+  "tools/list",
+]);
+
+function jsonRpcMethods(body: unknown): string[] {
+  const messages = Array.isArray(body) ? body : [body];
+  return messages.flatMap((message) => {
+    if (!message || typeof message !== "object") return [];
+    const method = (message as { method?: unknown }).method;
+    return typeof method === "string" ? [method] : [];
+  });
+}
+
+function isOpenAiSessionlessDiscoveryRequest(
+  userAgent: string | undefined,
+  methods: readonly string[],
+): boolean {
+  return Boolean(
+    userAgent
+    && OPENAI_MCP_USER_AGENT.test(userAgent)
+    && methods.length > 0
+    && methods.every((method) => OPENAI_SESSIONLESS_DISCOVERY_METHODS.has(method)),
+  );
+}
 
 export interface RunningUniversalBrokerNextServer {
   app: Express;
@@ -377,6 +403,7 @@ export function createUniversalBrokerNextServer(
     const requestId = res.locals.requestId as string | undefined;
     const currentSessionId = req.header("mcp-session-id");
     const initializeRequest = req.method === "POST" && isInitializeRequest(req.body);
+    const messageMethods = req.method === "POST" ? jsonRpcMethods(req.body) : [];
 
     await applyBearerAuth(bearerAuth, req, res);
     if (res.headersSent) return;
@@ -411,6 +438,7 @@ export function createUniversalBrokerNextServer(
 
     let acquiredSessionId: string | undefined;
     let initializationReserved = false;
+    let ephemeralServer: McpServer | undefined;
     try {
       let transport: NextTransport | undefined;
       if (currentSessionId) {
@@ -463,7 +491,34 @@ export function createUniversalBrokerNextServer(
           selfManagement,
         });
         await server.connect(transport);
+      } else if (isOpenAiSessionlessDiscoveryRequest(req.header("user-agent"), messageMethods)) {
+        logEvent(config.logging, "info", "v2_mcp_sessionless_discovery", {
+          requestId,
+          methods: messageMethods,
+          batch: Array.isArray(req.body),
+        });
+        transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: undefined,
+          enableJsonResponse: true,
+        });
+        ephemeralServer = createUniversalBrokerMcpServer({
+          targets,
+          contexts,
+          execution,
+          filesystem,
+          mcpProxy,
+          artifacts,
+          gui,
+          authority,
+          selfManagement,
+        });
+        await ephemeralServer.connect(transport);
       } else {
+        logEvent(config.logging, "warn", "v2_mcp_sessionless_rejected", {
+          requestId,
+          methods: messageMethods,
+          batch: Array.isArray(req.body),
+        });
         sendJsonRpcError(res, 400, -32000, "No valid MCP session");
         return;
       }
@@ -483,6 +538,7 @@ export function createUniversalBrokerNextServer(
       if (initializationReserved) {
         pendingInitializations = Math.max(0, pendingInitializations - 1);
       }
+      if (ephemeralServer) await ephemeralServer.close();
     }
   });
 
