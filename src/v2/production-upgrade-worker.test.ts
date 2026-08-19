@@ -17,6 +17,7 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test, { type TestContext } from "node:test";
+import Database from "better-sqlite3";
 import {
   directoryEvidence,
   pm2CommandEnvironment,
@@ -274,6 +275,26 @@ test("production upgrade worker switches one PM2 process and commits canonical p
   assert.equal((await readFile(fixture.pm2State.pid, "utf8")).trim(), "222");
   assert.equal((await readFile(fixture.pm2State.cwd, "utf8")).trim(), fixture.nextRelease);
   assert.equal((await readFile(fixture.pm2State.script, "utf8")).trim(), fixture.nextScript);
+  assert.equal(readFixtureDatabaseValue(fixture.oauthDatabasePath), "CANDIDATE_OAUTH_DATABASE");
+  assert.equal(readFixtureDatabaseValue(fixture.authorityDatabasePath), "CANDIDATE_AUTHORITY_DATABASE");
+});
+
+test("production upgrade worker rejects a corrupt live database before switching", async (t) => {
+  const fixture = await createFixture(t, { publicMetricsStatus: 404 });
+  await writeFile(fixture.authorityDatabasePath, "TAMPERED\n", { mode: 0o600 });
+  await assert.rejects(
+    runProductionUpgradeWorker(fixture.requestPath),
+    /file is not a database/u,
+  );
+  const status = JSON.parse(await readFile(fixture.statusPath, "utf8")) as {
+    state: string;
+    rollback?: { attempted?: boolean };
+  };
+  assert.equal(status.state, "FAIL");
+  assert.equal(status.rollback?.attempted, false);
+  assert.equal((await readFile(fixture.pm2State.pid, "utf8")).trim(), "111");
+  assert.equal(readFixtureDatabaseValue(fixture.oauthDatabasePath), "OLD_OAUTH_DATABASE");
+  assert.equal(await readFile(fixture.authorityDatabasePath, "utf8"), "TAMPERED\n");
 });
 
 test("production upgrade worker fails closed before switching when request manifest identity is stale", async (t) => {
@@ -312,6 +333,10 @@ test("production upgrade worker rejects private readiness identity drift and pro
     timeoutMs: 250,
     runtimeIdentityOverride: { runtimeRevision: "f".repeat(40) },
   });
+  writeFixtureDatabaseValue(fixture.oauthDatabasePath, "LATEST_OAUTH_DATABASE");
+  await writeFile(fixture.expectedOauthDatabasePath, "LATEST_OAUTH_DATABASE\n", { mode: 0o600 });
+  writeFixtureDatabaseValue(fixture.authorityDatabasePath, "LATEST_AUTHORITY_DATABASE");
+  await writeFile(fixture.expectedAuthorityDatabasePath, "LATEST_AUTHORITY_DATABASE\n", { mode: 0o600 });
   await assert.rejects(
     runProductionUpgradeWorker(fixture.requestPath),
     /Private readiness identity mismatch for runtimeRevision/u,
@@ -319,7 +344,13 @@ test("production upgrade worker rejects private readiness identity drift and pro
   const status = JSON.parse(await readFile(fixture.statusPath, "utf8")) as {
     state: string;
     failure?: { code?: string; phase?: string };
-    rollback?: { restored?: boolean; verified?: boolean; outcome?: string };
+    rollback?: {
+      restored?: boolean;
+      verified?: boolean;
+      outcome?: string;
+      oauthDatabase?: { restored?: boolean; restoredSha256?: string };
+      authorityDatabase?: { restored?: boolean; restoredSha256?: string };
+    };
   };
   assert.equal(status.state, "FAIL");
   assert.equal(status.failure?.code, "RUNTIME_IDENTITY_MISMATCH");
@@ -327,7 +358,17 @@ test("production upgrade worker rejects private readiness identity drift and pro
   assert.equal(status.rollback?.restored, true);
   assert.equal(status.rollback?.verified, true);
   assert.equal(status.rollback?.outcome, "RESTORED_PREVIOUS_RUNTIME");
+  assert.equal(status.rollback?.oauthDatabase?.restored, true);
+  assert.match(status.rollback?.oauthDatabase?.restoredSha256 ?? "", /^sha256:[a-f0-9]{64}$/u);
+  assert.equal(status.rollback?.authorityDatabase?.restored, true);
+  assert.match(status.rollback?.authorityDatabase?.restoredSha256 ?? "", /^sha256:[a-f0-9]{64}$/u);
   assert.equal(await readFile(fixture.productionEnvPath, "utf8"), "OLD_ENV=1\n");
+  assert.equal(readFixtureDatabaseValue(fixture.oauthDatabasePath), "LATEST_OAUTH_DATABASE");
+  assert.equal(readFixtureDatabaseValue(fixture.authorityDatabasePath), "LATEST_AUTHORITY_DATABASE");
+  await assert.rejects(stat(`${fixture.oauthDatabasePath}-wal`), /ENOENT/u);
+  await assert.rejects(stat(`${fixture.oauthDatabasePath}-shm`), /ENOENT/u);
+  await assert.rejects(stat(`${fixture.authorityDatabasePath}-wal`), /ENOENT/u);
+  await assert.rejects(stat(`${fixture.authorityDatabasePath}-shm`), /ENOENT/u);
   assert.equal((await readFile(fixture.pm2State.cwd, "utf8")).trim(), fixture.previousRelease);
 });
 
@@ -346,6 +387,8 @@ test("production upgrade worker rolls back env, process, start path, and audit l
   assert.equal(status.rollback?.outcome, "RESTORED_PREVIOUS_RUNTIME");
   assert.equal(status.rollback?.healthStatus, 200);
   assert.equal(await readFile(fixture.productionEnvPath, "utf8"), "OLD_ENV=1\n");
+  assert.equal(readFixtureDatabaseValue(fixture.oauthDatabasePath), "OLD_OAUTH_DATABASE");
+  assert.equal(readFixtureDatabaseValue(fixture.authorityDatabasePath), "OLD_AUTHORITY_DATABASE");
   assert.equal(await readFile(fixture.startScriptPath, "utf8"), "#!/bin/bash\nexec old\n");
   assert.equal(await readlink(fixture.currentAuditLink), fixture.previousAudit);
   assert.equal((await readFile(fixture.pm2State.cwd, "utf8")).trim(), fixture.previousRelease);
@@ -379,6 +422,8 @@ test("production upgrade worker records UNKNOWN when rollback cannot establish t
   assert.equal(status.rollback?.outcome, "RESTORATION_UNVERIFIED");
   assert.equal(status.rollback?.failure?.code, "ROLLBACK_FAILED");
   assert.equal(typeof status.rollback?.error, "string");
+  assert.equal(readFixtureDatabaseValue(fixture.oauthDatabasePath), "OLD_OAUTH_DATABASE");
+  assert.equal(readFixtureDatabaseValue(fixture.authorityDatabasePath), "OLD_AUTHORITY_DATABASE");
 });
 
 interface FixtureRuntimeIdentity {
@@ -496,11 +541,21 @@ async function createFixture(t: TestContext, options: FixtureOptions) {
 
   const productionEnvPath = join(root, "production.env");
   const productionEnvBackupPath = join(auditDirectory, "production.env.before");
+  const oauthDatabasePath = join(root, "oauth.sqlite");
+  const oauthDatabaseBackupPath = join(auditDirectory, "oauth-cutover-before.sqlite");
+  const authorityDatabasePath = join(root, "authority.sqlite");
+  const authorityDatabaseBackupPath = join(auditDirectory, "authority-cutover-before.sqlite");
+  const expectedOauthDatabasePath = join(root, "expected-oauth.sqlite");
+  const expectedAuthorityDatabasePath = join(root, "expected-authority.sqlite");
   const nextEnvPath = join(auditDirectory, "production.env.next");
   const startScriptPath = join(root, "canonical-start.sh");
   const startScriptBackupPath = join(auditDirectory, "canonical-start.before");
   await writeFile(productionEnvPath, "OLD_ENV=1\n", { mode: 0o600 });
   await writeFile(productionEnvBackupPath, "OLD_ENV=1\n", { mode: 0o600 });
+  createFixtureDatabase(oauthDatabasePath, "OLD_OAUTH_DATABASE");
+  createFixtureDatabase(authorityDatabasePath, "OLD_AUTHORITY_DATABASE");
+  await writeFile(expectedOauthDatabasePath, "OLD_OAUTH_DATABASE\n", { mode: 0o600 });
+  await writeFile(expectedAuthorityDatabasePath, "OLD_AUTHORITY_DATABASE\n", { mode: 0o600 });
   const nextEnvContent = [
     "NEXT_ENV=1",
     "DEVSPACE_NEXT_MANAGEMENT_HOST=127.0.0.1",
@@ -538,15 +593,20 @@ async function createFixture(t: TestContext, options: FixtureOptions) {
     `cwd_file=${shellQuote(pm2State.cwd)}`,
     `script_file=${shellQuote(pm2State.script)}`,
     `status_file=${shellQuote(statusPath)}`,
+    `oauth_database=${shellQuote(oauthDatabasePath)}`,
+    `authority_database=${shellQuote(authorityDatabasePath)}`,
+    `expected_oauth_database=${shellQuote(expectedOauthDatabasePath)}`,
+    `expected_authority_database=${shellQuote(expectedAuthorityDatabasePath)}`,
     "case \"$1\" in",
     "  jlist)",
     "    pid=$(cat \"$pid_file\")",
+    "    if [ \"$pid\" = 0 ]; then printf '[]\\n'; exit 0; fi",
     "    cwd=$(cat \"$cwd_file\")",
     "    script=$(cat \"$script_file\")",
     "    printf '[{\"name\":\"devspace-v2-production\",\"pid\":%s,\"pm2_env\":{\"status\":\"online\",\"pm_cwd\":\"%s\",\"pm_exec_path\":\"%s\"}}]\\n' \"$pid\" \"$cwd\" \"$script\"",
     "    ;;",
     "  delete)",
-    "    grep -q '\"state\": \"ACCEPTED\"' \"$status_file\" || exit 65",
+    "    printf '0\\n' > \"$pid_file\"",
     "    ;;",
     "  start)",
     "    script=$2",
@@ -555,9 +615,19 @@ async function createFixture(t: TestContext, options: FixtureOptions) {
     "    while [ $# -gt 0 ]; do",
     "      if [ \"$1\" = \"--cwd\" ]; then cwd=$2; shift 2; else shift; fi",
     "    done",
-    options.rollbackFails
-      ? `    if [ \"$script\" = ${shellQuote(nextScript)} ]; then printf '222\\n' > \"$pid_file\"; else exit 70; fi`
-      : `    if [ \"$script\" = ${shellQuote(nextScript)} ]; then printf '222\\n' > \"$pid_file\"; else printf '333\\n' > \"$pid_file\"; fi`,
+    `    if [ "$script" = ${shellQuote(nextScript)} ]; then`,
+    "      sqlite3 \"$oauth_database\" \"update sentinel set value='CANDIDATE_OAUTH_DATABASE';\"",
+    "      sqlite3 \"$authority_database\" \"update sentinel set value='CANDIDATE_AUTHORITY_DATABASE';\"",
+    "      printf 'stale\\n' > \"${oauth_database}-wal\"",
+    "      printf 'stale\\n' > \"${oauth_database}-shm\"",
+    "      printf 'stale\\n' > \"${authority_database}-wal\"",
+    "      printf 'stale\\n' > \"${authority_database}-shm\"",
+    "      printf '222\\n' > \"$pid_file\"",
+    "    else",
+    "      [ \"$(sqlite3 \"$oauth_database\" 'select value from sentinel;')\" = \"$(cat \"$expected_oauth_database\")\" ] || exit 71",
+    "      [ \"$(sqlite3 \"$authority_database\" 'select value from sentinel;')\" = \"$(cat \"$expected_authority_database\")\" ] || exit 72",
+    options.rollbackFails ? "      exit 70" : "      printf '333\\n' > \"$pid_file\"",
+    "    fi",
     "    printf '%s\\n' \"$cwd\" > \"$cwd_file\"",
     "    printf '%s\\n' \"$script\" > \"$script_file\"",
     "    ;;",
@@ -597,7 +667,7 @@ async function createFixture(t: TestContext, options: FixtureOptions) {
   const port = (server.address() as AddressInfo).port;
   const transactionId = "upgrade_11111111-1111-4111-8111-111111111111";
   const request: ProductionUpgradeRequest = {
-    version: 1,
+    version: 3,
     transactionId,
     requestedAt: new Date().toISOString(),
     delayMs: 1,
@@ -629,6 +699,10 @@ async function createFixture(t: TestContext, options: FixtureOptions) {
     },
     productionEnvPath,
     productionEnvBackupPath,
+    oauthDatabasePath,
+    oauthDatabaseBackupPath,
+    authorityDatabasePath,
+    authorityDatabaseBackupPath,
     nextEnvPath,
     startScriptPath,
     startScriptBackupPath,
@@ -648,6 +722,12 @@ async function createFixture(t: TestContext, options: FixtureOptions) {
     requestPath,
     statusPath,
     productionEnvPath,
+    oauthDatabasePath,
+    oauthDatabaseBackupPath,
+    authorityDatabasePath,
+    authorityDatabaseBackupPath,
+    expectedOauthDatabasePath,
+    expectedAuthorityDatabasePath,
     startScriptPath,
     currentAuditLink,
     auditDirectory,
@@ -678,6 +758,34 @@ async function listen(server: Server): Promise<void> {
 async function close(server: Server): Promise<void> {
   if (!server.listening) return;
   await new Promise<void>((resolvePromise) => server.close(() => resolvePromise()));
+}
+
+function createFixtureDatabase(path: string, value: string): void {
+  const database = new Database(path);
+  try {
+    database.exec("create table sentinel (value text not null)");
+    database.prepare("insert into sentinel (value) values (?)").run(value);
+  } finally {
+    database.close();
+  }
+}
+
+function writeFixtureDatabaseValue(path: string, value: string): void {
+  const database = new Database(path);
+  try {
+    database.prepare("update sentinel set value = ?").run(value);
+  } finally {
+    database.close();
+  }
+}
+
+function readFixtureDatabaseValue(path: string): string {
+  const database = new Database(path, { readonly: true });
+  try {
+    return database.prepare("select value from sentinel").pluck().get() as string;
+  } finally {
+    database.close();
+  }
 }
 
 function shellQuote(value: string): string {

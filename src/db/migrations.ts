@@ -9,6 +9,9 @@ interface Migration {
   up(sqlite: Database.Database): void;
 }
 
+const OAUTH_CONNECTOR_MIGRATION_VERSION = 6;
+const OAUTH_CONNECTOR_MIGRATION_NAME = "oauth-token-families-and-connector-bindings";
+
 const migrations: Migration[] = [
   {
     version: 1,
@@ -31,8 +34,8 @@ const migrations: Migration[] = [
     up: migrateWorkspaceConversationBindings,
   },
   {
-    version: 5,
-    name: "oauth-token-families-and-connector-bindings",
+    version: OAUTH_CONNECTOR_MIGRATION_VERSION,
+    name: OAUTH_CONNECTOR_MIGRATION_NAME,
     up: migrateOAuthTokenFamiliesAndConnectorBindings,
   },
 ];
@@ -48,19 +51,33 @@ export function migrateDatabase(sqlite: Database.Database): void {
       );
     `);
 
-    const applied = new Set(
-      (
-        sqlite.prepare("select version from devspace_schema_migrations").all() as Array<{
-          version: number;
-        }>
-      ).map((row) => row.version),
-    );
+    const appliedRows = sqlite.prepare(
+      "select version, name from devspace_schema_migrations",
+    ).all() as Array<{ version: number; name: string }>;
+    const appliedByVersion = new Map(appliedRows.map((row) => [row.version, row.name]));
+    const appliedNames = new Set(appliedRows.map((row) => row.name));
     const recordMigration = sqlite.prepare(
       "insert into devspace_schema_migrations (version, name, applied_at) values (?, ?, ?)",
     );
 
     for (const migration of migrations) {
-      if (applied.has(migration.version)) continue;
+      const appliedName = appliedByVersion.get(migration.version);
+      if (appliedName !== undefined && appliedName !== migration.name) {
+        throw new Error(
+          `Database migration version ${migration.version} is already assigned to ${appliedName}; expected ${migration.name}.`,
+        );
+      }
+      if (appliedName === migration.name || appliedNames.has(migration.name)) {
+        if (
+          migration.name === OAUTH_CONNECTOR_MIGRATION_NAME
+          && !hasCompleteOAuthConnectorSchema(sqlite)
+        ) {
+          throw new Error(
+            `Database migration ${OAUTH_CONNECTOR_MIGRATION_NAME} is recorded but its schema is incomplete.`,
+          );
+        }
+        continue;
+      }
       migration.up(sqlite);
       recordMigration.run(migration.version, migration.name, new Date().toISOString());
     }
@@ -74,11 +91,20 @@ function preservePendingOAuthMigrationPreimage(sqlite: Database.Database): void 
     "select 1 as present from sqlite_master where type = 'table' and name = 'devspace_schema_migrations'",
   ).get() as { present: number } | undefined;
   if (!migrationTable) return;
-  const versions = new Set((sqlite.prepare("select version from devspace_schema_migrations").all() as Array<{ version: number }>).map((row) => row.version));
-  if (!versions.has(2) || versions.has(5) || sqlite.name === ":memory:") return;
+  const appliedRows = sqlite.prepare(
+    "select version, name from devspace_schema_migrations",
+  ).all() as Array<{ version: number; name: string }>;
+  const versions = new Set(appliedRows.map((row) => row.version));
+  const names = new Set(appliedRows.map((row) => row.name));
+  if (
+    !versions.has(2)
+    || ((versions.has(OAUTH_CONNECTOR_MIGRATION_VERSION) || names.has(OAUTH_CONNECTOR_MIGRATION_NAME))
+      && hasCompleteOAuthConnectorSchema(sqlite))
+    || sqlite.name === ":memory:"
+  ) return;
   const image = sqlite.serialize();
   const digest = createHash("sha256").update(image).digest("hex");
-  const backupPath = `${sqlite.name}.migration-v5.${digest}.sqlite`;
+  const backupPath = `${sqlite.name}.migration-v6.${digest}.sqlite`;
   const checksumPath = `${backupPath}.sha256`;
   if (!existsSync(backupPath)) writeAtomic(backupPath, image);
   if (createHash("sha256").update(readFileSync(backupPath)).digest("hex") !== digest) {
@@ -89,6 +115,37 @@ function preservePendingOAuthMigrationPreimage(sqlite: Database.Database): void 
   else if (readFileSync(checksumPath, "utf8") !== checksum) {
     throw new Error(`OAuth migration backup checksum receipt mismatch: ${checksumPath}`);
   }
+}
+
+function hasCompleteOAuthConnectorSchema(sqlite: Database.Database): boolean {
+  const requiredTables = ["oauth_connector_bindings", "oauth_token_families"];
+  const requiredIndexes = [
+    "oauth_connector_bindings_one_active_name_idx",
+    "oauth_connector_bindings_client_idx",
+    "oauth_token_families_client_idx",
+    "oauth_token_families_binding_idx",
+    "oauth_access_tokens_family_idx",
+    "oauth_refresh_tokens_family_idx",
+  ];
+  const objects = new Set(
+    (sqlite.prepare(
+      "select name from sqlite_master where type in ('table', 'index')",
+    ).pluck().all() as string[]),
+  );
+  if ([...requiredTables, ...requiredIndexes].some((name) => !objects.has(name))) return false;
+  const requiredColumns = [
+    "family_id",
+    "connector_binding_id",
+    "connector_drain_epoch",
+    "installation_epoch",
+    "rotation_sequence",
+  ];
+  return ["oauth_access_tokens", "oauth_refresh_tokens"].every((table) => {
+    const columns = new Set(
+      (sqlite.prepare(`pragma table_info(${table})`).all() as Array<{ name: string }>).map((row) => row.name),
+    );
+    return requiredColumns.every((column) => columns.has(column));
+  });
 }
 
 function writeAtomic(path: string, value: Buffer): void {

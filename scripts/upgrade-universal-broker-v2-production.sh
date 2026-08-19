@@ -67,7 +67,7 @@ CANONICAL_START="$(python3 -c 'import os,sys; print(os.path.abspath(os.path.expa
 IDENTITY_DIRECTORY="$(python3 -c 'import os,sys; print(os.path.abspath(os.path.expanduser(sys.argv[1])))' "$IDENTITY_DIRECTORY")"
 CURRENT_AUDIT_LINK="${DEPLOYMENT_ROOT}/current"
 
-for command in git node npm pm2 curl python3; do
+for command in git node npm pm2 curl python3 sqlite3; do
   command -v "$command" >/dev/null 2>&1 || { echo "Required command is missing: $command" >&2; exit 1; }
 done
 ACTIVE_TRANSACTION_STATUS="$(
@@ -318,6 +318,11 @@ PRODUCTION_OAUTH_DATABASE="$PRODUCTION_OAUTH_STATE_DIR/devspace.sqlite"
   echo "Production OAuth database is missing: $PRODUCTION_OAUTH_DATABASE" >&2
   exit 1
 }
+PRODUCTION_AUTHORITY_DATABASE="$PRODUCTION_STATE_DIR/authority.sqlite"
+[[ -f "$PRODUCTION_AUTHORITY_DATABASE" ]] || {
+  echo "Production authority database is missing: $PRODUCTION_AUTHORITY_DATABASE" >&2
+  exit 1
+}
 PREVIOUS_AUDIT_TARGET=""
 if [[ -L "$CURRENT_AUDIT_LINK" ]]; then
   PREVIOUS_AUDIT_TARGET="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$CURRENT_AUDIT_LINK")"
@@ -523,17 +528,40 @@ for item in items:
 json.dump(out,sys.stdout,indent=2);sys.stdout.write("\n")' > "$AUDIT_DIR/pm2-before.json"
 tailscale funnel status > "$AUDIT_DIR/funnel-before.txt" 2>&1 || true
 chmod 600 "$AUDIT_DIR/pm2-before.json" "$AUDIT_DIR/funnel-before.txt"
-if command -v sqlite3 >/dev/null 2>&1; then
-  sqlite3 "$PRODUCTION_OAUTH_DATABASE" ".backup '$AUDIT_DIR/oauth-before.sqlite'"
-else
-  cp -p "$PRODUCTION_OAUTH_DATABASE" "$AUDIT_DIR/oauth-before.sqlite"
-fi
-chmod 600 "$AUDIT_DIR/oauth-before.sqlite"
+for database in "$PRODUCTION_OAUTH_DATABASE" "$PRODUCTION_AUTHORITY_DATABASE"; do
+  [[ "$(sqlite3 "$database" 'pragma integrity_check;')" == ok ]] || {
+    echo "Production database integrity check failed: $database" >&2
+    exit 1
+  }
+  [[ -z "$(sqlite3 "$database" 'pragma foreign_key_check;')" ]] || {
+    echo "Production database foreign-key check failed: $database" >&2
+    exit 1
+  }
+done
+OAUTH_PREFLIGHT_BACKUP="$AUDIT_DIR/oauth-preflight-before.sqlite"
+AUTHORITY_PREFLIGHT_BACKUP="$AUDIT_DIR/authority-preflight-before.sqlite"
+OAUTH_CUTOVER_BACKUP="$AUDIT_DIR/oauth-cutover-before.sqlite"
+AUTHORITY_CUTOVER_BACKUP="$AUDIT_DIR/authority-cutover-before.sqlite"
+sqlite3 "$PRODUCTION_OAUTH_DATABASE" ".backup '$OAUTH_PREFLIGHT_BACKUP'"
+sqlite3 "$PRODUCTION_AUTHORITY_DATABASE" ".backup '$AUTHORITY_PREFLIGHT_BACKUP'"
+chmod 600 "$OAUTH_PREFLIGHT_BACKUP" "$AUTHORITY_PREFLIGHT_BACKUP"
+for database in "$OAUTH_PREFLIGHT_BACKUP" "$AUTHORITY_PREFLIGHT_BACKUP"; do
+  [[ "$(sqlite3 "$database" 'pragma integrity_check;')" == ok ]] || {
+    echo "Production database backup integrity check failed: $database" >&2
+    exit 1
+  }
+  [[ -z "$(sqlite3 "$database" 'pragma foreign_key_check;')" ]] || {
+    echo "Production database backup foreign-key check failed: $database" >&2
+    exit 1
+  }
+done
 
 python3 - \
   "$REQUEST_PATH" "$STATUS_PATH" "$TRANSACTION_ID" "$REQUESTED_AT" \
   "$PROCESS_NAME" "$PM2_EXECUTABLE" "$GIT_EXECUTABLE" "$PREVIOUS_PID" "$PREVIOUS_CWD" "$PREVIOUS_SCRIPT" "$PREVIOUS_AUDIT_TARGET" \
   "$HEAD" "$SOURCE_TREE" "$DIST_FILES" "$DIST_SHA256" "$RELEASE" "$NEW_SCRIPT" "$PRODUCTION_ENV" "$ENV_BACKUP" "$NEXT_ENV" \
+  "$PRODUCTION_OAUTH_DATABASE" "$OAUTH_CUTOVER_BACKUP" \
+  "$PRODUCTION_AUTHORITY_DATABASE" "$AUTHORITY_CUTOVER_BACKUP" \
   "$BUILD_MANIFEST" "$MANIFEST_BUILD_DIGEST" "$MANIFEST_RUNTIME_REVISION" "$MANIFEST_SCHEMA_GENERATION" "$MANIFEST_AUTHORITY_GENERATION" "$MANIFEST_CONFIG_SCHEMA_IDENTITY" \
   "$CANONICAL_START" "$START_BACKUP" "$AUDIT_DIR" "$CURRENT_AUDIT_LINK" "$WORKER_LOG" \
   "http://127.0.0.1:${PRODUCTION_PORT}/healthz" "${PUBLIC_BASE_URL}/healthz" \
@@ -544,12 +572,13 @@ import json,os,sys,tempfile
   request_path,status_path,transaction_id,requested_at,
   process_name,pm2_executable,git_executable,previous_pid,previous_cwd,previous_script,previous_audit_target,
   head,source_tree,dist_files,dist_sha256,release,new_script,production_env,env_backup,next_env,
+  oauth_database,oauth_backup,authority_database,authority_backup,
   build_manifest,manifest_build_digest,manifest_runtime_revision,manifest_schema_generation,manifest_authority_generation,manifest_config_schema_identity,
   canonical_start,start_backup,audit_dir,current_audit_link,worker_log,
   local_health,public_health,public_metrics,public_mcp,oauth_metadata,live_evidence,
 )=sys.argv[1:]
 request={
-  "version":1,
+  "version":3,
   "transactionId":transaction_id,
   "requestedAt":requested_at,
   "delayMs":2000,
@@ -580,6 +609,10 @@ request={
   },
   "productionEnvPath":production_env,
   "productionEnvBackupPath":env_backup,
+  "oauthDatabasePath":oauth_database,
+  "oauthDatabaseBackupPath":oauth_backup,
+  "authorityDatabasePath":authority_database,
+  "authorityDatabaseBackupPath":authority_backup,
   "nextEnvPath":next_env,
   "startScriptPath":canonical_start,
   "startScriptBackupPath":start_backup,

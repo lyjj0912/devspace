@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { InvalidGrantError, InvalidTokenError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
 import type { OAuthClientInformationFull } from "@modelcontextprotocol/sdk/shared/auth.js";
+import Database from "better-sqlite3";
 import { databasePath, openDatabase } from "./db/client.js";
 import { SingleUserOAuthProvider } from "./oauth-provider.js";
 import { SqliteOAuthClientsStore, SqliteOAuthStore } from "./oauth-store.js";
@@ -23,6 +24,8 @@ const redirectUri = "https://chatgpt.com/connector_platform_oauth_redirect";
 try {
   await testDatabaseConfiguration(join(root, "database-configuration"));
   await testOAuthMigrationPreimageBackup(join(root, "migration-backup"));
+  await testOAuthMigrationVersionCollisionFailsClosed(join(root, "migration-collision"));
+  await testLegacyOAuthMigrationMarkerCompatibility(join(root, "legacy-migration-marker"));
   testPersistenceAndTokenHashing(join(root, "persistence"));
   testExpiredTokenCleanup(join(root, "expiration"));
   testTransactionalTokenRotation(join(root, "rotation"));
@@ -36,6 +39,33 @@ console.log("OAuth store/provider tests: PASS");
 
 async function testOAuthMigrationPreimageBackup(stateDir: string): Promise<void> {
   const initial = openDatabase(stateDir);
+  initial.sqlite.exec(`
+    delete from devspace_schema_migrations where version = 6;
+    drop table oauth_token_families;
+    drop table oauth_connector_bindings;
+    drop table oauth_access_tokens;
+    drop table oauth_refresh_tokens;
+    create table oauth_access_tokens (
+      token_hash text primary key,
+      client_id text not null,
+      scopes_json text not null,
+      expires_at integer not null,
+      resource text,
+      foreign key (client_id) references oauth_clients(client_id) on delete cascade
+    );
+    create table oauth_refresh_tokens (
+      token_hash text primary key,
+      client_id text not null,
+      scopes_json text not null,
+      expires_at integer not null,
+      resource text,
+      foreign key (client_id) references oauth_clients(client_id) on delete cascade
+    );
+    create index oauth_access_tokens_client_id_idx on oauth_access_tokens(client_id);
+    create index oauth_access_tokens_expires_at_idx on oauth_access_tokens(expires_at);
+    create index oauth_refresh_tokens_client_id_idx on oauth_refresh_tokens(client_id);
+    create index oauth_refresh_tokens_expires_at_idx on oauth_refresh_tokens(expires_at);
+  `);
   const legacyClient = {
     client_id: "legacy-client",
     client_id_issued_at: 1,
@@ -51,7 +81,9 @@ async function testOAuthMigrationPreimageBackup(stateDir: string): Promise<void>
   initial.sqlite.prepare(
     "insert into oauth_refresh_tokens (token_hash, client_id, scopes_json, expires_at) values (?, ?, ?, ?)",
   ).run("legacy-refresh", legacyClient.client_id, JSON.stringify(["devspace"]), expiresAt);
-  initial.sqlite.prepare("delete from devspace_schema_migrations where version = 5").run();
+  initial.sqlite.prepare(
+    "insert into devspace_schema_migrations (version, name, applied_at) values (5, 'external-communications', ?)",
+  ).run(new Date().toISOString());
   initial.close();
   const migrated = openDatabase(stateDir);
   const migratedAccess = migrated.sqlite.prepare(
@@ -64,13 +96,77 @@ async function testOAuthMigrationPreimageBackup(stateDir: string): Promise<void>
   assert.equal(migratedRefresh.family_id, migratedAccess.family_id);
   assert.equal(migratedAccess.rotation_sequence, 0);
   assert.equal(migratedRefresh.rotation_sequence, 0);
+  assert.deepEqual(
+    migrated.sqlite.prepare(
+      "select version, name from devspace_schema_migrations where version in (5, 6) order by version",
+    ).all(),
+    [
+      { version: 5, name: "external-communications" },
+      { version: 6, name: "oauth-token-families-and-connector-bindings" },
+    ],
+  );
   migrated.close();
   const names = await readdir(stateDir);
-  const backupName = names.find((name) => /^devspace\.sqlite\.migration-v5\.[a-f0-9]{64}\.sqlite$/u.test(name));
+  const backupName = names.find((name) => /^devspace\.sqlite\.migration-v6\.[a-f0-9]{64}\.sqlite$/u.test(name));
   assert.ok(backupName, "pending OAuth migration must retain a byte-exact SQLite preimage");
   const checksum = (await readFile(join(stateDir, `${backupName}.sha256`), "utf8")).trim().split(/\s+/u)[0];
   const backup = await readFile(join(stateDir, backupName));
   assert.equal(createHash("sha256").update(backup).digest("hex"), checksum);
+  const backupDatabase = new Database(join(stateDir, backupName), { readonly: true });
+  try {
+    assert.equal(
+      backupDatabase.prepare(
+        "select count(*) from devspace_schema_migrations where version = 5 and name = 'external-communications'",
+      ).pluck().get(),
+      1,
+    );
+    assert.equal(
+      backupDatabase.prepare("select count(*) from devspace_schema_migrations where version = 6").pluck().get(),
+      0,
+    );
+    assert.equal(
+      backupDatabase.prepare(
+        "select count(*) from sqlite_master where type = 'table' and name = 'oauth_token_families'",
+      ).pluck().get(),
+      0,
+    );
+  } finally {
+    backupDatabase.close();
+  }
+}
+
+async function testOAuthMigrationVersionCollisionFailsClosed(stateDir: string): Promise<void> {
+  const initial = openDatabase(stateDir);
+  initial.sqlite.prepare("delete from devspace_schema_migrations where version = 6").run();
+  initial.sqlite.prepare(
+    "insert into devspace_schema_migrations (version, name, applied_at) values (6, 'unexpected-migration', ?)",
+  ).run(new Date().toISOString());
+  initial.close();
+
+  assert.throws(
+    () => openDatabase(stateDir),
+    /migration version 6 is already assigned to unexpected-migration/u,
+  );
+}
+
+async function testLegacyOAuthMigrationMarkerCompatibility(stateDir: string): Promise<void> {
+  const initial = openDatabase(stateDir);
+  initial.sqlite.prepare(
+    "update devspace_schema_migrations set version = 5 where version = 6 and name = ?",
+  ).run("oauth-token-families-and-connector-bindings");
+  initial.close();
+
+  const reopened = openDatabase(stateDir);
+  try {
+    assert.deepEqual(
+      reopened.sqlite.prepare(
+        "select version, name from devspace_schema_migrations where name = ?",
+      ).get("oauth-token-families-and-connector-bindings"),
+      { version: 5, name: "oauth-token-families-and-connector-bindings" },
+    );
+  } finally {
+    reopened.close();
+  }
 }
 
 async function testDatabaseConfiguration(stateDir: string): Promise<void> {
@@ -89,7 +185,7 @@ async function testDatabaseConfiguration(stateDir: string): Promise<void> {
       { version: 2, name: "oauth-state" },
       { version: 3, name: "local-agent-sessions" },
       { version: 4, name: "workspace-conversation-bindings" },
-      { version: 5, name: "oauth-token-families-and-connector-bindings" },
+      { version: 6, name: "oauth-token-families-and-connector-bindings" },
     ]);
   } finally {
     database.close();

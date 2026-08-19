@@ -5,6 +5,7 @@ import {
   copyFile,
   lstat,
   mkdir,
+  open,
   readdir,
   readFile,
   readlink,
@@ -15,6 +16,7 @@ import {
 } from "node:fs/promises";
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import Database from "better-sqlite3";
 
 export const PRODUCTION_UPGRADE_STATES = [
   "PREPARED",
@@ -56,7 +58,7 @@ export interface ProductionUpgradeFailure {
 }
 
 export interface ProductionUpgradeRequest {
-  version: 1;
+  version: 3;
   transactionId: string;
   requestedAt: string;
   delayMs: number;
@@ -90,6 +92,10 @@ export interface ProductionUpgradeRequest {
   };
   productionEnvPath: string;
   productionEnvBackupPath: string;
+  oauthDatabasePath: string;
+  oauthDatabaseBackupPath: string;
+  authorityDatabasePath: string;
+  authorityDatabaseBackupPath: string;
   nextEnvPath: string;
   startScriptPath: string;
   startScriptBackupPath: string;
@@ -128,6 +134,7 @@ export interface ProductionUpgradeStatus extends Record<string, unknown> {
   unauthenticatedMcpStatus?: number;
   oauthScopes?: string[];
   runtimeCommit?: string;
+  databasePreimages?: DatabasePreimages;
   runtimeSourceTree?: string;
   runtimeDist?: { files: number; sha256: string };
   manifestSha256?: string;
@@ -226,14 +233,21 @@ export async function runProductionUpgradeWorker(requestPath: string): Promise<v
   await writeStatus(request.statusPath, status);
   let phase: ProductionUpgradeFailurePhase = "PREFLIGHT";
   let switchAttempted = false;
+  let databasePreimages: DatabasePreimages | undefined;
   try {
     const manifestBinding = await verifyManifestBinding(request);
+    verifySqliteDatabase(request.oauthDatabasePath);
+    verifySqliteDatabase(request.authorityDatabasePath);
     await sleep(request.delayMs);
     phase = "SWITCHING";
     status = await transition(request, status, "SWITCHING");
     switchAttempted = true;
+    stopPm2Process(request);
+    databasePreimages = await captureCutoverDatabasePreimages(request);
+    status = { ...status, databasePreimages };
+    await writeStatus(request.statusPath, status);
     await installFile(request.nextEnvPath, request.productionEnvPath, 0o600);
-    replacePm2Process(request, request.next.script, request.next.release);
+    startPm2Process(request, request.next.script, request.next.release);
     phase = "VERIFYING";
     status = await transition(request, status, "VERIFYING");
     const evidence = await verifyNextRuntime(request, manifestBinding);
@@ -275,7 +289,7 @@ export async function runProductionUpgradeWorker(requestPath: string): Promise<v
       error: failure.message,
       failure,
     }, "ROLLING_BACK");
-    const rollback = await rollbackRuntime(request);
+    const rollback = await rollbackRuntime(request, databasePreimages);
     const terminalAt = new Date().toISOString();
     const terminalState: ProductionUpgradeState = rollback.verified === true ? "FAIL" : "UNKNOWN";
     status = {
@@ -1069,12 +1083,18 @@ function isSafeManifestFileList(value: unknown): value is string[] {
   return new Set(value).size === value.length;
 }
 
-function replacePm2Process(
+function stopPm2Process(request: ProductionUpgradeRequest): void {
+  runPm2(request, ["delete", request.pm2ProcessName], 30_000, true);
+  if (pm2Process(request)) {
+    throw new Error(`PM2 process did not stop before database cutover: ${request.pm2ProcessName}`);
+  }
+}
+
+function startPm2Process(
   request: ProductionUpgradeRequest,
   script: string,
   cwd: string,
 ): void {
-  runPm2(request, ["delete", request.pm2ProcessName], 30_000, true);
   runPm2(request, [
     "start",
     script,
@@ -1198,21 +1218,46 @@ function pm2ExecutablePath(
   return [...new Set(entries)].join(delimiter);
 }
 
-async function rollbackRuntime(request: ProductionUpgradeRequest): Promise<{
+async function rollbackRuntime(
+  request: ProductionUpgradeRequest,
+  databasePreimages: DatabasePreimages | undefined,
+): Promise<{
   attempted: true;
   restored: boolean;
   verified: boolean;
   outcome: "RESTORED_PREVIOUS_RUNTIME" | "RESTORATION_UNVERIFIED";
   healthStatus?: number;
+  oauthDatabase?: DatabaseRestoreEvidence;
+  authorityDatabase?: DatabaseRestoreEvidence;
   error?: string;
   failure?: ProductionUpgradeFailure;
 }> {
   let restored = false;
   let healthStatus: number | undefined;
+  let oauthDatabase: DatabaseRestoreEvidence | undefined;
+  let authorityDatabase: DatabaseRestoreEvidence | undefined;
   let error: string | undefined;
   try {
     await installFile(request.productionEnvBackupPath, request.productionEnvPath, 0o600);
-    replacePm2Process(request, request.previous.script, request.previous.cwd);
+    stopPm2Process(request);
+    if (databasePreimages) {
+      await preserveFailedDatabase(request.oauthDatabasePath, join(request.auditDirectory, "oauth-after-failed-switch.sqlite"));
+      await preserveFailedDatabase(
+        request.authorityDatabasePath,
+        join(request.auditDirectory, "authority-after-failed-switch.sqlite"),
+      );
+      oauthDatabase = await restoreDatabase(
+        databasePreimages.oauth.path,
+        request.oauthDatabasePath,
+        databasePreimages.oauth.sha256,
+      );
+      authorityDatabase = await restoreDatabase(
+        databasePreimages.authority.path,
+        request.authorityDatabasePath,
+        databasePreimages.authority.sha256,
+      );
+    }
+    startPm2Process(request, request.previous.script, request.previous.cwd);
     await installFile(request.startScriptBackupPath, request.startScriptPath, 0o700);
     if (request.previous.auditTarget) {
       await replaceSymlink(request.currentAuditLink, request.previous.auditTarget);
@@ -1251,9 +1296,144 @@ async function rollbackRuntime(request: ProductionUpgradeRequest): Promise<{
     verified: restored,
     outcome: restored ? "RESTORED_PREVIOUS_RUNTIME" : "RESTORATION_UNVERIFIED",
     ...(healthStatus !== undefined ? { healthStatus } : {}),
+    ...(oauthDatabase ? { oauthDatabase } : {}),
+    ...(authorityDatabase ? { authorityDatabase } : {}),
     ...(error ? { error } : {}),
     ...(failure ? { failure } : {}),
   };
+}
+
+interface DatabaseRestoreEvidence {
+  restored: true;
+  backupSha256: string;
+  restoredSha256: string;
+  staleSidecarsRemoved: true;
+}
+
+interface DatabasePreimage {
+  path: string;
+  sha256: string;
+}
+
+interface DatabasePreimages {
+  capturedAt: string;
+  oauth: DatabasePreimage;
+  authority: DatabasePreimage;
+}
+
+async function captureCutoverDatabasePreimages(
+  request: ProductionUpgradeRequest,
+): Promise<DatabasePreimages> {
+  const [oauth, authority] = await Promise.all([
+    captureCutoverDatabasePreimage(
+      request.oauthDatabasePath,
+      request.oauthDatabaseBackupPath,
+    ),
+    captureCutoverDatabasePreimage(
+      request.authorityDatabasePath,
+      request.authorityDatabaseBackupPath,
+    ),
+  ]);
+  return { capturedAt: new Date().toISOString(), oauth, authority };
+}
+
+async function captureCutoverDatabasePreimage(
+  source: string,
+  destination: string,
+): Promise<DatabasePreimage> {
+  await verifyDatabaseFile(source);
+  await Promise.all([
+    rm(destination, { force: true }),
+    rm(`${destination}-wal`, { force: true }),
+    rm(`${destination}-shm`, { force: true }),
+  ]);
+  const sqlite = new Database(source, { readonly: true, fileMustExist: true });
+  try {
+    await sqlite.backup(destination);
+  } finally {
+    sqlite.close();
+  }
+  await chmod(destination, 0o600);
+  verifySqliteDatabase(destination);
+  return { path: destination, sha256: await fileSha256(destination) };
+}
+
+async function verifyDatabaseFile(path: string): Promise<void> {
+  const metadata = await lstat(path);
+  if (!metadata.isFile() || metadata.isSymbolicLink()) {
+    throw new Error(`Database is not a regular file: ${path}`);
+  }
+}
+
+function verifySqliteDatabase(path: string): void {
+  const sqlite = new Database(path, { readonly: true, fileMustExist: true });
+  try {
+    const integrity = sqlite.pragma("integrity_check", { simple: true });
+    if (integrity !== "ok") throw new Error(`SQLite integrity check failed for ${path}: ${String(integrity)}`);
+    const foreignKeys = sqlite.pragma("foreign_key_check") as unknown[];
+    if (foreignKeys.length > 0) throw new Error(`SQLite foreign-key check failed for ${path}.`);
+  } finally {
+    sqlite.close();
+  }
+}
+
+async function preserveFailedDatabase(source: string, destination: string): Promise<void> {
+  try {
+    const metadata = await lstat(source);
+    if (!metadata.isFile() || metadata.isSymbolicLink()) return;
+    await copyFile(source, destination);
+    await chmod(destination, 0o600);
+  } catch {
+    // Recovery of the bound preimage takes priority over optional incident evidence.
+  }
+}
+
+async function restoreDatabase(
+  backup: string,
+  destination: string,
+  expectedSha256: string,
+): Promise<DatabaseRestoreEvidence> {
+  await verifyDatabaseFile(backup);
+  if (await fileSha256(backup) !== expectedSha256) {
+    throw new Error(`Database backup digest mismatch: ${backup}`);
+  }
+  const temporary = temporaryPath(destination);
+  try {
+    await copyFile(backup, temporary);
+    await chmod(temporary, 0o600);
+    const handle = await open(temporary, "r+");
+    try {
+      await handle.sync();
+    } finally {
+      await handle.close();
+    }
+    if (await fileSha256(temporary) !== expectedSha256) {
+      throw new Error(`Staged database restore digest mismatch: ${destination}`);
+    }
+    await Promise.all([
+      rm(`${destination}-wal`, { force: true }),
+      rm(`${destination}-shm`, { force: true }),
+    ]);
+    await rename(temporary, destination);
+    await chmod(destination, 0o600);
+    verifySqliteDatabase(destination);
+    const restoredSha256 = await fileSha256(destination);
+    if (restoredSha256 !== expectedSha256) {
+      throw new Error(`Restored database digest mismatch: ${destination}`);
+    }
+    return {
+      restored: true,
+      backupSha256: expectedSha256,
+      restoredSha256,
+      staleSidecarsRemoved: true,
+    };
+  } finally {
+    await rm(temporary, { force: true });
+  }
+}
+
+async function fileSha256(path: string): Promise<string> {
+  return `sha256:${createHash("sha256").update(await readFile(path)).digest("hex")}`;
 }
 
 async function installStartScript(request: ProductionUpgradeRequest): Promise<void> {
@@ -1301,7 +1481,7 @@ function runPm2(
 async function readRequest(path: string): Promise<ProductionUpgradeRequest> {
   const request = JSON.parse(await readFile(resolve(path), "utf8")) as ProductionUpgradeRequest;
   if (
-    request?.version !== 1
+    request?.version !== 3
     || !TRANSACTION_PATTERN.test(request.transactionId)
     || !request.pm2ProcessName
     || !request.pm2Executable
@@ -1338,6 +1518,10 @@ async function readRequest(path: string): Promise<ProductionUpgradeRequest> {
     request.next.manifest.path,
     request.productionEnvPath,
     request.productionEnvBackupPath,
+    request.oauthDatabasePath,
+    request.oauthDatabaseBackupPath,
+    request.authorityDatabasePath,
+    request.authorityDatabaseBackupPath,
     request.nextEnvPath,
     request.startScriptPath,
     request.startScriptBackupPath,
