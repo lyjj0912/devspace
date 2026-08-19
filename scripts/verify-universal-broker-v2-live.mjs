@@ -363,7 +363,7 @@ async function runCanaries(client, sameClientTransport, foreignClient, root, can
     target: "local",
     path: externalPath,
     content: "external-storage\n",
-    overwrite: false,
+    overwrite: true,
   });
   const externalHash = data(await call(client, "fs", {
     operation: "hash",

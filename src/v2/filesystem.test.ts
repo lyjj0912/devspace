@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
+  chmod,
   copyFile,
   lstat,
   mkdir,
@@ -270,6 +271,287 @@ test("verified EXDEV fallback never deletes the source after destination corrupt
   );
   assert.equal(await readFile(source, "utf8"), "source-must-survive\n");
   assert.equal(await readFile(destination, "utf8"), "corrupt-after-copy\n");
+});
+
+test("verified EXDEV deletion quarantines and preserves a late source replacement", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-v2-fs-exdev-source-race-test-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const source = join(root, "source.txt");
+  const original = join(root, "original.txt");
+  const destination = join(root, "destination.txt");
+  await writeFile(source, "original-source\n");
+
+  let replacementQuarantine: string | undefined;
+  await assert.rejects(
+    safeMoveFile(source, destination, {
+      overwrite: false,
+      hooks: {
+        forceCrossDevice: true,
+        beforeSourceQuarantine: async () => {
+          await rename(source, original);
+          await writeFile(source, "late-replacement\n", { flag: "wx" });
+        },
+      },
+    }),
+    (error: unknown) => {
+      assert(error instanceof UniversalBrokerError);
+      assert.equal(error.code, "PRECONDITION_FAILED");
+      assert.equal(error.evidence?.publicSourceRestored, false);
+      assert.equal(error.evidence?.quarantineIdentityMatches, false);
+      replacementQuarantine = String(error.evidence?.quarantine);
+      return true;
+    },
+  );
+  await assert.rejects(readFile(source, "utf8"), { code: "ENOENT" });
+  assert.equal(await readFile(original, "utf8"), "original-source\n");
+  assert.equal(await readFile(replacementQuarantine!, "utf8"), "late-replacement\n");
+  await assert.rejects(readFile(destination, "utf8"), { code: "ENOENT" });
+});
+
+test("hard-link move quarantines and preserves a late source replacement", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-v2-fs-link-source-race-test-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const source = join(root, "source.txt");
+  const original = join(root, "original.txt");
+  const destination = join(root, "destination.txt");
+  await writeFile(source, "original-source\n");
+
+  let replacementQuarantine: string | undefined;
+  await assert.rejects(
+    safeMoveFile(source, destination, {
+      overwrite: false,
+      hooks: {
+        beforeSourceQuarantine: async () => {
+          await rename(source, original);
+          await writeFile(source, "late-replacement\n", { flag: "wx" });
+        },
+      },
+    }),
+    (error: unknown) => {
+      assert(error instanceof UniversalBrokerError);
+      assert.equal(error.code, "PRECONDITION_FAILED");
+      assert.equal(error.evidence?.publicSourceRestored, false);
+      assert.equal(error.evidence?.quarantineIdentityMatches, false);
+      replacementQuarantine = String(error.evidence?.quarantine);
+      return true;
+    },
+  );
+  await assert.rejects(readFile(source, "utf8"), { code: "ENOENT" });
+  assert.equal(await readFile(original, "utf8"), "original-source\n");
+  assert.equal(await readFile(replacementQuarantine!, "utf8"), "late-replacement\n");
+  await assert.rejects(readFile(destination, "utf8"), { code: "ENOENT" });
+});
+
+test("unsupported hard links require explicit overwrite permission for atomic publication", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-v2-fs-no-hardlink-test-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const written = join(root, "written.txt");
+  const source = join(root, "source.txt");
+  const moved = join(root, "moved.txt");
+
+  await assert.rejects(
+    atomicWriteBuffer(written, Buffer.from("must-not-publish\n"), {
+      overwrite: false,
+      hooks: { forceHardLinkUnsupported: true },
+    }),
+    hasCode("CAPABILITY_UNAVAILABLE"),
+  );
+  await assert.rejects(readFile(written, "utf8"), { code: "ENOENT" });
+
+  const publication = await atomicWriteBuffer(written, Buffer.from("explicit-overwrite\n"), {
+    overwrite: true,
+    hooks: { forceHardLinkUnsupported: true },
+  });
+  assert.equal(await readFile(written, "utf8"), "explicit-overwrite\n");
+  assert.equal(publication.overwritten, false);
+
+  await writeFile(source, "move-fallback\n");
+  let quarantinedSource: string | undefined;
+  await assert.rejects(
+    safeMoveFile(source, moved, {
+      overwrite: false,
+      hooks: {
+        forceHardLinkUnsupported: true,
+        forceSourceRestoreHardLinkUnsupported: true,
+      },
+    }),
+    (error: unknown) => {
+      assert(error instanceof UniversalBrokerError);
+      assert.equal(error.code, "CAPABILITY_UNAVAILABLE");
+      assert.equal(error.evidence?.source, source);
+      assert.equal(error.evidence?.destination, moved);
+      assert.equal(error.evidence?.sourcePreservedAtQuarantine, true);
+      assert.equal(error.evidence?.publicSourceRestored, false);
+      assert.equal(error.evidence?.originalErrorCode, "CAPABILITY_UNAVAILABLE");
+      assert.equal(typeof error.evidence?.quarantine, "string");
+      quarantinedSource = String(error.evidence?.quarantine);
+      return true;
+    },
+  );
+  await assert.rejects(readFile(source, "utf8"), { code: "ENOENT" });
+  await assert.rejects(readFile(moved, "utf8"), { code: "ENOENT" });
+  assert.equal(await readFile(quarantinedSource!, "utf8"), "move-fallback\n");
+
+  await writeFile(source, "move-fallback\n");
+  const movement = await safeMoveFile(source, moved, {
+    overwrite: true,
+    hooks: { forceHardLinkUnsupported: true },
+  });
+  assert.equal(await readFile(moved, "utf8"), "move-fallback\n");
+  await assert.rejects(readFile(source, "utf8"), { code: "ENOENT" });
+  assert.equal(movement.crossDevice, false);
+});
+
+test("move recovery reports a post-quarantine verification failure", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-v2-fs-quarantine-verify-test-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const source = join(root, "source.txt");
+  const destination = join(root, "destination.txt");
+  await writeFile(source, "verified-source\n");
+
+  let quarantine: string | undefined;
+  await assert.rejects(
+    safeMoveFile(source, destination, {
+      overwrite: false,
+      hooks: {
+        beforeSourceQuarantine: async () => {
+          await chmod(source, 0o000);
+        },
+      },
+    }),
+    (error: unknown) => {
+      assert(error instanceof UniversalBrokerError);
+      assert.equal(error.code, "PRECONDITION_FAILED");
+      assert.equal(typeof error.evidence?.quarantine, "string");
+      assert.equal(error.evidence?.publicSourceRestored, false);
+      assert.equal(error.evidence?.quarantineRetained, true);
+      quarantine = String(error.evidence?.quarantine);
+      return true;
+    },
+  );
+  await assert.rejects(readFile(source, "utf8"), { code: "ENOENT" });
+  await chmod(quarantine!, 0o600);
+  assert.equal(await readFile(quarantine!, "utf8"), "verified-source\n");
+  await assert.rejects(readFile(destination, "utf8"), { code: "ENOENT" });
+});
+
+test("move recovery never claims a replaced quarantine is the verified source", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-v2-fs-quarantine-race-test-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const source = join(root, "source.txt");
+  const original = join(root, "original.txt");
+  const destination = join(root, "destination.txt");
+  await writeFile(source, "verified-source\n");
+
+  await assert.rejects(
+    safeMoveFile(source, destination, {
+      overwrite: false,
+      hooks: {
+        beforeDestinationRevalidation: async ({ temporary }) => {
+          await rename(temporary, original);
+          await writeFile(temporary, "quarantine-racer\n", { flag: "wx" });
+        },
+      },
+    }),
+    (error: unknown) => {
+      assert(error instanceof UniversalBrokerError);
+      assert.equal(error.code, "PRECONDITION_FAILED");
+      assert.equal(error.evidence?.sourcePreservedAtQuarantine, false);
+      assert.equal(error.evidence?.quarantineIdentityMatches, false);
+      assert.equal(error.evidence?.publicSourceRestored, false);
+      return true;
+    },
+  );
+  assert.equal(await readFile(original, "utf8"), "verified-source\n");
+  await assert.rejects(readFile(destination, "utf8"), { code: "ENOENT" });
+});
+
+test("move recovery retains the verified quarantine after restoring the public source", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-v2-fs-quarantine-cleanup-test-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const source = join(root, "source.txt");
+  const destination = join(root, "destination.txt");
+  await writeFile(source, "verified-source\n");
+
+  let quarantine: string | undefined;
+  await assert.rejects(
+    safeMoveFile(source, destination, {
+      overwrite: false,
+      hooks: {
+        forceHardLinkUnsupported: true,
+      },
+    }),
+    (error: unknown) => {
+      assert(error instanceof UniversalBrokerError);
+      assert.equal(error.code, "CAPABILITY_UNAVAILABLE");
+      assert.equal(error.evidence?.publicSourceRestored, true);
+      assert.equal(error.evidence?.publicSourceIdentityMatches, true);
+      assert.equal(error.evidence?.quarantineRetained, true);
+      assert.equal(error.evidence?.quarantineIdentityMatches, true);
+      quarantine = String(error.evidence?.quarantine);
+      return true;
+    },
+  );
+  assert.equal(await readFile(source, "utf8"), "verified-source\n");
+  assert.equal(await readFile(quarantine!, "utf8"), "verified-source\n");
+  await assert.rejects(readFile(destination, "utf8"), { code: "ENOENT" });
+});
+
+test("same-filesystem move rejects a byte-identical quarantine inode swap", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-v2-fs-quarantine-inode-test-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const source = join(root, "source.txt");
+  const savedOriginal = join(root, "saved-original.txt");
+  const destination = join(root, "destination.txt");
+  const content = "byte-identical-source\n";
+  await writeFile(source, content);
+  const originalIdentity = await lstat(source);
+
+  await assert.rejects(
+    safeMoveFile(source, destination, {
+      overwrite: false,
+      hooks: {
+        afterMoveSourceRevalidation: async ({ quarantine }) => {
+          await rename(quarantine, savedOriginal);
+          await writeFile(quarantine, content, { flag: "wx", mode: originalIdentity.mode & 0o7777 });
+        },
+      },
+    }),
+    hasCode("PRECONDITION_FAILED"),
+  );
+  const destinationIdentity = await lstat(destination);
+  assert.notEqual(destinationIdentity.ino, originalIdentity.ino);
+  assert.equal(await readFile(destination, "utf8"), content);
+  assert.equal(await readFile(savedOriginal, "utf8"), content);
+});
+
+test("EXDEV move rejects a byte-identical published destination inode swap", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-v2-fs-exdev-inode-test-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const source = join(root, "source.txt");
+  const replacedDestination = join(root, "replaced-destination.txt");
+  const destination = join(root, "destination.txt");
+  const content = "byte-identical-source\n";
+  await writeFile(source, content);
+
+  await assert.rejects(
+    safeMoveFile(source, destination, {
+      overwrite: false,
+      hooks: {
+        forceCrossDevice: true,
+        afterCrossDevicePublication: async () => {
+          await rename(destination, replacedDestination);
+          await writeFile(destination, content, { flag: "wx", mode: 0o777 });
+          await chmod(destination, 0o777);
+        },
+      },
+    }),
+    hasCode("PRECONDITION_FAILED"),
+  );
+  assert.equal(await readFile(source, "utf8"), content);
+  assert.equal(await readFile(destination, "utf8"), content);
+  assert.equal((await lstat(destination)).mode & 0o7777, 0o777);
+  assert.equal(await readFile(replacedDestination, "utf8"), content);
 });
 
 test("remote POSIX fs uses framed helper execution and SFTP atomic publication", async (t) => {

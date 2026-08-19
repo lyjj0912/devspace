@@ -41,7 +41,17 @@ export interface AtomicPublicationHooks {
     source: string;
     destination: string;
   }) => void | Promise<void>;
+  beforeSourceQuarantine?: (input: {
+    source: string;
+    destination: string;
+  }) => void | Promise<void>;
+  afterMoveSourceRevalidation?: (input: {
+    quarantine: string;
+    destination: string;
+  }) => void | Promise<void>;
   forceCrossDevice?: boolean;
+  forceHardLinkUnsupported?: boolean;
+  forceSourceRestoreHardLinkUnsupported?: boolean;
 }
 
 export interface AtomicPublishOptions {
@@ -180,65 +190,168 @@ export async function safeMoveFile(
   }
   const destinationPreimage = await captureFilesystemPreimage(destination);
   validateDestinationPreimage(destination, destinationPreimage, options);
-
+  const quarantine = join(
+    dirname(source),
+    `.devspace-v2-move-${basename(source)}-${randomUUID()}.tmp`,
+  );
   try {
-    if (options.hooks?.forceCrossDevice) throw nodeError("EXDEV", "forced EXDEV");
-    await options.hooks?.beforeDestinationRevalidation?.({
+    await quarantineVerifiedMoveSource(
+      source,
       destination,
-      temporary: source,
-    });
-    await assertDestinationUnchanged(destination, destinationPreimage);
-    if (!destinationPreimage.exists) {
-      await link(source, destination);
-      await unlink(source);
-    } else {
-      await rename(source, destination);
-    }
-    await syncDirectory(dirname(destination));
-    const published = await verifyPublishedFile(
-      destination,
-      sourcePreimage.sha256,
-      sourcePreimage.size!,
+      quarantine,
+      sourcePreimage,
+      options.hooks,
     );
-    return {
-      ...published,
-      overwritten: destinationPreimage.exists,
-      preimage: destinationPreimage,
-      crossDevice: false,
-    };
-  } catch (error) {
-    if (!isNodeError(error, "EXDEV")) throw error;
-  }
+    try {
+      let removeQuarantineAfterVerification = false;
+      if (options.hooks?.forceCrossDevice) throw nodeError("EXDEV", "forced EXDEV");
+      await options.hooks?.beforeDestinationRevalidation?.({
+        destination,
+        temporary: quarantine,
+      });
+      await assertMoveSourceUnchanged(quarantine, sourcePreimage);
+      await assertDestinationUnchanged(destination, destinationPreimage);
+      await options.hooks?.afterMoveSourceRevalidation?.({ quarantine, destination });
+      if (!destinationPreimage.exists) {
+        let sourceMoved = false;
+        try {
+          if (options.hooks?.forceHardLinkUnsupported) {
+            throw nodeError("ENOTSUP", "forced unsupported hard link");
+          }
+          await link(quarantine, destination);
+        } catch (error) {
+          if (isNodeError(error, "EXDEV")) throw error;
+          if (!isHardLinkUnsupported(error)) throw error;
+          if (!options.overwrite) throw noReplaceCapabilityUnavailable(destination, error);
+          await rename(quarantine, destination);
+          sourceMoved = true;
+        }
+        removeQuarantineAfterVerification = !sourceMoved;
+      } else {
+        await rename(quarantine, destination);
+      }
+      await syncDirectory(dirname(destination));
+      const published = await verifyPublishedFile(
+        destination,
+        sourcePreimage.sha256,
+        sourcePreimage.size!,
+      );
+      const publishedIdentity = await captureFilesystemPreimage(destination);
+      if (!filesystemMoveSourceIdentitiesEqual(sourcePreimage, publishedIdentity)) {
+        throw new UniversalBrokerError(
+          "PRECONDITION_FAILED",
+          "Move destination identity does not match the verified source.",
+          {
+            evidence: {
+              source,
+              destination,
+              quarantine,
+              expectedDevice: sourcePreimage.device,
+              expectedInode: sourcePreimage.inode,
+              actualDevice: publishedIdentity.device,
+              actualInode: publishedIdentity.inode,
+              expectedSha256: sourcePreimage.sha256,
+              actualSha256: publishedIdentity.sha256,
+            },
+          },
+        );
+      }
+      if (removeQuarantineAfterVerification) {
+        await unlink(quarantine);
+        await syncDirectory(dirname(source));
+      }
+      return {
+        ...published,
+        overwritten: destinationPreimage.exists,
+        preimage: destinationPreimage,
+        crossDevice: false,
+      };
+    } catch (error) {
+      if (!isNodeError(error, "EXDEV")) throw error;
+    }
 
-  const published = await atomicCopyFile(source, destination, options);
-  await options.hooks?.afterCrossDevicePublication?.({ source, destination });
-  const [sourceBeforeDelete, destinationBeforeDelete] = await Promise.all([
-    captureFilesystemPreimage(source),
-    captureFilesystemPreimage(destination),
-  ]);
-  if (
-    !filesystemPreimagesEqual(sourcePreimage, sourceBeforeDelete)
-    || destinationBeforeDelete.type !== "file"
-    || destinationBeforeDelete.sha256 !== sourcePreimage.sha256
-    || destinationBeforeDelete.size !== sourcePreimage.size
-  ) {
+    await assertMoveSourceUnchanged(quarantine, sourcePreimage);
+    const published = await atomicCopyFile(quarantine, destination, options);
+    const publishedDestinationIdentity = await captureFilesystemPreimage(destination);
+    await options.hooks?.afterCrossDevicePublication?.({ source, destination });
+    const [sourceBeforeDelete, destinationBeforeDelete] = await Promise.all([
+      captureFilesystemPreimage(quarantine),
+      captureFilesystemPreimage(destination),
+    ]);
+    if (
+      !filesystemMoveSourceIdentitiesEqual(sourcePreimage, sourceBeforeDelete)
+      || !filesystemPublishedDestinationIdentitiesEqual(
+        publishedDestinationIdentity,
+        destinationBeforeDelete,
+      )
+    ) {
+      throw new UniversalBrokerError(
+        "PRECONDITION_FAILED",
+        "Cross-device move verification failed; the source was preserved.",
+        {
+          evidence: {
+            source,
+            destination,
+            sourcePreserved: sourceBeforeDelete.exists,
+            quarantine: sourceBeforeDelete.exists ? quarantine : undefined,
+            expectedSha256: sourcePreimage.sha256,
+            destinationSha256: destinationBeforeDelete.sha256,
+          },
+        },
+      );
+    }
+    await unlink(quarantine);
+    await syncDirectory(dirname(source));
+    return { ...published, crossDevice: true };
+  } catch (error) {
+    const recovery = await recoverQuarantinedSource(
+      quarantine,
+      source,
+      sourcePreimage,
+      options.hooks,
+    );
+    if (recovery.publicSourceRestored && !recovery.quarantineRetained) {
+      throw error;
+    }
+    const original = error instanceof UniversalBrokerError ? error : undefined;
+    const sourcePreservedAtQuarantine = recovery.quarantineRetained
+      && recovery.quarantineIdentityMatches;
     throw new UniversalBrokerError(
-      "PRECONDITION_FAILED",
-      "Cross-device move verification failed; the source was preserved.",
+      sourcePreservedAtQuarantine
+        ? (original?.code ?? "PRECONDITION_FAILED")
+        : "PRECONDITION_FAILED",
+      sourcePreservedAtQuarantine
+        ? `${original?.message ?? "Move publication failed."} The verified source remains recoverable at ${quarantine}.`
+        : `${original?.message ?? "Move publication failed."} Automatic source recovery could not verify the original bytes.`,
       {
+        operationId: original?.operationId,
+        retryable: false,
         evidence: {
+          ...(original?.evidence ?? {}),
           source,
           destination,
-          sourcePreserved: sourceBeforeDelete.exists,
-          expectedSha256: sourcePreimage.sha256,
-          destinationSha256: destinationBeforeDelete.sha256,
+          quarantine,
+          sourcePreservedAtQuarantine,
+          publicSourceRestored: recovery.publicSourceRestored,
+          publicSourceIdentityMatches: recovery.publicSourceIdentityMatches,
+          quarantineRetained: recovery.quarantineRetained,
+          quarantineIdentityMatches: recovery.quarantineIdentityMatches,
+          ...(recovery.recoveryError ? { recoveryError: recovery.recoveryError } : {}),
+          originalErrorCode: original?.code ?? "UNKNOWN_ERROR",
         },
+        ...(sourcePreservedAtQuarantine ? {
+          suggestions: [{
+            action: recovery.publicSourceRestored
+              ? "verify-and-remove-quarantine"
+              : "restore-quarantined-source",
+            source: quarantine,
+            destination: source,
+            overwrite: false,
+          }],
+        } : {}),
       },
     );
   }
-  await unlink(source);
-  await syncDirectory(dirname(source));
-  return { ...published, crossDevice: true };
 }
 
 async function atomicPublishFile(
@@ -274,9 +387,20 @@ async function atomicPublishFile(
 
     if (!preimage.exists) {
       // A hard-link publication gives POSIX/Windows file systems a real
-      // no-clobber primitive; the private staging name is then removed.
-      await link(temporary, destination);
-      await unlink(temporary);
+      // no-clobber primitive. Filesystems such as exFAT may not support hard
+      // links; only explicit overwrite permission permits atomic rename there.
+      try {
+        if (options.hooks?.forceHardLinkUnsupported) {
+          throw nodeError("ENOTSUP", "forced unsupported hard link");
+        }
+        await link(temporary, destination);
+      } catch (error) {
+        if (!isHardLinkUnsupported(error)) throw error;
+        if (!options.overwrite) throw noReplaceCapabilityUnavailable(destination, error);
+        await rename(temporary, destination);
+      }
+      published = true;
+      await rm(temporary, { force: true });
     } else {
       // rename replaces the final directory entry atomically; the old entry is
       // never removed first and therefore cannot expose a missing-path window.
@@ -297,6 +421,154 @@ async function atomicPublishFile(
   } finally {
     if (!published) await rm(temporary, { force: true }).catch(() => undefined);
   }
+}
+
+function isHardLinkUnsupported(error: unknown): boolean {
+  return ["ENOTSUP", "EOPNOTSUPP", "ENOSYS", "EPERM"].some((code) => isNodeError(error, code));
+}
+
+function noReplaceCapabilityUnavailable(
+  destination: string,
+  cause: unknown,
+): UniversalBrokerError {
+  return new UniversalBrokerError(
+    "CAPABILITY_UNAVAILABLE",
+    `This filesystem cannot atomically publish a new file without overwrite permission: ${destination}`,
+    {
+      evidence: {
+        destination,
+        overwrite: false,
+        requiredCapability: "atomic-no-replace",
+        filesystemError: cause instanceof Error ? cause.message : String(cause),
+      },
+    },
+  );
+}
+
+interface QuarantinedSourceRecovery {
+  publicSourceRestored: boolean;
+  publicSourceIdentityMatches: boolean;
+  quarantineRetained: boolean;
+  quarantineIdentityMatches: boolean;
+  recoveryError?: string;
+}
+
+async function recoverQuarantinedSource(
+  quarantine: string,
+  source: string,
+  expected: FilesystemPreimage,
+  hooks: AtomicPublicationHooks | undefined,
+): Promise<QuarantinedSourceRecovery> {
+  let recoveryError: string | undefined;
+  const initialSource = await inspectRecoveryPath(source, expected);
+  const initialQuarantine = await inspectRecoveryPath(quarantine, expected);
+
+  if (!initialSource.exists && initialQuarantine.identityMatches) {
+    try {
+      if (hooks?.forceSourceRestoreHardLinkUnsupported) {
+        throw nodeError("ENOTSUP", "forced unsupported source restore hard link");
+      }
+      await link(quarantine, source);
+    } catch (error) {
+      recoveryError = error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  const [finalSource, finalQuarantine] = await Promise.all([
+    inspectRecoveryPath(source, expected),
+    inspectRecoveryPath(quarantine, expected),
+  ]);
+  return {
+    publicSourceRestored: finalSource.identityMatches,
+    publicSourceIdentityMatches: finalSource.identityMatches,
+    quarantineRetained: finalQuarantine.exists,
+    quarantineIdentityMatches: finalQuarantine.identityMatches,
+    ...(recoveryError ? { recoveryError } : {}),
+  };
+}
+
+async function quarantineVerifiedMoveSource(
+  source: string,
+  destination: string,
+  quarantine: string,
+  sourcePreimage: FilesystemPreimage,
+  hooks: AtomicPublicationHooks | undefined,
+): Promise<void> {
+  await hooks?.beforeSourceQuarantine?.({ source, destination });
+  await rename(source, quarantine);
+  const quarantinedSource = await captureFilesystemPreimage(quarantine);
+  if (!filesystemMoveSourceIdentitiesEqual(sourcePreimage, quarantinedSource)) {
+    throw new UniversalBrokerError(
+      "PRECONDITION_FAILED",
+      "Move source changed before verified deletion; the replacement was not deleted.",
+      {
+        evidence: {
+          source,
+          destination,
+          quarantine,
+        },
+      },
+    );
+  }
+}
+
+async function assertMoveSourceUnchanged(
+  quarantine: string,
+  expected: FilesystemPreimage,
+): Promise<void> {
+  const observed = await captureFilesystemPreimage(quarantine);
+  if (filesystemMoveSourceIdentitiesEqual(expected, observed)) return;
+  throw new UniversalBrokerError(
+    "PRECONDITION_FAILED",
+    "Move source quarantine changed before publication.",
+    { evidence: { quarantine, expectedSha256: expected.sha256, actualSha256: observed.sha256 } },
+  );
+}
+
+async function inspectRecoveryPath(
+  path: string,
+  expected: FilesystemPreimage,
+): Promise<{ exists: boolean; identityMatches: boolean }> {
+  try {
+    const observed = await captureFilesystemPreimage(path);
+    return {
+      exists: observed.exists,
+      identityMatches: filesystemMoveSourceIdentitiesEqual(expected, observed),
+    };
+  } catch {
+    const exists = await lstat(path).then(() => true, () => false);
+    return { exists, identityMatches: false };
+  }
+}
+
+function filesystemMoveSourceIdentitiesEqual(
+  expected: FilesystemPreimage,
+  observed: FilesystemPreimage,
+): boolean {
+  return expected.exists === true
+    && observed.exists === true
+    && expected.type === "file"
+    && observed.type === "file"
+    && expected.device === observed.device
+    && expected.inode === observed.inode
+    && expected.mode === observed.mode
+    && expected.size === observed.size
+    && expected.sha256 === observed.sha256;
+}
+
+function filesystemPublishedDestinationIdentitiesEqual(
+  expected: FilesystemPreimage,
+  observed: FilesystemPreimage,
+): boolean {
+  return expected.exists === true
+    && observed.exists === true
+    && expected.type === "file"
+    && observed.type === "file"
+    && expected.device === observed.device
+    && expected.inode === observed.inode
+    && expected.mode === observed.mode
+    && expected.size === observed.size
+    && expected.sha256 === observed.sha256;
 }
 
 function validateDestinationPreimage(
