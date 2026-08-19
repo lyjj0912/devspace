@@ -63,7 +63,7 @@ const authorityAudit = {
 const health = await fetch(healthUrl);
 assert(health.status === 200, `health status is ${health.status}`);
 audit.health = await health.json();
-assert(audit.health?.ok === true, "health payload is not ok");
+assert(audit.health?.status === "ok", "health payload status is not ok");
 
 const tokenResource = await discoverTokenResource(mcpUrl, options.tokenResource);
 audit.tokenResource = tokenResource;

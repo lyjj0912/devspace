@@ -23,7 +23,13 @@ async function verifyLiveEndpoints() {
   const mcpPath = process.env.DEVSPACE_V2_LIVE_MCP_PATH ?? "/mcp";
   const health = await fetch(new URL(healthPath, base));
   const healthBody = await health.text();
-  if (health.status !== 200 || !healthBody.includes('"ok":true')) {
+  let healthPayload;
+  try {
+    healthPayload = JSON.parse(healthBody);
+  } catch {
+    healthPayload = undefined;
+  }
+  if (health.status !== 200 || healthPayload?.status !== "ok") {
     fail(`Live health check failed: ${health.status} ${healthBody.slice(0, 1_000)}`);
   }
   const unauthenticated = await fetch(new URL(mcpPath, base), {

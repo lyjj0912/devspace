@@ -41,7 +41,7 @@ test("live verifier defaults to parallel v2 and creates only a temporary user to
     try {
       if (request.method === "GET" && request.url === "/healthz-next") {
         response.writeHead(200, { "content-type": "application/json" });
-        response.end('{"ok":true}');
+        response.end('{"status":"ok","runtimeRevision":"fixture-revision"}');
         return;
       }
       if (request.method === "GET" && request.url === "/mcp-next") {
@@ -129,6 +129,8 @@ test("live verifier defaults to parallel v2 and creates only a temporary user to
 
   const source = await readFile("scripts/verify-universal-broker-v2-live.mjs", "utf8");
   assert.match(source, /baseUrl: "http:\/\/127\.0\.0\.1:7677"/u);
+  assert.match(source, /audit\.health\?\.status === "ok"/u);
+  assert.doesNotMatch(source, /audit\.health\?\.ok === true/u);
   assert.match(source, /universal-broker-v2\/devspace\.sqlite/u);
   assert.match(source, /code !== "GUI_STATE_CHANGED"/u);
   assert.match(source, /for \(let attempt = 0; attempt < 2; attempt \+= 1\)/u);
