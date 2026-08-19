@@ -451,10 +451,11 @@ curl -fsS --max-time 10 "http://127.0.0.1:${CANDIDATE_MANAGEMENT_PORT}/readyz" >
 node "$RELEASE/scripts/release-artifacts.mjs" verify-runtime \
   --package "$IMMUTABLE_RELEASE" --identity "$AUDIT_DIR/candidate-runtime-identity.json" \
   >"$AUDIT_DIR/candidate-runtime-verification.json"
-LOCAL_METRICS="$(curl -sS --max-time 10 -H "Host: 127.0.0.1:${CANDIDATE_PORT}" -o /dev/null -w '%{http_code}' "http://127.0.0.1:${CANDIDATE_PORT}/metrics" || true)"
-PUBLIC_HOST_METRICS="$(curl -sS --max-time 10 -H "Host: $PUBLIC_HOST" -o /dev/null -w '%{http_code}' "http://127.0.0.1:${CANDIDATE_PORT}/metrics" || true)"
-[[ "$LOCAL_METRICS" == 200 && "$PUBLIC_HOST_METRICS" == 403 ]] || {
-  echo "Candidate metrics boundary failed: local=$LOCAL_METRICS public-host=$PUBLIC_HOST_METRICS" >&2
+PRIVATE_METRICS="$(curl -sS --max-time 10 -H "Host: 127.0.0.1:${CANDIDATE_MANAGEMENT_PORT}" -o /dev/null -w '%{http_code}' "http://127.0.0.1:${CANDIDATE_MANAGEMENT_PORT}/metrics" || true)"
+DATA_LOCAL_METRICS="$(curl -sS --max-time 10 -H "Host: 127.0.0.1:${CANDIDATE_PORT}" -o /dev/null -w '%{http_code}' "http://127.0.0.1:${CANDIDATE_PORT}/metrics" || true)"
+DATA_PUBLIC_METRICS="$(curl -sS --max-time 10 -H "Host: $PUBLIC_HOST" -o /dev/null -w '%{http_code}' "http://127.0.0.1:${CANDIDATE_PORT}/metrics" || true)"
+[[ "$PRIVATE_METRICS" == 200 && "$DATA_LOCAL_METRICS" == 404 && "$DATA_PUBLIC_METRICS" == 404 ]] || {
+  echo "Candidate metrics boundary failed: private=$PRIVATE_METRICS data-local=$DATA_LOCAL_METRICS data-public=$DATA_PUBLIC_METRICS" >&2
   exit 1
 }
 UNAUTH="$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' -X POST -H 'content-type: application/json' \

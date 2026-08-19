@@ -227,7 +227,7 @@ test("external PM2 cleanup monitor persists dump state after terminal worker sel
 });
 
 test("production upgrade worker switches one PM2 process and commits canonical pointers only after verification", async (t) => {
-  const fixture = await createFixture(t, { publicMetricsStatus: 403 });
+  const fixture = await createFixture(t, { publicMetricsStatus: 404 });
   await runProductionUpgradeWorker(fixture.requestPath);
   const status = JSON.parse(await readFile(fixture.statusPath, "utf8")) as {
     state: string;
@@ -255,7 +255,7 @@ test("production upgrade worker switches one PM2 process and commits canonical p
     ["PREPARED", "ACCEPTED", "SWITCHING", "VERIFYING", "PASS"],
   );
   assert.equal(status.pidAfter, 222);
-  assert.equal(status.publicMetricsStatus, 403);
+  assert.equal(status.publicMetricsStatus, 404);
   assert.equal(status.unauthenticatedMcpStatus, 401);
   assert.deepEqual(status.oauthScopes, expectedScopes);
   assert.equal(status.runtimeCommit, fixture.nextCommit);
@@ -278,7 +278,7 @@ test("production upgrade worker switches one PM2 process and commits canonical p
 
 test("production upgrade worker fails closed before switching when request manifest identity is stale", async (t) => {
   const fixture = await createFixture(t, {
-    publicMetricsStatus: 403,
+    publicMetricsStatus: 404,
     requestManifestOverride: { configSchemaIdentity: `sha256:${"9".repeat(64)}` },
   });
   await assert.rejects(
@@ -308,7 +308,7 @@ test("production upgrade worker fails closed before switching when request manif
 
 test("production upgrade worker rejects private readiness identity drift and proves rollback", async (t) => {
   const fixture = await createFixture(t, {
-    publicMetricsStatus: 403,
+    publicMetricsStatus: 404,
     timeoutMs: 250,
     runtimeIdentityOverride: { runtimeRevision: "f".repeat(40) },
   });

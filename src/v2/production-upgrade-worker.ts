@@ -445,7 +445,7 @@ async function verifyNextRuntime(
       if (publicHealthStatus !== 200) {
         throw publicBoundaryFailure(`Public health returned ${publicHealthStatus}.`);
       }
-      if (publicMetricsStatus !== 403) {
+      if (publicMetricsStatus !== 404) {
         throw publicBoundaryFailure(`Public metrics returned ${publicMetricsStatus}.`);
       }
       if (unauthenticatedMcpStatus !== 401) {
