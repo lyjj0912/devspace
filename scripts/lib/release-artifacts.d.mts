@@ -12,6 +12,15 @@ export interface VerifiedGateProducerTrustAnchor {
   }>;
 }
 
+export function createGateProducerTrustAnchor(options: Readonly<{
+  path: string;
+  privateKeyPath: string;
+  key: Readonly<{ keyId: string; secret: Uint8Array }>;
+  ownerInstanceId: string;
+  environment: string;
+  createdAt?: string;
+}>): VerifiedGateProducerTrustAnchor;
+
 export function verifyGateProducerTrustAnchor(options: Readonly<{
   path: string;
   sha256: `sha256:${string}`;

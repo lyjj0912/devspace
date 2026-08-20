@@ -206,6 +206,15 @@ export class DurableFilesystemSync {
     }
   }
 
+  initializeStore(): void {
+    const database = this.openStore();
+    try {
+      database.pragma("wal_checkpoint(TRUNCATE)");
+    } finally {
+      database.close();
+    }
+  }
+
   private adapter(scope: FilesystemSyncScope): FilesystemSyncAdapter {
     return this.options.adapter ?? createLocalFilesystemSyncAdapter(
       scope.pathStyle ?? "local",

@@ -1,7 +1,9 @@
 import {
   createHash,
   createHmac,
+  createPrivateKey,
   createPublicKey,
+  randomBytes,
   timingSafeEqual,
   verify as verifySignature,
 } from "node:crypto";
@@ -921,6 +923,64 @@ export function verifyGateProducerTrustAnchor(options) {
   });
   verifiedGateProducerTrustAnchors.set(verified, identity);
   return verified;
+}
+
+export function createGateProducerTrustAnchor(options) {
+  const configuration = requiredObjectValue(options, "gate producer trust anchor creation options");
+  const path = configuration.path;
+  if (typeof path !== "string" || !isAbsolute(path) || resolve(path) !== path || /[\0\r\n]/u.test(path)) {
+    throw new Error("Gate producer trust anchor output must be a canonical absolute path.");
+  }
+  if (existsSync(path)) throw new Error(`Gate producer trust anchor already exists: ${path}`);
+  const privateKeyPath = canonicalOwnerOnlyAbsoluteFile(configuration.privateKeyPath, "gate producer private key");
+  let privateKey;
+  try { privateKey = createPrivateKey(readFileSync(privateKeyPath)); }
+  catch { throw new Error("Gate producer private key is unreadable or invalid."); }
+  if (privateKey.asymmetricKeyType !== "ed25519") throw new Error("Gate producer private key must be Ed25519.");
+  const publicDer = createPublicKey(privateKey).export({ format: "der", type: "spki" });
+  const publicKeySha256 = `sha256:${sha256(publicDer)}`;
+  const gateProducer = Object.freeze({
+    keyId: `gate-producer-ed25519-sha256:${publicKeySha256.slice("sha256:".length)}`,
+    publicKeySha256,
+  });
+  const key = normalizeManagementAuthorizationKey(configuration.key);
+  const createdAt = normalizeCreatedAt(configuration.createdAt);
+  const ownerInstanceId = configuration.ownerInstanceId;
+  const environment = configuration.environment;
+  if (typeof ownerInstanceId !== "string" || ownerInstanceId.length < 8 || ownerInstanceId.length > 512
+    || typeof environment !== "string" || environment.length < 1 || environment.length > 128) {
+    throw new Error("Gate producer trust anchor owner/environment scope is invalid.");
+  }
+  const payload = {
+    anchorNonce: randomBytes(32).toString("base64url"),
+    createdAt,
+    environment,
+    gateProducer,
+    ownerInstanceId,
+    provisioning: "ONE_TIME_OWNER_APPROVED",
+  };
+  const unsigned = {
+    schemaVersion: 1,
+    kind: TRUST_ANCHOR_KIND,
+    keyId: key.keyId,
+    payload,
+    payloadDigest: canonicalJsonSha256(payload),
+  };
+  const envelope = {
+    ...unsigned,
+    signature: createHmac("sha256", key.secret)
+      .update(`${TRUST_ANCHOR_DOMAIN}/${TRUST_ANCHOR_KIND}\0`)
+      .update(canonicalJson(unsigned))
+      .digest("base64url"),
+  };
+  writeOwnerOnlyTextAtomic(path, `${canonicalJson(envelope)}\n`);
+  return verifyGateProducerTrustAnchor({
+    path,
+    sha256: `sha256:${fileSha256(path)}`,
+    key: configuration.key,
+    expectedOwnerInstanceId: ownerInstanceId,
+    expectedEnvironment: environment,
+  });
 }
 
 export function assertVerifiedGateProducerTrustAnchor(value) {
@@ -2145,6 +2205,26 @@ function writeTextAtomic(path, value) {
   chmodSync(temporary, 0o644);
   renameSync(temporary, path);
   fsyncDirectory(dirname(path));
+}
+
+function writeOwnerOnlyTextAtomic(path, value) {
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  chmodSync(dirname(path), 0o700);
+  const temporary = `${path}.tmp-${process.pid}-${randomBytes(8).toString("hex")}`;
+  let descriptor;
+  try {
+    descriptor = openSync(temporary, "wx", 0o600);
+    writeFileSync(descriptor, value, "utf8");
+    fsyncSync(descriptor);
+    closeSync(descriptor);
+    descriptor = undefined;
+    renameSync(temporary, path);
+    fsyncDirectory(dirname(path));
+  } catch (error) {
+    if (descriptor !== undefined) closeSync(descriptor);
+    try { unlinkSync(temporary); } catch {}
+    throw error;
+  }
 }
 
 function fsyncDirectory(path) {
