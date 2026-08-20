@@ -1,36 +1,104 @@
 #!/usr/bin/env node
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { relative, resolve } from "node:path";
-import { createReleasePackage, verifyReleasePackage as verifyImmutableReleasePackage } from "./lib/release-artifacts.mjs";
+import {
+  createAttestedReleasePackage,
+  verifyGateProducerTrustAnchor,
+  verifyReleasePackage as verifyImmutableReleasePackage,
+} from "./lib/release-artifacts.mjs";
+import { loadExistingManagementAuthorizationKey } from "../dist/v2/management-authorization.js";
 
 const root = process.cwd();
 const requireClean = process.argv.includes("--require-clean");
 const createPackageAt = optionValue("--create-package");
 const verifyPackageAt = optionValue("--verify-package");
+const reportAt = optionValue("--report");
+const releaseMode = releaseModeValue();
+const REVISION3_NFR_RELEASE_ENVIRONMENT = Object.freeze([
+  {
+    name: "DEVSPACE_REV3_NFR_PUBLIC_BASE_URL",
+    purpose: "live public /metrics must remain inaccessible",
+  },
+  {
+    name: "DEVSPACE_REV3_NFR_MANAGEMENT_BASE_URL",
+    purpose: "private /readyz and /doctorz release latency/readback",
+  },
+  {
+    name: "DEVSPACE_REV3_NFR_SELF_RESTART_EVIDENCE",
+    purpose: "transport-flush self-restart evidence file",
+  },
+  {
+    name: "DEVSPACE_REV3_NFR_SSH_TARGETS_FILE",
+    purpose: "live SSH target registry",
+  },
+  {
+    name: "DEVSPACE_REV3_NFR_SSH_TARGET",
+    purpose: "bounded live SSH target selector",
+  },
+  {
+    name: "DEVSPACE_REV3_NFR_SSH_READ_PATH",
+    purpose: "existing harmless remote read path",
+  },
+]);
 if (createPackageAt || verifyPackageAt) {
   if (createPackageAt && verifyPackageAt) fail("Choose only one immutable package operation.");
   const sourceRevision = optionValue("--source-revision");
   const runtimeRevision = optionValue("--runtime-revision");
+  const gateProducerTrustAnchor = loadTrustedGateProducerAnchor();
   const result = createPackageAt
-    ? createReleasePackage({ sourceRoot: root, outputRoot: createPackageAt, sourceRevision, runtimeRevision })
+    ? createAttestedReleasePackage({
+        sourceRoot: root,
+        outputRoot: createPackageAt,
+        sourceRevision,
+        runtimeRevision,
+        gateProducerPrivateKeyPath: requiredOption("--gate-producer-private-key"),
+        gateProducerTrustAnchor,
+      })
     : verifyImmutableReleasePackage(verifyPackageAt, {
         expectedSourceRevision: sourceRevision,
         expectedRuntimeRevision: runtimeRevision,
+        gateProducerTrustAnchor,
       });
   console.log(JSON.stringify(result, null, 2));
   process.exit(0);
 }
 
+function loadTrustedGateProducerAnchor() {
+  const stateDir = requiredOption("--state-dir");
+  const key = loadExistingManagementAuthorizationKey({
+    keyRef: requiredOption("--management-key-ref"),
+    stateDir,
+  });
+  return verifyGateProducerTrustAnchor({
+    path: requiredOption("--gate-producer-trust-anchor"),
+    sha256: requiredOption("--gate-producer-trust-anchor-sha256"),
+    key,
+    expectedOwnerInstanceId: requiredOption("--owner-instance-id"),
+    expectedEnvironment: requiredOption("--environment"),
+  });
+}
+
+function requiredOption(name) {
+  const value = optionValue(name);
+  if (!value) fail(`${name} is required for an immutable release package operation.`);
+  return value;
+}
+
 run("npm", ["run", "typecheck"]);
+run("npm", ["run", "build"]);
 run("npm", ["run", "test"]);
 run(process.execPath, ["scripts/release-finalization.test.mjs"]);
+run(process.execPath, ["--import", "tsx", "--test", "scripts/connector-activation-release-driver.test.mjs"]);
+run(process.execPath, ["--import", "tsx", "--test", "scripts/check-universal-broker-rev3-nfr.test.mjs"]);
 run("npm", ["audit", "--omit=dev", "--audit-level=low"]);
-run("npm", ["run", "build"]);
 run("npm", ["run", "v2:budget"]);
 run("npm", ["run", "v2:load:quick"]);
+const revision3NfrEvidence = releaseMode === "release"
+  ? runRevision3NfrReleaseGate()
+  : preStageRevision3NfrEvidence();
 
 for (const script of [
   "scripts/deploy-universal-broker-v2-production.sh",
@@ -54,6 +122,12 @@ for (const script of [
   "scripts/release-artifacts.mjs",
   "scripts/finalize-universal-broker-v2.mjs",
   "scripts/finalization-live-driver.mjs",
+  "scripts/connector-activation-release-driver.mjs",
+  "scripts/check-universal-broker-rev3-nfr.mjs",
+  "scripts/lib/connector-activation-release-driver.mjs",
+  "scripts/lib/connector-rollback-evidence.mjs",
+  "scripts/lib/finalization-store-contract.mjs",
+  "scripts/lib/self-restart-evidence.mjs",
 ]) {
   run(process.execPath, ["--check", script]);
 }
@@ -69,6 +143,7 @@ verifyReleaseArtifactSources();
 verifyGranularOAuthSources();
 verifyLiveVerifierSources();
 verifyTestComposition();
+verifyRevision3NfrReleaseSources();
 verifyDist();
 const packageEvidence = verifyPackage();
 const contractEvidence = verifyContract();
@@ -79,13 +154,27 @@ if (requireClean) {
 }
 
 const distEvidence = treeEvidence(resolve(root, "dist"));
-console.log(JSON.stringify({
-  status: "PASS",
+const finalReport = {
+  status: releaseMode === "release" ? "PASS" : "PRE_STAGE_PASS",
+  mode: releaseMode,
+  finalReleaseEligible: releaseMode === "release" && revision3NfrEvidence.releaseEligible === true,
   contract: contractEvidence,
   dist: distEvidence,
   package: packageEvidence,
+  revision3Nfr: revision3NfrEvidence,
   cleanRequired: requireClean,
-}, null, 2));
+};
+const serializedFinalReport = `${JSON.stringify(finalReport, null, 2)}\n`;
+if (reportAt) {
+  const reportPath = resolve(reportAt);
+  if (existsSync(reportPath)) fail(`Release verification report already exists: ${reportPath}`);
+  try {
+    writeFileSync(reportPath, serializedFinalReport, { encoding: "utf8", flag: "wx", mode: 0o600 });
+  } catch (error) {
+    fail(`Unable to write release verification report: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+process.stdout.write(serializedFinalReport);
 
 function verifyNoPrivilegeElevationSources() {
   const forbiddenPaths = [
@@ -209,6 +298,55 @@ function verifyTestComposition() {
   const exclusions = Array.isArray(buildConfig.exclude) ? buildConfig.exclude : [];
   for (const required of ["src/**/*.test.ts", "src/v2/fixtures/**/*"]) {
     if (!exclusions.includes(required)) fail(`Production build exclusion is missing: ${required}`);
+  }
+}
+
+function verifyRevision3NfrReleaseSources() {
+  const packageJson = JSON.parse(text("package.json"));
+  const releaseVerifier = text("scripts/verify-universal-broker-v2-release.mjs");
+  const nfrGate = text("scripts/check-universal-broker-rev3-nfr.mjs");
+  const restartEvidence = text("scripts/lib/self-restart-evidence.mjs");
+  const releaseTests = text("scripts/release-finalization.test.mjs");
+  if (!packageJson.scripts?.["rev3:nfr"]?.includes("check-universal-broker-rev3-nfr.mjs")) {
+    fail("The package.json Rev3 NFR command is missing.");
+  }
+  for (const marker of [
+    "runRevision3NfrReleaseGate",
+    "preStageRevision3NfrEvidence",
+    'releaseMode === "release"',
+    'status: "NOT_RUN"',
+    'gate: "G08"',
+    "scripts/check-universal-broker-rev3-nfr.mjs",
+    "--mode=release",
+    "--json",
+    "BASE_PROFILE_NFR_PASS",
+    "releaseEligible",
+    "releaseBlockers",
+  ]) {
+    if (!releaseVerifier.includes(marker)) fail(`Release verifier Rev3 NFR marker is missing: ${marker}`);
+  }
+  for (const marker of REVISION3_NFR_RELEASE_ENVIRONMENT.map((entry) => entry.name)) {
+    if (!releaseVerifier.includes(marker)) fail(`Release verifier does not plumb explicit Rev3 NFR evidence: ${marker}`);
+  }
+  for (const marker of ["NOT_RUN", "LIMITED_PASS", "FAIL"]) {
+    if (!releaseVerifier.includes(marker)) fail(`Release verifier does not reject Rev3 NFR status: ${marker}`);
+  }
+  if (!nfrGate.includes("BASE_PROFILE_NFR_PASS") || !nfrGate.includes("releaseRequired: options.mode !== \"focused\"")) {
+    fail("The Rev3 NFR gate does not expose a release-required PASS contract.");
+  }
+  for (const marker of [
+    "validateSelfRestartEvidence",
+    "RESPONSE_BOUND",
+    "ACK_FLUSHED",
+    "HANDOFF_ACCEPTED",
+    "RESTARTING",
+    "new-session restart_status is not PASS",
+    "restartBeforeAckFlushed does not match the durable timeline",
+  ]) {
+    if (!restartEvidence.includes(marker)) fail(`Structural self-restart evidence validation is missing: ${marker}`);
+  }
+  if (!releaseTests.includes("assertReleaseVerifierRunsRev3NfrGate")) {
+    fail("Release finalization tests do not pin the Rev3 NFR release verifier contract.");
   }
 }
 
@@ -506,23 +644,38 @@ function verifySelfManagementSources() {
   const upgrade = text("scripts/upgrade-universal-broker-v2-production.sh");
   const upgradeStatus = text("scripts/status-universal-broker-v2-upgrade.sh");
   const server = text("src/v2/server.ts");
+  const httpServer = text("src/v2/http-server.ts");
   const start = text("scripts/start-universal-broker-v2-production.sh");
   const startup = text("scripts/start-universal-broker-v2.sh");
   const deploy = text("scripts/deploy-universal-broker-v2-production.sh");
   const tests = text("src/v2/self-management.test.ts");
   const upgradeTests = text("src/v2/production-upgrade-worker.test.ts");
   const packageJson = JSON.parse(text("package.json"));
-  for (const marker of ["restart_broker", "restart_status", "transactionId", "delayMs"]) {
+  if (upgrade.includes("NOT_INTEGRATED:")) {
+    fail("Production upgrade remains explicitly NOT_INTEGRATED.");
+  }
+  for (const marker of ["restart_broker", "restart_status", "transactionId"]) {
     if (!contracts.includes(marker)) fail(`Self-management contract is missing: ${marker}`);
+  }
+  if (contracts.includes("delayMs")) {
+    fail("Self-management contract still exposes delayMs instead of response-bound restart acknowledgement.");
   }
   for (const marker of [
     "UniversalSelfManagementService",
-    "WAITING_FOR_RESPONSE",
+    "RESPONSE_BOUND",
+    "ACK_FLUSHED",
+    "ACK_ABORTED",
     "expectedDisconnect",
     "launchDetachedRestartWorker",
+    "handoffPolicy: \"ACK_FLUSHED_ONLY\"",
+    "responseFlushedForRequest",
+    "responseAbortedForRequest",
     "staleRecovered",
   ]) {
     if (!service.includes(marker)) fail(`Durable restart service is missing: ${marker}`);
+  }
+  if (service.includes("WAITING_FOR_RESPONSE")) {
+    fail("Durable restart service still contains obsolete WAITING_FOR_RESPONSE state.");
   }
   for (const marker of [
     'runPm2(request, ["restart"',
@@ -538,9 +691,22 @@ function verifySelfManagementSources() {
     'typed.operation === "restart_broker"',
     'typed.operation === "restart_status"',
     "selfManagement.requestRestart",
+    "selfManagement.bindResponse",
     "selfManagement.status",
   ]) {
     if (!server.includes(marker)) fail(`Self-management MCP wiring is missing: ${marker}`);
+  }
+  for (const marker of [
+    "bindRestartResponseLifecycle",
+    "responseRequestIds",
+    "selfManagement.withResponseTransport",
+    'res.once("finish", flushed)',
+    'req.once("aborted"',
+    'res.once("close"',
+    "responseFlushedForRequest(httpRequestId, id)",
+    "responseAbortedForRequest(httpRequestId, id, event)",
+  ]) {
+    if (!httpServer.includes(marker)) fail(`HTTP restart response lifecycle seam is missing: ${marker}`);
   }
   if (!start.includes("DEVSPACE_NEXT_PM2_EXPECTED_SCRIPT")) {
     fail("Production start script does not bind the expected PM2 script for restart verification.");
@@ -599,13 +765,12 @@ function verifySelfManagementSources() {
     '"ACCEPTED"',
     "ROLLING_BACK",
     '"UNKNOWN"',
-    "captureCutoverDatabasePreimages",
+    "captureCutoverSnapshotGroup",
+    "snapshotGroupPreimage",
     "verifySqliteDatabase",
     "stopPm2Process",
     "startPm2Process",
-    "restoreDatabase",
-    "-wal",
-    "-shm",
+    "restoreSnapshotGroup",
     "verifyNextRuntime",
     "directoryEvidence",
     "runtimeCommit",
@@ -631,7 +796,21 @@ function verifySelfManagementSources() {
     if (!cleanupMonitor.includes(marker)) fail(`Production upgrade cleanup monitor is missing: ${marker}`);
   }
   for (const marker of [
-    "npm run release:verify -- --require-clean",
+    "npm run release:verify -- --mode=pre-stage --require-clean",
+    "validate_release_report",
+    "PRE_STAGE_VERIFY_REPORT",
+    "RELEASE_VERIFY_REPORT",
+    "DEVSPACE_REV3_NFR_SELF_RESTART_EVIDENCE",
+    "--mode=release",
+    "--candidate-public-base-url",
+    "production public health cannot prove candidate identity",
+    "Candidate public origin must be isolated from production",
+    'DEVSPACE_REV3_NFR_PUBLIC_BASE_URL="$CANDIDATE_PUBLIC_BASE_URL"',
+    'DEVSPACE_REV3_NFR_MANAGEMENT_BASE_URL="http://127.0.0.1:${CANDIDATE_MANAGEMENT_PORT}"',
+    "release-nfr-source-runtime-tree.json",
+    "candidate-local-gateway-post-nfr.json",
+    "post-NFR public health does not resolve to the running candidate",
+    "candidate-runtime-tree-post-nfr.json",
     "DEVSPACE_V2_LOAD_SSH_TARGET",
     "SKIP_COMPANY_GATES=0",
     "SKIP_COMPANY_CHROME_GATE=0",
@@ -866,6 +1045,14 @@ function verifyLiveVerifierSources() {
     "crossClientRejected",
     "sameClientTransport",
     "foreignClient",
+    'operation: "restart_broker"',
+    'operation: "restart_status"',
+    "createBoundedSelfRestartEvidence",
+    "restart_status reused a pre-restart MCP session",
+    "post-restart local health status",
+    "public health identity mismatch for startedAt",
+    'argument === "--exercise-self-restart"',
+    'argument === "--self-restart-evidence"',
     "sessions must be 2..20",
     "skipCompanyGates: false",
     "skipCompanyChromeGate: false",
@@ -933,23 +1120,28 @@ function verifyDeploymentSources() {
     if (!rollback.includes(marker)) fail(`Production rollback source is missing: ${marker}`);
   }
   for (const marker of [
-    "prepare|seal",
+    "status|verify",
     "finalize-universal-broker-v2.mjs",
-    "--evidence",
-    "--driver",
-    "interrupt-after-action",
-    "driver is intentionally unreachable until seal",
+    "--store",
+    "--control",
+    "--state-dir",
+    "--key-ref",
+    "BASE_PROFILE_FINAL_PASS",
   ]) {
     if (!finalize.includes(marker)) fail(`Production finalizer source is missing: ${marker}`);
   }
   const finalizationState = text("scripts/lib/finalization-state.mjs");
   for (const marker of [
     "PREPARED",
-    "POST_ROTATION_VERIFIED",
+    "PROFILE_GATES_EVALUATED",
+    "ACTIVATION_PENDING",
+    "POST_ACTIVATION_VERIFIED",
+    "DRAINING",
+    "SEALED",
     "APPLYING",
     "Completed destructive stage drifted and will not be repeated",
     "Stale token family cannot seal",
-    "FINAL_PASS",
+    "BASE_PROFILE_FINAL_PASS",
     "SHA256SUMS",
   ]) {
     if (!finalizationState.includes(marker)) fail(`Finalization state machine source is missing: ${marker}`);
@@ -966,6 +1158,8 @@ function verifyReleaseArtifactSources() {
     "SHA256SUMS",
     "config/config.schema.json",
     "payloadDigest",
+    "buildCapabilities",
+    "migrationManifestDigest",
     "verifyRuntimeTree",
   ]) {
     if (!artifacts.includes(marker)) fail(`Immutable release artifact source is missing: ${marker}`);
@@ -988,6 +1182,14 @@ function verifyDist() {
     "dist/v2/production-upgrade-worker-cli.js",
     "dist/v2/production-upgrade-cleanup-monitor.js",
     "dist/v2/doctor.js",
+    "dist/v2/connector-activation-evidence.js",
+    "dist/v2/connector-activation-finalizer.js",
+    "dist/v2/connector-activation-journal.js",
+    "dist/v2/connector-activation-lifecycle.js",
+    "dist/v2/connector-staging-activation-contract.js",
+    "dist/v2/connector-staging-activation.js",
+    "dist/v2/connector-route-identity.js",
+    "dist/v2/snapshot-group.js",
   ]) {
     if (!existsSync(resolve(root, path))) fail(`Missing build output: ${path}`);
   }
@@ -1032,7 +1234,14 @@ function verifyPackage() {
     "scripts/status-universal-broker-v2-upgrade.sh",
     "scripts/deploy-universal-broker-v2-parallel.sh",
     "scripts/release-artifacts.mjs",
+    "scripts/connector-activation-release-driver.mjs",
     "scripts/lib/release-artifacts.mjs",
+    "scripts/lib/connector-activation-release-driver.mjs",
+    "scripts/lib/connector-rollback-evidence.d.mts",
+    "scripts/lib/connector-rollback-evidence.mjs",
+    "scripts/lib/finalization-state.d.mts",
+    "scripts/lib/finalization-store-contract.d.mts",
+    "scripts/lib/finalization-store-contract.mjs",
     "scripts/lib/finalization-state.mjs",
     "scripts/lib/owner-instance-id.mjs",
     "scripts/finalize-universal-broker-v2.mjs",
@@ -1136,7 +1345,10 @@ function verifyContract() {
 }
 
 function treeEvidence(directory) {
-  const files = walkFiles(directory).sort((left, right) => relative(directory, left).localeCompare(relative(directory, right)));
+  const files = walkFiles(directory).sort((left, right) => compareCodeUnits(
+    relative(directory, left),
+    relative(directory, right),
+  ));
   const digest = createHash("sha256");
   for (const path of files) {
     const rel = relative(directory, path).replaceAll("\\", "/");
@@ -1147,6 +1359,10 @@ function treeEvidence(directory) {
     digest.update("\n");
   }
   return { files: files.length, sha256: digest.digest("hex") };
+}
+
+function compareCodeUnits(left, right) {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function walkFiles(directory) {
@@ -1176,6 +1392,91 @@ function capture(command, args) {
   return result.stdout;
 }
 
+function runRevision3NfrReleaseGate() {
+  const evidenceBindings = Object.fromEntries(
+    REVISION3_NFR_RELEASE_ENVIRONMENT.map((entry) => [
+      entry.name,
+      {
+        supplied: typeof process.env[entry.name] === "string" && process.env[entry.name].trim().length > 0,
+        purpose: entry.purpose,
+      },
+    ]),
+  );
+  const missing = Object.entries(evidenceBindings)
+    .filter(([, value]) => value.supplied !== true)
+    .map(([name]) => name);
+  if (missing.length > 0) {
+    console.error(`Revision-3 NFR release evidence is missing; release mode must report NOT_RUN and fail: ${missing.join(", ")}`);
+  }
+
+  const result = spawnSync(process.execPath, [
+    "--expose-gc",
+    "--import",
+    "tsx",
+    "scripts/check-universal-broker-rev3-nfr.mjs",
+    "--mode=release",
+    "--json",
+  ], {
+    cwd: root,
+    encoding: "utf8",
+    env: process.env,
+    maxBuffer: 128 * 1024 * 1024,
+    timeout: 45 * 60_000,
+  });
+  if (result.stdout) process.stdout.write(result.stdout);
+  if (result.stderr) process.stderr.write(result.stderr);
+  if (result.error) fail(`Revision-3 NFR release gate failed to execute: ${result.error.message}`);
+
+  let report;
+  try {
+    report = JSON.parse(result.stdout);
+  } catch (error) {
+    fail(`Revision-3 NFR release gate did not emit valid JSON: ${error instanceof Error ? error.message : String(error)}`);
+  }
+
+  const evaluation = report?.evaluation ?? {};
+  const releaseBlockers = Array.isArray(evaluation.releaseBlockers)
+    ? evaluation.releaseBlockers
+    : [];
+  const nonPassResults = Array.isArray(report?.results)
+    ? report.results.filter((entry) => entry?.status !== "PASS")
+    : [{ id: "UNKNOWN", status: "MISSING_RESULTS" }];
+  const explicitlyRejected = nonPassResults.filter((entry) =>
+    ["NOT_RUN", "LIMITED_PASS", "FAIL"].includes(entry.status)
+  );
+  const failures = [];
+  if (result.status !== 0) failures.push(`process exit ${result.status ?? "signal"}`);
+  if (evaluation.status !== "BASE_PROFILE_NFR_PASS") failures.push(`evaluation ${evaluation.status ?? "missing"}`);
+  if (evaluation.releaseEligible !== true) failures.push("releaseEligible false");
+  if (releaseBlockers.length > 0) failures.push(`releaseBlockers ${releaseBlockers.join(", ")}`);
+  if (nonPassResults.length > 0) {
+    failures.push(`non-PASS results ${nonPassResults.map((entry) => `${entry.id}:${entry.status}`).join(", ")}`);
+  }
+  if (explicitlyRejected.length > 0) {
+    failures.push(`explicitly rejected statuses ${explicitlyRejected.map((entry) => `${entry.id}:${entry.status}`).join(", ")}`);
+  }
+  if (failures.length > 0) {
+    fail(`Revision-3 NFR release gate failed: ${failures.join("; ")}`);
+  }
+  return {
+    status: evaluation.status,
+    releaseEligible: evaluation.releaseEligible,
+    counts: report.counts,
+    evidenceBindings,
+    completedAt: report.completedAt,
+  };
+}
+
+function preStageRevision3NfrEvidence() {
+  return {
+    gate: "G08",
+    status: "NOT_RUN",
+    releaseEligible: false,
+    reason: "Pre-stage verification is intentionally non-final; G08 requires immutable candidate URLs and durable self-restart evidence.",
+    requiredAfterCandidateStart: REVISION3_NFR_RELEASE_ENVIRONMENT.map((entry) => ({ ...entry })),
+  };
+}
+
 function run(command, args) {
   const result = spawnSync(command, args, {
     cwd: root,
@@ -1196,5 +1497,14 @@ function optionValue(name) {
   if (index < 0) return undefined;
   const value = process.argv[index + 1];
   if (!value || value.startsWith("--")) fail(`${name} requires a value.`);
+  return value;
+}
+
+function releaseModeValue() {
+  const inline = process.argv.find((argument) => argument.startsWith("--mode="));
+  const value = inline ? inline.slice("--mode=".length) : optionValue("--mode") ?? "release";
+  if (!new Set(["pre-stage", "release"]).has(value)) {
+    fail(`--mode must be pre-stage or release; observed ${value || "empty"}.`);
+  }
   return value;
 }

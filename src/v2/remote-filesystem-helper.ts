@@ -134,6 +134,14 @@ def stage_bytes(path, content, options):
         try: os.unlink(temporary)
         except FileNotFoundError: pass
 
+def create_symlink(path, link_target, options):
+    parent = require_parent(path, bool(options.get("createParents", False)))
+    if optional_lstat(path) is not None: raise RuntimeError("destination-exists")
+    if not isinstance(link_target, str) or "\x00" in link_target: raise RuntimeError("invalid-symlink-target")
+    os.symlink(link_target, path); fsync_directory(parent)
+    if not os.path.islink(path) or os.readlink(path) != link_target: raise RuntimeError("post-readback-mismatch")
+    return {"path": path, "type": "symlink", "linkTarget": link_target}
+
 def copy_regular_atomic(source, destination, options):
     source_before = preimage(source)
     if source_before.get("type") != "file": raise IsADirectoryError(source)
@@ -239,7 +247,7 @@ def trash_item(path, options):
     write_json_sync(os.path.join(entry, "metadata.json"), item)
     safe_move(path, payload, {"overwrite": False, "recursive": True, "allowCrossDevice": True, "finalSymlink": "replace"})
     item["state"] = "AVAILABLE"; write_json_sync(os.path.join(entry, "metadata.json"), item)
-    return {"path": path, "removed": True, "disposition": "trash", "recoverable": True, "trashId": trash_id, "restoreOperation": "restore"}
+    return {"path": path, "removed": True, "disposition": "trash", "recoverable": True, "trashId": trash_id}
 
 def restore_item(trash_id, destination, options):
     if not trash_id or any(character not in "0123456789abcdef-" for character in trash_id.lower()): raise RuntimeError("invalid-trash-id")
@@ -323,8 +331,9 @@ def execute():
         try: os.unlink(temporary)
         except FileNotFoundError: pass
         return {"path": temporary, "removed": True}
-    if op in ("copy", "sync"):
-        _, result = copy_item_atomic(path, destination, options); result.update({"source": path, "destination": destination, "copied": True, "synchronized": op == "sync"}); return result
+    if op == "symlink": return create_symlink(path, req.get("linkTarget"), options)
+    if op == "copy":
+        _, result = copy_item_atomic(path, destination, options); result.update({"source": path, "destination": destination, "copied": True}); return result
     if op == "move": result = safe_move(path, destination, options); result.update({"source": path, "destination": destination, "moved": True}); return result
     if op == "remove":
         if options.get("disposition", "trash") == "trash": return trash_item(path, options)

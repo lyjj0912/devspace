@@ -27,10 +27,13 @@ implicitly repeat the probe.
 Important production values include:
 
 ```text
+DEVSPACE_NEXT_STATE_DIR
+DEVSPACE_NEXT_AUTHORITY_STORE
+DEVSPACE_NEXT_CONNECTOR_ACTIVATION_JOURNAL
+DEVSPACE_NEXT_LIFECYCLE_FINALIZATION_STORE
 DEVSPACE_NEXT_SELF_MANAGEMENT_DIR
 DEVSPACE_NEXT_PM2_PROCESS_NAME
 DEVSPACE_NEXT_PM2_EXPECTED_SCRIPT
-DEVSPACE_NEXT_SELF_RESTART_DELAY_MS
 DEVSPACE_NEXT_SELF_RESTART_TIMEOUT_MS
 DEVSPACE_NEXT_OAUTH_STATE_DIR
 ```
@@ -116,16 +119,21 @@ DevSpace must not request, transmit, paste, store, or inspect the system passwor
 
 ## Durable broker restart
 
-1. Prepare one R3 action for `process.restart_broker` with the exact reason and
-   delay.
+1. Prepare one R3 action for `process.restart_broker` with the exact reason.
 2. Call `process.restart_broker` and retain the returned transaction ID.
-3. The broker writes request/status files and launches a user-level worker.
-4. The worker waits for the response grace period, replaces the PM2 process,
-   saves PM2 state, and verifies PID/cwd/script and local/public health.
-5. Reconnect the canonical connector.
-6. Call `process.restart_status` with the transaction ID; no authority is needed
+3. The broker durably records `PREPARED`, binds the transaction to the exact
+   response transport as `RESPONSE_BOUND`, and returns the transaction ID.
+4. Only the real HTTP/MCP response `finish` callback may durably record
+   `ACK_FLUSHED`. A pre-finish close, abort, or transport error records
+   `ACK_ABORTED`; an ACK-store failure forbids restart.
+5. The user-level Supervisor accepts a handoff only after durable
+   `ACK_FLUSHED`, replaces the PM2 process once, saves PM2 state, and verifies
+   PID/cwd/script plus local/public health. A dispatch whose result cannot be
+   proven becomes `UNKNOWN` and is never blindly replayed.
+6. Reconnect the canonical connector.
+7. Call `process.restart_status` with the transaction ID; no authority is needed
    for this read.
-7. Treat only `PASS` as completion. Preserve `FAIL` evidence and do not blindly
+8. Treat only `PASS` as completion. Preserve `FAIL`/`UNKNOWN` evidence and do not blindly
    repeat the restart.
 
 A restart changes no release revision. Use the production upgrade transaction to
@@ -145,6 +153,10 @@ Expected boundaries:
 - local and public health: 200;
 - unauthenticated MCP initialize: 401;
 - private readiness and metrics on the separate management listener: 200;
+- `/route-identityz` exists only on the management listener, requires the
+  owner-management bearer, and returns 200 only for production with exactly one
+  ACTIVE connector whose build/schema/authority identities match the running
+  immutable release;
 - the public data plane has no metrics route: 404.
 
 ## Production upgrade transaction
@@ -164,6 +176,17 @@ The upgrade procedure:
    reconnect;
 8. updates the canonical start path and audit link only after PASS;
 9. restores the previous release/environment on failure.
+
+`DEVSPACE_NEXT_LIFECYCLE_FINALIZATION_STORE` is the canonical mutable
+`<stateDir>/lifecycle.sqlite` ledger. The immutable candidate initializes it as
+exact `DRAFT` before the stopped-process snapshot and records that identity in
+the upgrade request. The production OAuth candidate must remain `VERIFIED`
+until that snapshot is complete; creating an `ACTIVATION_PREPARED` receipt
+before the snapshot is a cutover failure. The detached worker performs that
+preparation only after it has stopped database owners and verified the complete
+snapshot. The lifecycle database is part of mutable rollback, while the
+connector-activation one-shot journal is deliberately outside rollback so a
+restore cannot resurrect a dispatched approval.
 
 ## Logs and cleanup
 

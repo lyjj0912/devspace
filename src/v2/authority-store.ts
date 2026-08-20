@@ -13,7 +13,53 @@ export type DurableActionClaimState =
   | "UNCERTAIN"
   | "CANCELLED_NOT_DISPATCHED";
 
-export type DurableResourceLeaseState = "ACTIVE" | "FROZEN" | "RELEASED";
+export type DurableAuthorityReceiptAuditState =
+  | "RECORDED"
+  | "SINK_FAILED";
+
+export type DurableResourceLeaseState =
+  | "ACTIVE"
+  | "RELEASED"
+  | "EXPIRED"
+  | "RECOVERY_REQUIRED";
+
+export type DurableResourceReconciliationOutcome =
+  | "RESOURCE_VERIFIED"
+  | "RESOURCE_QUARANTINED";
+
+export interface DurableResourceLeaseHeartbeat {
+  resourceKeySha256: string;
+  actionClaimId: string;
+  fencingToken: number;
+  heartbeatAtMs: number;
+  expiresAtMs: number;
+}
+
+export type DurableResourceLeaseReconciliationResult =
+  | { ok: true; fencingToken: number; releasedAtMs: number }
+  | {
+      ok: false;
+      code:
+        | "AUTHORITY_PRINCIPAL_MISMATCH"
+        | "AUTHORITY_STATE_UNCERTAIN"
+        | "PRECONDITION_FAILED";
+    };
+
+export type DurableRecoveredConnectorActivationResult =
+  | {
+      ok: true;
+      fencingToken: number;
+      recoveredAtMs: number;
+      reconciliationEvidenceSha256: string;
+    }
+  | {
+      ok: false;
+      code:
+        | "AUTHORITY_PRINCIPAL_MISMATCH"
+        | "AUTHORITY_ACTION_MISMATCH"
+        | "AUTHORITY_STATE_UNCERTAIN"
+        | "PRECONDITION_FAILED";
+    };
 
 export interface DurableAuthorityTaskRecord {
   taskInstanceId: string;
@@ -56,6 +102,11 @@ export interface DurableAuthorityReceiptRecord {
   errorCode?: string;
   reasonCode?: string;
   cancellationProofCode?: string;
+  auditState?: DurableAuthorityReceiptAuditState;
+  auditEventDigest?: string;
+  auditReceiptDigest?: string;
+  auditRecordedAtMs?: number;
+  auditErrorCode?: string;
 }
 
 export interface DurableAuthorityRecord {
@@ -86,6 +137,7 @@ export type DurableAuthorityClaimResult =
       actionClaimId: string;
       resourceKeySha256: string;
       fencingToken: number;
+      leaseExpiresAtMs: number;
     }
   | {
       ok: false;
@@ -114,6 +166,15 @@ export type DurableAuthorityReleaseResult =
         | "PRECONDITION_FAILED";
       pendingReceipts?: number;
     };
+
+export type DurableAuthorityReceiptAuditResult =
+  | {
+      ok: true;
+      auditState: DurableAuthorityReceiptAuditState;
+      auditEventDigest?: string;
+      auditRecordedAtMs: number;
+    }
+  | { ok: false; code: "AUTHORITY_STATE_UNCERTAIN" | "PRECONDITION_FAILED" };
 
 export type DurableTaskCorrectionResult =
   | { ok: true; correctionEpoch: number; authorityIds: string[] }
@@ -172,6 +233,11 @@ interface ClaimRow {
   error_code: string | null;
   reason_code: string | null;
   cancellation_proof_code: string | null;
+  audit_state: DurableAuthorityReceiptAuditState | null;
+  audit_event_digest: string | null;
+  audit_receipt_digest: string | null;
+  audit_recorded_at_ms: number | null;
+  audit_error_code: string | null;
 }
 
 interface LeaseRow {
@@ -179,6 +245,16 @@ interface LeaseRow {
   action_claim_id: string;
   fencing_token: number;
   lease_state: DurableResourceLeaseState;
+  owner_instance_id: string;
+  acquired_at_ms: number;
+  heartbeat_at_ms: number;
+  expires_at_ms: number;
+  updated_at_ms: number;
+  reconciliation_state: "NOT_REQUIRED" | "PENDING" | "VERIFIED" | "FAILED";
+  reconciliation_outcome: DurableResourceReconciliationOutcome | null;
+  reconciliation_evidence_sha256: string | null;
+  reconciled_at_ms: number | null;
+  recovery_reason: string | null;
 }
 
 interface OwnerRunRow {
@@ -228,9 +304,15 @@ interface LegacyV3ReceiptRow {
   action_fingerprint: string;
 }
 
-const SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = 7;
 const HASH_PATTERN = /^[a-f0-9]{64}$/u;
-const OWNER_RUN_LEASE_MS = 30_000;
+const SHA256_DIGEST_PATTERN = /^sha256:[a-f0-9]{64}$/u;
+const DEFAULT_RESOURCE_LEASE_TTL_MS = 15 * 60_000;
+const DEFAULT_RESOURCE_LEASE_RECOVERY_GRACE_MS = 60_000;
+const DEFAULT_OWNER_RUN_LEASE_MS = 90_000;
+const MAXIMUM_RESOURCE_LEASE_TTL_MS = 8 * 60 * 60_000;
+const MAXIMUM_RESOURCE_LEASE_RECOVERY_GRACE_MS = 24 * 60 * 60_000;
+const MAXIMUM_OWNER_RUN_LEASE_MS = 24 * 60 * 60_000;
 const HOST_IDENTITY_SHA256 = createHash("sha256")
   .update(`${platform()}\0${hostname()}`)
   .digest("hex");
@@ -238,15 +320,45 @@ const HOST_IDENTITY_SHA256 = createHash("sha256")
 export class DurableAuthorityStore {
   private readonly sqlite: Database.Database;
   private readonly instanceId: string;
-  private readonly recoveredPendingUses: number;
+  private readonly resourceLeaseTtlMs: number;
+  private readonly resourceLeaseRecoveryGraceMs: number;
+  private readonly ownerRunLeaseMs: number;
+  private recoveredPendingUses: number;
 
   constructor(
     path: string | undefined,
     nowMs: number,
     instanceId = `authority_run_${randomUUID()}`,
     _activeOwnerInstanceIds: readonly string[] = [instanceId],
+    resourceLeaseTtlMs = DEFAULT_RESOURCE_LEASE_TTL_MS,
+    resourceLeaseRecoveryGraceMs = DEFAULT_RESOURCE_LEASE_RECOVERY_GRACE_MS,
+    ownerRunLeaseMs = DEFAULT_OWNER_RUN_LEASE_MS,
   ) {
     this.instanceId = instanceId;
+    if (
+      !Number.isSafeInteger(resourceLeaseTtlMs)
+      || resourceLeaseTtlMs < 1
+      || resourceLeaseTtlMs > MAXIMUM_RESOURCE_LEASE_TTL_MS
+    ) {
+      throw new Error("resourceLeaseTtlMs must be a positive bounded safe integer.");
+    }
+    this.resourceLeaseTtlMs = resourceLeaseTtlMs;
+    if (
+      !Number.isSafeInteger(resourceLeaseRecoveryGraceMs)
+      || resourceLeaseRecoveryGraceMs < 0
+      || resourceLeaseRecoveryGraceMs > MAXIMUM_RESOURCE_LEASE_RECOVERY_GRACE_MS
+    ) {
+      throw new Error("resourceLeaseRecoveryGraceMs must be a bounded non-negative safe integer.");
+    }
+    this.resourceLeaseRecoveryGraceMs = resourceLeaseRecoveryGraceMs;
+    if (
+      !Number.isSafeInteger(ownerRunLeaseMs)
+      || ownerRunLeaseMs < 1
+      || ownerRunLeaseMs > MAXIMUM_OWNER_RUN_LEASE_MS
+    ) {
+      throw new Error("ownerRunLeaseMs must be a positive bounded safe integer.");
+    }
+    this.ownerRunLeaseMs = ownerRunLeaseMs;
     if (path) mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     this.sqlite = new Database(path ?? ":memory:");
     if (path) chmodSync(path, 0o600);
@@ -328,7 +440,8 @@ export class DurableAuthorityStore {
               resource_key_sha256, fencing_token, claimed_at_ms,
               dispatched_at_ms, completed_at_ms, state, owner_instance_id,
               provider_call_count, error_code, reason_code,
-              cancellation_proof_code
+              cancellation_proof_code, audit_state, audit_event_digest,
+              audit_receipt_digest, audit_recorded_at_ms, audit_error_code
          from operation_authority_claims
         order by authority_id, claimed_at_ms, action_claim_id`,
     ).all() as ClaimRow[]) {
@@ -338,7 +451,7 @@ export class DurableAuthorityStore {
       const leaseState = lease?.action_claim_id === row.action_claim_id
         && lease.fencing_token === row.fencing_token
         ? lease.lease_state
-        : row.state === "UNCERTAIN" ? "FROZEN" : "RELEASED";
+        : row.state === "UNCERTAIN" ? "RECOVERY_REQUIRED" : "RELEASED";
       authority.receipts.push({
         actionClaimId: row.action_claim_id,
         useId: row.action_claim_id,
@@ -361,6 +474,11 @@ export class DurableAuthorityStore {
         ...(row.cancellation_proof_code
           ? { cancellationProofCode: row.cancellation_proof_code }
           : {}),
+        ...(row.audit_state ? { auditState: row.audit_state } : {}),
+        ...(row.audit_event_digest ? { auditEventDigest: row.audit_event_digest } : {}),
+        ...(row.audit_receipt_digest ? { auditReceiptDigest: row.audit_receipt_digest } : {}),
+        ...(row.audit_recorded_at_ms === null ? {} : { auditRecordedAtMs: row.audit_recorded_at_ms }),
+        ...(row.audit_error_code ? { auditErrorCode: row.audit_error_code } : {}),
       });
     }
     return {
@@ -464,6 +582,7 @@ export class DurableAuthorityStore {
     maximumReceipts: number;
   }): DurableAuthorityClaimResult {
     assertSha256(input.resourceKeySha256, "resourceKeySha256");
+    this.recoveredPendingUses += this.recoverNonterminalClaims(input.claimedAtMs);
     const claim = this.sqlite.transaction((): DurableAuthorityClaimResult => {
       this.touchOwnerRun(input.claimedAtMs);
       const authority = this.sqlite.prepare(
@@ -603,9 +722,12 @@ export class DurableAuthorityStore {
         `insert into operation_authority_resource_leases (
            resource_key_sha256, task_instance_id,
            principal_key_fingerprint, authority_id, action_id,
-           action_claim_id, fencing_token, lease_state,
-           acquired_at_ms, updated_at_ms
-         ) values (?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?)
+           action_claim_id, fencing_token, lease_state, owner_instance_id,
+           acquired_at_ms, heartbeat_at_ms, expires_at_ms, updated_at_ms,
+           reconciliation_state, reconciliation_outcome,
+           reconciliation_evidence_sha256, reconciled_at_ms, recovery_reason
+         ) values (?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?, ?, ?,
+                   'NOT_REQUIRED', null, null, null, null)
          on conflict(resource_key_sha256) do update set
            task_instance_id = excluded.task_instance_id,
            principal_key_fingerprint = excluded.principal_key_fingerprint,
@@ -614,8 +736,16 @@ export class DurableAuthorityStore {
            action_claim_id = excluded.action_claim_id,
            fencing_token = excluded.fencing_token,
            lease_state = 'ACTIVE',
+           owner_instance_id = excluded.owner_instance_id,
            acquired_at_ms = excluded.acquired_at_ms,
-           updated_at_ms = excluded.updated_at_ms`,
+           heartbeat_at_ms = excluded.heartbeat_at_ms,
+           expires_at_ms = excluded.expires_at_ms,
+           updated_at_ms = excluded.updated_at_ms,
+           reconciliation_state = 'NOT_REQUIRED',
+           reconciliation_outcome = null,
+           reconciliation_evidence_sha256 = null,
+           reconciled_at_ms = null,
+           recovery_reason = null`,
       ).run(
         input.resourceKeySha256,
         input.taskInstanceId,
@@ -624,7 +754,10 @@ export class DurableAuthorityStore {
         input.actionId,
         input.actionClaimId,
         fencingToken,
+        this.instanceId,
         input.claimedAtMs,
+        input.claimedAtMs,
+        input.claimedAtMs + this.resourceLeaseTtlMs,
         input.claimedAtMs,
       );
       this.pruneTerminalClaims(input.authorityId, input.maximumReceipts);
@@ -634,6 +767,7 @@ export class DurableAuthorityStore {
         actionClaimId: input.actionClaimId,
         resourceKeySha256: input.resourceKeySha256,
         fencingToken,
+        leaseExpiresAtMs: input.claimedAtMs + this.resourceLeaseTtlMs,
       };
     });
     return claim.immediate();
@@ -645,10 +779,10 @@ export class DurableAuthorityStore {
     resourceKeySha256: string;
     fencingToken: number;
     dispatchedAtMs: number;
-  }): boolean {
+  }): DurableResourceLeaseHeartbeat | undefined {
     const mark = this.sqlite.transaction(() => {
       this.touchOwnerRun(input.dispatchedAtMs);
-      if (!this.currentLeaseMatches(input, "ACTIVE")) return false;
+      if (!this.currentLeaseMatches(input, "ACTIVE", this.instanceId)) return undefined;
       const updated = this.sqlite.prepare(
         `update operation_authority_claims
             set state = 'DISPATCHED', dispatched_at_ms = ?
@@ -662,20 +796,75 @@ export class DurableAuthorityStore {
         input.resourceKeySha256,
         input.fencingToken,
       );
-      if (updated.changes !== 1) return false;
-      this.sqlite.prepare(
-        `update operation_authority_resource_leases set updated_at_ms = ?
+      if (updated.changes !== 1) return undefined;
+      const expiresAtMs = input.dispatchedAtMs + this.resourceLeaseTtlMs;
+      const lease = this.sqlite.prepare(
+        `update operation_authority_resource_leases
+            set heartbeat_at_ms = ?, expires_at_ms = ?, updated_at_ms = ?
           where resource_key_sha256 = ? and action_claim_id = ?
-            and fencing_token = ? and lease_state = 'ACTIVE'`,
+            and fencing_token = ? and lease_state = 'ACTIVE'
+            and owner_instance_id = ?`,
       ).run(
+        input.dispatchedAtMs,
+        expiresAtMs,
         input.dispatchedAtMs,
         input.resourceKeySha256,
         input.actionClaimId,
         input.fencingToken,
+        this.instanceId,
       );
-      return true;
+      if (lease.changes !== 1) {
+        throw new Error("DISPATCHED barrier could not atomically renew its resource lease.");
+      }
+      return {
+        resourceKeySha256: input.resourceKeySha256,
+        actionClaimId: input.actionClaimId,
+        fencingToken: input.fencingToken,
+        heartbeatAtMs: input.dispatchedAtMs,
+        expiresAtMs,
+      };
     });
     return mark.immediate();
+  }
+
+  heartbeatResourceLease(input: {
+    authorityId: string;
+    actionClaimId: string;
+    resourceKeySha256: string;
+    fencingToken: number;
+    heartbeatAtMs: number;
+  }): DurableResourceLeaseHeartbeat | undefined {
+    assertSha256(input.resourceKeySha256, "resourceKeySha256");
+    const heartbeat = this.sqlite.transaction(() => {
+      this.touchOwnerRun(input.heartbeatAtMs);
+      if (!this.currentLeaseMatches(input, "ACTIVE", this.instanceId)) return undefined;
+      const expiresAtMs = input.heartbeatAtMs + this.resourceLeaseTtlMs;
+      const updated = this.sqlite.prepare(
+        `update operation_authority_resource_leases
+            set heartbeat_at_ms = ?, expires_at_ms = ?, updated_at_ms = ?
+          where resource_key_sha256 = ? and authority_id = ?
+            and action_claim_id = ? and fencing_token = ?
+            and lease_state = 'ACTIVE' and owner_instance_id = ?`,
+      ).run(
+        input.heartbeatAtMs,
+        expiresAtMs,
+        input.heartbeatAtMs,
+        input.resourceKeySha256,
+        input.authorityId,
+        input.actionClaimId,
+        input.fencingToken,
+        this.instanceId,
+      );
+      if (updated.changes !== 1) return undefined;
+      return {
+        resourceKeySha256: input.resourceKeySha256,
+        actionClaimId: input.actionClaimId,
+        fencingToken: input.fencingToken,
+        heartbeatAtMs: input.heartbeatAtMs,
+        expiresAtMs,
+      };
+    });
+    return heartbeat.immediate();
   }
 
   cancelClaimNotDispatched(input: {
@@ -692,7 +881,7 @@ export class DurableAuthorityStore {
     if (!proofCode) return false;
     const cancel = this.sqlite.transaction(() => {
       this.touchOwnerRun(input.completedAtMs);
-      if (!this.currentLeaseMatches(input, "ACTIVE")) return false;
+      if (!this.currentLeaseMatches(input, "ACTIVE", this.instanceId)) return false;
       const claim = this.sqlite.prepare(
         `select action_id from operation_authority_claims
           where authority_id = ? and action_claim_id = ?
@@ -731,10 +920,13 @@ export class DurableAuthorityStore {
         throw new Error("Claim cancellation could not atomically reclaim its authority use.");
       }
       const released = this.sqlite.prepare(
-        `delete from operation_authority_resource_leases
+        `update operation_authority_resource_leases
+            set lease_state = 'RELEASED', updated_at_ms = ?,
+                reconciliation_state = 'NOT_REQUIRED', recovery_reason = null
           where resource_key_sha256 = ? and action_claim_id = ?
             and fencing_token = ? and lease_state = 'ACTIVE'`,
       ).run(
+        input.completedAtMs,
         input.resourceKeySha256,
         input.actionClaimId,
         input.fencingToken,
@@ -761,7 +953,7 @@ export class DurableAuthorityStore {
   }): boolean {
     const terminalize = this.sqlite.transaction(() => {
       this.touchOwnerRun(input.completedAtMs);
-      if (!this.currentLeaseMatches(input, "ACTIVE")) return false;
+      if (!this.currentLeaseMatches(input, "ACTIVE", this.instanceId)) return false;
       const updated = this.sqlite.prepare(
         `update operation_authority_claims
             set state = ?, completed_at_ms = ?, provider_call_count = 1,
@@ -783,20 +975,26 @@ export class DurableAuthorityStore {
       const released = input.state === "UNCERTAIN"
         ? this.sqlite.prepare(
           `update operation_authority_resource_leases
-              set lease_state = 'FROZEN', updated_at_ms = ?
+              set lease_state = 'RECOVERY_REQUIRED', updated_at_ms = ?,
+                  reconciliation_state = 'PENDING',
+                  recovery_reason = coalesce(?, 'ACTION_RESULT_UNCERTAIN')
             where resource_key_sha256 = ? and action_claim_id = ?
               and fencing_token = ? and lease_state = 'ACTIVE'`,
         ).run(
           input.completedAtMs,
+          safeCode(input.reasonCode),
           input.resourceKeySha256,
           input.actionClaimId,
           input.fencingToken,
         )
         : this.sqlite.prepare(
-          `delete from operation_authority_resource_leases
+          `update operation_authority_resource_leases
+              set lease_state = 'RELEASED', updated_at_ms = ?,
+                  reconciliation_state = 'NOT_REQUIRED', recovery_reason = null
             where resource_key_sha256 = ? and action_claim_id = ?
               and fencing_token = ? and lease_state = 'ACTIVE'`,
         ).run(
+          input.completedAtMs,
           input.resourceKeySha256,
           input.actionClaimId,
           input.fencingToken,
@@ -808,6 +1006,327 @@ export class DurableAuthorityStore {
       return true;
     });
     return terminalize.immediate();
+  }
+
+  recordClaimAuditResult(input: {
+    authorityId: string;
+    actionClaimId: string;
+    receiptDigest: string;
+    status: DurableAuthorityReceiptAuditState;
+    auditEventDigest?: string;
+    errorCode?: string;
+    recordedAtMs: number;
+  }): DurableAuthorityReceiptAuditResult {
+    if (input.status !== "RECORDED" && input.status !== "SINK_FAILED") {
+      return { ok: false, code: "PRECONDITION_FAILED" };
+    }
+    const receiptDigest = assertSha256Digest(input.receiptDigest, "receiptDigest");
+    const auditEventDigest = input.status === "RECORDED"
+      ? assertSha256Digest(input.auditEventDigest, "auditEventDigest")
+      : null;
+    if (input.status === "SINK_FAILED" && input.auditEventDigest !== undefined) {
+      return { ok: false, code: "PRECONDITION_FAILED" };
+    }
+    if (!Number.isSafeInteger(input.recordedAtMs) || input.recordedAtMs < 0) {
+      return { ok: false, code: "PRECONDITION_FAILED" };
+    }
+    const errorCode = input.status === "SINK_FAILED"
+      ? (safeCode(input.errorCode) ?? "AUDIT_SINK_FAILED")
+      : null;
+    const record = this.sqlite.transaction((): DurableAuthorityReceiptAuditResult => {
+      this.touchOwnerRun(input.recordedAtMs);
+      const current = this.sqlite.prepare(
+        `select state, audit_state, audit_event_digest, audit_receipt_digest,
+                audit_recorded_at_ms
+           from operation_authority_claims
+          where authority_id = ? and action_claim_id = ?`,
+      ).get(input.authorityId, input.actionClaimId) as {
+        state: DurableActionClaimState;
+        audit_state: DurableAuthorityReceiptAuditState | null;
+        audit_event_digest: string | null;
+        audit_receipt_digest: string | null;
+        audit_recorded_at_ms: number | null;
+      } | undefined;
+      if (!current || current.state === "CLAIMED" || current.state === "DISPATCHED") {
+        return { ok: false, code: "AUTHORITY_STATE_UNCERTAIN" };
+      }
+      if (current.audit_state !== null) {
+        const sameRecorded = current.audit_state === input.status
+          && current.audit_receipt_digest === receiptDigest
+          && (current.audit_event_digest ?? null) === auditEventDigest;
+        return sameRecorded
+          ? {
+              ok: true,
+              auditState: input.status,
+              ...(auditEventDigest ? { auditEventDigest } : {}),
+              auditRecordedAtMs: current.audit_recorded_at_ms ?? input.recordedAtMs,
+            }
+          : { ok: false, code: "AUTHORITY_STATE_UNCERTAIN" };
+      }
+      const updated = this.sqlite.prepare(
+        `update operation_authority_claims
+            set audit_state = ?, audit_event_digest = ?,
+                audit_receipt_digest = ?, audit_recorded_at_ms = ?,
+                audit_error_code = ?
+          where authority_id = ? and action_claim_id = ?
+            and audit_state is null`,
+      ).run(
+        input.status,
+        auditEventDigest,
+        receiptDigest,
+        input.recordedAtMs,
+        errorCode,
+        input.authorityId,
+        input.actionClaimId,
+      );
+      return updated.changes === 1
+        ? {
+            ok: true,
+            auditState: input.status,
+            ...(auditEventDigest ? { auditEventDigest } : {}),
+            auditRecordedAtMs: input.recordedAtMs,
+          }
+        : { ok: false, code: "AUTHORITY_STATE_UNCERTAIN" };
+    });
+    return record.immediate();
+  }
+
+  reconcileResourceLease(input: {
+    principalKeyFingerprint: string;
+    resourceKeySha256: string;
+    actionClaimId: string;
+    fencingToken: number;
+    outcome: DurableResourceReconciliationOutcome;
+    evidenceDigest: string;
+    reconciledAtMs: number;
+  }): DurableResourceLeaseReconciliationResult {
+    assertSha256(input.resourceKeySha256, "resourceKeySha256");
+    assertSha256(input.evidenceDigest, "evidenceDigest");
+    if (/^0{64}$/u.test(input.evidenceDigest)) {
+      return { ok: false, code: "PRECONDITION_FAILED" };
+    }
+    if (!(["RESOURCE_VERIFIED", "RESOURCE_QUARANTINED"] as const).includes(input.outcome)) {
+      return { ok: false, code: "PRECONDITION_FAILED" };
+    }
+    const reconcile = this.sqlite.transaction((): DurableResourceLeaseReconciliationResult => {
+      this.touchOwnerRun(input.reconciledAtMs);
+      const lease = this.sqlite.prepare(
+        `select principal_key_fingerprint, action_claim_id, fencing_token,
+                lease_state, reconciliation_state
+           from operation_authority_resource_leases
+          where resource_key_sha256 = ?`,
+      ).get(input.resourceKeySha256) as {
+        principal_key_fingerprint: string;
+        action_claim_id: string;
+        fencing_token: number;
+        lease_state: DurableResourceLeaseState;
+        reconciliation_state: string;
+      } | undefined;
+      if (!lease) return { ok: false, code: "AUTHORITY_STATE_UNCERTAIN" };
+      if (lease.principal_key_fingerprint !== input.principalKeyFingerprint) {
+        return { ok: false, code: "AUTHORITY_PRINCIPAL_MISMATCH" };
+      }
+      if (
+        lease.action_claim_id !== input.actionClaimId
+        || lease.fencing_token !== input.fencingToken
+        || lease.lease_state !== "RECOVERY_REQUIRED"
+        || lease.reconciliation_state !== "PENDING"
+      ) {
+        return { ok: false, code: "AUTHORITY_STATE_UNCERTAIN" };
+      }
+      const claim = this.sqlite.prepare(
+        `select state from operation_authority_claims
+          where action_claim_id = ? and resource_key_sha256 = ? and fencing_token = ?`,
+      ).get(
+        input.actionClaimId,
+        input.resourceKeySha256,
+        input.fencingToken,
+      ) as { state: DurableActionClaimState } | undefined;
+      if (claim?.state !== "UNCERTAIN") {
+        return { ok: false, code: "AUTHORITY_STATE_UNCERTAIN" };
+      }
+      const updated = this.sqlite.prepare(
+        `update operation_authority_resource_leases
+            set lease_state = 'RELEASED', reconciliation_state = 'VERIFIED',
+                reconciliation_outcome = ?, reconciliation_evidence_sha256 = ?,
+                reconciled_at_ms = ?, updated_at_ms = ?
+          where resource_key_sha256 = ? and action_claim_id = ?
+            and fencing_token = ? and lease_state = 'RECOVERY_REQUIRED'
+            and reconciliation_state = 'PENDING'`,
+      ).run(
+        input.outcome,
+        input.evidenceDigest,
+        input.reconciledAtMs,
+        input.reconciledAtMs,
+        input.resourceKeySha256,
+        input.actionClaimId,
+        input.fencingToken,
+      );
+      return updated.changes === 1
+        ? { ok: true, fencingToken: input.fencingToken, releasedAtMs: input.reconciledAtMs }
+        : { ok: false, code: "AUTHORITY_STATE_UNCERTAIN" };
+    });
+    return reconcile.immediate();
+  }
+
+  /**
+   * Atomically closes the only supported cross-store recovery case: an exact
+   * connector activation proof exists in OAuth after this claim was recovered
+   * as UNCERTAIN. Generic callers cannot use this to bless an unknown result.
+   */
+  terminalizeRecoveredConnectorActivationPass(input: {
+    principalKeyFingerprint: string;
+    authorityId: string;
+    actionClaimId: string;
+    actionFingerprint: string;
+    resourceKeySha256: string;
+    fencingToken: number;
+    oauthProofDigest: string;
+    reconciliationEvidenceSha256: string;
+    recoveredAtMs: number;
+  }): DurableRecoveredConnectorActivationResult {
+    if (!HASH_PATTERN.test(input.principalKeyFingerprint)
+      || !HASH_PATTERN.test(input.actionFingerprint)
+      || !HASH_PATTERN.test(input.resourceKeySha256)
+      || !SHA256_DIGEST_PATTERN.test(input.oauthProofDigest)
+      || !HASH_PATTERN.test(input.reconciliationEvidenceSha256)
+      || /^0{64}$/u.test(input.reconciliationEvidenceSha256)
+      || !Number.isSafeInteger(input.fencingToken)
+      || input.fencingToken < 1
+      || !Number.isSafeInteger(input.recoveredAtMs)
+      || input.recoveredAtMs < 0) {
+      return { ok: false, code: "PRECONDITION_FAILED" };
+    }
+    const recover = this.sqlite.transaction((): DurableRecoveredConnectorActivationResult => {
+      this.touchOwnerRun(input.recoveredAtMs);
+      const row = this.sqlite.prepare(
+        `select c.state, c.completed_at_ms, c.provider_call_count, c.principal_key_fingerprint,
+                c.action_fingerprint, c.resource_key_sha256, c.fencing_token,
+                c.reason_code, a.action_id, a.tool, a.operation,
+                a.fingerprint as durable_action_fingerprint,
+                a.resource_key_sha256 as action_resource_key_sha256,
+                l.principal_key_fingerprint as lease_principal_key_fingerprint,
+                l.action_claim_id as lease_action_claim_id,
+                l.fencing_token as lease_fencing_token,
+                l.lease_state, l.reconciliation_state,
+                l.reconciliation_outcome, l.reconciliation_evidence_sha256
+           from operation_authority_claims c
+           join operation_authority_actions a
+             on a.authority_id = c.authority_id and a.action_id = c.action_id
+           left join operation_authority_resource_leases l
+             on l.resource_key_sha256 = c.resource_key_sha256
+          where c.authority_id = ? and c.action_claim_id = ?`,
+      ).get(input.authorityId, input.actionClaimId) as {
+        state: DurableActionClaimState;
+        completed_at_ms: number | null;
+        provider_call_count: number | null;
+        principal_key_fingerprint: string;
+        action_fingerprint: string;
+        resource_key_sha256: string;
+        fencing_token: number;
+        reason_code: string | null;
+        action_id: string;
+        tool: string;
+        operation: string;
+        durable_action_fingerprint: string;
+        action_resource_key_sha256: string;
+        lease_principal_key_fingerprint: string | null;
+        lease_action_claim_id: string | null;
+        lease_fencing_token: number | null;
+        lease_state: DurableResourceLeaseState | null;
+        reconciliation_state: string | null;
+        reconciliation_outcome: string | null;
+        reconciliation_evidence_sha256: string | null;
+      } | undefined;
+      if (!row) return { ok: false, code: "AUTHORITY_STATE_UNCERTAIN" };
+      if (row.principal_key_fingerprint !== input.principalKeyFingerprint
+        || row.lease_principal_key_fingerprint !== input.principalKeyFingerprint) {
+        return { ok: false, code: "AUTHORITY_PRINCIPAL_MISMATCH" };
+      }
+      if (row.action_fingerprint !== input.actionFingerprint
+        || row.durable_action_fingerprint !== input.actionFingerprint
+        || row.action_id !== `action_${input.actionFingerprint}`
+        || row.tool !== "context"
+        || row.operation !== "connector_activation_finalize"
+        || row.resource_key_sha256 !== input.resourceKeySha256
+        || row.action_resource_key_sha256 !== input.resourceKeySha256
+        || row.fencing_token !== input.fencingToken
+        || row.lease_action_claim_id !== input.actionClaimId
+        || row.lease_fencing_token !== input.fencingToken) {
+        return { ok: false, code: "AUTHORITY_ACTION_MISMATCH" };
+      }
+      if (row.state === "PASS") {
+        const sameRecovery = row.provider_call_count === 1
+          && row.reason_code === "CONNECTOR_ACTIVATION_RECOVERED_EXACT_OAUTH_RECEIPT"
+          && row.lease_state === "RELEASED"
+          && row.reconciliation_state === "VERIFIED"
+          && row.reconciliation_outcome === "RESOURCE_VERIFIED"
+          && row.reconciliation_evidence_sha256 === input.reconciliationEvidenceSha256;
+        return sameRecovery
+          ? {
+              ok: true,
+              fencingToken: input.fencingToken,
+              recoveredAtMs: row.completed_at_ms ?? input.recoveredAtMs,
+              reconciliationEvidenceSha256: input.reconciliationEvidenceSha256,
+            }
+          : { ok: false, code: "AUTHORITY_STATE_UNCERTAIN" };
+      }
+      if (row.state !== "UNCERTAIN"
+        || row.provider_call_count !== 1
+        || row.lease_state !== "RECOVERY_REQUIRED"
+        || row.reconciliation_state !== "PENDING") {
+        return { ok: false, code: "AUTHORITY_STATE_UNCERTAIN" };
+      }
+      const claim = this.sqlite.prepare(
+        `update operation_authority_claims
+            set state = 'PASS', completed_at_ms = ?, provider_call_count = 1,
+                error_code = null,
+                reason_code = 'CONNECTOR_ACTIVATION_RECOVERED_EXACT_OAUTH_RECEIPT'
+          where authority_id = ? and action_claim_id = ?
+            and action_fingerprint = ? and resource_key_sha256 = ?
+            and fencing_token = ? and state = 'UNCERTAIN'
+            and provider_call_count = 1`,
+      ).run(
+        input.recoveredAtMs,
+        input.authorityId,
+        input.actionClaimId,
+        input.actionFingerprint,
+        input.resourceKeySha256,
+        input.fencingToken,
+      );
+      const lease = this.sqlite.prepare(
+        `update operation_authority_resource_leases
+            set lease_state = 'RELEASED', updated_at_ms = ?,
+                reconciliation_state = 'VERIFIED',
+                reconciliation_outcome = 'RESOURCE_VERIFIED',
+                reconciliation_evidence_sha256 = ?, reconciled_at_ms = ?,
+                recovery_reason = 'CONNECTOR_ACTIVATION_EXACT_OAUTH_RECEIPT'
+          where resource_key_sha256 = ? and authority_id = ?
+            and action_claim_id = ? and fencing_token = ?
+            and principal_key_fingerprint = ?
+            and lease_state = 'RECOVERY_REQUIRED'
+            and reconciliation_state = 'PENDING'`,
+      ).run(
+        input.recoveredAtMs,
+        input.reconciliationEvidenceSha256,
+        input.recoveredAtMs,
+        input.resourceKeySha256,
+        input.authorityId,
+        input.actionClaimId,
+        input.fencingToken,
+        input.principalKeyFingerprint,
+      );
+      if (claim.changes !== 1 || lease.changes !== 1) {
+        throw new Error("Recovered connector activation could not atomically terminalize its claim and lease.");
+      }
+      return {
+        ok: true,
+        fencingToken: input.fencingToken,
+        recoveredAtMs: input.recoveredAtMs,
+        reconciliationEvidenceSha256: input.reconciliationEvidenceSha256,
+      };
+    });
+    return recover.immediate();
   }
 
   incrementTaskCorrectionEpoch(
@@ -989,10 +1508,22 @@ export class DurableAuthorityStore {
       this.validateDatabase("post-v4-migration");
       return;
     }
+    if (currentVersion === 5) {
+      const backup = path ? this.createMigrationBackup(path) : undefined;
+      this.migrateV5Schema(nowMs, backup);
+      this.validateDatabase("post-v5-migration");
+      return;
+    }
+    if (currentVersion === 6) {
+      const backup = path ? this.createMigrationBackup(path) : undefined;
+      this.migrateV6Schema(nowMs, backup);
+      this.validateDatabase("post-v6-migration");
+      return;
+    }
     if (currentVersion === 0 && !hasLegacyTables) {
       this.createSchema();
       this.sqlite.pragma(`user_version = ${SCHEMA_VERSION}`);
-      this.validateDatabase("new-v5-store");
+      this.validateDatabase("new-v7-store");
       return;
     }
     if (currentVersion < SCHEMA_VERSION) {
@@ -1000,7 +1531,7 @@ export class DurableAuthorityStore {
         `Authority store schema ${currentVersion} cannot be migrated because its legacy tables are incomplete.`,
       );
     }
-    this.validateDatabase("existing-v5-store");
+    this.validateDatabase("existing-v7-store");
   }
 
   private createSchema(): void {
@@ -1094,6 +1625,17 @@ export class DurableAuthorityStore {
         error_code text,
         reason_code text,
         cancellation_proof_code text,
+        audit_state text check (audit_state is null or audit_state in ('RECORDED', 'SINK_FAILED')),
+        audit_event_digest text check (
+          audit_event_digest is null
+          or (length(audit_event_digest) = 71 and substr(audit_event_digest, 1, 7) = 'sha256:')
+        ),
+        audit_receipt_digest text check (
+          audit_receipt_digest is null
+          or (length(audit_receipt_digest) = 71 and substr(audit_receipt_digest, 1, 7) = 'sha256:')
+        ),
+        audit_recorded_at_ms integer,
+        audit_error_code text,
         unique (resource_key_sha256, fencing_token),
         foreign key (authority_id, action_id)
           references operation_authority_actions(authority_id, action_id) on delete cascade,
@@ -1111,18 +1653,35 @@ export class DurableAuthorityStore {
         action_id text not null,
         action_claim_id text not null,
         fencing_token integer not null check (fencing_token >= 1),
-        lease_state text not null check (lease_state in ('ACTIVE', 'FROZEN')),
+        lease_state text not null check (lease_state in (
+          'ACTIVE', 'RELEASED', 'EXPIRED', 'RECOVERY_REQUIRED'
+        )),
+        owner_instance_id text not null,
         acquired_at_ms integer not null,
+        heartbeat_at_ms integer not null,
+        expires_at_ms integer not null,
         updated_at_ms integer not null,
+        reconciliation_state text not null check (reconciliation_state in (
+          'NOT_REQUIRED', 'PENDING', 'VERIFIED', 'FAILED'
+        )),
+        reconciliation_outcome text check (reconciliation_outcome in (
+          'RESOURCE_VERIFIED', 'RESOURCE_QUARANTINED'
+        )),
+        reconciliation_evidence_sha256 text
+          check (reconciliation_evidence_sha256 is null or length(reconciliation_evidence_sha256) = 64),
+        reconciled_at_ms integer,
+        recovery_reason text,
         foreign key (task_instance_id)
           references operation_authority_tasks(task_instance_id),
         foreign key (authority_id, action_id)
           references operation_authority_actions(authority_id, action_id),
         foreign key (action_claim_id)
-          references operation_authority_claims(action_claim_id)
+          references operation_authority_claims(action_claim_id) on delete cascade
       );
       create index if not exists operation_authority_resource_leases_task_idx
         on operation_authority_resource_leases(task_instance_id, lease_state);
+      create index if not exists operation_authority_resource_leases_expiry_idx
+        on operation_authority_resource_leases(lease_state, expires_at_ms);
       create trigger if not exists operation_authority_resource_leases_exact_insert
       before insert on operation_authority_resource_leases
       begin
@@ -1267,6 +1826,7 @@ export class DurableAuthorityStore {
         `);
         this.ensureMigrationColumns();
         this.createSchema();
+        this.ensureClaimAuditColumns();
         const legacyActions = this.sqlite.prepare(
           `select authority_id, action_id, ordinal, tool, operation, fingerprint,
                   minimum_risk, risk, maximum_uses, consumed_uses
@@ -1367,6 +1927,7 @@ export class DurableAuthorityStore {
               actionId: receipt.action_id,
               taskInstanceId: receipt.task_instance_id,
               principalKeyFingerprint: receipt.principal_key_fingerprint,
+              ownerInstanceId: receipt.owner_instance_id,
               fencingToken,
               nowMs,
             });
@@ -1427,6 +1988,7 @@ export class DurableAuthorityStore {
            where state in ('CLAIMED', 'DISPATCHED');
         `);
         this.createSchema();
+        this.ensureClaimAuditColumns();
         this.sqlite.prepare(
           `insert into operation_authority_v4_lease_quarantine (
              resource_key_sha256, action_claim_id, quarantined_at_ms,
@@ -1454,12 +2016,17 @@ export class DurableAuthorityStore {
           insert into operation_authority_resource_leases (
             resource_key_sha256, task_instance_id, principal_key_fingerprint,
             authority_id, action_id, action_claim_id, fencing_token,
-            lease_state, acquired_at_ms, updated_at_ms
+            lease_state, owner_instance_id, acquired_at_ms, heartbeat_at_ms,
+            expires_at_ms, updated_at_ms, reconciliation_state,
+            reconciliation_outcome, reconciliation_evidence_sha256,
+            reconciled_at_ms, recovery_reason
           )
           select l.resource_key_sha256, l.task_instance_id,
                  l.principal_key_fingerprint, l.authority_id, l.action_id,
-                 l.action_claim_id, l.fencing_token, 'FROZEN',
-                 l.acquired_at_ms, ${Number(nowMs)}
+                 l.action_claim_id, l.fencing_token, 'RECOVERY_REQUIRED',
+                 c.owner_instance_id, l.acquired_at_ms, ${Number(nowMs)},
+                 ${Number(nowMs)}, ${Number(nowMs)}, 'PENDING',
+                 null, null, null, 'V4_NONTERMINAL_LEASE_MIGRATED'
             from legacy_v4_operation_authority_resource_leases l
             join operation_authority_claims c
               on c.action_claim_id = l.action_claim_id
@@ -1482,6 +2049,76 @@ export class DurableAuthorityStore {
     } finally {
       this.sqlite.pragma("foreign_keys = ON");
     }
+    this.finishMigrationRecord();
+  }
+
+  private migrateV5Schema(nowMs: number, backup: MigrationBackup | undefined): void {
+    this.sqlite.pragma("foreign_keys = OFF");
+    try {
+      const migrate = this.sqlite.transaction(() => {
+        this.sqlite.exec(`
+          drop trigger if exists operation_authority_resource_leases_exact_insert;
+          drop trigger if exists operation_authority_resource_leases_exact_update;
+          drop index if exists operation_authority_resource_leases_task_idx;
+          alter table operation_authority_resource_leases
+            rename to legacy_v5_operation_authority_resource_leases;
+        `);
+        this.createSchema();
+        this.ensureClaimAuditColumns();
+        this.sqlite.prepare(`
+          insert into operation_authority_resource_leases (
+            resource_key_sha256, task_instance_id, principal_key_fingerprint,
+            authority_id, action_id, action_claim_id, fencing_token,
+            lease_state, owner_instance_id, acquired_at_ms, heartbeat_at_ms,
+            expires_at_ms, updated_at_ms, reconciliation_state,
+            reconciliation_outcome, reconciliation_evidence_sha256,
+            reconciled_at_ms, recovery_reason
+          )
+          select l.resource_key_sha256, l.task_instance_id,
+                 l.principal_key_fingerprint, l.authority_id, l.action_id,
+                 l.action_claim_id, l.fencing_token,
+                 case when l.lease_state = 'FROZEN'
+                      then 'RECOVERY_REQUIRED' else 'ACTIVE' end,
+                 c.owner_instance_id, l.acquired_at_ms, l.updated_at_ms,
+                 l.updated_at_ms + ?, l.updated_at_ms,
+                 case when l.lease_state = 'FROZEN'
+                      then 'PENDING' else 'NOT_REQUIRED' end,
+                 null, null, null,
+                 case when l.lease_state = 'FROZEN'
+                      then 'V5_FROZEN_LEASE_MIGRATED' else null end
+            from legacy_v5_operation_authority_resource_leases l
+            join operation_authority_claims c
+              on c.action_claim_id = l.action_claim_id
+             and c.authority_id = l.authority_id
+             and c.action_id = l.action_id
+             and c.task_instance_id = l.task_instance_id
+             and c.principal_key_fingerprint = l.principal_key_fingerprint
+             and c.resource_key_sha256 = l.resource_key_sha256
+             and c.fencing_token = l.fencing_token
+        `).run(this.resourceLeaseTtlMs);
+        const recoveryRequired = (this.sqlite.prepare(
+          `select count(*) as count
+             from operation_authority_resource_leases
+            where lease_state = 'RECOVERY_REQUIRED'`,
+        ).get() as { count: number }).count;
+        this.sqlite.exec("drop table legacy_v5_operation_authority_resource_leases");
+        this.insertMigrationRecord(5, nowMs, backup, recoveryRequired);
+        this.sqlite.pragma(`user_version = ${SCHEMA_VERSION}`);
+      });
+      migrate.immediate();
+    } finally {
+      this.sqlite.pragma("foreign_keys = ON");
+    }
+    this.finishMigrationRecord();
+  }
+
+  private migrateV6Schema(nowMs: number, backup: MigrationBackup | undefined): void {
+    const migrate = this.sqlite.transaction(() => {
+      this.ensureClaimAuditColumns();
+      this.insertMigrationRecord(6, nowMs, backup, 0);
+      this.sqlite.pragma(`user_version = ${SCHEMA_VERSION}`);
+    });
+    migrate.immediate();
     this.finishMigrationRecord();
   }
 
@@ -1540,7 +2177,7 @@ export class DurableAuthorityStore {
         processStartKeySha256,
         nowMs,
         nowMs,
-        nowMs + OWNER_RUN_LEASE_MS,
+        nowMs + this.ownerRunLeaseMs,
       );
       const row = this.ownerRun(this.instanceId);
       if (
@@ -1561,17 +2198,20 @@ export class DurableAuthorityStore {
       `update operation_authority_owner_runs
           set heartbeat_at_ms = ?, lease_deadline_ms = ?
         where owner_run_id = ? and run_state = 'ACTIVE'`,
-    ).run(nowMs, nowMs + OWNER_RUN_LEASE_MS, this.instanceId);
+    ).run(nowMs, nowMs + this.ownerRunLeaseMs, this.instanceId);
     if (touched.changes !== 1) {
       throw new Error("Authority owner run is no longer active.");
     }
   }
 
   private recoverNonterminalClaims(nowMs: number): number {
+    const recoveryCutoffMs = nowMs - this.resourceLeaseRecoveryGraceMs;
     const rows = this.sqlite.prepare(
       `select c.authority_id, c.action_claim_id, c.action_id,
               c.resource_key_sha256, c.fencing_token,
               c.owner_instance_id, c.state,
+              l.owner_instance_id as lease_owner_instance_id,
+              l.lease_state, l.expires_at_ms as resource_expires_at_ms,
               o.host_identity_sha256, o.process_id,
               o.process_start_key_sha256, o.run_state,
               o.registered_at_ms, o.heartbeat_at_ms,
@@ -1579,6 +2219,10 @@ export class DurableAuthorityStore {
          from operation_authority_claims c
          left join operation_authority_owner_runs o
            on o.owner_run_id = c.owner_instance_id
+         left join operation_authority_resource_leases l
+           on l.resource_key_sha256 = c.resource_key_sha256
+          and l.action_claim_id = c.action_claim_id
+          and l.fencing_token = c.fencing_token
         where c.state in ('CLAIMED', 'DISPATCHED')
         order by c.claimed_at_ms, c.action_claim_id`,
     ).all() as Array<{
@@ -1589,6 +2233,9 @@ export class DurableAuthorityStore {
       fencing_token: number;
       owner_instance_id: string;
       state: "CLAIMED" | "DISPATCHED";
+      lease_owner_instance_id: string | null;
+      lease_state: DurableResourceLeaseState | null;
+      resource_expires_at_ms: number | null;
       host_identity_sha256: string | null;
       process_id: number | null;
       process_start_key_sha256: string | null;
@@ -1598,7 +2245,13 @@ export class DurableAuthorityStore {
       lease_deadline_ms: number | null;
       closed_at_ms: number | null;
     }>;
-    const recoverable = rows.filter((row) => ownerRunIsVerifiedDead(row, nowMs));
+    const recoverable = rows.filter((row) => (
+      row.lease_state === "ACTIVE"
+      && row.lease_owner_instance_id === row.owner_instance_id
+      && row.resource_expires_at_ms !== null
+      && row.resource_expires_at_ms <= recoveryCutoffMs
+      && ownerRunIsVerifiedDead(row, nowMs)
+    ));
     if (recoverable.length === 0) return 0;
     const recover = this.sqlite.transaction(() => {
       let recovered = 0;
@@ -1610,7 +2263,7 @@ export class DurableAuthorityStore {
           actionClaimId: row.action_claim_id,
           resourceKeySha256: row.resource_key_sha256,
           fencingToken: row.fencing_token,
-        }, "ACTIVE")) continue;
+        }, "ACTIVE", row.owner_instance_id)) continue;
         if (row.state === "CLAIMED") {
           const claim = this.sqlite.prepare(
             `update operation_authority_claims
@@ -1635,11 +2288,29 @@ export class DurableAuthorityStore {
                 set consumed_uses = consumed_uses - 1
               where authority_id = ? and action_id = ? and consumed_uses > 0`,
           ).run(row.authority_id, row.action_id);
+          const reconciliationDigest = createHash("sha256")
+            .update(`dispatch-barrier-zero\0${row.action_claim_id}\0${row.fencing_token}`)
+            .digest("hex");
           const released = this.sqlite.prepare(
-            `delete from operation_authority_resource_leases
+            `update operation_authority_resource_leases
+                set lease_state = 'RELEASED', updated_at_ms = ?,
+                    reconciliation_state = 'VERIFIED',
+                    reconciliation_outcome = 'RESOURCE_VERIFIED',
+                    reconciliation_evidence_sha256 = ?, reconciled_at_ms = ?,
+                    recovery_reason = 'OWNER_RUN_DEAD_BEFORE_DISPATCH'
               where resource_key_sha256 = ? and action_claim_id = ?
-                and fencing_token = ? and lease_state = 'ACTIVE'`,
-          ).run(row.resource_key_sha256, row.action_claim_id, row.fencing_token);
+                and fencing_token = ? and lease_state = 'ACTIVE'
+                and owner_instance_id = ? and expires_at_ms <= ?`,
+          ).run(
+            nowMs,
+            reconciliationDigest,
+            nowMs,
+            row.resource_key_sha256,
+            row.action_claim_id,
+            row.fencing_token,
+            row.owner_instance_id,
+            recoveryCutoffMs,
+          );
           if (reclaimed.changes !== 1 || released.changes !== 1) {
             throw new Error("Dead CLAIMED owner could not atomically reclaim its use and lease.");
           }
@@ -1664,17 +2335,22 @@ export class DurableAuthorityStore {
           if (claim.changes !== 1) continue;
           const lease = this.sqlite.prepare(
             `update operation_authority_resource_leases
-                set lease_state = 'FROZEN', updated_at_ms = ?
+                set lease_state = 'RECOVERY_REQUIRED', updated_at_ms = ?,
+                    reconciliation_state = 'PENDING',
+                    recovery_reason = 'NONTERMINAL_CLAIM_RECOVERED'
               where resource_key_sha256 = ? and action_claim_id = ?
-                and fencing_token = ? and lease_state = 'ACTIVE'`,
+                and fencing_token = ? and lease_state = 'ACTIVE'
+                and owner_instance_id = ? and expires_at_ms <= ?`,
           ).run(
             nowMs,
             row.resource_key_sha256,
             row.action_claim_id,
             row.fencing_token,
+            row.owner_instance_id,
+            recoveryCutoffMs,
           );
           if (lease.changes !== 1) {
-            throw new Error("Recovered DISPATCHED claim could not atomically freeze its writer lease.");
+            throw new Error("Recovered DISPATCHED claim could not enter resource reconciliation.");
           }
         }
         recovered += 1;
@@ -1701,22 +2377,25 @@ export class DurableAuthorityStore {
       fencingToken: number;
     },
     expectedState: DurableResourceLeaseState,
+    expectedOwnerInstanceId?: string,
   ): boolean {
     const lease = this.sqlite.prepare(
-      `select authority_id, action_claim_id, fencing_token, lease_state
+      `select authority_id, action_claim_id, fencing_token, lease_state, owner_instance_id
          from operation_authority_resource_leases where resource_key_sha256 = ?`,
     ).get(input.resourceKeySha256) as {
       authority_id: string;
       action_claim_id: string;
       fencing_token: number;
       lease_state: DurableResourceLeaseState;
+      owner_instance_id: string;
     } | undefined;
     return Boolean(
       lease
       && lease.authority_id === input.authorityId
       && lease.action_claim_id === input.actionClaimId
       && lease.fencing_token === input.fencingToken
-      && lease.lease_state === expectedState,
+      && lease.lease_state === expectedState
+      && (expectedOwnerInstanceId === undefined || lease.owner_instance_id === expectedOwnerInstanceId)
     );
   }
 
@@ -1751,6 +2430,7 @@ export class DurableAuthorityStore {
     actionId: string;
     taskInstanceId: string;
     principalKeyFingerprint: string;
+    ownerInstanceId: string;
     fencingToken: number;
     nowMs: number;
   }): void {
@@ -1758,8 +2438,12 @@ export class DurableAuthorityStore {
       `insert into operation_authority_resource_leases (
          resource_key_sha256, task_instance_id, principal_key_fingerprint,
          authority_id, action_id, action_claim_id, fencing_token,
-         lease_state, acquired_at_ms, updated_at_ms
-       ) values (?, ?, ?, ?, ?, ?, ?, 'FROZEN', ?, ?)
+         lease_state, owner_instance_id, acquired_at_ms, heartbeat_at_ms,
+         expires_at_ms, updated_at_ms, reconciliation_state,
+         reconciliation_outcome, reconciliation_evidence_sha256,
+         reconciled_at_ms, recovery_reason
+       ) values (?, ?, ?, ?, ?, ?, ?, 'RECOVERY_REQUIRED', ?, ?, ?, ?, ?,
+                 'PENDING', null, null, null, 'LEGACY_NONTERMINAL_LEASE_MIGRATED')
        on conflict(resource_key_sha256) do update set
          task_instance_id = excluded.task_instance_id,
          principal_key_fingerprint = excluded.principal_key_fingerprint,
@@ -1767,9 +2451,17 @@ export class DurableAuthorityStore {
          action_id = excluded.action_id,
          action_claim_id = excluded.action_claim_id,
          fencing_token = excluded.fencing_token,
-         lease_state = 'FROZEN',
+         lease_state = 'RECOVERY_REQUIRED',
+         owner_instance_id = excluded.owner_instance_id,
          acquired_at_ms = excluded.acquired_at_ms,
-         updated_at_ms = excluded.updated_at_ms
+         heartbeat_at_ms = excluded.heartbeat_at_ms,
+         expires_at_ms = excluded.expires_at_ms,
+         updated_at_ms = excluded.updated_at_ms,
+         reconciliation_state = 'PENDING',
+         reconciliation_outcome = null,
+         reconciliation_evidence_sha256 = null,
+         reconciled_at_ms = null,
+         recovery_reason = excluded.recovery_reason
        where excluded.fencing_token > operation_authority_resource_leases.fencing_token`,
     ).run(
       input.resourceKey,
@@ -1779,6 +2471,9 @@ export class DurableAuthorityStore {
       input.actionId,
       input.actionClaimId,
       input.fencingToken,
+      input.ownerInstanceId,
+      input.nowMs,
+      input.nowMs,
       input.nowMs,
       input.nowMs,
     );
@@ -1824,6 +2519,37 @@ export class DurableAuthorityStore {
     }
   }
 
+  private ensureClaimAuditColumns(): void {
+    for (const [name, definition] of [
+      [
+        "audit_state",
+        "text check (audit_state is null or audit_state in ('RECORDED', 'SINK_FAILED'))",
+      ],
+      [
+        "audit_event_digest",
+        `text check (
+          audit_event_digest is null
+          or (length(audit_event_digest) = 71 and substr(audit_event_digest, 1, 7) = 'sha256:')
+        )`,
+      ],
+      [
+        "audit_receipt_digest",
+        `text check (
+          audit_receipt_digest is null
+          or (length(audit_receipt_digest) = 71 and substr(audit_receipt_digest, 1, 7) = 'sha256:')
+        )`,
+      ],
+      ["audit_recorded_at_ms", "integer"],
+      ["audit_error_code", "text"],
+    ] as const) {
+      if (!this.columnExists("operation_authority_claims", name)) {
+        this.sqlite.exec(
+          `alter table operation_authority_claims add column ${name} ${definition}`,
+        );
+      }
+    }
+  }
+
   private ensureMigrationColumns(): void {
     for (const [name, definition] of [
       ["source_integrity_check", "text not null default 'ok'"],
@@ -1844,9 +2570,25 @@ export class DurableAuthorityStore {
       operation_authority_tasks: ["task_instance_id", "principal_key_fingerprint", "correction_epoch"],
       operation_authorities: ["authority_id", "task_instance_id", "principal_key_fingerprint"],
       operation_authority_actions: ["authority_id", "action_id", "resource_key_sha256", "consumed_uses"],
-      operation_authority_claims: ["action_claim_id", "resource_key_sha256", "fencing_token", "state"],
+      operation_authority_claims: [
+        "action_claim_id",
+        "resource_key_sha256",
+        "fencing_token",
+        "state",
+        "audit_state",
+        "audit_event_digest",
+        "audit_receipt_digest",
+      ],
       operation_authority_resource_fences: ["resource_key_sha256", "last_fencing_token"],
-      operation_authority_resource_leases: ["resource_key_sha256", "action_claim_id", "lease_state"],
+      operation_authority_resource_leases: [
+        "resource_key_sha256",
+        "action_claim_id",
+        "lease_state",
+        "owner_instance_id",
+        "heartbeat_at_ms",
+        "expires_at_ms",
+        "reconciliation_state",
+      ],
     };
     for (const [table, columns] of Object.entries(requiredColumns)) {
       if (!this.tableExists(table)) {
@@ -2083,6 +2825,13 @@ function observeProcessIdentity(processId: number): {
 
 function assertSha256(value: string, name: string): void {
   if (!HASH_PATTERN.test(value)) throw new Error(`${name} must be a SHA-256 hex digest.`);
+}
+
+function assertSha256Digest(value: string | undefined, name: string): string {
+  if (!value || !SHA256_DIGEST_PATTERN.test(value)) {
+    throw new Error(`${name} must be a SHA-256 digest.`);
+  }
+  return value;
 }
 
 function safeCode(value: string | undefined): string | null {

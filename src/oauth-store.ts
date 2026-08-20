@@ -1,8 +1,9 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { OAuthRegisteredClientsStore } from "@modelcontextprotocol/sdk/server/auth/clients.js";
 import { InvalidRequestError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
 import type { OAuthClientInformationFull } from "@modelcontextprotocol/sdk/shared/auth.js";
 import { openDatabase, type DatabaseHandle } from "./db/client.js";
+import type { UniversalBrokerMetrics } from "./v2/metrics.js";
 
 export interface PersistedTokenBinding {
   familyId?: string;
@@ -33,7 +34,42 @@ export interface PersistedTokenPair {
   refreshToken: PersistedRefreshTokenRecord;
 }
 
-export type ConnectorBindingState = "ACTIVE" | "DEPRECATED" | "DRAINED";
+export const CONNECTOR_BINDING_STATES = [
+  "REGISTERED",
+  "CANDIDATE",
+  "VERIFIED",
+  "ACTIVATION_PREPARED",
+  "ACTIVE",
+  "DRAINING",
+  "RETIRED",
+  "REJECTED",
+  "FAILED",
+] as const;
+
+export type ConnectorBindingState = typeof CONNECTOR_BINDING_STATES[number];
+
+export type ConnectorReadinessInvalidState =
+  | "ACTIVE_COUNT"
+  | "VERIFICATION_IDENTITY_INCOMPLETE"
+  | "ACTIVE_DRAIN_FIELDS_SET"
+  | "DRAINING_DEADLINE_INVALID"
+  | "DRAINING_DEADLINE_ELAPSED"
+  | "REFERENCE_COUNT_UNDERFLOW"
+  | "TERMINAL_REFERENCES_REMAIN"
+  | "PREPARED_RECEIPT_MISMATCH"
+  | "UNKNOWN_BINDING_STATE"
+  | "CANONICAL_NAME_UNCONFIGURED";
+
+export interface ConnectorReadinessSummary {
+  state: "PASS" | "FAIL";
+  activeCount: number;
+  bindingsByState: Record<ConnectorBindingState, number>;
+  invalidStates: ConnectorReadinessInvalidState[];
+}
+
+const DIGEST_PATTERN = /^sha256:[a-f0-9]{64}$/u;
+const RAW_SHA256_PATTERN = /^[a-f0-9]{64}$/u;
+const UUID_PATTERN = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/u;
 
 export interface ConnectorBindingRecord {
   bindingId: string;
@@ -41,18 +77,171 @@ export interface ConnectorBindingRecord {
   clientId: string;
   installationEpoch: number;
   schemaGeneration: string;
+  authorityContractGeneration?: string;
+  redirectUrisDigest?: string;
+  buildDigest?: string;
   drainEpoch: number;
+  drainDeadlineAt?: string;
+  refreshAllowedDuringDrain: boolean;
   state: ConnectorBindingState;
+  stateReason?: string;
   refCount: number;
   createdAt: string;
   updatedAt: string;
 }
 
-export interface CanonicalConnectorBindingInput {
+export interface ConnectorRegistrationInput {
   canonicalName: string;
   clientId: string;
   installationEpoch: number;
   schemaGeneration: string;
+}
+
+export interface ConnectorVerificationEvidence {
+  authorityContractGeneration: string;
+  redirectUrisDigest: string;
+  buildDigest: string;
+}
+
+export interface ConnectorActivationTuple extends ConnectorVerificationEvidence {
+  canonicalName: string;
+  candidateBindingId: string;
+  clientId: string;
+  installationEpoch: number;
+  schemaGeneration: string;
+}
+
+export interface ConnectorActivationPlan {
+  drainDeadlineAt: string;
+  refreshAllowedDuringDrain: boolean;
+}
+
+export interface ConnectorActivationAuthorityBinding {
+  receiptId: string;
+  tupleDigest: string;
+  activePreimageDigest: string;
+  finalizationPlanDigest: string;
+  canonicalName: string;
+}
+
+export interface ConnectorActivationAuthorityDescriptor {
+  readonly tool: "context";
+  readonly operation: "connector_activation_finalize";
+  readonly target: string;
+  readonly resource: string;
+  readonly parameters: Readonly<ConnectorActivationAuthorityBinding>;
+}
+
+/**
+ * Cross-store proof from the already-claimed owner-only internal R3 action.
+ * It contains identifiers and digests only; no authority text, token, or raw evidence.
+ */
+export interface ConnectorActivationAuthorityProof extends ConnectorActivationAuthorityBinding {
+  schemaVersion: 1;
+  authorityId: string;
+  actionClaimId: string;
+  actionFingerprint: string;
+  resourceKeySha256: string;
+  fencingToken: number;
+  principalKeyFingerprint: string;
+  risk: "R3";
+  claimState: "DISPATCHED";
+  approvalAssurance: "cooperative";
+  evidenceDigest: string;
+  claimedAtMs: number;
+  dispatchedAtMs: number;
+}
+
+export interface ConnectorActivationAuthorityReceipt extends ConnectorActivationAuthorityProof {
+  proofDigest: string;
+  consumedAt: string;
+}
+
+export function connectorActivationAuthorityDescriptor(
+  binding: ConnectorActivationAuthorityBinding,
+): ConnectorActivationAuthorityDescriptor {
+  validateConnectorActivationAuthorityBinding(binding);
+  return {
+    tool: "context",
+    operation: "connector_activation_finalize",
+    target: binding.canonicalName,
+    resource: `connector:${binding.canonicalName}`,
+    parameters: {
+      receiptId: binding.receiptId,
+      tupleDigest: binding.tupleDigest,
+      activePreimageDigest: binding.activePreimageDigest,
+      finalizationPlanDigest: binding.finalizationPlanDigest,
+      canonicalName: binding.canonicalName,
+    },
+  };
+}
+
+export function connectorActivationAuthorityActionFingerprint(
+  binding: ConnectorActivationAuthorityBinding,
+): string {
+  return sha256Hex(stableJson(connectorActivationAuthorityDescriptor(binding)));
+}
+
+export function connectorActivationAuthorityResourceKeySha256(
+  binding: ConnectorActivationAuthorityBinding,
+): string {
+  const descriptor = connectorActivationAuthorityDescriptor(binding);
+  return sha256Hex(stableJson({
+    tool: descriptor.tool,
+    target: descriptor.target,
+    resource: descriptor.resource,
+    endpointGeneration: "unversioned-endpoint",
+  }));
+}
+
+export type ConnectorActivationReceiptStatus = "PREPARED" | "ACTIVATED" | "FAILED";
+
+export interface ConnectorActivationReceipt {
+  receiptId: string;
+  tuple: ConnectorActivationTuple;
+  tupleDigest: string;
+  previousActiveBindingId?: string;
+  preimageDigest: string;
+  activationAuthority?: ConnectorActivationAuthorityReceipt;
+  /** Compatibility readback; equals activationAuthority.authorityId for v8 activations. */
+  ownerAuthorityId?: string;
+  drainDeadlineAt: string;
+  refreshAllowedDuringDrain: boolean;
+  status: ConnectorActivationReceiptStatus;
+  failureCode?: string;
+  preparedAt: string;
+  activatedAt?: string;
+  failedAt?: string;
+}
+
+export interface ConnectorRetirementReceipt {
+  receiptId: string;
+  bindingId: string;
+  canonicalName: string;
+  drainEpoch: number;
+  reason: "REFERENCE_ZERO" | "DEADLINE_ELAPSED";
+  revokedFamilyCount: number;
+  retiredAt: string;
+}
+
+export interface ConnectorAuthenticationContext {
+  bindingId: string;
+  canonicalName: string;
+  state: ConnectorBindingState;
+  installationEpoch: number;
+  schemaGeneration: string;
+  buildDigest?: string;
+  drainDeadlineAt?: string;
+  activationRequired: boolean;
+}
+
+export class ConnectorStateConflictError extends Error {
+  readonly code = "CONNECTOR_STATE_CONFLICT";
+
+  constructor(message: string) {
+    super(message);
+    this.name = "ConnectorStateConflictError";
+  }
 }
 
 function redirectHostAllowed(redirectUri: string, allowedHosts: string[]): boolean {
@@ -69,9 +258,11 @@ function redirectHostAllowed(redirectUri: string, allowedHosts: string[]): boole
 
 export class SqliteOAuthStore {
   private readonly database: DatabaseHandle;
+  private readonly metrics?: UniversalBrokerMetrics;
 
-  constructor(stateDir: string) {
+  constructor(stateDir: string, metrics?: UniversalBrokerMetrics) {
     this.database = openDatabase(stateDir);
+    this.metrics = metrics;
     this.deleteExpiredTokens(Math.floor(Date.now() / 1000));
   }
 
@@ -86,6 +277,7 @@ export class SqliteOAuthStore {
   registerClient(
     client: Omit<OAuthClientInformationFull, "client_id" | "client_id_issued_at">,
     allowedRedirectHosts: string[],
+    connectorRegistration?: Omit<ConnectorRegistrationInput, "clientId">,
   ): OAuthClientInformationFull {
     if (!client.redirect_uris.every((uri) => redirectHostAllowed(String(uri), allowedRedirectHosts))) {
       throw new InvalidRequestError("Client redirect_uri is not allowed for this DevSpace server");
@@ -101,66 +293,356 @@ export class SqliteOAuthStore {
       response_types: client.response_types ?? ["code"],
     };
 
-    this.database.sqlite
-      .prepare("insert into oauth_clients (client_id, client_json, issued_at) values (?, ?, ?)")
-      .run(registered.client_id, JSON.stringify(registered), now);
-
-    return registered;
+    let registeredBinding = false;
+    const register = this.database.sqlite.transaction(() => {
+      this.database.sqlite
+        .prepare("insert into oauth_clients (client_id, client_json, issued_at) values (?, ?, ?)")
+        .run(registered.client_id, JSON.stringify(registered), now);
+      if (connectorRegistration) {
+        const bindingInput = { ...connectorRegistration, clientId: registered.client_id };
+        validateConnectorBindingInput(bindingInput);
+        this.insertConnectorBinding(bindingInput, "REGISTERED");
+        registeredBinding = true;
+      }
+      return registered;
+    });
+    const result = register.immediate();
+    if (registeredBinding) this.recordConnectorTransition("NONE", "REGISTERED");
+    return result;
   }
 
-  ensureCanonicalConnectorBinding(input: CanonicalConnectorBindingInput): ConnectorBindingRecord {
+  registerConnectorBinding(input: ConnectorRegistrationInput): ConnectorBindingRecord {
     validateConnectorBindingInput(input);
+    let inserted = false;
+    const register = this.database.sqlite.transaction(() => {
+      const existing = this.getConnectorBindingByIdentity(input);
+      if (existing) {
+        if (existing.clientId !== input.clientId || existing.schemaGeneration !== input.schemaGeneration) {
+          throw new ConnectorStateConflictError("Connector installation epoch is already assigned to a different client or schema.");
+        }
+        return existing;
+      }
+      inserted = true;
+      return this.insertConnectorBinding(input, "REGISTERED");
+    });
+    const result = register.immediate();
+    if (inserted) this.recordConnectorTransition("NONE", "REGISTERED");
+    return result;
+  }
+
+  ensureCandidateConnectorBinding(input: ConnectorRegistrationInput): ConnectorBindingRecord {
+    validateConnectorBindingInput(input);
+    let transitionFrom: ConnectorBindingState | "NONE" | undefined;
     const ensure = this.database.sqlite.transaction(() => {
-      const current = this.getActiveConnectorBinding(input.canonicalName);
-      if (current
-        && current.clientId === input.clientId
-        && current.installationEpoch >= input.installationEpoch
-        && current.schemaGeneration === input.schemaGeneration) return current;
-
-      const now = new Date().toISOString();
-      if (current) {
-        const deprecated = this.database.sqlite.prepare(
-          `update oauth_connector_bindings
-             set state = 'DEPRECATED', drain_epoch = drain_epoch + 1, updated_at = ?
-           where binding_id = ? and state = 'ACTIVE' and drain_epoch = ?`,
-        ).run(now, current.bindingId, current.drainEpoch);
-        if (deprecated.changes !== 1) throw new Error("Canonical connector binding changed concurrently.");
+      const existing = this.getConnectorBindingByIdentity(input);
+      if (!existing) {
+        transitionFrom = "NONE";
+        return this.insertConnectorBinding(input, "CANDIDATE");
       }
-
-      const installationEpoch = current
-        ? Math.max(input.installationEpoch, current.installationEpoch + 1)
-        : input.installationEpoch;
-      const previous = this.database.sqlite.prepare(
-        `select binding_id from oauth_connector_bindings
-          where canonical_name = ? and installation_epoch = ? and schema_generation = ?`,
-      ).get(input.canonicalName, installationEpoch, input.schemaGeneration) as { binding_id: string } | undefined;
-      if (previous) {
-        throw new Error("A retired connector installation/schema epoch cannot be reused.");
+      if (existing.clientId !== input.clientId || existing.schemaGeneration !== input.schemaGeneration) {
+        throw new ConnectorStateConflictError("Connector installation epoch is already assigned to a different client or schema.");
       }
-      const bindingId = `connector-${randomUUID()}`;
-      this.database.sqlite.prepare(
-        `insert into oauth_connector_bindings
-          (binding_id, canonical_name, client_id, installation_epoch, schema_generation,
-           drain_epoch, state, ref_count, created_at, updated_at)
-         values (?, ?, ?, ?, ?, 0, 'ACTIVE', 0, ?, ?)`,
-      ).run(
+      if (existing.state === "REGISTERED") {
+        const updated = this.database.sqlite.prepare(`
+          update oauth_connector_bindings
+             set state = 'CANDIDATE', state_reason = null, updated_at = ?
+           where binding_id = ? and state = 'REGISTERED'
+        `).run(new Date().toISOString(), existing.bindingId);
+        if (updated.changes !== 1) throw new ConnectorStateConflictError("Connector registration changed concurrently.");
+        transitionFrom = "REGISTERED";
+        return this.getConnectorBinding(existing.bindingId)!;
+      }
+      if (["CANDIDATE", "VERIFIED", "ACTIVATION_PREPARED", "ACTIVE"].includes(existing.state)) return existing;
+      throw new ConnectorStateConflictError(`Connector binding in ${existing.state} cannot issue a new token family.`);
+    });
+    const result = ensure.immediate();
+    if (transitionFrom) this.recordConnectorTransition(transitionFrom, "CANDIDATE");
+    return result;
+  }
+
+  markConnectorBindingVerified(
+    bindingId: string,
+    evidence: ConnectorVerificationEvidence,
+  ): ConnectorBindingRecord {
+    validateVerificationEvidence(evidence);
+    let transitioned = false;
+    const verify = this.database.sqlite.transaction(() => {
+      const binding = this.getConnectorBinding(bindingId);
+      if (!binding) throw new ConnectorStateConflictError("Connector candidate does not exist.");
+      if (binding.state === "VERIFIED"
+        && binding.authorityContractGeneration === evidence.authorityContractGeneration
+        && binding.redirectUrisDigest === evidence.redirectUrisDigest
+        && binding.buildDigest === evidence.buildDigest) return binding;
+      if (binding.state !== "CANDIDATE") {
+        throw new ConnectorStateConflictError(`Connector binding in ${binding.state} cannot be verified.`);
+      }
+      const updated = this.database.sqlite.prepare(`
+        update oauth_connector_bindings
+           set authority_contract_generation = ?, redirect_uris_digest = ?, build_digest = ?,
+               state = 'VERIFIED', state_reason = null, updated_at = ?
+         where binding_id = ? and state = 'CANDIDATE'
+      `).run(
+        evidence.authorityContractGeneration,
+        evidence.redirectUrisDigest,
+        evidence.buildDigest,
+        new Date().toISOString(),
         bindingId,
-        input.canonicalName,
-        input.clientId,
-        installationEpoch,
-        input.schemaGeneration,
-        now,
-        now,
       );
+      if (updated.changes !== 1) throw new ConnectorStateConflictError("Connector candidate changed concurrently.");
+      transitioned = true;
       return this.getConnectorBinding(bindingId)!;
     });
-    return ensure.immediate();
+    const result = verify.immediate();
+    if (transitioned) this.recordConnectorTransition("CANDIDATE", "VERIFIED");
+    return result;
+  }
+
+  prepareConnectorActivation(
+    tuple: ConnectorActivationTuple,
+    plan: ConnectorActivationPlan,
+  ): ConnectorActivationReceipt {
+    validateActivationTuple(tuple);
+    validateActivationPlan(plan);
+    let transitioned = false;
+    const prepare = this.database.sqlite.transaction(() => {
+      const candidate = this.getConnectorBinding(tuple.candidateBindingId);
+      if (!candidate || !bindingMatchesTuple(candidate, tuple)) {
+        throw new ConnectorStateConflictError("Connector activation tuple does not match the persisted candidate.");
+      }
+      const existing = this.getPreparedActivationReceipt(tuple.canonicalName);
+      if (existing) {
+        if (existing.tupleDigest === connectorActivationTupleDigest(tuple)
+          && existing.drainDeadlineAt === plan.drainDeadlineAt
+          && existing.refreshAllowedDuringDrain === plan.refreshAllowedDuringDrain) return existing;
+        throw new ConnectorStateConflictError("A different activation tuple is already prepared for this connector.");
+      }
+      if (candidate.state !== "VERIFIED") {
+        throw new ConnectorStateConflictError(`Connector binding in ${candidate.state} cannot prepare activation.`);
+      }
+
+      const previousActive = this.getActiveConnectorBinding(tuple.canonicalName);
+      const preimageJson = connectorPreimageJson(previousActive);
+      const preparedAt = new Date().toISOString();
+      const receiptId = `connector-activation-${randomUUID()}`;
+      const tupleJson = activationTupleJson(tuple);
+      this.database.sqlite.prepare(`
+        insert into oauth_connector_activation_receipts
+          (receipt_id, canonical_name, candidate_binding_id, client_id, installation_epoch,
+           schema_generation, authority_contract_generation, redirect_uris_digest, build_digest,
+           tuple_digest, preimage_json, preimage_digest, previous_active_binding_id,
+           drain_deadline_at, refresh_allowed_during_drain, status, prepared_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PREPARED', ?)
+      `).run(
+        receiptId,
+        tuple.canonicalName,
+        tuple.candidateBindingId,
+        tuple.clientId,
+        tuple.installationEpoch,
+        tuple.schemaGeneration,
+        tuple.authorityContractGeneration,
+        tuple.redirectUrisDigest,
+        tuple.buildDigest,
+        sha256Digest(tupleJson),
+        preimageJson,
+        sha256Digest(preimageJson),
+        previousActive?.bindingId ?? null,
+        plan.drainDeadlineAt,
+        plan.refreshAllowedDuringDrain ? 1 : 0,
+        preparedAt,
+      );
+      const updated = this.database.sqlite.prepare(`
+        update oauth_connector_bindings
+           set state = 'ACTIVATION_PREPARED', state_reason = ?, updated_at = ?
+         where binding_id = ? and state = 'VERIFIED'
+      `).run(receiptId, preparedAt, candidate.bindingId);
+      if (updated.changes !== 1) throw new ConnectorStateConflictError("Connector candidate changed concurrently.");
+      transitioned = true;
+      return this.getActivationReceipt(receiptId)!;
+    });
+    const result = prepare.immediate();
+    if (transitioned) this.recordConnectorTransition("VERIFIED", "ACTIVATION_PREPARED");
+    return result;
+  }
+
+  activatePreparedConnector(
+    receiptId: string,
+    tuple: ConnectorActivationTuple,
+    authorityProof: ConnectorActivationAuthorityProof,
+  ): ConnectorActivationReceipt {
+    validateActivationTuple(tuple);
+    validateConnectorActivationAuthorityProof(authorityProof);
+    let previousDrained = false;
+    let candidateActivated = false;
+    const activate = this.database.sqlite.transaction(() => {
+      const receipt = this.getActivationReceipt(receiptId);
+      if (!receipt) throw new ConnectorStateConflictError("Connector activation receipt does not exist.");
+      if (receipt.tupleDigest !== connectorActivationTupleDigest(tuple)) {
+        throw new ConnectorStateConflictError("Connector activation tuple changed after preparation.");
+      }
+      if (receipt.status === "ACTIVATED") {
+        throw new ConnectorStateConflictError(
+          "Connector activation authority was already consumed; reconcile from the persisted activation receipt.",
+        );
+      }
+      if (receipt.status !== "PREPARED") {
+        throw new ConnectorStateConflictError(`Connector activation receipt is ${receipt.status}.`);
+      }
+      assertConnectorActivationAuthorityMatchesReceipt(authorityProof, receipt);
+      const candidate = this.getConnectorBinding(tuple.candidateBindingId);
+      if (!candidate || candidate.state !== "ACTIVATION_PREPARED" || !bindingMatchesTuple(candidate, tuple)) {
+        throw new ConnectorStateConflictError("Prepared connector candidate no longer matches the activation tuple.");
+      }
+      const current = this.getActiveConnectorBinding(tuple.canonicalName);
+      if ((current?.bindingId ?? undefined) !== receipt.previousActiveBindingId) {
+        throw new ConnectorStateConflictError("Canonical ACTIVE binding changed after activation preparation.");
+      }
+      if (sha256Digest(connectorPreimageJson(current)) !== receipt.preimageDigest) {
+        throw new ConnectorStateConflictError("Canonical ACTIVE preimage changed after activation preparation.");
+      }
+
+      const activatedAt = new Date().toISOString();
+      const proofDigest = connectorActivationAuthorityProofDigest(authorityProof);
+      try {
+        const consumed = this.database.sqlite.prepare(`
+          insert into oauth_connector_activation_authorities
+            (action_claim_id, receipt_id, authority_id, principal_key_fingerprint,
+             action_fingerprint, resource_key_sha256, fencing_token, risk, claim_state,
+             approval_assurance, canonical_name, tuple_digest, active_preimage_digest,
+             finalization_plan_digest, evidence_digest, claimed_at_ms, dispatched_at_ms,
+             proof_digest, consumed_at)
+          values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          authorityProof.actionClaimId,
+          receiptId,
+          authorityProof.authorityId,
+          authorityProof.principalKeyFingerprint,
+          authorityProof.actionFingerprint,
+          authorityProof.resourceKeySha256,
+          authorityProof.fencingToken,
+          authorityProof.risk,
+          authorityProof.claimState,
+          authorityProof.approvalAssurance,
+          authorityProof.canonicalName,
+          authorityProof.tupleDigest,
+          authorityProof.activePreimageDigest,
+          authorityProof.finalizationPlanDigest,
+          authorityProof.evidenceDigest,
+          authorityProof.claimedAtMs,
+          authorityProof.dispatchedAtMs,
+          proofDigest,
+          activatedAt,
+        );
+        if (consumed.changes !== 1) {
+          throw new ConnectorStateConflictError("Connector activation authority could not be atomically consumed.");
+        }
+      } catch (error) {
+        if (isSqliteConstraintError(error)) {
+          throw new ConnectorStateConflictError(
+            "Connector activation authority proof was already consumed or conflicts with persisted evidence.",
+          );
+        }
+        throw error;
+      }
+      if (current) {
+        const drained = this.database.sqlite.prepare(`
+          update oauth_connector_bindings
+             set state = 'DRAINING', state_reason = ?, drain_deadline_at = ?,
+                 refresh_allowed_during_drain = ?, updated_at = ?
+           where binding_id = ? and state = 'ACTIVE' and drain_epoch = ?
+        `).run(
+          receiptId,
+          receipt.drainDeadlineAt,
+          receipt.refreshAllowedDuringDrain ? 1 : 0,
+          activatedAt,
+          current.bindingId,
+          current.drainEpoch,
+        );
+        if (drained.changes !== 1) throw new ConnectorStateConflictError("Canonical ACTIVE binding changed concurrently.");
+        previousDrained = true;
+      }
+      const promoted = this.database.sqlite.prepare(`
+        update oauth_connector_bindings
+           set state = 'ACTIVE', state_reason = ?, drain_deadline_at = null,
+               refresh_allowed_during_drain = 0, updated_at = ?
+         where binding_id = ? and state = 'ACTIVATION_PREPARED'
+      `).run(receiptId, activatedAt, candidate.bindingId);
+      if (promoted.changes !== 1) throw new ConnectorStateConflictError("Prepared connector changed concurrently.");
+      candidateActivated = true;
+      const sealed = this.database.sqlite.prepare(`
+        update oauth_connector_activation_receipts
+           set status = 'ACTIVATED', owner_authority_id = ?, activated_at = ?
+         where receipt_id = ? and status = 'PREPARED'
+      `).run(authorityProof.authorityId, activatedAt, receiptId);
+      if (sealed.changes !== 1) throw new ConnectorStateConflictError("Connector activation receipt changed concurrently.");
+      return this.getActivationReceipt(receiptId)!;
+    });
+    const result = activate.immediate();
+    if (previousDrained) this.recordConnectorTransition("ACTIVE", "DRAINING");
+    if (candidateActivated) this.recordConnectorTransition("ACTIVATION_PREPARED", "ACTIVE");
+    return result;
+  }
+
+  rejectConnectorBinding(bindingId: string, reason: string): ConnectorBindingRecord {
+    validateStateReason(reason);
+    let transitionFrom: ConnectorBindingState | undefined;
+    const reject = this.database.sqlite.transaction(() => {
+      const binding = this.getConnectorBinding(bindingId);
+      if (!binding) throw new ConnectorStateConflictError("Connector binding does not exist.");
+      if (binding.state === "REJECTED" && binding.stateReason === reason) return binding;
+      if (!["CANDIDATE", "VERIFIED"].includes(binding.state)) {
+        throw new ConnectorStateConflictError("Connector binding cannot be rejected from its current state.");
+      }
+      const rejectedAt = new Date().toISOString();
+      this.revokeBindingTokenFamilies(bindingId, rejectedAt);
+      const rejected = this.database.sqlite.prepare(`
+        update oauth_connector_bindings
+           set state = 'REJECTED', state_reason = ?, ref_count = 0, updated_at = ?
+         where binding_id = ? and state in ('CANDIDATE', 'VERIFIED')
+      `).run(reason, rejectedAt, bindingId);
+      if (rejected.changes !== 1) throw new ConnectorStateConflictError("Connector binding changed concurrently.");
+      transitionFrom = binding.state;
+      return this.getConnectorBinding(bindingId)!;
+    });
+    const result = reject.immediate();
+    if (transitionFrom) this.recordConnectorTransition(transitionFrom, "REJECTED");
+    return result;
+  }
+
+  failPreparedConnectorActivation(receiptId: string, failureCode: string): ConnectorActivationReceipt {
+    validateStateReason(failureCode);
+    let transitioned = false;
+    const fail = this.database.sqlite.transaction(() => {
+      const receipt = this.getActivationReceipt(receiptId);
+      if (!receipt) throw new ConnectorStateConflictError("Connector activation receipt does not exist.");
+      if (receipt.status === "FAILED" && receipt.failureCode === failureCode) return receipt;
+      if (receipt.status !== "PREPARED") {
+        throw new ConnectorStateConflictError(`Connector activation receipt is ${receipt.status}.`);
+      }
+      const failedAt = new Date().toISOString();
+      this.revokeBindingTokenFamilies(receipt.tuple.candidateBindingId, failedAt);
+      const binding = this.database.sqlite.prepare(`
+        update oauth_connector_bindings
+           set state = 'FAILED', state_reason = ?, ref_count = 0, updated_at = ?
+         where binding_id = ? and state = 'ACTIVATION_PREPARED'
+      `).run(failureCode, failedAt, receipt.tuple.candidateBindingId);
+      if (binding.changes !== 1) throw new ConnectorStateConflictError("Prepared connector changed concurrently.");
+      const result = this.database.sqlite.prepare(`
+        update oauth_connector_activation_receipts
+           set status = 'FAILED', failure_code = ?, failed_at = ?
+         where receipt_id = ? and status = 'PREPARED'
+      `).run(failureCode, failedAt, receiptId);
+      if (result.changes !== 1) throw new ConnectorStateConflictError("Connector activation receipt changed concurrently.");
+      transitioned = true;
+      return this.getActivationReceipt(receiptId)!;
+    });
+    const result = fail.immediate();
+    if (transitioned) this.recordConnectorTransition("ACTIVATION_PREPARED", "FAILED");
+    return result;
   }
 
   getActiveConnectorBinding(canonicalName: string): ConnectorBindingRecord | undefined {
     const row = this.database.sqlite.prepare(
-      `select binding_id, canonical_name, client_id, installation_epoch, schema_generation,
-              drain_epoch, state, ref_count, created_at, updated_at
+      `select ${CONNECTOR_BINDING_COLUMNS}
          from oauth_connector_bindings where canonical_name = ? and state = 'ACTIVE'`,
     ).get(canonicalName) as ConnectorBindingRow | undefined;
     return row ? rowToConnectorBinding(row) : undefined;
@@ -168,17 +650,160 @@ export class SqliteOAuthStore {
 
   getConnectorBinding(bindingId: string): ConnectorBindingRecord | undefined {
     const row = this.database.sqlite.prepare(
-      `select binding_id, canonical_name, client_id, installation_epoch, schema_generation,
-              drain_epoch, state, ref_count, created_at, updated_at
+      `select ${CONNECTOR_BINDING_COLUMNS}
          from oauth_connector_bindings where binding_id = ?`,
     ).get(bindingId) as ConnectorBindingRow | undefined;
     return row ? rowToConnectorBinding(row) : undefined;
   }
 
+  getConnectorBindingForClient(canonicalName: string, clientId: string): ConnectorBindingRecord | undefined {
+    const row = this.database.sqlite.prepare(`
+      select ${CONNECTOR_BINDING_COLUMNS}
+        from oauth_connector_bindings
+       where canonical_name = ? and client_id = ?
+       order by installation_epoch desc, created_at desc limit 1
+    `).get(canonicalName, clientId) as ConnectorBindingRow | undefined;
+    return row ? rowToConnectorBinding(row) : undefined;
+  }
+
+  connectorReadiness(canonicalName?: string, nowMs = Date.now()): ConnectorReadinessSummary {
+    const bindingsByState = emptyConnectorBindingCounts();
+    if (!canonicalName) {
+      return {
+        state: "FAIL",
+        activeCount: 0,
+        bindingsByState,
+        invalidStates: ["CANONICAL_NAME_UNCONFIGURED"],
+      };
+    }
+    const invalidStates = new Set<ConnectorReadinessInvalidState>();
+    const rows = this.database.sqlite.prepare(`
+      select binding_id, canonical_name, client_id, installation_epoch, state,
+             schema_generation, authority_contract_generation, redirect_uris_digest, build_digest,
+             drain_deadline_at, refresh_allowed_during_drain, ref_count,
+             (select count(*) from oauth_token_families as family
+               where family.connector_binding_id = binding.binding_id and family.status <> 'REVOKED')
+               as active_family_count,
+             ((select count(*) from oauth_access_tokens as access_token
+                 where access_token.connector_binding_id = binding.binding_id)
+               + (select count(*) from oauth_refresh_tokens as refresh_token
+                   where refresh_token.connector_binding_id = binding.binding_id)) as persisted_token_count,
+             (select count(*) from oauth_connector_activation_receipts as receipt
+               where receipt.candidate_binding_id = binding.binding_id
+                 and receipt.status = 'PREPARED') as prepared_receipt_count,
+             (select count(*) from oauth_connector_activation_receipts as receipt
+                where receipt.candidate_binding_id = binding.binding_id
+                  and receipt.canonical_name = binding.canonical_name
+                  and receipt.client_id = binding.client_id
+                  and receipt.installation_epoch = binding.installation_epoch
+                  and receipt.schema_generation = binding.schema_generation
+                  and receipt.authority_contract_generation = binding.authority_contract_generation
+                  and receipt.redirect_uris_digest = binding.redirect_uris_digest
+                  and receipt.build_digest = binding.build_digest
+                  and receipt.status = 'PREPARED') as prepared_receipt_identity_match_count,
+             (select tuple_digest from oauth_connector_activation_receipts as receipt
+               where receipt.candidate_binding_id = binding.binding_id and receipt.status = 'PREPARED'
+               order by receipt_id limit 1) as prepared_tuple_digest,
+             (select count(*) from oauth_connector_activation_receipts as receipt
+               where receipt.canonical_name = binding.canonical_name and receipt.status = 'PREPARED')
+               as canonical_prepared_receipt_count
+        from oauth_connector_bindings as binding
+       where canonical_name = ?
+       order by installation_epoch, binding_id
+    `).all(canonicalName) as ConnectorReadinessRow[];
+
+    for (const row of rows) {
+      if (!isConnectorBindingState(row.state)) {
+        invalidStates.add("UNKNOWN_BINDING_STATE");
+        continue;
+      }
+      bindingsByState[row.state] += 1;
+      if (["VERIFIED", "ACTIVATION_PREPARED", "ACTIVE", "DRAINING"].includes(row.state)
+        && !connectorVerificationIdentityIsComplete(row)) {
+        invalidStates.add("VERIFICATION_IDENTITY_INCOMPLETE");
+      }
+      if (row.state === "ACTIVE" && (row.drain_deadline_at !== null || row.refresh_allowed_during_drain !== 0)) {
+        invalidStates.add("ACTIVE_DRAIN_FIELDS_SET");
+      }
+      if (row.state === "DRAINING") {
+        const deadlineMs = row.drain_deadline_at === null ? Number.NaN : Date.parse(row.drain_deadline_at);
+        if (!Number.isFinite(deadlineMs)) invalidStates.add("DRAINING_DEADLINE_INVALID");
+        else if (nowMs >= deadlineMs) invalidStates.add("DRAINING_DEADLINE_ELAPSED");
+      }
+      if (row.active_family_count > row.ref_count) invalidStates.add("REFERENCE_COUNT_UNDERFLOW");
+      if (["RETIRED", "REJECTED", "FAILED"].includes(row.state)
+        && (row.ref_count !== 0 || row.active_family_count !== 0 || row.persisted_token_count !== 0)) {
+        invalidStates.add("TERMINAL_REFERENCES_REMAIN");
+      }
+      if (row.state === "ACTIVATION_PREPARED"
+        ? !preparedReceiptMatchesBinding(row)
+        : row.prepared_receipt_count !== 0) {
+        invalidStates.add("PREPARED_RECEIPT_MISMATCH");
+      }
+    }
+
+    if ((rows[0]?.canonical_prepared_receipt_count ?? 0) !== bindingsByState.ACTIVATION_PREPARED) {
+      invalidStates.add("PREPARED_RECEIPT_MISMATCH");
+    }
+
+    const activeCount = bindingsByState.ACTIVE;
+    if (activeCount !== 1) invalidStates.add("ACTIVE_COUNT");
+    const orderedInvalidStates = CONNECTOR_READINESS_INVALID_STATE_ORDER.filter((state) => invalidStates.has(state));
+    return {
+      state: orderedInvalidStates.length === 0 ? "PASS" : "FAIL",
+      activeCount,
+      bindingsByState,
+      invalidStates: orderedInvalidStates,
+    };
+  }
+
+  connectorCanIssueAuthorizationCode(canonicalName: string, clientId: string): boolean {
+    const binding = this.getConnectorBindingForClient(canonicalName, clientId);
+    if (!binding) return true;
+    return ["REGISTERED", "CANDIDATE", "VERIFIED", "ACTIVATION_PREPARED", "ACTIVE"].includes(binding.state);
+  }
+
+  getActivationReceipt(receiptId: string): ConnectorActivationReceipt | undefined {
+    const row = this.database.sqlite.prepare(`
+      select receipt_id, canonical_name, candidate_binding_id, client_id, installation_epoch,
+             schema_generation, authority_contract_generation, redirect_uris_digest, build_digest,
+             tuple_digest, preimage_digest, previous_active_binding_id, owner_authority_id, drain_deadline_at,
+             refresh_allowed_during_drain, status, failure_code, prepared_at, activated_at, failed_at
+        from oauth_connector_activation_receipts where receipt_id = ?
+    `).get(receiptId) as ConnectorActivationReceiptRow | undefined;
+    if (!row) return undefined;
+    const receipt = rowToActivationReceipt(row);
+    const activationAuthority = this.getActivationAuthorityReceipt(receiptId);
+    return activationAuthority ? { ...receipt, activationAuthority } : receipt;
+  }
+
+  getActivationAuthorityReceipt(receiptId: string): ConnectorActivationAuthorityReceipt | undefined {
+    const row = this.database.sqlite.prepare(`
+      select action_claim_id, receipt_id, authority_id, principal_key_fingerprint,
+             action_fingerprint, resource_key_sha256, fencing_token, risk, claim_state,
+             approval_assurance, canonical_name, tuple_digest, active_preimage_digest,
+             finalization_plan_digest, evidence_digest, claimed_at_ms, dispatched_at_ms,
+             proof_digest, consumed_at
+        from oauth_connector_activation_authorities where receipt_id = ?
+    `).get(receiptId) as ConnectorActivationAuthorityReceiptRow | undefined;
+    return row ? rowToActivationAuthorityReceipt(row) : undefined;
+  }
+
+  getRetirementReceipt(bindingId: string): ConnectorRetirementReceipt | undefined {
+    const row = this.database.sqlite.prepare(`
+      select receipt_id, binding_id, canonical_name, drain_epoch, reason,
+             revoked_family_count, retired_at
+        from oauth_connector_retirement_receipts where binding_id = ?
+    `).get(bindingId) as ConnectorRetirementReceiptRow | undefined;
+    return row ? rowToRetirementReceipt(row) : undefined;
+  }
+
   acquireConnectorReference(bindingId: string, expectedDrainEpoch: number): boolean {
     const result = this.database.sqlite.prepare(
       `update oauth_connector_bindings set ref_count = ref_count + 1, updated_at = ?
-        where binding_id = ? and state = 'ACTIVE' and drain_epoch = ?`,
+        where binding_id = ?
+          and state in ('CANDIDATE', 'VERIFIED', 'ACTIVATION_PREPARED', 'ACTIVE')
+          and drain_epoch = ?`,
     ).run(new Date().toISOString(), bindingId, expectedDrainEpoch);
     return result.changes === 1;
   }
@@ -191,13 +816,65 @@ export class SqliteOAuthStore {
     return result.changes === 1;
   }
 
-  drainConnectorBinding(bindingId: string, expectedDrainEpoch: number): boolean {
-    const result = this.database.sqlite.prepare(
-      `update oauth_connector_bindings
-          set state = 'DRAINED', drain_epoch = drain_epoch + 1, updated_at = ?
-        where binding_id = ? and state = 'DEPRECATED' and ref_count = 0 and drain_epoch = ?`,
-    ).run(new Date().toISOString(), bindingId, expectedDrainEpoch);
-    return result.changes === 1;
+  retireConnectorBinding(
+    bindingId: string,
+    expectedDrainEpoch: number,
+    nowMs = Date.now(),
+  ): ConnectorRetirementReceipt | undefined {
+    let transitioned = false;
+    const retire = this.database.sqlite.transaction(() => {
+      const binding = this.getConnectorBinding(bindingId);
+      if (!binding) throw new ConnectorStateConflictError("Connector binding does not exist.");
+      if (binding.state === "RETIRED") return this.getRetirementReceipt(bindingId);
+      if (binding.state !== "DRAINING" || binding.drainEpoch !== expectedDrainEpoch) {
+        throw new ConnectorStateConflictError("Connector binding is not the expected DRAINING generation.");
+      }
+      const activeFamilies = this.database.sqlite.prepare(`
+        select family_id from oauth_token_families
+         where connector_binding_id = ? and status <> 'REVOKED'
+         order by family_id
+      `).pluck().all(bindingId) as string[];
+      if (activeFamilies.length > binding.refCount) {
+        throw new ConnectorStateConflictError("Connector reference count does not match active token families.");
+      }
+      const deadlineMs = binding.drainDeadlineAt ? Date.parse(binding.drainDeadlineAt) : Number.NaN;
+      const deadlineElapsed = Number.isFinite(deadlineMs) && nowMs >= deadlineMs;
+      if (binding.refCount > 0 && !deadlineElapsed) return undefined;
+
+      const retiredAt = new Date(nowMs).toISOString();
+      let revokedFamilyCount = 0;
+      if (deadlineElapsed && activeFamilies.length > 0) {
+        revokedFamilyCount = this.revokeBindingTokenFamilies(bindingId, retiredAt);
+      }
+      const reason: ConnectorRetirementReceipt["reason"] = deadlineElapsed
+        ? "DEADLINE_ELAPSED"
+        : "REFERENCE_ZERO";
+      const updated = this.database.sqlite.prepare(`
+        update oauth_connector_bindings
+           set state = 'RETIRED', state_reason = ?, ref_count = 0,
+               drain_epoch = drain_epoch + 1, refresh_allowed_during_drain = 0, updated_at = ?
+         where binding_id = ? and state = 'DRAINING' and drain_epoch = ?
+      `).run(reason, retiredAt, bindingId, expectedDrainEpoch);
+      if (updated.changes !== 1) throw new ConnectorStateConflictError("DRAINING connector changed concurrently.");
+      this.database.sqlite.prepare(`
+        insert into oauth_connector_retirement_receipts
+          (receipt_id, binding_id, canonical_name, drain_epoch, reason, revoked_family_count, retired_at)
+        values (?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        `connector-retirement-${randomUUID()}`,
+        bindingId,
+        binding.canonicalName,
+        expectedDrainEpoch + 1,
+        reason,
+        revokedFamilyCount,
+        retiredAt,
+      );
+      transitioned = true;
+      return this.getRetirementReceipt(bindingId)!;
+    });
+    const result = retire.immediate();
+    if (transitioned) this.recordConnectorTransition("DRAINING", "RETIRED");
+    return result;
   }
 
   saveAccessToken(tokenHash: string, record: PersistedAccessTokenRecord): void {
@@ -308,7 +985,7 @@ export class SqliteOAuthStore {
         if (familyId && !this.bindingAndFamilyAreCurrent({
           ...pair.refreshToken,
           rotationSequence: consumed.rotation_sequence,
-        })) return false;
+        }, "refresh", Date.now())) return false;
         const removed = this.database.sqlite.prepare("delete from oauth_refresh_tokens where token_hash = ?").run(consumedRefreshTokenHash);
         if (removed.changes !== 1) return false;
         if (familyId) {
@@ -369,8 +1046,23 @@ export class SqliteOAuthStore {
   }
 
   credentialBindingIsCurrent(record: PersistedTokenBinding & { clientId: string }): boolean {
+    return this.accessTokenBindingIsCurrent(record);
+  }
+
+  accessTokenBindingIsCurrent(
+    record: PersistedTokenBinding & { clientId: string },
+    nowMs = Date.now(),
+  ): boolean {
     if (!record.familyId && !record.connectorBindingId) return true;
-    return this.bindingAndFamilyAreCurrent(record);
+    return this.bindingAndFamilyAreCurrent(record, "access", nowMs);
+  }
+
+  refreshTokenBindingIsCurrent(
+    record: PersistedTokenBinding & { clientId: string },
+    nowMs = Date.now(),
+  ): boolean {
+    if (!record.familyId && !record.connectorBindingId) return true;
+    return this.bindingAndFamilyAreCurrent(record, "refresh", nowMs);
   }
 
   revokeTokenFamily(familyId: string): boolean {
@@ -406,7 +1098,69 @@ export class SqliteOAuthStore {
     this.database.close();
   }
 
-  private bindingAndFamilyAreCurrent(record: PersistedTokenBinding & { clientId: string }): boolean {
+  private insertConnectorBinding(
+    input: ConnectorRegistrationInput,
+    state: "REGISTERED" | "CANDIDATE",
+  ): ConnectorBindingRecord {
+    const highestEpoch = this.database.sqlite.prepare(`
+      select max(installation_epoch) from oauth_connector_bindings where canonical_name = ?
+    `).pluck().get(input.canonicalName) as number | null;
+    if (highestEpoch !== null && input.installationEpoch <= highestEpoch) {
+      throw new ConnectorStateConflictError("Connector installation epoch must advance monotonically.");
+    }
+    const bindingId = `connector-${randomUUID()}`;
+    const now = new Date().toISOString();
+    this.database.sqlite.prepare(`
+      insert into oauth_connector_bindings
+        (binding_id, canonical_name, client_id, installation_epoch, schema_generation,
+         drain_epoch, refresh_allowed_during_drain, state, ref_count, created_at, updated_at)
+      values (?, ?, ?, ?, ?, 0, 0, ?, 0, ?, ?)
+    `).run(
+      bindingId,
+      input.canonicalName,
+      input.clientId,
+      input.installationEpoch,
+      input.schemaGeneration,
+      state,
+      now,
+      now,
+    );
+    return this.getConnectorBinding(bindingId)!;
+  }
+
+  private getConnectorBindingByIdentity(input: ConnectorRegistrationInput): ConnectorBindingRecord | undefined {
+    const row = this.database.sqlite.prepare(`
+      select ${CONNECTOR_BINDING_COLUMNS}
+        from oauth_connector_bindings
+       where canonical_name = ? and installation_epoch = ?
+    `).get(input.canonicalName, input.installationEpoch) as ConnectorBindingRow | undefined;
+    return row ? rowToConnectorBinding(row) : undefined;
+  }
+
+  private getPreparedActivationReceipt(canonicalName: string): ConnectorActivationReceipt | undefined {
+    const row = this.database.sqlite.prepare(`
+      select receipt_id from oauth_connector_activation_receipts
+       where canonical_name = ? and status = 'PREPARED'
+    `).get(canonicalName) as { receipt_id: string } | undefined;
+    return row ? this.getActivationReceipt(row.receipt_id) : undefined;
+  }
+
+  private revokeBindingTokenFamilies(bindingId: string, revokedAt: string): number {
+    const revoked = this.database.sqlite.prepare(`
+      update oauth_token_families
+         set status = 'REVOKED', revoked_at = ?
+       where connector_binding_id = ? and status <> 'REVOKED'
+    `).run(revokedAt, bindingId);
+    this.database.sqlite.prepare("delete from oauth_access_tokens where connector_binding_id = ?").run(bindingId);
+    this.database.sqlite.prepare("delete from oauth_refresh_tokens where connector_binding_id = ?").run(bindingId);
+    return revoked.changes;
+  }
+
+  private bindingAndFamilyAreCurrent(
+    record: PersistedTokenBinding & { clientId: string },
+    use: "access" | "refresh",
+    nowMs: number,
+  ): boolean {
     if (!record.familyId) return false;
     const family = this.database.sqlite.prepare(
       `select client_id, connector_binding_id, installation_epoch, drain_epoch, status, rotation_sequence
@@ -426,11 +1180,26 @@ export class SqliteOAuthStore {
       || family.installation_epoch !== record.installationEpoch
       || family.drain_epoch !== record.connectorDrainEpoch) return false;
     const binding = this.getConnectorBinding(record.connectorBindingId);
-    return Boolean(binding
-      && binding.state === "ACTIVE"
-      && binding.clientId === record.clientId
-      && binding.installationEpoch === record.installationEpoch
-      && binding.drainEpoch === record.connectorDrainEpoch);
+    if (!binding
+      || binding.clientId !== record.clientId
+      || binding.installationEpoch !== record.installationEpoch
+      || binding.drainEpoch !== record.connectorDrainEpoch) return false;
+    if (["CANDIDATE", "VERIFIED", "ACTIVATION_PREPARED", "ACTIVE"].includes(binding.state)) return true;
+    if (binding.state !== "DRAINING" || !binding.drainDeadlineAt) return false;
+    const deadlineMs = Date.parse(binding.drainDeadlineAt);
+    if (!Number.isFinite(deadlineMs) || nowMs >= deadlineMs) return false;
+    return use === "access" || binding.refreshAllowedDuringDrain;
+  }
+
+  private recordConnectorTransition(
+    from: ConnectorBindingState | "NONE",
+    to: ConnectorBindingState,
+  ): void {
+    try {
+      this.metrics?.recordConnectorTransition(from, to, "pass");
+    } catch {
+      // Observability must never replace the committed connector transition.
+    }
   }
 
   private deleteExpiredTokens(nowSeconds: number): void {
@@ -452,6 +1221,7 @@ export class SqliteOAuthClientsStore implements OAuthRegisteredClientsStore {
   constructor(
     private readonly store: SqliteOAuthStore,
     private readonly allowedRedirectHosts: string[],
+    private readonly connectorRegistration?: Omit<ConnectorRegistrationInput, "clientId">,
   ) {}
 
   getClient(clientId: string): OAuthClientInformationFull | undefined {
@@ -461,7 +1231,7 @@ export class SqliteOAuthClientsStore implements OAuthRegisteredClientsStore {
   registerClient(
     client: Omit<OAuthClientInformationFull, "client_id" | "client_id_issued_at">,
   ): OAuthClientInformationFull {
-    return this.store.registerClient(client, this.allowedRedirectHosts);
+    return this.store.registerClient(client, this.allowedRedirectHosts, this.connectorRegistration);
   }
 }
 
@@ -477,17 +1247,106 @@ interface TokenRow {
   rotation_sequence: number;
 }
 
+const CONNECTOR_BINDING_COLUMNS = `
+  binding_id, canonical_name, client_id, installation_epoch, schema_generation,
+  authority_contract_generation, redirect_uris_digest, build_digest, drain_epoch,
+  drain_deadline_at, refresh_allowed_during_drain, state, state_reason, ref_count,
+  created_at, updated_at
+`;
+
 interface ConnectorBindingRow {
   binding_id: string;
   canonical_name: string;
   client_id: string;
   installation_epoch: number;
   schema_generation: string;
+  authority_contract_generation: string | null;
+  redirect_uris_digest: string | null;
+  build_digest: string | null;
   drain_epoch: number;
+  drain_deadline_at: string | null;
+  refresh_allowed_during_drain: number;
   state: ConnectorBindingState;
+  state_reason: string | null;
   ref_count: number;
   created_at: string;
   updated_at: string;
+}
+
+interface ConnectorReadinessRow {
+  binding_id: string;
+  canonical_name: string;
+  client_id: string;
+  installation_epoch: number;
+  state: string;
+  schema_generation: string;
+  authority_contract_generation: string | null;
+  redirect_uris_digest: string | null;
+  build_digest: string | null;
+  drain_deadline_at: string | null;
+  refresh_allowed_during_drain: number;
+  ref_count: number;
+  active_family_count: number;
+  persisted_token_count: number;
+  prepared_receipt_count: number;
+  prepared_receipt_identity_match_count: number;
+  prepared_tuple_digest: string | null;
+  canonical_prepared_receipt_count: number;
+}
+
+interface ConnectorActivationReceiptRow {
+  receipt_id: string;
+  canonical_name: string;
+  candidate_binding_id: string;
+  client_id: string;
+  installation_epoch: number;
+  schema_generation: string;
+  authority_contract_generation: string;
+  redirect_uris_digest: string;
+  build_digest: string;
+  tuple_digest: string;
+  preimage_digest: string;
+  previous_active_binding_id: string | null;
+  owner_authority_id: string | null;
+  drain_deadline_at: string;
+  refresh_allowed_during_drain: number;
+  status: ConnectorActivationReceiptStatus;
+  failure_code: string | null;
+  prepared_at: string;
+  activated_at: string | null;
+  failed_at: string | null;
+}
+
+interface ConnectorActivationAuthorityReceiptRow {
+  action_claim_id: string;
+  receipt_id: string;
+  authority_id: string;
+  principal_key_fingerprint: string;
+  action_fingerprint: string;
+  resource_key_sha256: string;
+  fencing_token: number;
+  risk: "R3";
+  claim_state: "DISPATCHED";
+  approval_assurance: "cooperative";
+  canonical_name: string;
+  tuple_digest: string;
+  active_preimage_digest: string;
+  finalization_plan_digest: string;
+  evidence_digest: string;
+  claimed_at_ms: number;
+  dispatched_at_ms: number;
+  proof_digest: string;
+  consumed_at: string;
+}
+
+interface ConnectorRetirementReceiptRow {
+  receipt_id: string;
+  binding_id: string;
+  canonical_name: string;
+  drain_epoch: number;
+  reason: ConnectorRetirementReceipt["reason"];
+  revoked_family_count: number;
+  retired_at: string;
 }
 
 function rowToAccessTokenRecord(row: TokenRow): PersistedAccessTokenRecord {
@@ -519,19 +1378,363 @@ function rowToConnectorBinding(row: ConnectorBindingRow): ConnectorBindingRecord
     clientId: row.client_id,
     installationEpoch: row.installation_epoch,
     schemaGeneration: row.schema_generation,
+    authorityContractGeneration: row.authority_contract_generation ?? undefined,
+    redirectUrisDigest: row.redirect_uris_digest ?? undefined,
+    buildDigest: row.build_digest ?? undefined,
     drainEpoch: row.drain_epoch,
+    drainDeadlineAt: row.drain_deadline_at ?? undefined,
+    refreshAllowedDuringDrain: row.refresh_allowed_during_drain === 1,
     state: row.state,
+    stateReason: row.state_reason ?? undefined,
     refCount: row.ref_count,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
 }
 
-function validateConnectorBindingInput(input: CanonicalConnectorBindingInput): void {
+function rowToActivationReceipt(row: ConnectorActivationReceiptRow): ConnectorActivationReceipt {
+  return {
+    receiptId: row.receipt_id,
+    tuple: {
+      canonicalName: row.canonical_name,
+      candidateBindingId: row.candidate_binding_id,
+      clientId: row.client_id,
+      installationEpoch: row.installation_epoch,
+      schemaGeneration: row.schema_generation,
+      authorityContractGeneration: row.authority_contract_generation,
+      redirectUrisDigest: row.redirect_uris_digest,
+      buildDigest: row.build_digest,
+    },
+    tupleDigest: row.tuple_digest,
+    previousActiveBindingId: row.previous_active_binding_id ?? undefined,
+    preimageDigest: row.preimage_digest,
+    ownerAuthorityId: row.owner_authority_id ?? undefined,
+    drainDeadlineAt: row.drain_deadline_at,
+    refreshAllowedDuringDrain: row.refresh_allowed_during_drain === 1,
+    status: row.status,
+    failureCode: row.failure_code ?? undefined,
+    preparedAt: row.prepared_at,
+    activatedAt: row.activated_at ?? undefined,
+    failedAt: row.failed_at ?? undefined,
+  };
+}
+
+function rowToActivationAuthorityReceipt(
+  row: ConnectorActivationAuthorityReceiptRow,
+): ConnectorActivationAuthorityReceipt {
+  return {
+    schemaVersion: 1,
+    authorityId: row.authority_id,
+    actionClaimId: row.action_claim_id,
+    actionFingerprint: row.action_fingerprint,
+    resourceKeySha256: row.resource_key_sha256,
+    fencingToken: row.fencing_token,
+    principalKeyFingerprint: row.principal_key_fingerprint,
+    risk: row.risk,
+    claimState: row.claim_state,
+    approvalAssurance: row.approval_assurance,
+    receiptId: row.receipt_id,
+    canonicalName: row.canonical_name,
+    tupleDigest: row.tuple_digest,
+    activePreimageDigest: row.active_preimage_digest,
+    finalizationPlanDigest: row.finalization_plan_digest,
+    evidenceDigest: row.evidence_digest,
+    claimedAtMs: row.claimed_at_ms,
+    dispatchedAtMs: row.dispatched_at_ms,
+    proofDigest: row.proof_digest,
+    consumedAt: row.consumed_at,
+  };
+}
+
+function rowToRetirementReceipt(row: ConnectorRetirementReceiptRow): ConnectorRetirementReceipt {
+  return {
+    receiptId: row.receipt_id,
+    bindingId: row.binding_id,
+    canonicalName: row.canonical_name,
+    drainEpoch: row.drain_epoch,
+    reason: row.reason,
+    revokedFamilyCount: row.revoked_family_count,
+    retiredAt: row.retired_at,
+  };
+}
+
+const CONNECTOR_READINESS_INVALID_STATE_ORDER: readonly ConnectorReadinessInvalidState[] = [
+  "ACTIVE_COUNT",
+  "VERIFICATION_IDENTITY_INCOMPLETE",
+  "ACTIVE_DRAIN_FIELDS_SET",
+  "DRAINING_DEADLINE_INVALID",
+  "DRAINING_DEADLINE_ELAPSED",
+  "REFERENCE_COUNT_UNDERFLOW",
+  "TERMINAL_REFERENCES_REMAIN",
+  "PREPARED_RECEIPT_MISMATCH",
+  "UNKNOWN_BINDING_STATE",
+  "CANONICAL_NAME_UNCONFIGURED",
+];
+
+function emptyConnectorBindingCounts(): Record<ConnectorBindingState, number> {
+  return {
+    REGISTERED: 0,
+    CANDIDATE: 0,
+    VERIFIED: 0,
+    ACTIVATION_PREPARED: 0,
+    ACTIVE: 0,
+    DRAINING: 0,
+    RETIRED: 0,
+    REJECTED: 0,
+    FAILED: 0,
+  };
+}
+
+function isConnectorBindingState(value: string): value is ConnectorBindingState {
+  return (CONNECTOR_BINDING_STATES as readonly string[]).includes(value);
+}
+
+function connectorVerificationIdentityIsComplete(row: ConnectorReadinessRow): boolean {
+  return DIGEST_PATTERN.test(row.schema_generation)
+    && row.authority_contract_generation !== null
+    && DIGEST_PATTERN.test(row.authority_contract_generation)
+    && row.redirect_uris_digest !== null
+    && DIGEST_PATTERN.test(row.redirect_uris_digest)
+    && row.build_digest !== null
+    && DIGEST_PATTERN.test(row.build_digest);
+}
+
+function preparedReceiptMatchesBinding(row: ConnectorReadinessRow): boolean {
+  if (row.prepared_receipt_count !== 1
+    || row.prepared_receipt_identity_match_count !== 1
+    || !connectorVerificationIdentityIsComplete(row)) return false;
+  return row.prepared_tuple_digest === connectorActivationTupleDigest({
+    canonicalName: row.canonical_name,
+    candidateBindingId: row.binding_id,
+    clientId: row.client_id,
+    installationEpoch: row.installation_epoch,
+    schemaGeneration: row.schema_generation,
+    authorityContractGeneration: row.authority_contract_generation!,
+    redirectUrisDigest: row.redirect_uris_digest!,
+    buildDigest: row.build_digest!,
+  });
+}
+
+function validateConnectorBindingInput(input: ConnectorRegistrationInput): void {
   if (!/^[A-Za-z][A-Za-z0-9._-]{0,127}$/u.test(input.canonicalName)) throw new Error("Canonical connector name is invalid.");
   if (!input.clientId) throw new Error("Canonical connector clientId is required.");
   if (!Number.isInteger(input.installationEpoch) || input.installationEpoch < 1) throw new Error("Connector installation epoch is invalid.");
-  if (!/^sha256:[a-f0-9]{64}$/u.test(input.schemaGeneration)) throw new Error("Connector schema generation is invalid.");
+  validateDigest(input.schemaGeneration, "Connector schema generation");
+}
+
+function validateVerificationEvidence(evidence: ConnectorVerificationEvidence): void {
+  validateDigest(evidence.authorityContractGeneration, "Connector authority contract generation");
+  validateDigest(evidence.redirectUrisDigest, "Connector redirect URI digest");
+  validateDigest(evidence.buildDigest, "Connector build digest");
+}
+
+function validateActivationTuple(tuple: ConnectorActivationTuple): void {
+  validateConnectorBindingInput({
+    canonicalName: tuple.canonicalName,
+    clientId: tuple.clientId,
+    installationEpoch: tuple.installationEpoch,
+    schemaGeneration: tuple.schemaGeneration,
+  });
+  if (!/^connector-[A-Za-z0-9-]{8,}$/u.test(tuple.candidateBindingId)) {
+    throw new Error("Connector candidate binding ID is invalid.");
+  }
+  validateVerificationEvidence(tuple);
+}
+
+function validateActivationPlan(plan: ConnectorActivationPlan): void {
+  if (!Number.isFinite(Date.parse(plan.drainDeadlineAt))) {
+    throw new Error("Connector drain deadline is invalid.");
+  }
+}
+
+const CONNECTOR_ACTIVATION_AUTHORITY_PROOF_KEYS = [
+  "actionClaimId",
+  "actionFingerprint",
+  "activePreimageDigest",
+  "approvalAssurance",
+  "authorityId",
+  "canonicalName",
+  "claimState",
+  "claimedAtMs",
+  "dispatchedAtMs",
+  "evidenceDigest",
+  "fencingToken",
+  "finalizationPlanDigest",
+  "principalKeyFingerprint",
+  "receiptId",
+  "resourceKeySha256",
+  "risk",
+  "schemaVersion",
+  "tupleDigest",
+] as const;
+
+function validateConnectorActivationAuthorityBinding(binding: ConnectorActivationAuthorityBinding): void {
+  if (!binding || typeof binding !== "object") {
+    throw new Error("Connector activation authority binding is required.");
+  }
+  if (!new RegExp(`^connector-activation-${UUID_PATTERN.source.slice(1, -1)}$`, "u").test(binding.receiptId)) {
+    throw new Error("Connector activation authority receiptId is invalid.");
+  }
+  if (!/^[A-Za-z][A-Za-z0-9._-]{0,127}$/u.test(binding.canonicalName)) {
+    throw new Error("Connector activation authority canonicalName is invalid.");
+  }
+  validateDigest(binding.tupleDigest, "Connector activation authority tuple digest");
+  validateDigest(binding.activePreimageDigest, "Connector activation authority active preimage digest");
+  validateDigest(binding.finalizationPlanDigest, "Connector activation authority finalization plan digest");
+}
+
+function validateConnectorActivationAuthorityProof(
+  value: unknown,
+): asserts value is ConnectorActivationAuthorityProof {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new ConnectorStateConflictError("Connector activation authority proof must be a typed object.");
+  }
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new ConnectorStateConflictError("Connector activation authority proof must be a plain typed object.");
+  }
+  const proof = value as Partial<ConnectorActivationAuthorityProof> & Record<string, unknown>;
+  const keys = Object.keys(proof).sort();
+  if (keys.length !== CONNECTOR_ACTIVATION_AUTHORITY_PROOF_KEYS.length
+    || keys.some((key, index) => key !== CONNECTOR_ACTIVATION_AUTHORITY_PROOF_KEYS[index])) {
+    throw new ConnectorStateConflictError("Connector activation authority proof shape is invalid.");
+  }
+  if (proof.schemaVersion !== 1
+    || proof.risk !== "R3"
+    || proof.claimState !== "DISPATCHED"
+    || proof.approvalAssurance !== "cooperative") {
+    throw new ConnectorStateConflictError("Connector activation authority proof state is invalid.");
+  }
+  if (typeof proof.authorityId !== "string"
+    || !new RegExp(`^authority_${UUID_PATTERN.source.slice(1, -1)}$`, "u").test(proof.authorityId)
+    || typeof proof.actionClaimId !== "string"
+    || !new RegExp(`^authority_claim_${UUID_PATTERN.source.slice(1, -1)}$`, "u").test(proof.actionClaimId)) {
+    throw new ConnectorStateConflictError("Connector activation authority proof identity is invalid.");
+  }
+  if (typeof proof.actionFingerprint !== "string" || !RAW_SHA256_PATTERN.test(proof.actionFingerprint)
+    || typeof proof.resourceKeySha256 !== "string" || !RAW_SHA256_PATTERN.test(proof.resourceKeySha256)
+    || typeof proof.principalKeyFingerprint !== "string" || !RAW_SHA256_PATTERN.test(proof.principalKeyFingerprint)) {
+    throw new ConnectorStateConflictError("Connector activation authority proof fingerprint is invalid.");
+  }
+  if (!Number.isSafeInteger(proof.fencingToken) || Number(proof.fencingToken) < 1
+    || !Number.isSafeInteger(proof.claimedAtMs) || Number(proof.claimedAtMs) < 1
+    || !Number.isSafeInteger(proof.dispatchedAtMs) || Number(proof.dispatchedAtMs) < Number(proof.claimedAtMs)) {
+    throw new ConnectorStateConflictError("Connector activation authority proof timing or fencing is invalid.");
+  }
+  try {
+    validateConnectorActivationAuthorityBinding(proof as unknown as ConnectorActivationAuthorityBinding);
+    if (typeof proof.evidenceDigest !== "string") throw new Error("Evidence digest is required.");
+    validateDigest(proof.evidenceDigest, "Connector activation authority evidence digest");
+  } catch {
+    throw new ConnectorStateConflictError("Connector activation authority proof binding is invalid.");
+  }
+  const binding = proof as unknown as ConnectorActivationAuthorityBinding;
+  if (proof.actionFingerprint !== connectorActivationAuthorityActionFingerprint(binding)
+    || proof.resourceKeySha256 !== connectorActivationAuthorityResourceKeySha256(binding)) {
+    throw new ConnectorStateConflictError("Connector activation authority proof does not match its exact action descriptor.");
+  }
+}
+
+function assertConnectorActivationAuthorityMatchesReceipt(
+  proof: ConnectorActivationAuthorityProof,
+  receipt: ConnectorActivationReceipt,
+): void {
+  if (proof.receiptId !== receipt.receiptId
+    || proof.canonicalName !== receipt.tuple.canonicalName
+    || proof.tupleDigest !== receipt.tupleDigest
+    || proof.activePreimageDigest !== receipt.preimageDigest) {
+    throw new ConnectorStateConflictError(
+      "Connector activation authority proof does not match the exact prepared receipt, tuple, or ACTIVE preimage.",
+    );
+  }
+}
+
+function connectorActivationAuthorityProofDigest(proof: ConnectorActivationAuthorityProof): string {
+  return sha256Digest(stableJson(proof));
+}
+
+function validateStateReason(reason: string): void {
+  if (!/^[A-Z][A-Z0-9._:-]{0,255}$/u.test(reason)) throw new Error("Connector state reason is invalid.");
+}
+
+function validateDigest(value: string, label: string): void {
+  if (!DIGEST_PATTERN.test(value)) throw new Error(`${label} is invalid.`);
+}
+
+function bindingMatchesTuple(binding: ConnectorBindingRecord, tuple: ConnectorActivationTuple): boolean {
+  return binding.bindingId === tuple.candidateBindingId
+    && binding.canonicalName === tuple.canonicalName
+    && binding.clientId === tuple.clientId
+    && binding.installationEpoch === tuple.installationEpoch
+    && binding.schemaGeneration === tuple.schemaGeneration
+    && binding.authorityContractGeneration === tuple.authorityContractGeneration
+    && binding.redirectUrisDigest === tuple.redirectUrisDigest
+    && binding.buildDigest === tuple.buildDigest;
+}
+
+function activationTupleJson(tuple: ConnectorActivationTuple): string {
+  return JSON.stringify({
+    canonicalName: tuple.canonicalName,
+    candidateBindingId: tuple.candidateBindingId,
+    clientId: tuple.clientId,
+    installationEpoch: tuple.installationEpoch,
+    schemaGeneration: tuple.schemaGeneration,
+    authorityContractGeneration: tuple.authorityContractGeneration,
+    redirectUrisDigest: tuple.redirectUrisDigest,
+    buildDigest: tuple.buildDigest,
+  });
+}
+
+export function connectorActivationTupleDigest(tuple: ConnectorActivationTuple): string {
+  return sha256Digest(activationTupleJson(tuple));
+}
+
+function connectorPreimageJson(binding: ConnectorBindingRecord | undefined): string {
+  if (!binding) return "null";
+  return JSON.stringify({
+    bindingId: binding.bindingId,
+    canonicalName: binding.canonicalName,
+    clientId: binding.clientId,
+    installationEpoch: binding.installationEpoch,
+    schemaGeneration: binding.schemaGeneration,
+    authorityContractGeneration: binding.authorityContractGeneration ?? null,
+    redirectUrisDigest: binding.redirectUrisDigest ?? null,
+    buildDigest: binding.buildDigest ?? null,
+    drainEpoch: binding.drainEpoch,
+    drainDeadlineAt: binding.drainDeadlineAt ?? null,
+    refreshAllowedDuringDrain: binding.refreshAllowedDuringDrain,
+    state: binding.state,
+    stateReason: binding.stateReason ?? null,
+    refCount: binding.refCount,
+    createdAt: binding.createdAt,
+    updatedAt: binding.updatedAt,
+  });
+}
+
+function sha256Digest(value: string): string {
+  return `sha256:${createHash("sha256").update(value).digest("hex")}`;
+}
+
+function sha256Hex(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${stableJson(record[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
+function isSqliteConstraintError(error: unknown): boolean {
+  return Boolean(
+    error
+      && typeof error === "object"
+      && "code" in error
+      && String(error.code).startsWith("SQLITE_CONSTRAINT"),
+  );
 }
 
 function validateTokenPairBinding(pair: PersistedTokenPair): void {

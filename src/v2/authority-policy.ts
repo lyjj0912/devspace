@@ -380,20 +380,40 @@ export function contextAction(
 export function filesystemAction(
   input: UniversalFilesystemInput,
   targetId: string,
+  binding: {
+    syncPlanDigest?: string;
+    syncDeleteMode?: "none" | "trash" | "permanent";
+  } = {},
 ): AuthorityActionDescriptor {
+  const sync = input.sync;
   return {
     tool: "fs",
     operation: input.operation,
     target: targetId,
-    resource: input.path ?? input.destination,
+    resource: input.operation === "sync"
+      ? input.destination
+      : input.path ?? input.destination,
     parameters: compact({
       contextId: input.contextId,
       path: input.path,
       destination: input.destination,
+      offset: input.offset,
+      cursor: input.cursor,
+      limit: input.limit,
+      query: input.query,
       overwrite: input.overwrite,
       expectedSha256: input.expectedSha256,
       disposition: input.disposition,
       recursive: input.recursive,
+      trashId: input.trashId,
+      finalSymlink: input.finalSymlink,
+      syncPhase: sync?.phase,
+      syncPlanId: sync?.planId,
+      syncPlanDigest: binding.syncPlanDigest ?? sync?.planDigest,
+      syncIncludeSha256: sync?.include === undefined ? undefined : sha256(stableJson(sync.include)),
+      syncExcludeSha256: sync?.exclude === undefined ? undefined : sha256(stableJson(sync.exclude)),
+      syncDeleteMode: binding.syncDeleteMode ?? sync?.deleteMode,
+      syncConflictStrategy: sync?.conflictStrategy,
       contentSha256: input.content === undefined ? undefined : sha256(input.content),
       patchSha256: input.patch === undefined ? undefined : sha256(input.patch),
     }),
@@ -442,7 +462,6 @@ export function processAction(
       rows: input.rows,
       transactionId: input.transactionId,
       reason: input.reason,
-      delayMs: input.delayMs,
       charsSha256: input.chars === undefined ? undefined : sha256(input.chars),
       classifierGeneration: PROCESS_RISK_CLASSIFIER_GENERATION,
       targetGeneration: binding.targetGeneration,
@@ -507,6 +526,8 @@ export function filesystemRisk(
   parameters?: Record<string, unknown>,
 ): AuthorityRiskClass {
   if (["stat", "list", "read", "search", "hash"].includes(operation)) return "R0";
+  if (operation === "sync" && parameters?.syncPhase === "plan") return "R0";
+  if (operation === "sync" && parameters?.syncDeleteMode === "permanent") return "R3";
   if (operation === "remove" && parameters?.disposition === "permanent") return "R3";
   if (operation === "remove") return "R2";
   return target && target !== "local" ? "R2" : "R1";

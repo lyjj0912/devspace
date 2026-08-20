@@ -38,6 +38,11 @@ test("next config uses an isolated port, endpoint, state directory, and full own
   assert.equal(next.publicMcpUrl, `http://127.0.0.1:${base.port + 1}/mcp-next`);
   assert.equal(next.stateDir, join(base.stateDir, "universal-broker-v2"));
   assert.equal(next.authorityStorePath, join(next.stateDir, "authority.sqlite"));
+  assert.equal(
+    next.connectorActivationJournalPath,
+    join(next.stateDir, "connector-activation-journal.sqlite"),
+  );
+  assert.equal(next.lifecycleFinalizationStorePath, join(next.stateDir, "lifecycle.sqlite"));
   assert.equal(next.authorityPrincipalMode, "single-owner");
   assert.equal(next.authorityOwnerInstanceId, "parallel-config-test-owner");
   assert.equal(next.oauthStateDir, next.stateDir);
@@ -45,9 +50,9 @@ test("next config uses an isolated port, endpoint, state directory, and full own
   assert.equal(next.mcpRouteConfigPath, join(root, ".config", "mcp-routes.v2.json"));
   assert.equal(next.contextStorePath, join(next.stateDir, "contexts.json"));
   assert.equal(next.envProfileConfigPath, join(homedir(), ".devspace", "env-profiles.v2.json"));
-  assert.equal(next.contextIdleTtlMs, 24 * 60 * 60_000);
+  assert.equal(next.contextIdleTtlMs, 30 * 60_000);
   assert.equal(next.contextWorktreeRoot, join(next.stateDir, "worktrees"));
-  assert.equal(next.contextMaximumEntries, 128);
+  assert.equal(next.contextMaximumEntries, 64);
   assert.equal(next.contextMaximumWorktrees, 8);
   assert.equal(next.contextMaximumWorktreeBytes, 8 * 1024 * 1024 * 1024);
   assert.equal(next.contextDiffMaximumEntries, 64);
@@ -57,26 +62,25 @@ test("next config uses an isolated port, endpoint, state directory, and full own
   assert.equal(next.selfManagementDir, join(next.stateDir, "self-management"));
   assert.equal(next.selfRestartPm2ProcessName, "devspace-next");
   assert.equal(next.selfRestartExpectedScript, undefined);
-  assert.equal(next.selfRestartDelayMs, 2_000);
   assert.equal(next.selfRestartTimeoutMs, 120_000);
   assert.equal(next.maxRunningProcesses, 16);
   assert.equal(next.maxRunningProcessesPerTarget, 16);
-  assert.equal(next.maximumProcessRecords, 256);
+  assert.equal(next.maximumProcessRecords, 128);
   assert.equal(next.processBufferCharacters, 64 * 1024);
   assert.equal(next.processOutputMaxBytes, 100 * 1024 * 1024);
-  assert.equal(next.completedProcessTtlMs, 24 * 60 * 60_000);
+  assert.equal(next.completedProcessTtlMs, 15 * 60_000);
   assert.equal(next.artifactStagingDir, join(next.stateDir, "artifacts"));
   assert.equal(next.artifactMaximumEntries, 256);
   assert.equal(next.artifactMaximumTotalBytes, 2 * 1024 * 1024 * 1024);
-  assert.equal(next.artifactMaximumFileBytes, 2 * 1024 * 1024 * 1024);
+  assert.equal(next.artifactMaximumFileBytes, 1024 * 1024 * 1024);
   assert.equal(next.artifactTtlMs, 24 * 60 * 60_000);
   assert.equal(next.guiMaximumSessions, 16);
-  assert.equal(next.guiSessionTtlMs, 30 * 60_000);
+  assert.equal(next.guiSessionTtlMs, 10 * 60_000);
   assert.equal(next.guiPayloadBudgetCharacters, 12_000);
   assert.equal(next.downstreamMcpMaximumSessions, 64);
   assert.equal(next.downstreamMcpSessionIdleTtlMs, 15 * 60_000);
   assert.equal(next.mcpResultMaximumEntries, 64);
-  assert.equal(next.mcpResultMaximumCharacters, 10_000_000);
+  assert.equal(next.mcpResultMaximumBytes, 256 * 1024 * 1024);
   assert.equal(next.mcpResultTtlMs, 15 * 60_000);
   assert.equal(next.maximumMcpSessions, 128);
   assert.equal(next.canonicalConnectorName, "myDevSpace");
@@ -104,6 +108,14 @@ test("production v2 uses canonical production routes and may reuse the legacy OA
   assert.equal(production.oauthStateDir, base.stateDir);
   assert.equal(production.stateDir, join(root, "v2-production-state"));
   assert.equal(production.authorityStorePath, join(production.stateDir, "authority.sqlite"));
+  assert.equal(
+    production.connectorActivationJournalPath,
+    join(production.stateDir, "connector-activation-journal.sqlite"),
+  );
+  assert.equal(
+    production.lifecycleFinalizationStorePath,
+    join(production.stateDir, "lifecycle.sqlite"),
+  );
   assert.equal(production.publicBaseUrl, new URL(base.publicBaseUrl).origin);
   assert.equal(production.selfRestartPm2ProcessName, "devspace-v2-production");
 
@@ -172,6 +184,46 @@ test("production v2 uses canonical production routes and may reuse the legacy OA
     }),
     /must not reuse the OAuth database/,
   );
+  assert.throws(
+    () => loadUniversalBrokerNextConfig(base, {
+      ...PARALLEL_OWNER_ENV,
+      DEVSPACE_NEXT_STATE_DIR: join(root, "connector-journal-state"),
+      DEVSPACE_NEXT_CONNECTOR_ACTIVATION_JOURNAL: join(root, "outside-connector-journal.sqlite"),
+    }),
+    /CONNECTOR_ACTIVATION_JOURNAL must stay inside DEVSPACE_NEXT_STATE_DIR/,
+  );
+  assert.throws(
+    () => loadUniversalBrokerNextConfig(base, {
+      ...PARALLEL_OWNER_ENV,
+      DEVSPACE_NEXT_STATE_DIR: join(root, "shared-connector-journal-state"),
+      DEVSPACE_NEXT_CONNECTOR_ACTIVATION_JOURNAL: join(
+        root,
+        "shared-connector-journal-state",
+        "authority.sqlite",
+      ),
+    }),
+    /CONNECTOR_ACTIVATION_JOURNAL must use a dedicated database path/,
+  );
+  assert.throws(
+    () => loadUniversalBrokerNextConfig(base, {
+      ...PARALLEL_OWNER_ENV,
+      DEVSPACE_NEXT_STATE_DIR: join(root, "lifecycle-state"),
+      DEVSPACE_NEXT_LIFECYCLE_FINALIZATION_STORE: join(root, "outside", "lifecycle.sqlite"),
+    }),
+    /LIFECYCLE_FINALIZATION_STORE must stay inside DEVSPACE_NEXT_STATE_DIR/,
+  );
+  assert.throws(
+    () => loadUniversalBrokerNextConfig(base, {
+      ...PARALLEL_OWNER_ENV,
+      DEVSPACE_NEXT_STATE_DIR: join(root, "lifecycle-name-state"),
+      DEVSPACE_NEXT_LIFECYCLE_FINALIZATION_STORE: join(
+        root,
+        "lifecycle-name-state",
+        "finalization.sqlite",
+      ),
+    }),
+    /LIFECYCLE_FINALIZATION_STORE must use the canonical lifecycle.sqlite basename/,
+  );
 });
 
 test("next config accepts explicit parallel deployment values", async (t) => {
@@ -183,6 +235,8 @@ test("next config accepts explicit parallel deployment values", async (t) => {
     DEVSPACE_NEXT_PUBLIC_BASE_URL: "https://devspace-next.example.com/v2/",
     DEVSPACE_NEXT_MCP_PATH: "/mcp-next/v2",
     DEVSPACE_NEXT_STATE_DIR: join(root, "next-state"),
+    DEVSPACE_NEXT_CONNECTOR_ACTIVATION_JOURNAL: join(root, "next-state", "activation.sqlite"),
+    DEVSPACE_NEXT_LIFECYCLE_FINALIZATION_STORE: join(root, "next-state", "lifecycle.sqlite"),
     DEVSPACE_NEXT_AUTHORITY_PRINCIPAL_MODE: "single-owner",
     DEVSPACE_NEXT_AUTHORITY_OWNER_INSTANCE_ID: "configured-owner-instance",
     DEVSPACE_NEXT_TARGETS_FILE: join(root, "targets.json"),
@@ -202,7 +256,6 @@ test("next config accepts explicit parallel deployment values", async (t) => {
     DEVSPACE_NEXT_SELF_MANAGEMENT_DIR: join(root, "self-management"),
     DEVSPACE_NEXT_PM2_PROCESS_NAME: "devspace-custom",
     DEVSPACE_NEXT_PM2_EXPECTED_SCRIPT: join(root, "start-custom.sh"),
-    DEVSPACE_NEXT_SELF_RESTART_DELAY_MS: "3000",
     DEVSPACE_NEXT_SELF_RESTART_TIMEOUT_MS: "180000",
     DEVSPACE_NEXT_MAX_RUNNING_PROCESSES: "10",
     DEVSPACE_NEXT_MAX_RUNNING_PROCESSES_PER_TARGET: "4",
@@ -220,7 +273,7 @@ test("next config accepts explicit parallel deployment values", async (t) => {
     DEVSPACE_NEXT_DOWNSTREAM_MCP_MAXIMUM_SESSIONS: "5",
     DEVSPACE_NEXT_DOWNSTREAM_MCP_SESSION_IDLE_TTL_MS: "40000",
     DEVSPACE_NEXT_MCP_RESULT_MAXIMUM_ENTRIES: "6",
-    DEVSPACE_NEXT_MCP_RESULT_MAXIMUM_CHARACTERS: "700000",
+    DEVSPACE_NEXT_MCP_RESULT_MAXIMUM_BYTES: "700000",
     DEVSPACE_NEXT_MCP_RESULT_TTL_MS: "50000",
     DEVSPACE_NEXT_ALLOWED_HOSTS: "devspace-next.example.com,127.0.0.1",
     DEVSPACE_NEXT_MCP_SESSION_IDLE_TIMEOUT_MS: "60000",
@@ -235,6 +288,8 @@ test("next config accepts explicit parallel deployment values", async (t) => {
   assert.equal(next.endpointPath, "/mcp-next/v2");
   assert.equal(next.authorityPrincipalMode, "single-owner");
   assert.equal(next.authorityOwnerInstanceId, "configured-owner-instance");
+  assert.equal(next.connectorActivationJournalPath, join(root, "next-state", "activation.sqlite"));
+  assert.equal(next.lifecycleFinalizationStorePath, join(root, "next-state", "lifecycle.sqlite"));
   assert.deepEqual(next.allowedHosts, ["devspace-next.example.com", "127.0.0.1"]);
   assert.equal(next.mcpSessionIdleTimeoutMs, 60_000);
   assert.equal(next.mcpSessionCleanupIntervalMs, 5_000);
@@ -255,7 +310,6 @@ test("next config accepts explicit parallel deployment values", async (t) => {
   assert.equal(next.selfManagementDir, join(root, "self-management"));
   assert.equal(next.selfRestartPm2ProcessName, "devspace-custom");
   assert.equal(next.selfRestartExpectedScript, join(root, "start-custom.sh"));
-  assert.equal(next.selfRestartDelayMs, 3_000);
   assert.equal(next.selfRestartTimeoutMs, 180_000);
   assert.equal(next.maxRunningProcesses, 10);
   assert.equal(next.maxRunningProcessesPerTarget, 4);
@@ -273,7 +327,7 @@ test("next config accepts explicit parallel deployment values", async (t) => {
   assert.equal(next.downstreamMcpMaximumSessions, 5);
   assert.equal(next.downstreamMcpSessionIdleTtlMs, 40_000);
   assert.equal(next.mcpResultMaximumEntries, 6);
-  assert.equal(next.mcpResultMaximumCharacters, 700_000);
+  assert.equal(next.mcpResultMaximumBytes, 700_000);
   assert.equal(next.mcpResultTtlMs, 50_000);
   assert.equal(next.maximumMcpSessions, 9);
 
@@ -295,7 +349,7 @@ test("next config accepts explicit parallel deployment values", async (t) => {
     () => loadUniversalBrokerNextConfig(baseConfig(root), {
       DEVSPACE_NEXT_AUTHORITY_PRINCIPAL_MODE: "multi-user",
     }),
-    /verified OAuth subject-claim policy/u,
+    /supports single-owner only/u,
   );
 });
 
@@ -432,24 +486,36 @@ test("unified production config is canonical, materializes inline registries, an
   assert.deepEqual(first.authorityTtlSeconds, { R1: 1800, R2: 900, R3: 300 });
   assert.deepEqual(first.authorityMaximumUses, { R1: 50, R2: 10, R3: 1 });
   assert.equal(first.authorityResourceLeaseTtlSeconds, 900);
+  assert.equal(first.authorityResourceLeaseHeartbeatSeconds, 30);
+  assert.equal(first.authorityResourceLeaseRecoveryGraceSeconds, 60);
+  assert.equal(first.authorityApprovalAssurance, "cooperative");
   assert.equal(first.authorityMaximumActionsPerPlan, 64);
   assert.equal(first.supervisorEndpoint, "http://127.0.0.1:9797");
   assert.equal(first.supervisorRestartMaximumAttempts, 4);
   assert.equal(first.publicMetrics, false);
   assert.equal(first.canonicalConnectorName, "myDevSpace");
-  assert.equal(first.contextMaximumEntries, 128);
-  assert.equal(first.maximumProcessRecords, 256);
+  assert.equal(first.contextMaximumEntries, 64);
+  assert.equal(first.maximumProcessRecords, 128);
   assert.equal(first.maxRunningProcesses, 16);
   assert.equal(first.downstreamMcpMaximumSessions, 64);
   assert.equal(first.guiMaximumSessions, 16);
   assert.equal(first.artifactMaximumEntries, 256);
   assert.equal(first.processBufferCharacters, 65_536);
   assert.equal(first.processOutputMaxBytes, 104_857_600);
-  assert.equal(first.artifactMaximumFileBytes, 2_147_483_648);
-  assert.equal(first.contextIdleTtlMs, 86_400_000);
-  assert.equal(first.completedProcessTtlMs, 86_400_000);
+  assert.equal(first.artifactMaximumFileBytes, 1_073_741_824);
+  assert.equal(first.artifactMaximumTotalBytes, 2_147_483_648);
+  assert.equal(first.artifactCatalogPath, join(root, "unified-state", "artifacts.sqlite"));
+  assert.equal(first.artifactObjectRoot, join(root, "unified-state", "artifact-objects"));
+  assert.equal(first.lifecycleFinalizationStorePath, join(root, "unified-state", "lifecycle.sqlite"));
+  assert.equal(first.cursorTtlMs, 600_000);
+  assert.equal(first.mcpResultTtlMs, 900_000);
+  assert.equal(first.cursorMaximumSnapshotsPerPrincipal, 128);
+  assert.equal(first.connectorDrainGraceSeconds, 3_600);
+  assert.equal(first.rateLimit.mode, "internal");
+  assert.equal(first.contextIdleTtlMs, 1_800_000);
+  assert.equal(first.completedProcessTtlMs, 900_000);
   assert.equal(first.downstreamMcpSessionIdleTtlMs, 900_000);
-  assert.equal(first.guiSessionTtlMs, 1_800_000);
+  assert.equal(first.guiSessionTtlMs, 600_000);
   assert.equal(first.artifactTtlMs, 86_400_000);
   assert.match(first.configDigest, /^sha256:[a-f0-9]{64}$/u);
   assert.equal(first.configDigest, reordered.configDigest);
@@ -499,6 +565,7 @@ test("unified YAML config uses central defaults", async (t) => {
   const path = join(root, "config.yaml");
   await writeFile(path, [
     "version: 2",
+    "productProfile: BASE_SINGLE_OWNER",
     "profile: development",
     "oauth:",
     "  principalMode: single-owner",
@@ -517,7 +584,7 @@ test("unified YAML config uses central defaults", async (t) => {
   });
   assert.equal(config.configProfile, "development");
   assert.equal(config.authorityOwnerInstanceId, "yaml-stable-owner");
-  assert.equal(config.contextMaximumEntries, 128);
+  assert.equal(config.contextMaximumEntries, 64);
   assert.equal(config.artifactTtlMs, 24 * 60 * 60_000);
   assert.equal(config.targetConfigPath, join(root, "yaml-state", "generated-config", "targets.v1.json"));
 });
@@ -535,11 +602,11 @@ test("unified production validation rejects unsafe policy and broken references"
 
   const anonymous = productionUnifiedConfig(root);
   anonymous.oauth.allowAnonymousSessionFallback = true;
-  assert.throws(await load(anonymous), /anonymous or MCP-session principal fallback/u);
+  assert.throws(await load(anonymous), /allowAnonymousSessionFallback|expected false/u);
 
   const publicMetrics = productionUnifiedConfig(root);
   publicMetrics.observability.publicMetrics = true;
-  assert.throws(await load(publicMetrics), /Public metrics are forbidden/u);
+  assert.throws(await load(publicMetrics), /publicMetrics|expected false/u);
 
   const auditAuthority = productionUnifiedConfig(root);
   auditAuthority.authority.mode = "audit";
@@ -551,12 +618,11 @@ test("unified production validation rejects unsafe policy and broken references"
 
   const sidecar = productionUnifiedConfig(root);
   sidecar.authority.deployment = "sidecar";
-  sidecar.authority.endpoint = "http://127.0.0.1:9898";
-  assert.throws(await load(sidecar), /Sidecar authority deployment is unsupported/u);
+  assert.throws(await load(sidecar), /deployment|in-process/u);
 
   const attestation = productionUnifiedConfig(root);
-  attestation.authority.requireHostAttestation = true;
-  assert.throws(await load(attestation), /host attestation verifier is not configured/u);
+  (attestation.authority as Record<string, unknown>).requireHostAttestation = true;
+  assert.throws(await load(attestation), /requireHostAttestation|Unrecognized/u);
 
   const duplicateTarget = productionUnifiedConfig(root);
   duplicateTarget.targets.push({ ...duplicateTarget.targets[0]! });
@@ -581,8 +647,16 @@ test("unified production validation rejects unsafe policy and broken references"
   assert.throws(await load(elevation), /elevationPolicy must be deny/u);
 
   const missingConnector = productionUnifiedConfig(root);
-  delete (missingConnector.server as { canonicalConnectorName?: string }).canonicalConnectorName;
+  delete (missingConnector as { connector?: unknown }).connector;
   assert.throws(await load(missingConnector), /canonicalConnectorName/u);
+
+  assert.throws(
+    () => loadUniversalBrokerNextConfig(base, {
+      DEVSPACE_NEXT_SELF_RESTART_DELAY_MS: "2000",
+      DEVSPACE_NEXT_AUTHORITY_OWNER_INSTANCE_ID: "delay-negative-owner",
+    }),
+    /requires transport ACK_FLUSHED evidence/u,
+  );
 });
 
 test("published config schema describes the unified production safety surface", async () => {
@@ -590,7 +664,7 @@ test("published config schema describes the unified production safety surface", 
     await readFile(join(process.cwd(), "config", "config.schema.json"), "utf8"),
   ) as Record<string, unknown>;
   assert.equal(schema.$schema, "https://json-schema.org/draft/2020-12/schema");
-  assert.deepEqual(schema.required, ["version", "oauth", "supervisor"]);
+  assert.deepEqual(schema.required, ["version", "productProfile"]);
   assert.equal(
     ((schema.properties as Record<string, unknown>).observability as {
       properties: { publicMetrics: { const: boolean } };
@@ -603,18 +677,21 @@ test("published config schema describes the unified production safety surface", 
     }).properties.mode.enum),
     ["enforced", "audit", "disabled"],
   );
+  const schemaText = JSON.stringify(schema);
+  assert.doesNotMatch(schemaText, /multi-user|sidecar|host-attested|requireHostAttestation|GUI_CAPTURE/u);
+  assert.match(schemaText, /BASE_SINGLE_OWNER/u);
 });
 
 function productionUnifiedConfig(root: string) {
   return {
     version: 2,
+    productProfile: "BASE_SINGLE_OWNER",
     profile: "production",
     server: {
       publicBaseUrl: "http://127.0.0.1:8686",
       mcpPath: "/mcp",
       dataPlane: { host: "127.0.0.1", port: 8686 },
       managementPlane: { host: "127.0.0.1", port: 9696 },
-      canonicalConnectorName: "myDevSpace",
     },
     oauth: {
       issuer: "http://127.0.0.1:8686",
@@ -630,12 +707,11 @@ function productionUnifiedConfig(root: string) {
     authority: {
       mode: "enforced",
       deployment: "in-process",
-      endpoint: null as string | null,
+      approvalAssurance: "cooperative",
       stateDirectory: join(root, "unified-state", "authority"),
       r0FastPath: true,
-      requireHostAttestation: false,
       authorityTtlSeconds: { R1: 1800, R2: 900, R3: 300 },
-      resourceLeaseTtlSeconds: 900,
+      resourceLease: { ttlSeconds: 900, heartbeatSeconds: 30, recoveryGraceSeconds: 60 },
       maximumActionsPerPlan: 64,
       maximumUses: { R1: 50, R2: 10, R3: 1 },
     },
@@ -644,34 +720,68 @@ function productionUnifiedConfig(root: string) {
       processManager: "pm2",
       transactionDirectory: join(root, "unified-state", "restarts"),
       healthTimeoutMs: 30_000,
-      restartPolicy: { maximumAttempts: 4, delayMs: 2_000, maximumDelayMs: 60_000 },
+      responseFlushRequired: true,
+      restartPolicy: { maximumAttempts: 4, maximumDelayMs: 60_000 },
+    },
+    pagination: {
+      cursorTtlSeconds: 600,
+      maximumSnapshotsPerPrincipal: 128,
+      signingKeyRef: join(root, "cursor-current.key"),
+      previousSigningKeyRef: join(root, "cursor-previous.key"),
+    },
+    artifact: {
+      catalogPath: join(root, "unified-state", "artifacts.sqlite"),
+      objectRoot: join(root, "unified-state", "artifact-objects"),
+      defaultTtlSeconds: 86_400,
+      maximumArtifactBytes: 1_073_741_824,
+      maximumTotalBytes: 2_147_483_648,
+    },
+    connector: {
+      canonicalName: "myDevSpace",
+      activationMode: "owner-approved",
+      drainGraceSeconds: 3_600,
+    },
+    rateLimit: {
+      mode: "internal",
+      preAuth: { refillPerMinute: 120, burst: 30 },
+      postAuth: { refillPerMinute: 600, burst: 100 },
+      initialize: { refillPerMinute: 30, burst: 10 },
+    },
+    management: { bind: "127.0.0.1", port: 9696, publicExposure: "deny" },
+    audit: {
+      sink: join(root, "unified-state", "audit", "operations.jsonl"),
+      flushIntervalMs: 250,
+      rawArguments: false,
     },
     storage: {
       root,
       stateDirectory: join(root, "unified-state"),
+      lifecycleFinalizationStore: join(root, "unified-state", "lifecycle.sqlite"),
       artifactRoot: join(root, "resources", "artifacts", "sha256"),
       processOutputRoot: join(root, "resources", "process-output"),
       stateFileMode: "0600",
       directoryMode: "0700",
     },
     quotas: {
-      contexts: 128,
-      processes: 256,
+      contexts: 64,
+      processes: 128,
       concurrentProcesses: 16,
       mcpConnections: 64,
+      mcpRetainedResultBytes: 268_435_456,
       guiSessions: 16,
       artifacts: 256,
       inlineOutputBytes: 65_536,
       processOutputBytes: 104_857_600,
-      artifactMaxBytes: 2_147_483_648,
+      artifactMaxBytes: 1_073_741_824,
     },
     ttls: {
-      contextSeconds: 86_400,
-      completedProcessSeconds: 86_400,
+      contextSeconds: 1_800,
+      completedProcessSeconds: 900,
       mcpIdleSeconds: 900,
-      guiSeconds: 1_800,
+      guiSeconds: 600,
       artifactSeconds: 86_400,
-      cursorSnapshotSeconds: 900,
+      cursorSnapshotSeconds: 600,
+      mcpRetainedResultSeconds: 900,
     },
     targets: [
       {

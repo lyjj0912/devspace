@@ -3,10 +3,11 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import Database from "better-sqlite3";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { createBoundedSelfRestartEvidence } from "./lib/self-restart-evidence.mjs";
 
 const expectedTools = [
   "target",
@@ -36,11 +37,13 @@ const mcpUrl = options.mcpUrl
 const healthUrl = options.healthUrl
   ? new URL(options.healthUrl)
   : new URL(options.healthPath, baseUrl);
+const publicHealthUrl = options.publicHealthUrl ? new URL(options.publicHealthUrl) : undefined;
 const audit = {
   ok: false,
   baseUrl: baseUrl.href,
   mcpUrl: mcpUrl.href,
   healthUrl: healthUrl.href,
+  ...(publicHealthUrl ? { publicHealthUrl: publicHealthUrl.href } : {}),
   companyGates: options.skipCompanyGates
     ? { skipped: true, reason: "Explicit --skip-company-gates deployment option." }
     : { skipped: false },
@@ -72,6 +75,12 @@ const health = await fetch(healthUrl);
 assert(health.status === 200, `health status is ${health.status}`);
 audit.health = await health.json();
 assert(audit.health?.status === "ok", "health payload status is not ok");
+if (publicHealthUrl) {
+  const publicHealth = await fetch(publicHealthUrl);
+  assert(publicHealth.status === 200, `public health status is ${publicHealth.status}`);
+  audit.publicHealth = await publicHealth.json();
+  assertPublicHealthMatchesRuntime(audit.publicHealth, audit.health, true);
+}
 
 const tokenResource = await discoverTokenResource(mcpUrl, options.tokenResource);
 audit.tokenResource = tokenResource;
@@ -112,12 +121,67 @@ try {
     sessionId: foreign.transport.sessionId,
   });
   await runCanaries(primary.client, secondary.client, foreign.client, root, audit.canaries);
-  await primary.client.close();
-  await secondary.client.close();
-  await foreign.client.close();
-  primary = undefined;
-  secondary = undefined;
-  foreign = undefined;
+  if (options.exerciseSelfRestart) {
+    const requestSessionId = requiredSessionId(secondary.transport.sessionId, "restart request");
+    const oldSessionIds = new Set([
+      requiredSessionId(primary.transport.sessionId, "primary pre-restart"),
+      requestSessionId,
+      requiredSessionId(foreign.transport.sessionId, "foreign pre-restart"),
+    ]);
+    const responseBound = await requestSelfRestart(primary.client, secondary.client);
+    const responseBoundObservedAt = new Date().toISOString();
+    const expectedClose = await closeSessionsForRestart([
+      ["primary", primary],
+      ["secondary", secondary],
+      ["foreign", foreign],
+    ]);
+    primary = undefined;
+    secondary = undefined;
+    foreign = undefined;
+    const terminal = await waitForRestartStatus(
+      credential.token,
+      responseBound.transactionId,
+      oldSessionIds,
+    );
+    const postRestartLocalResponse = await fetch(healthUrl);
+    assert(postRestartLocalResponse.status === 200, `post-restart local health status is ${postRestartLocalResponse.status}`);
+    const postRestartLocalHealth = await postRestartLocalResponse.json();
+    assertPublicHealthMatchesRuntime(postRestartLocalHealth, terminal.status.expectedRuntimeIdentity, false);
+    const postRestartPublicResponse = await fetch(publicHealthUrl);
+    assert(postRestartPublicResponse.status === 200, `post-restart public health status is ${postRestartPublicResponse.status}`);
+    const postRestartPublicHealth = await postRestartPublicResponse.json();
+    assertPublicHealthMatchesRuntime(postRestartPublicHealth, postRestartLocalHealth, true);
+    const selfRestartEvidence = createBoundedSelfRestartEvidence({
+      responseBound,
+      terminalStatus: terminal.status,
+      requestSessionId,
+      statusSessionId: terminal.sessionId,
+      responseBoundObservedAt,
+      statusObservedAt: terminal.observedAt,
+      postRestartLocalHealth,
+      postRestartPublicHealth,
+    });
+    await mkdir(dirname(options.selfRestartEvidence), { recursive: true, mode: 0o700 });
+    const serializedEvidence = `${JSON.stringify(selfRestartEvidence, null, 2)}\n`;
+    await writeFile(options.selfRestartEvidence, serializedEvidence, { mode: 0o600, flag: "wx" });
+    audit.canaries.selfRestart = {
+      transactionId: selfRestartEvidence.transactionId,
+      responseState: selfRestartEvidence.responseBound.state,
+      terminalState: selfRestartEvidence.statusReadback.state,
+      newSession: selfRestartEvidence.statusReadback.newSession,
+      historyStates: selfRestartEvidence.timeline.map((entry) => entry.state),
+      restartBeforeAckFlushed: selfRestartEvidence.restartBeforeAckFlushed,
+      evidenceSha256: `sha256:${createHash("sha256").update(serializedEvidence).digest("hex")}`,
+      expectedSessionClose: expectedClose,
+    };
+  } else {
+    await primary.client.close();
+    await secondary.client.close();
+    await foreign.client.close();
+    primary = undefined;
+    secondary = undefined;
+    foreign = undefined;
+  }
   audit.ok = true;
 } catch (error) {
   terminalError = error;
@@ -269,8 +333,8 @@ async function runCanaries(client, sameClientTransport, foreignClient, root, can
     arguments: {
       ...exactAuthorityArgs,
       path: `${exactAuthorityPath}.mismatch`,
-      authorityId: exactAuthority.authorityId,
     },
+    _meta: { devspace: { authorityId: exactAuthority.authorityId } },
   });
   assert(
     errorCode(mismatchResult) === "AUTHORITY_ACTION_MISMATCH",
@@ -279,7 +343,8 @@ async function runCanaries(client, sameClientTransport, foreignClient, root, can
   authorityAudit.mismatchRejected = true;
   const crossClientResult = await foreignClient.callTool({
     name: "fs",
-    arguments: { ...exactAuthorityArgs, authorityId: exactAuthority.authorityId },
+    arguments: exactAuthorityArgs,
+    _meta: { devspace: { authorityId: exactAuthority.authorityId } },
   });
   assert(
     errorCode(crossClientResult) === "AUTHORITY_PRINCIPAL_MISMATCH",
@@ -288,13 +353,15 @@ async function runCanaries(client, sameClientTransport, foreignClient, root, can
   authorityAudit.crossClientRejected = true;
   const exactResult = await sameClientTransport.callTool({
     name: "fs",
-    arguments: { ...exactAuthorityArgs, authorityId: exactAuthority.authorityId },
+    arguments: exactAuthorityArgs,
+    _meta: { devspace: { authorityId: exactAuthority.authorityId } },
   });
   assert(exactResult.isError !== true && exactResult.structuredContent?.ok !== false, "exact authority action failed");
   authorityAudit.crossTransportAccepted = true;
   const consumedResult = await client.callTool({
     name: "fs",
-    arguments: { ...exactAuthorityArgs, authorityId: exactAuthority.authorityId },
+    arguments: exactAuthorityArgs,
+    _meta: { devspace: { authorityId: exactAuthority.authorityId } },
   });
   assert(errorCode(consumedResult) === "AUTHORITY_CONSUMED", "consumed authority was reusable");
   authorityAudit.consumedRejected = true;
@@ -315,12 +382,12 @@ async function runCanaries(client, sameClientTransport, foreignClient, root, can
   );
   await call(client, "context", {
     operation: "invalidate_authority",
-    taskInstanceId: correctedAuthority.taskInstanceId,
     correctionText: "Do not execute the prepared corrected-file write.",
-  });
+  }, { taskInstanceId: correctedAuthority.taskInstanceId });
   const correctedResult = await client.callTool({
     name: "fs",
-    arguments: { ...correctedArgs, authorityId: correctedAuthority.authorityId },
+    arguments: correctedArgs,
+    _meta: { devspace: { authorityId: correctedAuthority.authorityId } },
   });
   assert(errorCode(correctedResult) === "AUTHORITY_STALE", "corrected authority was not invalidated");
   authorityAudit.correctionInvalidated = true;
@@ -838,6 +905,134 @@ async function prepareLocalGuiApplication() {
   await new Promise((resolvePromise) => setTimeout(resolvePromise, 1_000));
 }
 
+async function requestSelfRestart(authorityClient, requestClient) {
+  const args = {
+    operation: "restart_broker",
+    reason: "Rev3 immutable staging transport-flush self-restart verification.",
+  };
+  const authority = await prepareExactAuthority(
+    authorityClient,
+    "process",
+    args,
+    "R3",
+    "Authorize exactly one immutable staging broker self-restart for release verification.",
+  );
+  const result = await requestClient.callTool({
+    name: "process",
+    arguments: args,
+    _meta: { devspace: { authorityId: authority.authorityId } },
+  });
+  if (result.isError === true || result.structuredContent?.ok === false) {
+    throw new Error(`process.restart_broker failed: ${JSON.stringify(result.structuredContent ?? result.content).slice(0, 4_000)}`);
+  }
+  const responseBound = data(result);
+  assert(responseBound.state === "RESPONSE_BOUND", `process.restart_broker response state is ${responseBound.state}`);
+  assert(/^restart_[0-9a-f-]{36}$/u.test(String(responseBound.transactionId ?? "")), "process.restart_broker returned an invalid transactionId");
+  assert(typeof responseBound.responseTransportId === "string" && responseBound.responseTransportId.length > 0, "restart response transport binding is missing");
+  assert(["string", "number"].includes(typeof responseBound.responseRequestId), "restart response request binding is missing");
+  const historyStates = Array.isArray(responseBound.history)
+    ? responseBound.history.map((entry) => entry?.state)
+    : [];
+  assert(
+    JSON.stringify(historyStates) === JSON.stringify(["PREPARED", "RESPONSE_BOUND"]),
+    `restart response-bound history is invalid: ${historyStates.join(",")}`,
+  );
+  return responseBound;
+}
+
+async function closeSessionsForRestart(entries) {
+  const failures = [];
+  for (const [label, session] of entries) {
+    try {
+      await session.client.close();
+    } catch (error) {
+      failures.push({ label, ...safeErrorSummary(error) });
+    }
+  }
+  return {
+    attempted: entries.length,
+    failures: failures.length,
+  };
+}
+
+async function waitForRestartStatus(token, transactionId, oldSessionIds) {
+  const deadline = Date.now() + options.selfRestartTimeoutMs;
+  let attempts = 0;
+  let lastState = "CONNECTION_PENDING";
+  let lastError;
+  while (Date.now() <= deadline) {
+    attempts += 1;
+    let session;
+    let terminalFailure;
+    let terminalPass;
+    try {
+      session = await connectClient(mcpUrl, token, options.sessions + attempts + 100);
+      const sessionId = requiredSessionId(session.transport.sessionId, "restart status");
+      assert(!oldSessionIds.has(sessionId), "restart_status reused a pre-restart MCP session");
+      const status = data(await call(session.client, "process", {
+        operation: "restart_status",
+      }, { transactionId }));
+      lastState = String(status.state ?? "MISSING");
+      if (["FAIL", "UNKNOWN"].includes(lastState)) {
+        terminalFailure = new Error(`process.restart_status reached ${lastState}`);
+      } else if (lastState === "PASS") {
+        terminalPass = {
+          status,
+          sessionId,
+          observedAt: new Date().toISOString(),
+          attempts,
+        };
+      }
+    } catch (error) {
+      lastError = error;
+    } finally {
+      if (session) {
+        try {
+          await session.client.close();
+        } catch {
+          // Replacement shutdown can race a status-session close; terminal state remains authoritative.
+        }
+      }
+    }
+    if (terminalFailure) throw terminalFailure;
+    if (terminalPass) return terminalPass;
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 500));
+  }
+  const suffix = lastError ? `; last error: ${safeErrorSummary(lastError).message}` : "";
+  throw new Error(`process.restart_status did not reach PASS within ${options.selfRestartTimeoutMs}ms; last state ${lastState}${suffix}`);
+}
+
+function assertPublicHealthMatchesRuntime(publicHealth, runtimeIdentity, requireStartedAtMatch) {
+  assert(publicHealth && typeof publicHealth === "object", "public health payload is missing");
+  assert(runtimeIdentity && typeof runtimeIdentity === "object", "runtime identity is missing");
+  assert(publicHealth.status === "ok", "public health payload status is not ok");
+  for (const key of [
+    "productVersion",
+    "productProfile",
+    "buildCapabilityDigest",
+    "resourceUriVersion",
+    "schemaGeneration",
+    "authorityContractGeneration",
+    "runtimeRevision",
+  ]) {
+    assert(
+      publicHealth[key] === runtimeIdentity[key],
+      `public health identity mismatch for ${key}`,
+    );
+  }
+  if (requireStartedAtMatch) {
+    assert(
+      typeof publicHealth.startedAt === "string" && publicHealth.startedAt === runtimeIdentity.startedAt,
+      "public health identity mismatch for startedAt",
+    );
+  }
+}
+
+function requiredSessionId(value, label) {
+  assert(typeof value === "string" && value.length > 0, `${label} MCP session ID is missing`);
+  return value;
+}
+
 async function connectClient(url, token, index) {
   const transport = new StreamableHTTPClientTransport(url, {
     requestInit: { headers: { Authorization: `Bearer ${token}` } },
@@ -905,16 +1100,26 @@ async function callReadOnlyMcpWhenReady(
   );
 }
 
-async function call(client, name, args) {
-  const result = await callWithAuthority(client, name, args);
+async function call(client, name, args, requestMeta = {}) {
+  const result = await callWithAuthority(client, name, args, ["R1", "R2", "R3"], requestMeta);
   if (result.isError === true || result.structuredContent?.ok === false) {
     throw new Error(`${name} failed: ${JSON.stringify(result.structuredContent ?? result.content).slice(0, 4_000)}`);
   }
   return result;
 }
 
-async function callWithAuthority(client, name, args, allowedRisks = ["R1", "R2", "R3"]) {
-  let result = await client.callTool({ name, arguments: args });
+async function callWithAuthority(
+  client,
+  name,
+  args,
+  allowedRisks = ["R1", "R2", "R3"],
+  requestMeta = {},
+) {
+  let result = await client.callTool({
+    name,
+    arguments: args,
+    ...(Object.keys(requestMeta).length > 0 ? { _meta: { devspace: requestMeta } } : {}),
+  });
   if (errorCode(result) !== "AUTHORITY_REQUIRED") return result;
   const requiredRisk = result.structuredContent?.error?.evidence?.requiredRisk;
   assert(["R1", "R2", "R3"].includes(requiredRisk), `invalid required authority risk: ${requiredRisk}`);
@@ -928,7 +1133,13 @@ async function callWithAuthority(client, name, args, allowedRisks = ["R1", "R2",
   );
   result = await client.callTool({
     name,
-    arguments: { ...args, authorityId: authority.authorityId },
+    arguments: args,
+    _meta: {
+      devspace: {
+        ...requestMeta,
+        authorityId: authority.authorityId,
+      },
+    },
   });
   return result;
 }
@@ -1047,6 +1258,7 @@ function parseArgs(args) {
     baseUrl: "http://127.0.0.1:7677",
     mcpUrl: undefined,
     healthUrl: undefined,
+    publicHealthUrl: undefined,
     mcpPath: "/mcp-next",
     healthPath: "/healthz-next",
     artifactFetchBaseUrl: undefined,
@@ -1054,6 +1266,9 @@ function parseArgs(args) {
     databasePath: `${process.env.HOME}/.local/share/devspace/universal-broker-v2/devspace.sqlite`,
     sessions: 5,
     output: undefined,
+    exerciseSelfRestart: false,
+    selfRestartEvidence: undefined,
+    selfRestartTimeoutMs: 180_000,
     skipCompanyGates: false,
     skipCompanyChromeGate: false,
     companyTarget: "company",
@@ -1070,6 +1285,7 @@ function parseArgs(args) {
     if (argument === "--base-url") result.baseUrl = requiredValue(argument, value), index += 1;
     else if (argument === "--mcp-url") result.mcpUrl = requiredValue(argument, value), index += 1;
     else if (argument === "--health-url") result.healthUrl = requiredValue(argument, value), index += 1;
+    else if (argument === "--public-health-url") result.publicHealthUrl = requiredValue(argument, value), index += 1;
     else if (argument === "--mcp-path") result.mcpPath = requiredValue(argument, value), index += 1;
     else if (argument === "--health-path") result.healthPath = requiredValue(argument, value), index += 1;
     else if (argument === "--artifact-fetch-base-url") result.artifactFetchBaseUrl = requiredValue(argument, value), index += 1;
@@ -1077,6 +1293,9 @@ function parseArgs(args) {
     else if (argument === "--database") result.databasePath = requiredValue(argument, value), index += 1;
     else if (argument === "--sessions") result.sessions = Number(requiredValue(argument, value)), index += 1;
     else if (argument === "--output") result.output = requiredValue(argument, value), index += 1;
+    else if (argument === "--exercise-self-restart") result.exerciseSelfRestart = true;
+    else if (argument === "--self-restart-evidence") result.selfRestartEvidence = requiredValue(argument, value), index += 1;
+    else if (argument === "--self-restart-timeout-ms") result.selfRestartTimeoutMs = Number(requiredValue(argument, value)), index += 1;
     else if (argument === "--skip-company-gates") result.skipCompanyGates = true;
     else if (argument === "--skip-company-chrome-gate") result.skipCompanyChromeGate = true;
     else if (argument === "--company-target") result.companyTarget = requiredValue(argument, value), index += 1;
@@ -1089,6 +1308,18 @@ function parseArgs(args) {
     else throw new Error(`Unknown option: ${argument}`);
   }
   assert(Number.isInteger(result.sessions) && result.sessions >= 2 && result.sessions <= 20, "sessions must be 2..20");
+  assert(
+    Number.isInteger(result.selfRestartTimeoutMs)
+      && result.selfRestartTimeoutMs >= 30_000
+      && result.selfRestartTimeoutMs <= 300_000,
+    "self-restart-timeout-ms must be 30000..300000",
+  );
+  if (result.exerciseSelfRestart) {
+    assert(result.publicHealthUrl, "--exercise-self-restart requires --public-health-url");
+    assert(result.selfRestartEvidence, "--exercise-self-restart requires --self-restart-evidence");
+  } else {
+    assert(!result.selfRestartEvidence, "--self-restart-evidence requires --exercise-self-restart");
+  }
   return result;
 }
 

@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
-import { constants as fsConstants } from "node:fs";
+import { createHash, randomUUID } from "node:crypto";
+import { constants as fsConstants, type Stats } from "node:fs";
 import {
   copyFile,
   cp,
@@ -29,8 +29,17 @@ import {
 } from "node:path";
 import { applyPatch, parsePatch } from "../apply-patch.js";
 import { expandHomePath } from "../roots.js";
-import type { CapabilityCallContext } from "./capability-call-context.js";
+import {
+  requireCapabilityCallContext,
+  type CapabilityCallContext,
+} from "./capability-call-context.js";
 import type { ContextRegistry } from "./contexts.js";
+import {
+  CursorCapabilityError,
+  cursorFailure,
+  type CursorBinding,
+  type SignedSnapshotCursorStore,
+} from "./cursor-capability.js";
 import type {
   UniversalExecutionPlane,
   UniversalProcessSnapshot,
@@ -39,11 +48,22 @@ import { UniversalBrokerError } from "./errors.js";
 import {
   atomicCopyFile,
   atomicWriteBuffer,
+  nodeAtomicFilesystemOperations,
   safeMoveFile,
   sha256File,
-  type AtomicPublicationHooks,
+  type AtomicFilesystemOperations,
 } from "./filesystem-atomic.js";
 import { RecoverableFilesystemTrash } from "./filesystem-trash.js";
+import {
+  DurableFilesystemSync,
+  type FilesystemSyncAuthorityBinding,
+  type FilesystemSyncAdapter,
+  type FilesystemSyncEntry,
+  type FilesystemSyncRequest,
+  type StoredSelectors,
+  type SyncOperation,
+  type TreeSnapshot,
+} from "./filesystem-sync.js";
 import { prepareSshControlPath } from "./ssh-control.js";
 import {
   REMOTE_FILESYSTEM_HELPER_SOURCE,
@@ -67,6 +87,8 @@ const DEFAULT_SEARCH_LIMIT = 50;
 const MAX_SEARCH_LIMIT = 500;
 const MAX_SEARCH_FILE_BYTES = 2 * 1024 * 1024;
 const MAX_SEARCH_FILES = 20_000;
+const MAX_LIST_SNAPSHOT_ENTRIES = 100_000;
+const REMOTE_LIST_PAGE_LIMIT = 1_000;
 const MAX_DIRECT_REMOTE_WRITE_BYTES = 64 * 1024;
 const DEFAULT_REMOTE_TIMEOUT_MS = 60_000;
 
@@ -114,7 +136,10 @@ export interface UniversalFilesystemInput {
   finalSymlink?: "follow" | "preserve" | "replace" | "reject";
   authorityId?: string;
   cursor?: string;
+  /** Byte range offset for fs.read; never a pagination cursor. */
+  offset?: number;
   limit?: number;
+  sync?: FilesystemSyncRequest;
 }
 
 export interface UniversalFilesystemOptions {
@@ -122,7 +147,12 @@ export interface UniversalFilesystemOptions {
   sftpExecutable?: string;
   remoteTimeoutMs?: number;
   trashRoot?: string;
-  atomicHooks?: AtomicPublicationHooks;
+  atomicFilesystem?: AtomicFilesystemOperations;
+  syncStatePath?: string;
+  syncPlanTtlMs?: number;
+  syncNow?: () => number;
+  syncAdapter?: FilesystemSyncAdapter;
+  cursorStore?: SignedSnapshotCursorStore;
   sftpPut?: (input: SftpTransferInput) => Promise<void>;
   sftpGet?: (input: SftpTransferInput) => Promise<void>;
 }
@@ -146,8 +176,34 @@ interface RemoteResponse {
   message?: string;
 }
 
+interface FilesystemListEntry {
+  name: string;
+  type: "directory" | "file" | "symlink" | "other";
+}
+
+interface FilesystemListSnapshot {
+  resolvedPath: string;
+  entries: FilesystemListEntry[];
+  generation: string;
+}
+
+interface FilesystemSearchResult {
+  path: string;
+  line: number;
+  text: string;
+}
+
+interface FilesystemSearchSnapshot {
+  resolvedPath: string;
+  results: FilesystemSearchResult[];
+  visitedFiles: number;
+  truncated: boolean;
+  generation: string;
+}
+
 export class UniversalFilesystemService {
   private readonly trash: RecoverableFilesystemTrash;
+  private syncService: DurableFilesystemSync | undefined;
 
   constructor(
     private readonly targets: TargetRegistry,
@@ -157,7 +213,7 @@ export class UniversalFilesystemService {
   ) {
     this.trash = new RecoverableFilesystemTrash(
       options.trashRoot ?? join(dirname(options.sshControlDir), "filesystem-trash"),
-      options.atomicHooks,
+      options.atomicFilesystem ?? nodeAtomicFilesystemOperations,
     );
   }
 
@@ -170,10 +226,46 @@ export class UniversalFilesystemService {
       if (resolved.target.transport === "ssh") {
         return await this.executeRemote(input, resolved, callContext);
       }
-      return await this.executeLocal(input, resolved);
+      return await this.executeLocal(input, resolved, callContext);
     } catch (error) {
+      if (cursorFailure(error)) throw error;
       throw normalizeFilesystemError(error, input);
     }
+  }
+
+  async prepareSyncAuthorityBinding(
+    input: UniversalFilesystemInput,
+    callContext?: CapabilityCallContext,
+  ): Promise<FilesystemSyncAuthorityBinding> {
+    if (input.operation !== "sync" || input.sync?.phase !== "apply") {
+      throw new UniversalBrokerError(
+        "PRECONDITION_FAILED",
+        "Filesystem sync authority binding requires fs.sync phase=apply.",
+      );
+    }
+    const resolved = await this.resolveRequest(input, callContext);
+    const owner = requireCapabilityCallContext(callContext);
+    const requestedSource = requirePath(resolved.path, "fs.sync");
+    const requestedDestination = requirePath(resolved.destination, "fs.sync destination");
+    const sourceRoot = resolved.target.transport === "local"
+      ? await resolveLocalFinalPath(requestedSource, "sync", input.finalSymlink)
+      : requestedSource;
+    const destinationRoot = resolved.target.transport === "local"
+      ? await resolveLocalFinalPath(requestedDestination, "write", input.finalSymlink)
+      : requestedDestination;
+    const sync = resolved.target.transport === "local"
+      ? this.localSyncService()
+      : this.remoteSyncService(resolved.target, callContext);
+    return sync.inspectApplyAuthorityBinding(input.sync, {
+      ownerFingerprint: owner.principalKeyFingerprint,
+      targetId: resolved.target.id,
+      targetGeneration: resolved.target.generation,
+      sourceRoot,
+      destinationRoot,
+      ...(resolved.target.transport === "ssh"
+        ? { pathStyle: resolved.target.platform === "windows" ? "windows" : "posix" }
+        : {}),
+    });
   }
 
   /** Stage a local file into any configured filesystem target without putting it in tool text. */
@@ -202,7 +294,7 @@ export class UniversalFilesystemService {
         {
           overwrite: input.overwrite === true,
           expectedSha256: input.expectedSha256,
-          hooks: this.options.atomicHooks,
+          filesystem: this.options.atomicFilesystem,
         },
       );
     }
@@ -264,6 +356,7 @@ export class UniversalFilesystemService {
   private async executeLocal(
     input: UniversalFilesystemInput,
     resolved: ResolvedFilesystemRequest,
+    callContext?: CapabilityCallContext,
   ): Promise<Record<string, unknown>> {
     const requestedPath = resolved.path;
     const path = requestedPath === undefined
@@ -284,23 +377,24 @@ export class UniversalFilesystemService {
       case "stat":
         return withPathIdentity(await localStat(requirePath(path, "fs.stat")));
       case "list":
-        return withPathIdentity(await localList(
+        return withPathIdentity(await this.paginateLocalList(
+          resolved.target,
           requirePath(path, "fs.list"),
-          parseCursor(input.cursor),
-          boundedLimit(input.limit, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT),
+          input,
+          callContext,
         ));
       case "read":
         return withPathIdentity(await localRead(
           requirePath(path, "fs.read"),
-          parseCursor(input.cursor),
+          readOffset(input),
           boundedLimit(input.limit, DEFAULT_READ_BYTES, MAX_READ_BYTES),
         ));
       case "search":
-        return withPathIdentity(await localSearch(
+        return withPathIdentity(await this.paginateLocalSearch(
+          resolved.target,
           requirePath(path, "fs.search"),
-          requireText(input.query, "fs.search requires query."),
-          input.recursive !== false,
-          boundedLimit(input.limit, DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT),
+          input,
+          callContext,
         ));
       case "write":
         if (input.content === undefined) {
@@ -313,7 +407,7 @@ export class UniversalFilesystemService {
             overwrite: input.overwrite === true,
             expectedSha256: input.expectedSha256,
             allowReplaceSymlink: input.finalSymlink === "replace",
-            hooks: this.options.atomicHooks,
+            filesystem: this.options.atomicFilesystem,
           },
         ));
       case "patch":
@@ -321,7 +415,7 @@ export class UniversalFilesystemService {
           requirePath(path, "fs.patch"),
           requireText(input.patch, "fs.patch requires patch."),
           input.expectedSha256,
-          this.options.atomicHooks,
+          this.options.atomicFilesystem,
         );
       case "mkdir":
         return localMkdir(requirePath(path, "fs.mkdir"), input.recursive === true);
@@ -331,8 +425,7 @@ export class UniversalFilesystemService {
           requirePath(destinationPath, "fs.copy destination"),
           input.overwrite === true,
           input.recursive === true,
-          false,
-          this.options.atomicHooks,
+          this.options.atomicFilesystem,
           input.finalSymlink === "replace",
         ));
       case "move":
@@ -340,7 +433,7 @@ export class UniversalFilesystemService {
           requirePath(path, "fs.move"),
           requirePath(destinationPath, "fs.move destination"),
           input.overwrite === true,
-          this.options.atomicHooks,
+          this.options.atomicFilesystem,
           input.finalSymlink === "replace",
         ));
       case "remove":
@@ -359,14 +452,12 @@ export class UniversalFilesystemService {
       case "hash":
         return withPathIdentity(await localHash(requirePath(path, "fs.hash")));
       case "sync":
-        return withPathIdentity(await localCopy(
+        return withPathIdentity(await this.executeLocalSync(
+          input,
+          resolved.target,
           requirePath(path, "fs.sync"),
           requirePath(destinationPath, "fs.sync destination"),
-          input.overwrite === true,
-          input.recursive === true,
-          true,
-          this.options.atomicHooks,
-          input.finalSymlink === "replace",
+          callContext,
         ));
     }
   }
@@ -385,20 +476,18 @@ export class UniversalFilesystemService {
           path: requirePath(path, "fs.stat"),
         }, callContext));
       case "list":
-        return asRecord(await this.remoteRequest(target, {
-          op: "list",
-          path: requirePath(path, "fs.list"),
-          options: {
-            offset: parseCursor(input.cursor),
-            limit: boundedLimit(input.limit, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT),
-          },
-        }, callContext));
+        return this.paginateRemoteList(
+          target,
+          requirePath(path, "fs.list"),
+          input,
+          callContext,
+        );
       case "read": {
         const result = asRecord(await this.remoteRequest(target, {
           op: "read",
           path: requirePath(path, "fs.read"),
           options: {
-            offset: parseCursor(input.cursor),
+            offset: readOffset(input),
             maxBytes: boundedLimit(input.limit, DEFAULT_READ_BYTES, MAX_READ_BYTES),
           },
         }, callContext));
@@ -407,16 +496,12 @@ export class UniversalFilesystemService {
         return presentBytes(result, Buffer.from(encoded, "base64"));
       }
       case "search":
-        return asRecord(await this.remoteRequest(target, {
-          op: "search",
-          path: requirePath(path, "fs.search"),
-          query: requireText(input.query, "fs.search requires query."),
-          options: {
-            recursive: input.recursive !== false,
-            limit: boundedLimit(input.limit, DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT),
-            maxFileBytes: MAX_SEARCH_FILE_BYTES,
-          },
-        }, callContext));
+        return this.paginateRemoteSearch(
+          target,
+          requirePath(path, "fs.search"),
+          input,
+          callContext,
+        );
       case "write": {
         if (input.content === undefined) {
           throw new UniversalBrokerError("PRECONDITION_FAILED", "fs.write requires content.");
@@ -462,17 +547,24 @@ export class UniversalFilesystemService {
           options: { recursive: input.recursive === true },
         }, callContext));
       case "copy":
-      case "sync":
         return asRecord(await this.remoteRequest(target, {
-          op: input.operation,
-          path: requirePath(path, `fs.${input.operation}`),
-          destination: requirePath(resolved.destination, `fs.${input.operation} destination`),
+          op: "copy",
+          path: requirePath(path, "fs.copy"),
+          destination: requirePath(resolved.destination, "fs.copy destination"),
           options: {
             overwrite: input.overwrite === true,
             recursive: input.recursive === true,
             finalSymlink: input.finalSymlink ?? "reject",
           },
         }, callContext));
+      case "sync":
+        return this.executeRemoteSync(
+          input,
+          target,
+          requirePath(path, "fs.sync"),
+          requirePath(resolved.destination, "fs.sync destination"),
+          callContext,
+        );
       case "move":
         return asRecord(await this.remoteRequest(target, {
           op: "move",
@@ -507,6 +599,858 @@ export class UniversalFilesystemService {
           path: requirePath(path, "fs.hash"),
         }, callContext));
     }
+  }
+
+  private async paginateLocalList(
+    target: TargetDefinition,
+    path: string,
+    input: UniversalFilesystemInput,
+    callContext?: CapabilityCallContext,
+  ): Promise<Record<string, unknown>> {
+    const owner = requireCapabilityCallContext(callContext);
+    const store = this.requireCursorStore();
+    const limit = paginationLimit(input.limit, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT);
+    const snapshot = await localListSnapshot(path);
+    const page = paginateSnapshotItems({
+      store,
+      cursor: input.cursor,
+      limit,
+      binding: filesystemCursorBinding({
+        principalKeyFingerprint: owner.principalKeyFingerprint,
+        target,
+        resourceKind: "filesystem.list",
+        resolvedPath: snapshot.resolvedPath,
+        queryDigest: digestJson({ version: 1, operation: "list" }),
+        snapshotGeneration: snapshot.generation,
+      }),
+      items: snapshot.entries,
+    });
+    return {
+      path: snapshot.resolvedPath,
+      entries: page.items,
+      totalEntries: snapshot.entries.length,
+      offset: page.offset,
+      limit: page.limit,
+      snapshotGeneration: snapshot.generation,
+      snapshotDigest: page.snapshotDigest,
+      snapshotExpiresAt: page.expiresAt,
+      targetGeneration: target.generation,
+      ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
+    };
+  }
+
+  private async paginateLocalSearch(
+    target: TargetDefinition,
+    path: string,
+    input: UniversalFilesystemInput,
+    callContext?: CapabilityCallContext,
+  ): Promise<Record<string, unknown>> {
+    const owner = requireCapabilityCallContext(callContext);
+    const store = this.requireCursorStore();
+    const query = requireText(input.query, "fs.search requires query.");
+    const recursive = input.recursive !== false;
+    const limit = paginationLimit(input.limit, DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT);
+    const snapshot = await localSearchSnapshot(path, query, recursive);
+    const page = paginateSnapshotItems({
+      store,
+      cursor: input.cursor,
+      limit,
+      binding: filesystemCursorBinding({
+        principalKeyFingerprint: owner.principalKeyFingerprint,
+        target,
+        resourceKind: "filesystem.search",
+        resolvedPath: snapshot.resolvedPath,
+        queryDigest: digestJson({
+          version: 1,
+          operation: "search",
+          query,
+          recursive,
+          maximumFileBytes: MAX_SEARCH_FILE_BYTES,
+          maximumFiles: MAX_SEARCH_FILES,
+          maximumResults: MAX_SEARCH_LIMIT,
+        }),
+        snapshotGeneration: snapshot.generation,
+      }),
+      items: snapshot.results,
+    });
+    return {
+      path: snapshot.resolvedPath,
+      query,
+      results: page.items,
+      visitedFiles: snapshot.visitedFiles,
+      offset: page.offset,
+      limit: page.limit,
+      truncated: snapshot.truncated || Boolean(page.nextCursor),
+      boundedSnapshotTruncated: snapshot.truncated,
+      snapshotGeneration: snapshot.generation,
+      snapshotDigest: page.snapshotDigest,
+      snapshotExpiresAt: page.expiresAt,
+      targetGeneration: target.generation,
+      ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
+    };
+  }
+
+  private async paginateRemoteList(
+    target: TargetDefinition,
+    path: string,
+    input: UniversalFilesystemInput,
+    callContext?: CapabilityCallContext,
+  ): Promise<Record<string, unknown>> {
+    const owner = requireCapabilityCallContext(callContext);
+    const store = this.requireCursorStore();
+    const limit = paginationLimit(input.limit, DEFAULT_LIST_LIMIT, MAX_LIST_LIMIT);
+    const snapshot = await this.remoteListSnapshot(target, path, callContext);
+    const page = paginateSnapshotItems({
+      store,
+      cursor: input.cursor,
+      limit,
+      binding: filesystemCursorBinding({
+        principalKeyFingerprint: owner.principalKeyFingerprint,
+        target,
+        resourceKind: "filesystem.list",
+        resolvedPath: snapshot.resolvedPath,
+        queryDigest: digestJson({ version: 1, operation: "list" }),
+        snapshotGeneration: snapshot.generation,
+      }),
+      items: snapshot.entries,
+    });
+    return {
+      path: snapshot.resolvedPath,
+      entries: page.items,
+      totalEntries: snapshot.entries.length,
+      offset: page.offset,
+      limit: page.limit,
+      snapshotGeneration: snapshot.generation,
+      snapshotDigest: page.snapshotDigest,
+      snapshotExpiresAt: page.expiresAt,
+      targetGeneration: target.generation,
+      ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
+    };
+  }
+
+  private async paginateRemoteSearch(
+    target: TargetDefinition,
+    path: string,
+    input: UniversalFilesystemInput,
+    callContext?: CapabilityCallContext,
+  ): Promise<Record<string, unknown>> {
+    const owner = requireCapabilityCallContext(callContext);
+    const store = this.requireCursorStore();
+    const query = requireText(input.query, "fs.search requires query.");
+    const recursive = input.recursive !== false;
+    const limit = paginationLimit(input.limit, DEFAULT_SEARCH_LIMIT, MAX_SEARCH_LIMIT);
+    const snapshot = await this.remoteSearchSnapshot(
+      target,
+      path,
+      query,
+      recursive,
+      callContext,
+    );
+    const page = paginateSnapshotItems({
+      store,
+      cursor: input.cursor,
+      limit,
+      binding: filesystemCursorBinding({
+        principalKeyFingerprint: owner.principalKeyFingerprint,
+        target,
+        resourceKind: "filesystem.search",
+        resolvedPath: snapshot.resolvedPath,
+        queryDigest: digestJson({
+          version: 1,
+          operation: "search",
+          query,
+          recursive,
+          maximumFileBytes: MAX_SEARCH_FILE_BYTES,
+          maximumFiles: MAX_SEARCH_FILES,
+          maximumResults: MAX_SEARCH_LIMIT,
+        }),
+        snapshotGeneration: snapshot.generation,
+      }),
+      items: snapshot.results,
+    });
+    return {
+      path: snapshot.resolvedPath,
+      query,
+      results: page.items,
+      visitedFiles: snapshot.visitedFiles,
+      offset: page.offset,
+      limit: page.limit,
+      truncated: snapshot.truncated || Boolean(page.nextCursor),
+      boundedSnapshotTruncated: snapshot.truncated,
+      snapshotGeneration: snapshot.generation,
+      snapshotDigest: page.snapshotDigest,
+      snapshotExpiresAt: page.expiresAt,
+      targetGeneration: target.generation,
+      ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
+    };
+  }
+
+  private async remoteListSnapshot(
+    target: TargetDefinition,
+    path: string,
+    callContext?: CapabilityCallContext,
+  ): Promise<FilesystemListSnapshot> {
+    const first = await this.remoteListSnapshotPass(target, path, callContext);
+    const second = await this.remoteListSnapshotPass(target, path, callContext);
+    if (first.generation !== second.generation || first.resolvedPath !== second.resolvedPath) {
+      throw new CursorCapabilityError(
+        "CURSOR_STALE",
+        "Remote directory changed while its ordered pagination snapshot was captured.",
+        { resourceKind: "filesystem.list", targetId: target.id },
+      );
+    }
+    return second;
+  }
+
+  private async remoteListSnapshotPass(
+    target: TargetDefinition,
+    path: string,
+    callContext?: CapabilityCallContext,
+  ): Promise<FilesystemListSnapshot> {
+    const entries: FilesystemListEntry[] = [];
+    let expectedTotal: number | undefined;
+    let resolvedPath: string | undefined;
+    while (expectedTotal === undefined || entries.length < expectedTotal) {
+      const result = asRecord(await this.remoteRequest(target, {
+        op: "list",
+        path,
+        options: { offset: entries.length, limit: REMOTE_LIST_PAGE_LIMIT },
+      }, callContext));
+      const observedPath = requireTextField(result.path, "remote list path");
+      if (resolvedPath !== undefined && resolvedPath !== observedPath) {
+        throw remoteSnapshotChanged("Remote directory resolved path changed during capture.", target);
+      }
+      resolvedPath = observedPath;
+      const total = requireBoundedCount(
+        result.totalEntries,
+        "remote list totalEntries",
+        MAX_LIST_SNAPSHOT_ENTRIES,
+        "RESOURCE_QUOTA_EXCEEDED",
+      );
+      if (expectedTotal !== undefined && expectedTotal !== total) {
+        throw remoteSnapshotChanged("Remote directory entry count changed during capture.", target);
+      }
+      expectedTotal = total;
+      const offset = requireBoundedCount(
+        result.offset,
+        "remote list offset",
+        MAX_LIST_SNAPSHOT_ENTRIES,
+      );
+      if (offset !== entries.length) {
+        throw remoteSnapshotChanged("Remote directory page offset changed during capture.", target);
+      }
+      const page = normalizeListEntries(result.entries, REMOTE_LIST_PAGE_LIMIT);
+      if (page.length === 0 && entries.length < total) {
+        throw remoteSnapshotChanged("Remote directory pagination stopped before the snapshot ended.", target);
+      }
+      entries.push(...page);
+      if (entries.length > total || entries.length > MAX_LIST_SNAPSHOT_ENTRIES) {
+        throw remoteSnapshotChanged("Remote directory pagination exceeded its declared size.", target);
+      }
+    }
+    entries.sort((left, right) => compareText(left.name, right.name));
+    for (let index = 1; index < entries.length; index++) {
+      if (entries[index - 1]!.name === entries[index]!.name) {
+        throw new UniversalBrokerError(
+          "STATE_CORRUPTED",
+          "Remote directory snapshot contains a duplicate entry name.",
+          { evidence: { targetId: target.id } },
+        );
+      }
+    }
+    const normalizedPath = resolvedPath ?? path;
+    return {
+      resolvedPath: normalizedPath,
+      entries,
+      generation: digestJson({ version: 1, resolvedPath: normalizedPath, entries }),
+    };
+  }
+
+  private async remoteSearchSnapshot(
+    target: TargetDefinition,
+    path: string,
+    query: string,
+    recursive: boolean,
+    callContext?: CapabilityCallContext,
+  ): Promise<FilesystemSearchSnapshot> {
+    const scan = async (): Promise<FilesystemSearchSnapshot> => {
+      const result = asRecord(await this.remoteRequest(target, {
+        op: "search",
+        path,
+        query,
+        options: {
+          recursive,
+          limit: MAX_SEARCH_LIMIT,
+          maxFileBytes: MAX_SEARCH_FILE_BYTES,
+        },
+      }, callContext));
+      const resolvedPath = requireTextField(result.path, "remote search path");
+      const results = normalizeSearchResults(result.results, MAX_SEARCH_LIMIT)
+        .sort(compareSearchResults);
+      const visitedFiles = requireBoundedCount(
+        result.visitedFiles,
+        "remote search visitedFiles",
+        MAX_SEARCH_FILES,
+      );
+      const truncated = result.truncated === true;
+      return {
+        resolvedPath,
+        results,
+        visitedFiles,
+        truncated,
+        generation: digestJson({
+          version: 1,
+          resolvedPath,
+          query,
+          recursive,
+          results,
+          visitedFiles,
+          truncated,
+        }),
+      };
+    };
+    const first = await scan();
+    const second = await scan();
+    if (first.generation !== second.generation || first.resolvedPath !== second.resolvedPath) {
+      throw new CursorCapabilityError(
+        "CURSOR_STALE",
+        "Remote search changed while its ordered pagination snapshot was captured.",
+        { resourceKind: "filesystem.search", targetId: target.id },
+      );
+    }
+    return second;
+  }
+
+  private requireCursorStore(): SignedSnapshotCursorStore {
+    if (!this.options.cursorStore) {
+      throw new UniversalBrokerError(
+        "CAPABILITY_UNAVAILABLE",
+        "Signed filesystem pagination is unavailable because no cursor store was configured.",
+        { evidence: { providerDispatch: false } },
+      );
+    }
+    return this.options.cursorStore;
+  }
+
+  private async executeLocalSync(
+    input: UniversalFilesystemInput,
+    target: TargetDefinition,
+    sourceRoot: string,
+    destinationRoot: string,
+    callContext?: CapabilityCallContext,
+  ): Promise<Record<string, unknown>> {
+    const request = input.sync;
+    if (!request) {
+      throw new UniversalBrokerError(
+        "PRECONDITION_FAILED",
+        "fs.sync requires sync.phase=plan or sync.phase=apply.",
+      );
+    }
+    const owner = requireCapabilityCallContext(callContext);
+    return this.localSyncService().execute(request, {
+      ownerFingerprint: owner.principalKeyFingerprint,
+      targetId: target.id,
+      targetGeneration: target.generation,
+      sourceRoot,
+      destinationRoot,
+    });
+  }
+
+  private async executeRemoteSync(
+    input: UniversalFilesystemInput,
+    target: TargetDefinition,
+    sourceRoot: string,
+    destinationRoot: string,
+    callContext?: CapabilityCallContext,
+  ): Promise<Record<string, unknown>> {
+    const request = input.sync;
+    if (!request) {
+      throw new UniversalBrokerError(
+        "PRECONDITION_FAILED",
+        "fs.sync requires sync.phase=plan or sync.phase=apply.",
+      );
+    }
+    const owner = requireCapabilityCallContext(callContext);
+    return this.remoteSyncService(target, callContext).execute(request, {
+      ownerFingerprint: owner.principalKeyFingerprint,
+      targetId: target.id,
+      targetGeneration: target.generation,
+      sourceRoot,
+      destinationRoot,
+      pathStyle: target.platform === "windows" ? "windows" : "posix",
+    });
+  }
+
+  private localSyncService(): DurableFilesystemSync {
+    this.syncService ??= new DurableFilesystemSync({
+      storePath: this.options.syncStatePath
+        ?? join(dirname(this.options.sshControlDir), "filesystem-sync", "sync.sqlite"),
+      trash: this.trash,
+      ...(this.options.syncPlanTtlMs === undefined
+        ? {}
+        : { planTtlMs: this.options.syncPlanTtlMs }),
+      ...(this.options.syncNow ? { now: this.options.syncNow } : {}),
+      ...(this.options.syncAdapter ? { adapter: this.options.syncAdapter } : {}),
+    });
+    return this.syncService;
+  }
+
+  private remoteSyncService(
+    target: TargetDefinition,
+    callContext?: CapabilityCallContext,
+  ): DurableFilesystemSync {
+    return new DurableFilesystemSync({
+      storePath: this.options.syncStatePath
+        ?? join(dirname(this.options.sshControlDir), "filesystem-sync", "sync.sqlite"),
+      trash: this.trash,
+      ...(this.options.syncPlanTtlMs === undefined
+        ? {}
+        : { planTtlMs: this.options.syncPlanTtlMs }),
+      ...(this.options.syncNow ? { now: this.options.syncNow } : {}),
+      adapter: this.remoteSyncAdapter(target, callContext),
+    });
+  }
+
+  private remoteSyncAdapter(
+    target: TargetDefinition,
+    callContext?: CapabilityCallContext,
+  ): FilesystemSyncAdapter {
+    return {
+      pathStyle: target.platform === "windows" ? "windows" : "posix",
+      snapshotTree: (root, selectors, sourceRequired) => this.remoteSyncSnapshotTree(
+        target,
+        root,
+        selectors,
+        sourceRequired,
+        callContext,
+      ),
+      applyOperation: (input) => this.remoteSyncApplyOperation(target, input, callContext),
+      operationPostcondition: (destinationRoot, operation) => this.remoteSyncOperationPostcondition(
+        target,
+        destinationRoot,
+        operation,
+        callContext,
+      ),
+      operationPostreadbackDigest: (destinationRoot, operation) => this.remoteSyncOperationPostreadbackDigest(
+        target,
+        destinationRoot,
+        operation,
+        callContext,
+      ),
+      assertSourceEntry: (sourceRoot, operation) => this.remoteSyncAssertSourceEntry(
+        target,
+        sourceRoot,
+        operation,
+        callContext,
+      ),
+    };
+  }
+
+  private async remoteSyncSnapshotTree(
+    target: TargetDefinition,
+    root: string,
+    selectors: StoredSelectors,
+    sourceRequired: boolean,
+    callContext?: CapabilityCallContext,
+  ): Promise<TreeSnapshot> {
+    const rootMetadata = await this.remoteSyncOptionalStat(target, root, callContext);
+    if (!rootMetadata) {
+      if (sourceRequired) {
+        throw new UniversalBrokerError("PATH_NOT_FOUND", `Filesystem sync source was not found: ${root}`);
+      }
+      return syncTreeSnapshot("absent", []);
+    }
+    const rootType = remoteSyncEntryType(rootMetadata);
+    if (rootType === "file") return syncTreeSnapshot(rootType, [await this.remoteSyncFileEntry(
+      target,
+      root,
+      ".",
+      rootMetadata,
+      callContext,
+    )]);
+    if (rootType === "symlink") {
+      const linkTarget = typeof rootMetadata.linkTarget === "string" ? rootMetadata.linkTarget : undefined;
+      if (linkTarget === undefined) throw remoteSyncUnsupported(target, root, "symlink");
+      return syncTreeSnapshot(rootType, [{ path: ".", type: rootType, linkTarget }]);
+    }
+    if (rootType !== "directory") return syncTreeSnapshot("other", []);
+
+    const entries: FilesystemSyncEntry[] = [];
+    const walk = async (directory: string, relativeDirectory: string): Promise<void> => {
+      const children = await this.remoteSyncListAll(target, directory, callContext);
+      for (const child of children) {
+        const relativePath = relativeDirectory ? `${relativeDirectory}/${child.name}` : child.name;
+        if (syncMatchesAny(relativePath, selectors.exclude, child.type === "directory")) continue;
+        const absolutePath = remoteTreePath(target, directory, child.name);
+        if (child.type === "directory") {
+          entries.push({ path: relativePath, type: "directory" });
+          if (entries.length > MAX_LIST_SNAPSHOT_ENTRIES) throw remoteSyncEntryQuota(target, root);
+          await walk(absolutePath, relativePath);
+          continue;
+        }
+        if (selectors.include.length > 0 && !syncMatchesAny(relativePath, selectors.include, false)) continue;
+        if (child.type === "file") {
+          const metadata = await this.remoteSyncRequiredStat(target, absolutePath, callContext);
+          entries.push(await this.remoteSyncFileEntry(target, absolutePath, relativePath, metadata, callContext));
+        } else if (child.type === "symlink") {
+          const metadata = await this.remoteSyncRequiredStat(target, absolutePath, callContext);
+          const linkTarget = typeof metadata.linkTarget === "string" ? metadata.linkTarget : undefined;
+          if (linkTarget === undefined) throw remoteSyncUnsupported(target, absolutePath, "symlink");
+          entries.push({ path: relativePath, type: "symlink", linkTarget });
+        } else {
+          throw remoteSyncUnsupported(target, absolutePath, child.type);
+        }
+        if (entries.length > MAX_LIST_SNAPSHOT_ENTRIES) throw remoteSyncEntryQuota(target, root);
+      }
+    };
+    await walk(root, "");
+    return syncTreeSnapshot(
+      "directory",
+      selectors.include.length === 0 ? entries : retainSyncIncludedAncestors(entries),
+    );
+  }
+
+  private async remoteSyncApplyOperation(
+    target: TargetDefinition,
+    input: {
+      planId: string;
+      sourceRoot: string;
+      destinationRoot: string;
+    operation: SyncOperation;
+    persistPartialResult?: (result: Record<string, unknown>) => void;
+  },
+    callContext?: CapabilityCallContext,
+  ): Promise<Record<string, unknown>> {
+    const { planId, sourceRoot, destinationRoot, operation } = input;
+    const sourcePath = operation.path === "." ? sourceRoot : remoteTreePath(target, sourceRoot, operation.path);
+    const destinationPath = operation.path === "."
+      ? destinationRoot
+      : remoteTreePath(target, destinationRoot, operation.path);
+    switch (operation.kind) {
+      case "CREATE_ROOT":
+        await this.remoteRequest(target, {
+          op: "mkdir",
+          path: destinationRoot,
+          options: { recursive: true },
+        }, callContext);
+        return { createdRoot: true };
+      case "COPY_DIRECTORY":
+        await this.remoteRequest(target, {
+          op: "mkdir",
+          path: destinationPath,
+          options: { recursive: false },
+        }, callContext);
+        return { createdDirectory: operation.path };
+      case "COPY_FILE": {
+        const copied = asRecord(await this.remoteRequest(target, {
+          op: "copy",
+          path: sourcePath,
+          destination: destinationPath,
+          options: { overwrite: false, createParents: true, finalSymlink: "reject" },
+        }, callContext));
+        return { copied: operation.path, sha256: copied.sha256 ?? operation.source?.sha256 };
+      }
+      case "UPDATE_FILE": {
+        const expectedSha256 = operation.destination?.sha256;
+        if (!expectedSha256) throw remoteSyncStale(input.planId, "UPDATE_PREIMAGE_MISSING", operation.path);
+        const updated = asRecord(await this.remoteRequest(target, {
+          op: "copy",
+          path: sourcePath,
+          destination: destinationPath,
+          options: {
+            overwrite: true,
+            expectedSha256,
+            createParents: true,
+            finalSymlink: "reject",
+          },
+        }, callContext));
+        return { updated: operation.path, sha256: updated.sha256 ?? operation.source?.sha256 };
+      }
+      case "COPY_SYMLINK":
+        if (target.platform === "windows") throw remoteSyncUnsupported(target, destinationPath, operation.kind);
+        if (typeof operation.source?.linkTarget !== "string") {
+          throw remoteSyncStale(input.planId, "SYMLINK_TARGET_MISSING", operation.path);
+        }
+        await this.remoteRequest(target, {
+          op: "symlink",
+          path: destinationPath,
+          linkTarget: operation.source.linkTarget,
+          options: { createParents: true },
+        }, callContext);
+        return { copiedSymlink: operation.path };
+      case "UPDATE_SYMLINK": {
+        if (target.platform === "windows") throw remoteSyncUnsupported(target, destinationPath, operation.kind);
+        if (typeof operation.source?.linkTarget !== "string") {
+          throw remoteSyncStale(input.planId, "SYMLINK_TARGET_MISSING", operation.path);
+        }
+        const recovery = await this.remoteSyncTrash(target, destinationPath, operation.path, callContext);
+        input.persistPartialResult?.({ recovery });
+        await this.remoteRequest(target, {
+          op: "symlink",
+          path: destinationPath,
+          linkTarget: operation.source.linkTarget,
+          options: { createParents: true },
+        }, callContext);
+        return { updatedSymlink: operation.path, recovery };
+      }
+      case "REPLACE_CONFLICT": {
+        const existing = await this.remoteSyncOptionalStat(target, destinationPath, callContext);
+        const recovery = existing
+          ? await this.remoteSyncTrash(target, destinationPath, operation.path, callContext)
+          : undefined;
+        if (recovery) {
+          input.persistPartialResult?.({ recovery });
+        }
+        if (operation.source?.type === "directory") {
+          await this.remoteRequest(target, {
+            op: "mkdir",
+            path: destinationPath,
+            options: { recursive: true },
+          }, callContext);
+        } else if (operation.source?.type === "file") {
+          await this.remoteRequest(target, {
+            op: "copy",
+            path: sourcePath,
+            destination: destinationPath,
+            options: { overwrite: false, createParents: true, finalSymlink: "reject" },
+          }, callContext);
+        } else if (operation.source?.type === "symlink") {
+          throw remoteSyncUnsupported(target, destinationPath, "REPLACE_SYMLINK_CONFLICT");
+        } else {
+          throw new UniversalBrokerError("SYNC_CONFLICT", "A conflict has no source entry.");
+        }
+        return { replacedConflict: operation.path, ...(recovery ? { recovery } : {}) };
+      }
+      case "DELETE_ENTRY": {
+        if (!await this.remoteSyncOptionalStat(target, destinationPath, callContext)) {
+          return { reconciledAbsent: operation.path };
+        }
+        if (operation.deleteMode === "permanent") {
+          const result = asRecord(await this.remoteRequest(target, {
+            op: "remove",
+            path: destinationPath,
+            options: {
+              disposition: "permanent",
+              recursive: true,
+              finalSymlink: "preserve",
+            },
+          }, callContext));
+          if (result.removed !== true || result.disposition !== "permanent") {
+            throw new UniversalBrokerError(
+              "SYNC_PLAN_STALE",
+              "Remote permanent sync deletion did not return its exact post-readback receipt.",
+              { evidence: { targetId: target.id, path: operation.path } },
+            );
+          }
+          return { deleted: operation.path, disposition: "permanent" };
+        }
+        if (operation.deleteMode !== "trash") {
+          throw new UniversalBrokerError(
+            "SYNC_PLAN_STALE",
+            "Stored remote sync deletion has an invalid immutable delete mode.",
+            { evidence: { targetId: target.id, path: operation.path, deleteMode: operation.deleteMode } },
+          );
+        }
+        const recovery = await this.remoteSyncTrash(target, destinationPath, operation.path, callContext);
+        input.persistPartialResult?.({ recovery });
+        return { deleted: operation.path, recovery };
+      }
+    }
+  }
+
+  private async remoteSyncOperationPostcondition(
+    target: TargetDefinition,
+    destinationRoot: string,
+    operation: SyncOperation,
+    callContext?: CapabilityCallContext,
+  ): Promise<boolean> {
+    const path = operation.path === "." ? destinationRoot : remoteTreePath(target, destinationRoot, operation.path);
+    if (operation.kind === "DELETE_ENTRY") return !(await this.remoteSyncOptionalStat(target, path, callContext));
+    const expected = operation.source;
+    if (operation.kind === "CREATE_ROOT") {
+      return remoteSyncEntryType(await this.remoteSyncOptionalStat(target, path, callContext)) === "directory";
+    }
+    if (!expected) return false;
+    const observed = await this.remoteSyncOptionalStat(target, path, callContext);
+    if (!observed) return false;
+    const observedType = remoteSyncEntryType(observed);
+    if (expected.type === "directory") return observedType === "directory";
+    if (expected.type === "file") {
+      if (observedType !== "file" || Number(observed.size) !== expected.size) return false;
+      const hash = await this.remoteSyncHash(target, path, callContext);
+      return hash.sha256 === expected.sha256;
+    }
+    return observedType === "symlink" && observed.linkTarget === expected.linkTarget;
+  }
+
+  private async remoteSyncOperationPostreadbackDigest(
+    target: TargetDefinition,
+    destinationRoot: string,
+    operation: SyncOperation,
+    callContext?: CapabilityCallContext,
+  ): Promise<string> {
+    const path = operation.path === "." ? destinationRoot : remoteTreePath(target, destinationRoot, operation.path);
+    const observed = await this.remoteSyncOptionalStat(target, path, callContext);
+    if (!observed) return sha256Text("absent");
+    const observedType = remoteSyncEntryType(observed);
+    if (observedType === "file") {
+      const hash = await this.remoteSyncHash(target, path, callContext);
+      return sha256Text(`file\0${hash.size}\0${hash.sha256}`);
+    }
+    if (observedType === "symlink") return sha256Text(`symlink\0${String(observed.linkTarget ?? "")}`);
+    return sha256Text("directory");
+  }
+
+  private async remoteSyncAssertSourceEntry(
+    target: TargetDefinition,
+    sourceRoot: string,
+    operation: SyncOperation,
+    callContext?: CapabilityCallContext,
+  ): Promise<void> {
+    if (!operation.source || operation.kind === "CREATE_ROOT" || operation.kind === "DELETE_ENTRY") return;
+    if (operation.path === "." && operation.source.type === "directory") return;
+    const sourcePath = remoteTreePath(target, sourceRoot, operation.path);
+    const observed = await this.remoteSyncOptionalStat(target, sourcePath, callContext);
+    const expected = operation.source;
+    const observedType = remoteSyncEntryType(observed);
+    const matches = expected.type === "directory"
+      ? observedType === "directory"
+      : expected.type === "file"
+        ? Boolean(
+            observedType === "file"
+            && Number(observed?.size) === expected.size
+            && (await this.remoteSyncHash(target, sourcePath, callContext)).sha256 === expected.sha256
+          )
+        : Boolean(observedType === "symlink" && observed?.linkTarget === expected.linkTarget);
+    if (!matches) throw remoteSyncStale("unknown", "SOURCE_ENTRY_CHANGED", operation.path);
+  }
+
+  private async remoteSyncFileEntry(
+    target: TargetDefinition,
+    path: string,
+    relativePath: string,
+    before: Record<string, unknown>,
+    callContext?: CapabilityCallContext,
+  ): Promise<FilesystemSyncEntry> {
+    const beforeIdentity = remoteSyncStatIdentity(before);
+    const hash = await this.remoteSyncHash(target, path, callContext);
+    const after = await this.remoteSyncRequiredStat(target, path, callContext);
+    if (
+      remoteSyncEntryType(after) !== "file"
+      || stableJson(remoteSyncStatIdentity(after)) !== stableJson(beforeIdentity)
+      || hash.size !== Number(after.size)
+    ) {
+      throw remoteSyncStale("snapshot", "FILE_CHANGED_DURING_SNAPSHOT", relativePath);
+    }
+    return { path: relativePath, type: "file", size: hash.size, sha256: hash.sha256 };
+  }
+
+  private async remoteSyncListAll(
+    target: TargetDefinition,
+    path: string,
+    callContext?: CapabilityCallContext,
+  ): Promise<FilesystemListEntry[]> {
+    const entries: FilesystemListEntry[] = [];
+    let expectedTotal: number | undefined;
+    while (expectedTotal === undefined || entries.length < expectedTotal) {
+      const result = asRecord(await this.remoteRequest(target, {
+        op: "list",
+        path,
+        options: { offset: entries.length, limit: REMOTE_LIST_PAGE_LIMIT },
+      }, callContext));
+      const total = requireBoundedCount(
+        result.totalEntries,
+        "remote sync list totalEntries",
+        MAX_LIST_SNAPSHOT_ENTRIES,
+        "RESOURCE_QUOTA_EXCEEDED",
+      );
+      if (expectedTotal !== undefined && total !== expectedTotal) {
+        throw remoteSyncStale("snapshot", "DIRECTORY_ENTRY_COUNT_CHANGED", path);
+      }
+      expectedTotal = total;
+      const offset = requireBoundedCount(result.offset, "remote sync list offset", MAX_LIST_SNAPSHOT_ENTRIES);
+      if (offset !== entries.length) throw remoteSyncStale("snapshot", "DIRECTORY_PAGE_OFFSET_CHANGED", path);
+      const page = normalizeListEntries(result.entries, REMOTE_LIST_PAGE_LIMIT);
+      if (page.length === 0 && entries.length < total) {
+        throw remoteSyncStale("snapshot", "DIRECTORY_PAGE_TRUNCATED", path);
+      }
+      entries.push(...page);
+      if (entries.length > total || entries.length > MAX_LIST_SNAPSHOT_ENTRIES) {
+        throw remoteSyncEntryQuota(target, path);
+      }
+    }
+    entries.sort((left, right) => compareText(left.name, right.name));
+    return entries;
+  }
+
+  private async remoteSyncHash(
+    target: TargetDefinition,
+    path: string,
+    callContext?: CapabilityCallContext,
+  ): Promise<{ sha256: string; size: number }> {
+    const result = asRecord(await this.remoteRequest(target, {
+      op: "hash",
+      path,
+    }, callContext));
+    const sha256 = typeof result.sha256 === "string" ? result.sha256.toLowerCase() : "";
+    const size = Number(result.size);
+    if (!/^[a-f0-9]{64}$/u.test(sha256) || !Number.isSafeInteger(size) || size < 0) {
+      throw new UniversalBrokerError(
+        "STATE_CORRUPTED",
+        "Remote filesystem hash result is invalid.",
+        { evidence: { targetId: target.id, path } },
+      );
+    }
+    return { sha256, size };
+  }
+
+  private async remoteSyncOptionalStat(
+    target: TargetDefinition,
+    path: string,
+    callContext?: CapabilityCallContext,
+  ): Promise<Record<string, unknown> | undefined> {
+    try {
+      return await this.remoteSyncRequiredStat(target, path, callContext);
+    } catch (error) {
+      if (error instanceof UniversalBrokerError && error.code === "PATH_NOT_FOUND") return undefined;
+      throw error;
+    }
+  }
+
+  private async remoteSyncRequiredStat(
+    target: TargetDefinition,
+    path: string,
+    callContext?: CapabilityCallContext,
+  ): Promise<Record<string, unknown>> {
+    return asRecord(await this.remoteRequest(target, {
+      op: "stat",
+      path,
+    }, callContext));
+  }
+
+  private async remoteSyncTrash(
+    target: TargetDefinition,
+    path: string,
+    relativePath: string,
+    callContext?: CapabilityCallContext,
+  ): Promise<Record<string, unknown>> {
+    const recovery = asRecord(await this.remoteRequest(target, {
+      op: "remove",
+      path,
+      options: {
+        disposition: "trash",
+        recursive: true,
+        finalSymlink: "preserve",
+      },
+    }, callContext));
+    if (recovery.disposition !== "trash" || recovery.recoverable !== true) {
+      throw new UniversalBrokerError(
+        "CAPABILITY_UNAVAILABLE",
+        "Remote fs.sync delete did not return a recoverable trash receipt.",
+        { evidence: { targetId: target.id, path: relativePath, deleteMode: "trash" } },
+      );
+    }
+    return recovery;
   }
 
   private async resolveRequest(
@@ -857,33 +1801,43 @@ async function localStat(path: string): Promise<Record<string, unknown>> {
   };
 }
 
-async function localList(
-  path: string,
-  offset: number,
-  limit: number,
-): Promise<Record<string, unknown>> {
-  const metadata = await requiredStat(path);
-  if (!metadata.isDirectory()) throw pathTypeError(path, "directory");
-  const entries = (await readdir(path, { withFileTypes: true }))
-    .sort((left, right) => left.name.localeCompare(right.name));
-  const page = entries.slice(offset, offset + limit).map((entry) => ({
-    name: entry.name,
-    type: entry.isDirectory()
-      ? "directory"
-      : entry.isFile()
-        ? "file"
-        : entry.isSymbolicLink()
-          ? "symlink"
-          : "other",
-  }));
-  const nextOffset = offset + page.length;
+async function localListSnapshot(path: string): Promise<FilesystemListSnapshot> {
+  const before = await requiredStat(path);
+  if (!before.isDirectory()) throw pathTypeError(path, "directory");
+  const entries = normalizeListEntries(
+    (await readdir(path, { withFileTypes: true }))
+      .sort((left, right) => compareText(left.name, right.name))
+      .map((entry) => ({
+        name: entry.name,
+        type: entry.isDirectory()
+          ? "directory"
+          : entry.isFile()
+            ? "file"
+            : entry.isSymbolicLink()
+              ? "symlink"
+              : "other",
+      })),
+    MAX_LIST_SNAPSHOT_ENTRIES,
+  );
+  const after = await requiredStat(path);
+  const beforeIdentity = filesystemStatIdentity(before);
+  const afterIdentity = filesystemStatIdentity(after);
+  if (!after.isDirectory() || digestJson(beforeIdentity) !== digestJson(afterIdentity)) {
+    throw new CursorCapabilityError(
+      "CURSOR_STALE",
+      "Directory changed while its ordered pagination snapshot was captured.",
+      { resourceKind: "filesystem.list" },
+    );
+  }
   return {
-    path,
-    entries: page,
-    totalEntries: entries.length,
-    offset,
-    limit,
-    ...(nextOffset < entries.length ? { nextCursor: String(nextOffset) } : {}),
+    resolvedPath: path,
+    entries,
+    generation: digestJson({
+      version: 1,
+      resolvedPath: path,
+      directoryIdentity: afterIdentity,
+      entries,
+    }),
   };
 }
 
@@ -905,76 +1859,149 @@ async function localRead(
       bytesRead,
       size: metadata.size,
       truncated: nextOffset < metadata.size,
-      ...(nextOffset < metadata.size ? { nextCursor: String(nextOffset) } : {}),
+      ...(nextOffset < metadata.size ? { nextOffset } : {}),
     }, buffer.subarray(0, bytesRead));
   } finally {
     await handle.close();
   }
 }
 
-async function localSearch(
+async function localSearchSnapshot(
   root: string,
   query: string,
   recursive: boolean,
-  limit: number,
-): Promise<Record<string, unknown>> {
+): Promise<FilesystemSearchSnapshot> {
   const metadata = await requiredStat(root);
   const candidates: string[] = [];
+  const directoryObservations: Array<Record<string, unknown>> = [];
+  let candidateLimitReached = false;
   if (metadata.isFile()) {
     candidates.push(root);
   } else if (metadata.isDirectory()) {
     const walk = async (directory: string): Promise<void> => {
-      if (candidates.length >= MAX_SEARCH_FILES) return;
+      if (candidateLimitReached) return;
+      const before = await stat(directory);
       let entries;
       try {
-        entries = await readdir(directory, { withFileTypes: true });
+        entries = (await readdir(directory, { withFileTypes: true }))
+          .sort((left, right) => compareText(left.name, right.name));
       } catch (error) {
-        if (isPermissionError(error)) return;
+        if (isPermissionError(error)) {
+          directoryObservations.push({ path: directory, unreadable: true });
+          return;
+        }
         throw error;
       }
       for (const entry of entries) {
-        if (candidates.length >= MAX_SEARCH_FILES) return;
-        const path = join(directory, entry.name);
+        if (candidates.length >= MAX_SEARCH_FILES) {
+          candidateLimitReached = true;
+          break;
+        }
+        const candidatePath = join(directory, entry.name);
         if (entry.isDirectory()) {
-          if (recursive && !SEARCH_SKIPPED_DIRECTORIES.has(entry.name)) await walk(path);
+          if (recursive && !SEARCH_SKIPPED_DIRECTORIES.has(entry.name)) {
+            await walk(candidatePath);
+          }
         } else if (entry.isFile()) {
-          candidates.push(path);
+          candidates.push(candidatePath);
         }
       }
+      const after = await stat(directory);
+      const beforeIdentity = filesystemStatIdentity(before);
+      const afterIdentity = filesystemStatIdentity(after);
+      if (digestJson(beforeIdentity) !== digestJson(afterIdentity)) {
+        throw new CursorCapabilityError(
+          "CURSOR_STALE",
+          "Search directory changed while its pagination snapshot was captured.",
+          { resourceKind: "filesystem.search" },
+        );
+      }
+      directoryObservations.push({ path: directory, identity: afterIdentity });
     };
     await walk(root);
   } else {
     throw pathTypeError(root, "file or directory");
   }
 
-  const results: Array<Record<string, unknown>> = [];
+  const results: FilesystemSearchResult[] = [];
+  const fileObservations: Array<Record<string, unknown>> = [];
   let visitedFiles = 0;
-  for (const path of candidates) {
-    if (results.length >= limit) break;
-    let file;
+  for (const candidatePath of candidates) {
+    if (results.length > MAX_SEARCH_LIMIT) break;
     try {
-      file = await stat(path);
-      if (file.size > MAX_SEARCH_FILE_BYTES) continue;
-      const content = await readFile(path);
-      if (content.includes(0)) continue;
+      const before = await stat(candidatePath);
+      const beforeIdentity = filesystemStatIdentity(before);
+      if (before.size > MAX_SEARCH_FILE_BYTES) {
+        fileObservations.push({ path: candidatePath, identity: beforeIdentity, skipped: "size" });
+        continue;
+      }
+      const content = await readFile(candidatePath);
+      const after = await stat(candidatePath);
+      const afterIdentity = filesystemStatIdentity(after);
+      if (digestJson(beforeIdentity) !== digestJson(afterIdentity)) {
+        throw new CursorCapabilityError(
+          "CURSOR_STALE",
+          "A searched file changed while its pagination snapshot was captured.",
+          { resourceKind: "filesystem.search" },
+        );
+      }
+      const contentDigest = createHash("sha256").update(content).digest("hex");
+      if (content.includes(0)) {
+        fileObservations.push({
+          path: candidatePath,
+          identity: afterIdentity,
+          contentDigest,
+          skipped: "binary",
+        });
+        continue;
+      }
       visitedFiles++;
       const lines = content.toString("utf8").split(/\r?\n/);
       for (let index = 0; index < lines.length; index++) {
         if (!lines[index]!.includes(query)) continue;
-        results.push({ path, line: index + 1, text: lines[index]!.slice(0, 500) });
-        if (results.length >= limit) break;
+        results.push({
+          path: candidatePath,
+          line: index + 1,
+          text: lines[index]!.slice(0, 500),
+        });
+        if (results.length > MAX_SEARCH_LIMIT) break;
       }
+      fileObservations.push({ path: candidatePath, identity: afterIdentity, contentDigest });
     } catch (error) {
-      if (isPermissionError(error) || isNodeError(error, "ENOENT")) continue;
+      if (error instanceof CursorCapabilityError) throw error;
+      if (isNodeError(error, "ENOENT")) {
+        throw new CursorCapabilityError(
+          "CURSOR_STALE",
+          "A search candidate disappeared while its pagination snapshot was captured.",
+          { resourceKind: "filesystem.search" },
+        );
+      }
+      if (isPermissionError(error)) {
+        fileObservations.push({ path: candidatePath, unreadable: true });
+        continue;
+      }
       throw error;
     }
   }
+  const boundedResults = results.slice(0, MAX_SEARCH_LIMIT).sort(compareSearchResults);
+  const truncated = candidateLimitReached || results.length > MAX_SEARCH_LIMIT;
   return {
-    path: root,
-    query,
-    results,
+    resolvedPath: root,
+    results: boundedResults,
     visitedFiles,
-    truncated: results.length >= limit || candidates.length >= MAX_SEARCH_FILES,
+    truncated,
+    generation: digestJson({
+      version: 1,
+      resolvedPath: root,
+      query,
+      recursive,
+      directoryObservations: directoryObservations.sort(comparePathRecords),
+      fileObservations,
+      candidateLimitReached,
+      results: boundedResults,
+      visitedFiles,
+      truncated,
+    }),
   };
 }
 
@@ -985,7 +2012,7 @@ async function atomicLocalWrite(
     overwrite: boolean;
     expectedSha256?: string;
     allowReplaceSymlink?: boolean;
-    hooks?: AtomicPublicationHooks;
+    filesystem?: AtomicFilesystemOperations;
   },
 ): Promise<Record<string, unknown>> {
   return { ...await atomicWriteBuffer(path, content, options) };
@@ -998,7 +2025,7 @@ async function publishLocalFile(
     overwrite: boolean;
     expectedSha256?: string;
     allowReplaceSymlink?: boolean;
-    hooks?: AtomicPublicationHooks;
+    filesystem?: AtomicFilesystemOperations;
   },
 ): Promise<Record<string, unknown>> {
   return { ...await atomicCopyFile(localPath, path, options) };
@@ -1008,7 +2035,7 @@ async function localPatch(
   path: string,
   patch: string,
   expectedSha256: string | undefined,
-  hooks?: AtomicPublicationHooks,
+  filesystem?: AtomicFilesystemOperations,
 ): Promise<Record<string, unknown>> {
   const metadata = await requiredStat(path);
   if (metadata.isDirectory()) {
@@ -1038,7 +2065,7 @@ async function localPatch(
     const published = await atomicCopyFile(staged, path, {
       overwrite: true,
       expectedSha256: originalSha256,
-      hooks,
+      filesystem,
     });
     return {
       root: dirname(path),
@@ -1066,10 +2093,10 @@ async function localCopy(
   destination: string,
   overwrite: boolean,
   recursive: boolean,
-  synchronized = false,
-  hooks?: AtomicPublicationHooks,
+  filesystem?: AtomicFilesystemOperations,
   allowReplaceSymlink = false,
 ): Promise<Record<string, unknown>> {
+  const io = filesystem ?? nodeAtomicFilesystemOperations;
   const sourceMetadata = await requiredLstat(source);
   const existing = await optionalLstat(destination);
   if (existing && !overwrite) {
@@ -1097,36 +2124,34 @@ async function localCopy(
       `.devspace-v2-${basename(destination)}-${randomUUID()}.tmp`,
     );
     try {
-      await cp(source, temporary, {
+      await io.cp(source, temporary, {
         recursive: true,
         force: false,
         errorOnExist: true,
         dereference: false,
         preserveTimestamps: true,
       });
-      await hooks?.beforeDestinationRevalidation?.({ destination, temporary });
       if (await optionalLstat(destination)) {
         throw new UniversalBrokerError(
           "PRECONDITION_FAILED",
           `Destination changed while the directory was staged: ${destination}`,
         );
       }
-      await rename(temporary, destination);
+      await io.rename(temporary, destination);
       await syncDirectory(dirname(destination));
     } finally {
-      await rm(temporary, { recursive: true, force: true }).catch(() => undefined);
+      await io.rm(temporary, { recursive: true, force: true }).catch(() => undefined);
     }
   } else if (sourceMetadata.isFile()) {
     const published = await atomicCopyFile(source, destination, {
       overwrite,
       allowReplaceSymlink,
-      hooks,
+      filesystem,
     });
     return {
       source,
       destination,
       copied: true,
-      synchronized,
       overwritten: published.overwritten,
       size: published.size,
       sha256: published.sha256,
@@ -1138,7 +2163,6 @@ async function localCopy(
     source,
     destination,
     copied: true,
-    synchronized,
     overwritten: Boolean(existing),
   };
 }
@@ -1147,7 +2171,7 @@ async function localMove(
   source: string,
   destination: string,
   overwrite: boolean,
-  hooks?: AtomicPublicationHooks,
+  filesystem?: AtomicFilesystemOperations,
   allowReplaceSymlink = false,
 ): Promise<Record<string, unknown>> {
   const sourceMetadata = await requiredLstat(source);
@@ -1155,7 +2179,7 @@ async function localMove(
     const moved = await safeMoveFile(source, destination, {
       overwrite,
       allowReplaceSymlink,
-      hooks,
+      filesystem,
     });
     return {
       source,
@@ -1424,6 +2448,145 @@ function remoteSiblingTemporaryPath(target: TargetDefinition, path: string): str
   return posix.join(posix.dirname(path), name);
 }
 
+function remoteTreePath(target: TargetDefinition, root: string, relativePath: string): string {
+  if (!relativePath || relativePath === "." || relativePath.startsWith("/") || relativePath.includes("\0")) {
+    throw new UniversalBrokerError("STATE_CORRUPTED", "Stored remote filesystem sync path is invalid.");
+  }
+  if (target.platform === "windows") {
+    const rootNative = root.replaceAll("/", "\\");
+    const resolvedRoot = win32.resolve(rootNative);
+    const resolved = win32.resolve(resolvedRoot, ...relativePath.split("/"));
+    const child = win32.relative(resolvedRoot, resolved);
+    if (!child || child === ".." || child.startsWith("..\\") || win32.isAbsolute(child)) {
+      throw new UniversalBrokerError("STATE_CORRUPTED", "Stored remote filesystem sync path escaped its root.");
+    }
+    return normalizeWindowsPath(resolved);
+  }
+  const resolvedRoot = posix.resolve(root);
+  const resolved = posix.resolve(resolvedRoot, ...relativePath.split("/"));
+  const child = posix.relative(resolvedRoot, resolved);
+  if (!child || child === ".." || child.startsWith("../") || posix.isAbsolute(child)) {
+    throw new UniversalBrokerError("STATE_CORRUPTED", "Stored remote filesystem sync path escaped its root.");
+  }
+  return posix.normalize(resolved);
+}
+
+function syncTreeSnapshot(
+  rootType: TreeSnapshot["rootType"],
+  entries: FilesystemSyncEntry[],
+): TreeSnapshot {
+  const sorted = [...entries].sort((left, right) => Buffer.from(left.path).compare(Buffer.from(right.path)));
+  return {
+    rootType,
+    entries: sorted,
+    digest: sha256Text(stableJson({ rootType, entries: sorted })),
+  };
+}
+
+function syncMatchesAny(path: string, patterns: readonly string[], directory: boolean): boolean {
+  return patterns.some((pattern) => {
+    const expression = syncGlobExpression(pattern);
+    return expression.test(path) || (directory && expression.test(`${path}/`));
+  });
+}
+
+function syncGlobExpression(pattern: string): RegExp {
+  let expression = pattern.includes("/") ? "^" : "(?:^|/)";
+  for (let index = 0; index < pattern.length; index += 1) {
+    const character = pattern[index]!;
+    if (character === "*") {
+      if (pattern[index + 1] === "*") {
+        expression += ".*";
+        index += 1;
+      } else expression += "[^/]*";
+    } else if (character === "?") expression += "[^/]";
+    else expression += character.replace(/[|\\{}()[\]^$+?.]/gu, "\\$&");
+  }
+  return new RegExp(`${expression}$`, "u");
+}
+
+function retainSyncIncludedAncestors(entries: FilesystemSyncEntry[]): FilesystemSyncEntry[] {
+  const selectedPaths = new Set(entries.filter((entry) => entry.type !== "directory").map((entry) => entry.path));
+  for (const path of [...selectedPaths]) {
+    let parent = path.includes("/") ? path.slice(0, path.lastIndexOf("/")) : "";
+    while (parent) {
+      selectedPaths.add(parent);
+      parent = parent.includes("/") ? parent.slice(0, parent.lastIndexOf("/")) : "";
+    }
+  }
+  return entries.filter((entry) => selectedPaths.has(entry.path));
+}
+
+function remoteSyncEntryType(
+  metadata: Record<string, unknown> | undefined,
+): FilesystemSyncEntry["type"] | "other" | undefined {
+  if (!metadata) return undefined;
+  if (metadata.type === "file" || metadata.type === "directory" || metadata.type === "symlink") {
+    return metadata.type;
+  }
+  return "other";
+}
+
+function remoteSyncStatIdentity(metadata: Record<string, unknown>): Record<string, unknown> {
+  return {
+    type: metadata.type,
+    size: metadata.size,
+    mode: metadata.mode ?? null,
+    mtimeMs: metadata.mtimeMs ?? null,
+    birthtimeMs: metadata.birthtimeMs ?? null,
+    linkTarget: metadata.linkTarget ?? null,
+  };
+}
+
+function remoteSyncUnsupported(
+  target: TargetDefinition,
+  path: string,
+  entryType: string,
+): UniversalBrokerError {
+  return new UniversalBrokerError(
+    "CAPABILITY_UNAVAILABLE",
+    `Remote fs.sync does not support ${entryType} entries on target ${target.id}.`,
+    { evidence: { targetId: target.id, path, entryType } },
+  );
+}
+
+function remoteSyncEntryQuota(target: TargetDefinition, root: string): UniversalBrokerError {
+  return new UniversalBrokerError(
+    "RESOURCE_QUOTA_EXCEEDED",
+    `Remote filesystem sync snapshot exceeds ${MAX_LIST_SNAPSHOT_ENTRIES} entries.`,
+    { evidence: { targetId: target.id, root, maximumEntries: MAX_LIST_SNAPSHOT_ENTRIES } },
+  );
+}
+
+function remoteSyncStale(planId: string, reason: string, path: string): UniversalBrokerError {
+  return new UniversalBrokerError(
+    "SYNC_PLAN_STALE",
+    "The immutable remote filesystem sync plan is stale or no longer matches its bound state.",
+    { evidence: { planId, reason, path } },
+  );
+}
+
+function stableJson(value: unknown): string {
+  return JSON.stringify(canonicalize(value));
+}
+
+function canonicalize(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .filter(([, item]) => item !== undefined)
+        .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+        .map(([key, item]) => [key, canonicalize(item)]),
+    );
+  }
+  return value;
+}
+
+function sha256Text(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
 async function resolveLocalFinalPath(
   requestedPath: string,
   operation: UniversalFilesystemOperation,
@@ -1451,7 +2614,7 @@ function defaultFinalSymlinkBehavior(
   operation: UniversalFilesystemOperation,
 ): NonNullable<UniversalFilesystemInput["finalSymlink"]> {
   if (["stat", "move", "remove", "restore"].includes(operation)) return "preserve";
-  if (["write", "mkdir"].includes(operation)) return "reject";
+  if (["write", "mkdir", "sync"].includes(operation)) return "reject";
   return "follow";
 }
 
@@ -1523,13 +2686,23 @@ function requireText(value: string | undefined, message: string): string {
   return value;
 }
 
-function parseCursor(cursor: string | undefined): number {
-  if (cursor === undefined) return 0;
-  const parsed = Number(cursor);
-  if (!Number.isSafeInteger(parsed) || parsed < 0) {
-    throw new UniversalBrokerError("PRECONDITION_FAILED", `Invalid cursor: ${cursor}`);
+function readOffset(input: UniversalFilesystemInput): number {
+  if (input.cursor !== undefined) {
+    throw new UniversalBrokerError(
+      "PRECONDITION_FAILED",
+      "fs.read byte ranges use offset; cursor is reserved for signed list/search pagination.",
+      { evidence: { operation: "read", cursorAccepted: false } },
+    );
   }
-  return parsed;
+  const offset = input.offset ?? 0;
+  if (!Number.isSafeInteger(offset) || offset < 0) {
+    throw new UniversalBrokerError(
+      "PRECONDITION_FAILED",
+      "offset must be a non-negative safe integer.",
+      { evidence: { operation: "read", offset } },
+    );
+  }
+  return offset;
 }
 
 function boundedLimit(value: number | undefined, fallback: number, maximum: number): number {
@@ -1542,6 +2715,249 @@ function boundedLimit(value: number | undefined, fallback: number, maximum: numb
     );
   }
   return parsed;
+}
+
+interface PaginationLimit {
+  creationLimit: number;
+  continuationLimit?: number;
+}
+
+function paginationLimit(
+  value: number | undefined,
+  fallback: number,
+  maximum: number,
+): PaginationLimit {
+  return {
+    creationLimit: boundedLimit(value, fallback, maximum),
+    ...(value === undefined ? {} : { continuationLimit: boundedLimit(value, fallback, maximum) }),
+  };
+}
+
+function paginateSnapshotItems<T>(input: {
+  store: SignedSnapshotCursorStore;
+  cursor?: string;
+  limit: PaginationLimit;
+  binding: CursorBinding;
+  items: readonly T[];
+}): {
+  items: T[];
+  offset: number;
+  limit: number;
+  snapshotDigest: string;
+  expiresAt: string;
+  nextCursor?: string;
+} {
+  const page = input.cursor === undefined
+    ? input.store.createSnapshot({
+        binding: input.binding,
+        orderedItemIdentities: input.items.map((value, index) => JSON.stringify({
+          version: 1,
+          index,
+          initialLimit: input.limit.creationLimit,
+          value,
+        })),
+        limit: input.limit.creationLimit,
+      })
+    : input.store.continueSnapshot({
+        cursor: input.cursor,
+        binding: input.binding,
+        ...(input.limit.continuationLimit === undefined
+          ? {}
+          : { limit: input.limit.continuationLimit }),
+      });
+  const decoded = page.itemIdentities.map((identity) => decodeSnapshotItem<T>(identity));
+  for (let index = 1; index < decoded.length; index++) {
+    if (
+      decoded[index]!.index !== decoded[index - 1]!.index + 1
+      || decoded[index]!.initialLimit !== decoded[0]!.initialLimit
+    ) {
+      throw new UniversalBrokerError(
+        "STATE_CORRUPTED",
+        "Filesystem pagination snapshot item order is invalid.",
+      );
+    }
+  }
+  return {
+    items: decoded.map((item) => item.value),
+    offset: decoded[0]?.index ?? 0,
+    limit: input.limit.continuationLimit
+      ?? decoded[0]?.initialLimit
+      ?? input.limit.creationLimit,
+    snapshotDigest: page.snapshotDigest,
+    expiresAt: page.expiresAt,
+    ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
+  };
+}
+
+function decodeSnapshotItem<T>(identity: string): {
+  index: number;
+  initialLimit: number;
+  value: T;
+} {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(identity);
+  } catch {
+    throw new UniversalBrokerError(
+      "STATE_CORRUPTED",
+      "Filesystem pagination snapshot item is not valid JSON.",
+    );
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new UniversalBrokerError(
+      "STATE_CORRUPTED",
+      "Filesystem pagination snapshot item is invalid.",
+    );
+  }
+  const value = parsed as Record<string, unknown>;
+  if (
+    value.version !== 1
+    || !Number.isSafeInteger(value.index)
+    || (value.index as number) < 0
+    || !Number.isSafeInteger(value.initialLimit)
+    || (value.initialLimit as number) < 1
+    || !("value" in value)
+  ) {
+    throw new UniversalBrokerError(
+      "STATE_CORRUPTED",
+      "Filesystem pagination snapshot item fields are invalid.",
+    );
+  }
+  return {
+    index: value.index as number,
+    initialLimit: value.initialLimit as number,
+    value: value.value as T,
+  };
+}
+
+function filesystemCursorBinding(input: {
+  principalKeyFingerprint: string;
+  target: TargetDefinition;
+  resourceKind: "filesystem.list" | "filesystem.search";
+  resolvedPath: string;
+  queryDigest: string;
+  snapshotGeneration: string;
+}): CursorBinding {
+  return {
+    principalKeyFingerprint: input.principalKeyFingerprint,
+    resourceKind: input.resourceKind,
+    resourceIdentityDigest: digestJson({
+      version: 1,
+      targetId: input.target.id,
+      targetGeneration: input.target.generation,
+      endpointFingerprint: input.target.endpointFingerprint,
+      resolvedPath: input.resolvedPath,
+    }),
+    queryDigest: input.queryDigest,
+    snapshotGeneration: input.snapshotGeneration,
+  };
+}
+
+function normalizeListEntries(value: unknown, maximum: number): FilesystemListEntry[] {
+  if (!Array.isArray(value) || value.length > maximum) {
+    throw new UniversalBrokerError(
+      value instanceof Array ? "RESOURCE_QUOTA_EXCEEDED" : "STATE_CORRUPTED",
+      "Filesystem directory snapshot entry count is invalid.",
+      { evidence: { maximumEntries: maximum } },
+    );
+  }
+  return value.map((entry) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      throw new UniversalBrokerError("STATE_CORRUPTED", "Filesystem list entry is invalid.");
+    }
+    const record = entry as Record<string, unknown>;
+    const name = requireTextField(record.name, "filesystem list entry name");
+    if (name.length > 4_096 || name.includes("\0")) {
+      throw new UniversalBrokerError("STATE_CORRUPTED", "Filesystem list entry name is invalid.");
+    }
+    const type = record.type;
+    if (type !== "directory" && type !== "file" && type !== "symlink" && type !== "other") {
+      throw new UniversalBrokerError("STATE_CORRUPTED", "Filesystem list entry type is invalid.");
+    }
+    return { name, type };
+  });
+}
+
+function normalizeSearchResults(value: unknown, maximum: number): FilesystemSearchResult[] {
+  if (!Array.isArray(value) || value.length > maximum) {
+    throw new UniversalBrokerError("STATE_CORRUPTED", "Filesystem search result count is invalid.");
+  }
+  return value.map((entry) => {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      throw new UniversalBrokerError("STATE_CORRUPTED", "Filesystem search result is invalid.");
+    }
+    const record = entry as Record<string, unknown>;
+    const path = requireTextField(record.path, "filesystem search result path");
+    const text = typeof record.text === "string" ? record.text.slice(0, 500) : undefined;
+    const line = record.line;
+    if (text === undefined || !Number.isSafeInteger(line) || (line as number) < 1) {
+      throw new UniversalBrokerError("STATE_CORRUPTED", "Filesystem search result fields are invalid.");
+    }
+    return { path, line: line as number, text };
+  });
+}
+
+function requireTextField(value: unknown, label: string): string {
+  if (typeof value !== "string" || value.length === 0 || value.length > 32_768) {
+    throw new UniversalBrokerError("STATE_CORRUPTED", `${label} is invalid.`);
+  }
+  return value;
+}
+
+function requireBoundedCount(
+  value: unknown,
+  label: string,
+  maximum: number,
+  overflowCode: "STATE_CORRUPTED" | "RESOURCE_QUOTA_EXCEEDED" = "STATE_CORRUPTED",
+): number {
+  if (!Number.isSafeInteger(value) || (value as number) < 0) {
+    throw new UniversalBrokerError("STATE_CORRUPTED", `${label} is invalid.`);
+  }
+  if ((value as number) > maximum) {
+    throw new UniversalBrokerError(
+      overflowCode,
+      `${label} exceeds the supported bound.`,
+      { evidence: { maximum, actual: value } },
+    );
+  }
+  return value as number;
+}
+
+function remoteSnapshotChanged(message: string, target: TargetDefinition): CursorCapabilityError {
+  return new CursorCapabilityError(
+    "CURSOR_STALE",
+    message,
+    { resourceKind: "filesystem.list", targetId: target.id },
+  );
+}
+
+function filesystemStatIdentity(metadata: Stats): Record<string, unknown> {
+  return {
+    dev: String(metadata.dev),
+    ino: String(metadata.ino),
+    mode: metadata.mode,
+    size: metadata.size,
+    mtimeMs: metadata.mtimeMs,
+    ctimeMs: metadata.ctimeMs,
+  };
+}
+
+function compareSearchResults(left: FilesystemSearchResult, right: FilesystemSearchResult): number {
+  return compareText(left.path, right.path)
+    || left.line - right.line
+    || compareText(left.text, right.text);
+}
+
+function comparePathRecords(left: Record<string, unknown>, right: Record<string, unknown>): number {
+  return compareText(String(left.path ?? ""), String(right.path ?? ""));
+}
+
+function compareText(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function digestJson(value: unknown): string {
+  return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 }
 
 function pathTypeError(path: string, expected: string): UniversalBrokerError {

@@ -53,7 +53,7 @@ on capabilitiesResult()
     set accessibilityEnabled to false
     set probeError to my boundedText(errorMessage & " (" & errorNumber & ")", 300)
   end try
-  set payload to "{\"platform\":\"macos\",\"accessibility\":" & my jsonBoolean(accessibilityEnabled) & ",\"screenCapture\":\"not_probed\",\"frontmostProcess\":{" & ¬
+  set payload to "{\"platform\":\"macos\",\"accessibility\":" & my jsonBoolean(accessibilityEnabled) & ",\"screenCapture\":false,\"frontmostProcess\":{" & ¬
     "\"name\":" & my jsonString(frontName) & ",\"pid\":" & frontProcessId & "},\"probeError\":" & my jsonString(probeError) & "}"
   return my emitSuccess(payload)
 end capabilitiesResult

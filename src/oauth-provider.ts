@@ -11,10 +11,15 @@ import type {
 } from "@modelcontextprotocol/sdk/shared/auth.js";
 import { checkResourceAllowed, resourceUrlFromServerUrl } from "@modelcontextprotocol/sdk/shared/auth-utils.js";
 import {
+  ConnectorStateConflictError,
   SqliteOAuthClientsStore,
   SqliteOAuthStore,
+  type ConnectorAuthenticationContext,
+  type ConnectorBindingRecord,
+  type ConnectorReadinessSummary,
   type PersistedRefreshTokenRecord,
 } from "./oauth-store.js";
+import type { UniversalBrokerMetrics } from "./v2/metrics.js";
 
 export interface OAuthConfig {
   ownerToken: string;
@@ -64,7 +69,7 @@ function formHtml(params: {
   resource?: URL;
   fields: Record<string, string | undefined>;
 }): string {
-  const scopeText = params.scopes.length > 0 ? params.scopes.join(" ") : "devspace";
+  const scopeText = params.scopes.length > 0 ? params.scopes.join(" ") : "No tool scope requested";
   const resourceText = params.resource?.href ?? "DevSpace MCP endpoint";
   const error = params.error
     ? `<p class="error">${htmlEscape(params.error)}</p>`
@@ -131,12 +136,23 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     private readonly config: OAuthConfig,
     resourceServerUrl: URL,
     stateDir: string,
+    metrics?: UniversalBrokerMetrics,
   ) {
     this.resourceServerUrl = resourceUrlFromServerUrl(resourceServerUrl);
     this.canonicalConnector = config.canonicalConnector ?? canonicalConnectorFromEnvironment(process.env);
     if (this.canonicalConnector) validateCanonicalConnector(this.canonicalConnector);
-    this.oauthStore = new SqliteOAuthStore(stateDir);
-    this.clientsStore = new SqliteOAuthClientsStore(this.oauthStore, config.allowedRedirectHosts);
+    this.oauthStore = new SqliteOAuthStore(stateDir, metrics);
+    this.clientsStore = new SqliteOAuthClientsStore(
+      this.oauthStore,
+      config.allowedRedirectHosts,
+      this.canonicalConnector
+        ? {
+            canonicalName: this.canonicalConnector.name,
+            installationEpoch: this.canonicalConnector.installationEpoch,
+            schemaGeneration: this.canonicalConnector.schemaGeneration,
+          }
+        : undefined,
+    );
   }
 
   async authorize(
@@ -149,6 +165,10 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     }
     if (!requestedScopesAllowed(params.scopes ?? [], this.config.scopes)) {
       throw new InvalidRequestError("Requested scope is not supported");
+    }
+    if (this.canonicalConnector
+      && !this.oauthStore.connectorCanIssueAuthorizationCode(this.canonicalConnector.name, client.client_id)) {
+      throw new AccessDeniedError("Connector binding cannot issue a new authorization code while draining or retired");
     }
 
     if (res.req.method !== "POST") {
@@ -230,7 +250,10 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     if (!record || record.clientId !== client.client_id || record.expiresAt < Math.floor(Date.now() / 1000)) {
       throw new InvalidGrantError("Invalid refresh token");
     }
-    if (!this.oauthStore.credentialBindingIsCurrent(record)) {
+    if (this.canonicalConnector && !record.connectorBindingId) {
+      throw new InvalidGrantError("Refresh token is not bound to a connector candidate or ACTIVE binding");
+    }
+    if (!this.oauthStore.refreshTokenBindingIsCurrent(record)) {
       throw new InvalidGrantError("Refresh token belongs to a stale connector binding or token family");
     }
     if (resource && !checkResourceAllowed({ requestedResource: resource, configuredResource: this.resourceServerUrl })) {
@@ -255,9 +278,27 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     if (!record || record.expiresAt < Math.floor(Date.now() / 1000)) {
       throw new InvalidTokenError("Invalid or expired access token");
     }
-    if (!this.oauthStore.credentialBindingIsCurrent(record)) {
+    if (this.canonicalConnector && !record.connectorBindingId) {
+      throw new InvalidTokenError("Access token is not bound to a connector candidate or ACTIVE binding");
+    }
+    if (!this.oauthStore.accessTokenBindingIsCurrent(record)) {
       throw new InvalidTokenError("Access token belongs to a stale connector binding or token family");
     }
+    const connectorBinding = record.connectorBindingId
+      ? this.oauthStore.getConnectorBinding(record.connectorBindingId)
+      : undefined;
+    const connectorContext: ConnectorAuthenticationContext | undefined = connectorBinding
+      ? {
+          bindingId: connectorBinding.bindingId,
+          canonicalName: connectorBinding.canonicalName,
+          state: connectorBinding.state,
+          installationEpoch: connectorBinding.installationEpoch,
+          schemaGeneration: connectorBinding.schemaGeneration,
+          buildDigest: connectorBinding.buildDigest,
+          drainDeadlineAt: connectorBinding.drainDeadlineAt,
+          activationRequired: !["ACTIVE", "DRAINING"].includes(connectorBinding.state),
+        }
+      : undefined;
 
     return {
       token,
@@ -265,6 +306,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
       scopes: record.scopes,
       expiresAt: record.expiresAt,
       resource: record.resource ? new URL(record.resource) : undefined,
+      extra: connectorContext ? { devspaceConnector: connectorContext } : undefined,
     };
   }
 
@@ -272,6 +314,14 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     const hashed = hashToken(request.token);
     this.oauthStore.deleteAccessToken(hashed);
     this.oauthStore.deleteRefreshToken(hashed);
+  }
+
+  connectorReadiness(canonicalName = this.canonicalConnector?.name, nowMs = Date.now()): ConnectorReadinessSummary {
+    return this.oauthStore.connectorReadiness(canonicalName, nowMs);
+  }
+
+  activeConnectorBinding(canonicalName = this.canonicalConnector?.name): ConnectorBindingRecord | undefined {
+    return canonicalName ? this.oauthStore.getActiveConnectorBinding(canonicalName) : undefined;
   }
 
   close(): void {
@@ -300,16 +350,27 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     const refreshToken = randomToken();
     const accessExpiresAt = now + this.config.accessTokenTtlSeconds;
     const refreshExpiresAt = now + this.config.refreshTokenTtlSeconds;
-    const connectorBinding = consumed?.record.connectorBindingId
-      ? undefined
-      : this.canonicalConnector
-        ? this.oauthStore.ensureCanonicalConnectorBinding({
-            canonicalName: this.canonicalConnector.name,
-            clientId,
-            installationEpoch: this.canonicalConnector.installationEpoch,
-            schemaGeneration: this.canonicalConnector.schemaGeneration,
-          })
+    let connectorBinding: ConnectorBindingRecord | undefined;
+    try {
+      const registeredBinding = this.canonicalConnector
+        ? this.oauthStore.getConnectorBindingForClient(this.canonicalConnector.name, clientId)
         : undefined;
+      connectorBinding = consumed?.record.connectorBindingId
+        ? undefined
+        : this.canonicalConnector
+          ? this.oauthStore.ensureCandidateConnectorBinding({
+              canonicalName: this.canonicalConnector.name,
+              clientId,
+              installationEpoch: registeredBinding?.installationEpoch ?? this.canonicalConnector.installationEpoch,
+              schemaGeneration: registeredBinding?.schemaGeneration ?? this.canonicalConnector.schemaGeneration,
+            })
+          : undefined;
+    } catch (error) {
+      if (error instanceof ConnectorStateConflictError) {
+        throw new InvalidGrantError("Connector binding is not eligible for a new token family");
+      }
+      throw error;
+    }
     const binding = {
       familyId: consumed?.record.familyId ?? `family-${randomUUID()}`,
       connectorBindingId: consumed?.record.connectorBindingId ?? connectorBinding?.bindingId,

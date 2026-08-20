@@ -15,6 +15,7 @@ import { dirname, extname, isAbsolute, join, resolve } from "node:path";
 import { parse as parseYaml } from "yaml";
 import * as z from "zod/v4";
 import { expandHomePath } from "../roots.js";
+import { BASE_PRODUCT_PROFILE } from "./build-capabilities.js";
 
 const IDENTIFIER_PATTERN = /^[a-z][a-z0-9._-]{0,63}$/u;
 const CONNECTOR_PATTERN = /^[A-Za-z][A-Za-z0-9._-]{0,127}$/u;
@@ -80,22 +81,16 @@ const serverSchema = z.strictObject({
   allowedHosts: z.array(singleLine(256)).max(256).optional(),
 });
 
-const subjectClaimPolicySchema = z.strictObject({
-  claim: singleLine(128),
-  required: z.boolean().optional(),
-});
-
 const oauthSchema = z.strictObject({
   issuer: z.url().optional(),
   resource: z.url().optional(),
-  principalMode: z.enum(["single-owner", "multi-user"]).optional(),
+  principalMode: z.literal("single-owner").optional(),
   ownerInstanceId: singleLine(512).optional(),
-  subjectClaimPolicy: subjectClaimPolicySchema.optional(),
   capabilityScopes: z.array(singleLine(128)).max(32).optional(),
   allowOfflineAccess: z.boolean().optional(),
-  legacyBlanketScopeCompatibility: z.boolean().optional(),
-  adminScopeEnabled: z.boolean().optional(),
-  allowAnonymousSessionFallback: z.boolean().optional(),
+  legacyBlanketScopeCompatibility: z.literal(false).optional(),
+  adminScopeEnabled: z.literal(false).optional(),
+  allowAnonymousSessionFallback: z.literal(false).optional(),
 });
 
 const riskTtlSchema = z.strictObject({
@@ -112,21 +107,23 @@ const maximumUsesSchema = z.strictObject({
 
 const authoritySchema = z.strictObject({
   mode: z.enum(["enforced", "audit", "disabled"]).optional(),
-  deployment: z.enum(["in-process", "sidecar"]).optional(),
-  endpoint: z.union([z.url(), z.string().startsWith("unix://")]).nullable().optional(),
+  deployment: z.literal("in-process").optional(),
+  approvalAssurance: z.literal("cooperative").optional(),
   stateDirectory: pathText.optional(),
   storePath: pathText.optional(),
   r0FastPath: z.boolean().optional(),
-  requireHostAttestation: z.boolean().optional(),
   authorityTtlSeconds: riskTtlSchema.optional(),
-  resourceLeaseTtlSeconds: positiveInteger(86_400).optional(),
+  resourceLease: z.strictObject({
+    ttlSeconds: positiveInteger(86_400).optional(),
+    heartbeatSeconds: positiveInteger(86_400).optional(),
+    recoveryGraceSeconds: positiveInteger(86_400).optional(),
+  }).optional(),
   maximumActionsPerPlan: positiveInteger(1_024).optional(),
   maximumUses: maximumUsesSchema.optional(),
 });
 
 const restartPolicySchema = z.strictObject({
   maximumAttempts: positiveInteger(100).optional(),
-  delayMs: positiveInteger(60_000).optional(),
   maximumDelayMs: positiveInteger(600_000).optional(),
 });
 
@@ -137,7 +134,55 @@ const supervisorSchema = z.strictObject({
   expectedScript: pathText.optional(),
   transactionDirectory: pathText.optional(),
   healthTimeoutMs: positiveInteger(600_000).optional(),
+  responseFlushRequired: z.literal(true).optional(),
   restartPolicy: restartPolicySchema.optional(),
+});
+
+const paginationSchema = z.strictObject({
+  cursorTtlSeconds: positiveInteger(86_400).optional(),
+  maximumSnapshotsPerPrincipal: positiveInteger(10_000).optional(),
+  signingKeyRef: singleLine(512),
+  previousSigningKeyRef: singleLine(512).optional(),
+});
+
+const artifactSchema = z.strictObject({
+  catalogPath: pathText,
+  objectRoot: pathText,
+  defaultTtlSeconds: positiveInteger(86_400).optional(),
+  maximumArtifactBytes: positiveInteger(10 * 1_024 * 1_024 * 1_024).optional(),
+  maximumTotalBytes: positiveInteger(10 * 1_024 * 1_024 * 1_024).optional(),
+});
+
+const connectorSchema = z.strictObject({
+  canonicalName: z.string().regex(CONNECTOR_PATTERN),
+  installationEpoch: positiveInteger(Number.MAX_SAFE_INTEGER).optional(),
+  activationMode: z.literal("owner-approved"),
+  drainGraceSeconds: positiveInteger(86_400).optional(),
+});
+
+const tokenBucketSchema = z.strictObject({
+  refillPerMinute: positiveInteger(1_000_000),
+  burst: positiveInteger(1_000_000),
+});
+
+const rateLimitSchema = z.strictObject({
+  mode: z.literal("internal"),
+  preAuth: tokenBucketSchema,
+  postAuth: tokenBucketSchema,
+  initialize: tokenBucketSchema,
+});
+
+const managementSchema = z.strictObject({
+  bind: singleLine(256),
+  port: positiveInteger(65_535),
+  publicExposure: z.literal("deny"),
+  authorizationKeyRef: pathText.optional(),
+});
+
+const auditSchema = z.strictObject({
+  sink: pathText,
+  flushIntervalMs: positiveInteger(60_000).optional(),
+  rawArguments: z.literal(false).optional(),
 });
 
 const storageSchema = z.strictObject({
@@ -152,6 +197,9 @@ const storageSchema = z.strictObject({
   envProfileConfig: pathText.optional(),
   targetConfig: pathText.optional(),
   mcpRouteConfig: pathText.optional(),
+  connectorActivationJournal: pathText.optional(),
+  lifecycleFinalizationStore: pathText.optional(),
+  lifecycleFinalizationControl: pathText.optional(),
   stateFileMode: z.literal("0600").optional(),
   directoryMode: z.literal("0700").optional(),
 });
@@ -161,6 +209,7 @@ const quotasSchema = z.strictObject({
   processes: positiveInteger(10_000).optional(),
   concurrentProcesses: positiveInteger(1_024).optional(),
   mcpConnections: positiveInteger(256).optional(),
+  mcpRetainedResultBytes: positiveInteger(10 * 1_024 * 1_024 * 1_024).optional(),
   guiSessions: positiveInteger(1_000).optional(),
   artifacts: positiveInteger(10_000).optional(),
   inlineOutputBytes: positiveInteger(100_000_000).optional(),
@@ -172,6 +221,7 @@ const ttlSchema = z.strictObject({
   contextSeconds: positiveInteger(86_400).optional(),
   completedProcessSeconds: positiveInteger(86_400).optional(),
   mcpIdleSeconds: positiveInteger(3_600).optional(),
+  mcpRetainedResultSeconds: positiveInteger(86_400).optional(),
   guiSeconds: positiveInteger(86_400).optional(),
   artifactSeconds: positiveInteger(86_400).optional(),
   cursorSnapshotSeconds: positiveInteger(86_400).optional(),
@@ -250,7 +300,7 @@ const routeSchema = z.strictObject({
 
 const observabilitySchema = z.strictObject({
   publicHealth: z.boolean().optional(),
-  publicMetrics: z.boolean().optional(),
+  publicMetrics: z.literal(false).optional(),
   logLevel: z.enum(["silent", "error", "warn", "info", "debug"]).optional(),
   redactSecrets: z.boolean().optional(),
 });
@@ -269,12 +319,19 @@ const releaseSchema = z.strictObject({
 
 export const unifiedConfigSchema = z.strictObject({
   version: z.literal(2),
+  productProfile: z.literal(BASE_PRODUCT_PROFILE),
   profile: z.enum(["development", "production"]).optional(),
   deploymentMode: z.enum(["parallel", "production"]).optional(),
   server: serverSchema.optional(),
   oauth: oauthSchema.optional(),
   authority: authoritySchema.optional(),
   supervisor: supervisorSchema.optional(),
+  pagination: paginationSchema.optional(),
+  artifact: artifactSchema.optional(),
+  connector: connectorSchema.optional(),
+  rateLimit: rateLimitSchema.optional(),
+  management: managementSchema.optional(),
+  audit: auditSchema.optional(),
   storage: storageSchema.optional(),
   quotas: quotasSchema.optional(),
   ttls: ttlSchema.optional(),
@@ -379,20 +436,26 @@ export function unifiedConfigEnvironment(
     DEVSPACE_V2_DEPLOYMENT_MODE: deploymentMode,
     DEVSPACE_NEXT_HOST: config.server?.dataPlane?.host,
     DEVSPACE_NEXT_PORT: numberText(config.server?.dataPlane?.port),
-    DEVSPACE_NEXT_MANAGEMENT_HOST: config.server?.managementPlane?.host,
-    DEVSPACE_NEXT_MANAGEMENT_PORT: numberText(config.server?.managementPlane?.port),
+    DEVSPACE_NEXT_MANAGEMENT_HOST: config.management?.bind ?? config.server?.managementPlane?.host,
+    DEVSPACE_NEXT_MANAGEMENT_PORT: numberText(config.management?.port ?? config.server?.managementPlane?.port),
+    DEVSPACE_NEXT_MANAGEMENT_AUTHORIZATION_KEY_REF: config.management?.authorizationKeyRef,
     DEVSPACE_NEXT_PUBLIC_BASE_URL: config.server?.publicBaseUrl,
     DEVSPACE_NEXT_MCP_PATH: config.server?.mcpPath,
     DEVSPACE_NEXT_ALLOWED_HOSTS: config.server?.allowedHosts?.join(","),
-    DEVSPACE_NEXT_CANONICAL_CONNECTOR_NAME: config.server?.canonicalConnectorName,
+    DEVSPACE_NEXT_CANONICAL_CONNECTOR_NAME:
+      config.connector?.canonicalName ?? config.server?.canonicalConnectorName,
     DEVSPACE_NEXT_AUTHORITY_PRINCIPAL_MODE: config.oauth?.principalMode,
     DEVSPACE_NEXT_AUTHORITY_OWNER_INSTANCE_ID: config.oauth?.ownerInstanceId,
     DEVSPACE_NEXT_AUTHORITY_DEPLOYMENT: config.authority?.deployment,
+    DEVSPACE_NEXT_AUTHORITY_APPROVAL_ASSURANCE: config.authority?.approvalAssurance,
     DEVSPACE_V2_LEGACY_SCOPE_COMPATIBILITY: booleanText(config.oauth?.legacyBlanketScopeCompatibility),
     DEVSPACE_NEXT_STATE_DIR: stateDirectory,
     DEVSPACE_NEXT_OAUTH_STATE_DIR: config.storage?.oauthStateDirectory,
     DEVSPACE_NEXT_AUTHORITY_STORE: config.authority?.storePath
       ?? (authorityDirectory ? join(authorityDirectory, "authority.sqlite") : undefined),
+    DEVSPACE_NEXT_CONNECTOR_ACTIVATION_JOURNAL: config.storage?.connectorActivationJournal,
+    DEVSPACE_NEXT_LIFECYCLE_FINALIZATION_STORE: config.storage?.lifecycleFinalizationStore,
+    DEVSPACE_NEXT_LIFECYCLE_FINALIZATION_CONTROL: config.storage?.lifecycleFinalizationControl,
     DEVSPACE_NEXT_TARGETS_FILE: config.storage?.targetConfig,
     DEVSPACE_NEXT_MCP_ROUTES_FILE: config.storage?.mcpRouteConfig,
     DEVSPACE_NEXT_CONTEXT_STORE: config.storage?.contextStore,
@@ -401,11 +464,23 @@ export function unifiedConfigEnvironment(
     DEVSPACE_NEXT_PROCESS_OUTPUT_DIR: config.storage?.processOutputRoot,
     DEVSPACE_NEXT_SSH_CONTROL_DIR: config.storage?.sshControlDirectory,
     DEVSPACE_NEXT_ARTIFACT_STAGING_DIR: config.storage?.artifactRoot,
+    DEVSPACE_NEXT_ARTIFACT_CATALOG: config.artifact?.catalogPath,
+    DEVSPACE_NEXT_ARTIFACT_OBJECT_ROOT: config.artifact?.objectRoot,
     DEVSPACE_NEXT_SELF_MANAGEMENT_DIR: config.supervisor?.transactionDirectory,
     DEVSPACE_NEXT_PM2_PROCESS_NAME: config.supervisor?.processName,
     DEVSPACE_NEXT_PM2_EXPECTED_SCRIPT: config.supervisor?.expectedScript,
-    DEVSPACE_NEXT_SELF_RESTART_DELAY_MS: numberText(config.supervisor?.restartPolicy?.delayMs),
     DEVSPACE_NEXT_SELF_RESTART_TIMEOUT_MS: numberText(config.supervisor?.healthTimeoutMs),
+    DEVSPACE_NEXT_AUTHORITY_RESOURCE_LEASE_TTL_SECONDS:
+      numberText(config.authority?.resourceLease?.ttlSeconds),
+    DEVSPACE_NEXT_AUTHORITY_RESOURCE_LEASE_HEARTBEAT_SECONDS:
+      numberText(config.authority?.resourceLease?.heartbeatSeconds),
+    DEVSPACE_NEXT_AUTHORITY_RESOURCE_LEASE_RECOVERY_GRACE_SECONDS:
+      numberText(config.authority?.resourceLease?.recoveryGraceSeconds),
+    DEVSPACE_NEXT_CURSOR_TTL_MS: secondsAsMilliseconds(config.pagination?.cursorTtlSeconds),
+    DEVSPACE_NEXT_CURSOR_MAXIMUM_SNAPSHOTS_PER_PRINCIPAL:
+      numberText(config.pagination?.maximumSnapshotsPerPrincipal),
+    DEVSPACE_NEXT_CURSOR_SIGNING_KEY_REF: config.pagination?.signingKeyRef,
+    DEVSPACE_NEXT_CURSOR_PREVIOUS_SIGNING_KEY_REF: config.pagination?.previousSigningKeyRef,
     DEVSPACE_NEXT_CONTEXT_MAXIMUM_ENTRIES: numberText(config.quotas?.contexts),
     DEVSPACE_NEXT_MAXIMUM_PROCESS_RECORDS: numberText(config.quotas?.processes),
     DEVSPACE_NEXT_MAX_RUNNING_PROCESSES: numberText(config.quotas?.concurrentProcesses),
@@ -413,18 +488,37 @@ export function unifiedConfigEnvironment(
     DEVSPACE_NEXT_PROCESS_BUFFER_CHARACTERS: numberText(config.quotas?.inlineOutputBytes),
     DEVSPACE_NEXT_PROCESS_OUTPUT_MAX_BYTES: numberText(config.quotas?.processOutputBytes),
     DEVSPACE_NEXT_DOWNSTREAM_MCP_MAXIMUM_SESSIONS: numberText(config.quotas?.mcpConnections),
+    DEVSPACE_NEXT_MCP_RESULT_MAXIMUM_BYTES: numberText(config.quotas?.mcpRetainedResultBytes),
     DEVSPACE_NEXT_GUI_MAXIMUM_SESSIONS: numberText(config.quotas?.guiSessions),
     DEVSPACE_NEXT_ARTIFACT_MAXIMUM_ENTRIES: numberText(config.quotas?.artifacts),
-    DEVSPACE_NEXT_ARTIFACT_MAXIMUM_TOTAL_BYTES: numberText(config.quotas?.artifactMaxBytes),
-    DEVSPACE_NEXT_ARTIFACT_MAXIMUM_FILE_BYTES: numberText(config.quotas?.artifactMaxBytes),
+    DEVSPACE_NEXT_ARTIFACT_MAXIMUM_TOTAL_BYTES:
+      numberText(config.artifact?.maximumTotalBytes ?? config.quotas?.artifactMaxBytes),
+    DEVSPACE_NEXT_ARTIFACT_MAXIMUM_FILE_BYTES:
+      numberText(config.artifact?.maximumArtifactBytes ?? config.quotas?.artifactMaxBytes),
     DEVSPACE_NEXT_CONTEXT_IDLE_TTL_MS: secondsAsMilliseconds(config.ttls?.contextSeconds),
     DEVSPACE_NEXT_COMPLETED_PROCESS_TTL_MS: secondsAsMilliseconds(config.ttls?.completedProcessSeconds),
     DEVSPACE_NEXT_DOWNSTREAM_MCP_SESSION_IDLE_TTL_MS: secondsAsMilliseconds(config.ttls?.mcpIdleSeconds),
     DEVSPACE_NEXT_GUI_SESSION_TTL_MS: secondsAsMilliseconds(config.ttls?.guiSeconds),
-    DEVSPACE_NEXT_ARTIFACT_TTL_MS: secondsAsMilliseconds(config.ttls?.artifactSeconds),
+    DEVSPACE_NEXT_ARTIFACT_TTL_MS:
+      secondsAsMilliseconds(config.artifact?.defaultTtlSeconds ?? config.ttls?.artifactSeconds),
     DEVSPACE_NEXT_CONTEXT_DIFF_TTL_MS: secondsAsMilliseconds(config.ttls?.cursorSnapshotSeconds),
-    DEVSPACE_NEXT_MCP_RESULT_TTL_MS: secondsAsMilliseconds(config.ttls?.cursorSnapshotSeconds),
+    DEVSPACE_NEXT_MCP_RESULT_TTL_MS: secondsAsMilliseconds(config.ttls?.mcpRetainedResultSeconds),
     DEVSPACE_LOG_LEVEL: config.observability?.logLevel,
+    DEVSPACE_OAUTH_CONNECTOR_INSTALLATION_EPOCH:
+      numberText(config.connector?.installationEpoch),
+    DEVSPACE_NEXT_CONNECTOR_DRAIN_GRACE_SECONDS: numberText(config.connector?.drainGraceSeconds),
+    DEVSPACE_NEXT_RATE_LIMIT_MODE: config.rateLimit?.mode,
+    DEVSPACE_NEXT_RATE_LIMIT_PRE_AUTH_REFILL_PER_MINUTE:
+      numberText(config.rateLimit?.preAuth.refillPerMinute),
+    DEVSPACE_NEXT_RATE_LIMIT_PRE_AUTH_BURST: numberText(config.rateLimit?.preAuth.burst),
+    DEVSPACE_NEXT_RATE_LIMIT_POST_AUTH_REFILL_PER_MINUTE:
+      numberText(config.rateLimit?.postAuth.refillPerMinute),
+    DEVSPACE_NEXT_RATE_LIMIT_POST_AUTH_BURST: numberText(config.rateLimit?.postAuth.burst),
+    DEVSPACE_NEXT_RATE_LIMIT_INITIALIZE_REFILL_PER_MINUTE:
+      numberText(config.rateLimit?.initialize.refillPerMinute),
+    DEVSPACE_NEXT_RATE_LIMIT_INITIALIZE_BURST: numberText(config.rateLimit?.initialize.burst),
+    DEVSPACE_NEXT_AUDIT_SINK: config.audit?.sink,
+    DEVSPACE_NEXT_AUDIT_FLUSH_INTERVAL_MS: numberText(config.audit?.flushIntervalMs),
   };
   return Object.fromEntries(Object.entries(values).filter((entry): entry is [string, string] => entry[1] !== undefined));
 }
@@ -469,7 +563,7 @@ export function canonicalJson(value: unknown): string {
   if (value && typeof value === "object") {
     return `{${Object.entries(value as Record<string, unknown>)
       .filter(([, child]) => child !== undefined)
-      .sort(([left], [right]) => left.localeCompare(right))
+      .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
       .map(([key, child]) => `${JSON.stringify(key)}:${canonicalJson(child)}`)
       .join(",")}}`;
   }

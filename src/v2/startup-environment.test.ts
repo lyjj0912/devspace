@@ -38,7 +38,7 @@ test("startup environment file overrides and removes inherited DevSpace variable
     ownerToken: "<unset>",
     configDir: "/from-file/config",
     expectedScript: "/from-file/start.sh",
-    args: `${resolve("dist/cli.js")} serve-next`,
+    args: `--import ${resolve("scripts/lib/runtime-dependency-loader.mjs")} ${resolve("dist/cli.js")} serve-next`,
   });
 });
 
@@ -71,12 +71,21 @@ async function createFixture(t: test.TestContext, lines: string[]) {
   const bin = join(root, "bin");
   await mkdir(bin, { recursive: true });
   const environmentFile = join(root, "runtime.env");
-  await writeFile(environmentFile, `${lines.join("\n")}\n`, { mode: 0o600 });
+  const productionRuntime = [
+    `DEVSPACE_RUNTIME_PACKAGE_ROOT=${resolve(".")}`,
+    `DEVSPACE_RUNTIME_DEPENDENCY_ROOT=${join(root, "runtime-dependencies")}`,
+    `DEVSPACE_RUNTIME_DEPENDENCY_EVIDENCE=${join(root, "runtime-dependencies.json")}`,
+    `DEVSPACE_EXPECTED_RUNTIME_DEPENDENCY_EVIDENCE_SHA256=sha256:${"1".repeat(64)}`,
+    `DEVSPACE_RELEASE_MANIFEST=${resolve("BUILD-MANIFEST.json")}`,
+    `DEVSPACE_EXPECTED_RELEASE_MANIFEST_SHA256=sha256:${"2".repeat(64)}`,
+  ];
+  await writeFile(environmentFile, `${[...lines, ...productionRuntime].join("\n")}\n`, { mode: 0o600 });
   await chmod(environmentFile, 0o600);
   const fakeNode = join(bin, "node");
   await writeFile(fakeNode, [
     "#!/bin/bash",
     "set -euo pipefail",
+    "if [[ \"${1-}\" == " + JSON.stringify(resolve("scripts/release-artifacts.mjs")) + " ]]; then exit 0; fi",
     "printf 'deployment=%s\\n' \"${DEVSPACE_V2_DEPLOYMENT_MODE-<unset>}\"",
     "printf 'port=%s\\n' \"${DEVSPACE_NEXT_PORT-<unset>}\"",
     "printf 'legacy=%s\\n' \"${DEVSPACE_V2_LEGACY_SCOPE_COMPATIBILITY-<unset>}\"",

@@ -228,7 +228,7 @@ function TrashItem([string]$Path, $Options) {
   else { [void](MoveFileSafe $Path $payload ([pscustomobject]@{ overwrite = $false; createParents = $false; finalSymlink = 'replace' })) }
   $metadata.state = 'AVAILABLE'
   WriteJsonSync (Join-Path $entry 'metadata.json') $metadata
-  return @{ path = $Path; removed = $true; disposition = 'trash'; recoverable = $true; trashId = $trashId; restoreOperation = 'restore' }
+  return @{ path = $Path; removed = $true; disposition = 'trash'; recoverable = $true; trashId = $trashId }
 }
 
 function RestoreItem([string]$TrashId, [string]$Destination, $Options) {
@@ -366,7 +366,7 @@ try {
       $data = @{ path = $temporary; removed = $true }
       break
     }
-    { $_ -in @('copy','sync') } {
+    'copy' {
       $sourceItem = Get-Item -LiteralPath $path -Force
       if ($sourceItem.PSIsContainer) {
         if (-not [bool]$options.recursive) { throw 'recursive-required' }
@@ -380,13 +380,13 @@ try {
           Copy-Item -LiteralPath $path -Destination $temporary -Recurse
           if (Existing $destination) { throw 'destination-preimage-changed' }
           [IO.Directory]::Move($temporary, $destination)
-          $data = @{ source = $path; destination = $destination; copied = $true; overwritten = $false; synchronized = $op -eq 'sync' }
+          $data = @{ source = $path; destination = $destination; copied = $true; overwritten = $false }
         } finally {
           if (Existing $temporary) { Remove-Item -LiteralPath $temporary -Force -Recurse -ErrorAction SilentlyContinue }
         }
       } else {
         $published = CopyFileAtomic $path $destination $options
-        $data = @{ source = $path; destination = $destination; copied = $true; overwritten = [bool]$published.overwritten; synchronized = $op -eq 'sync'; size = [int64]$published.size; sha256 = [string]$published.sha256 }
+        $data = @{ source = $path; destination = $destination; copied = $true; overwritten = [bool]$published.overwritten; size = [int64]$published.size; sha256 = [string]$published.sha256 }
       }
       break
     }

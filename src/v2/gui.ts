@@ -279,6 +279,7 @@ export class UniversalGuiService {
         available: false,
         platform: target.platform,
         guiMode: target.gui.mode,
+        screenCapture: false,
         reason: "The current generic GUI node implements macOS Accessibility only.",
       };
     }
@@ -289,6 +290,7 @@ export class UniversalGuiService {
         available: false,
         platform: target.platform,
         guiMode: target.gui.mode,
+        screenCapture: false,
         reason: "GUI is disabled for this target in the target registry.",
       };
     }
@@ -303,6 +305,7 @@ export class UniversalGuiService {
           available: false,
           platform: target.platform,
           guiMode: target.gui.mode,
+          screenCapture: false,
           reason: error.message,
         };
       }
@@ -320,6 +323,7 @@ export class UniversalGuiService {
       available,
       guiMode: target.gui.mode,
       ...node,
+      screenCapture: false,
       ...(!available
         ? { reason: nodeReason ?? `macOS Accessibility UI scripting is disabled for target ${target.id}.` }
         : {}),

@@ -6,17 +6,30 @@ import {
   type CapabilityCallContextProvider,
 } from "./capability-call-context.js";
 import { UniversalBrokerError } from "./errors.js";
-import { SynchronousQuotaReservations } from "./quota-reservations.js";
+import type { UniversalBrokerMetrics } from "./metrics.js";
+import {
+  SynchronousQuotaReservations,
+  type QuotaReservation,
+} from "./quota-reservations.js";
 import {
   RESOURCE_DEFAULT_MCP_CONNECTIONS,
   RESOURCE_DEFAULT_MCP_IDLE_TTL_MS,
+  RESOURCE_DEFAULT_MCP_RESULT_MAX_BYTES,
 } from "./resource-defaults.js";
+import {
+  createEphemeralResourceContinuation,
+  isResourceContinuationToken,
+  SignedResourceContinuation,
+} from "./resource-continuation.js";
+import { formatResourceUri, parseResourceUri, ResourceUriError } from "./resource-uri.js";
 
 interface ResultRecord {
   id: string;
+  generation: string;
   routeId: string;
   principalKeyFingerprint: string;
   serialized: string;
+  bytes: number;
   createdAt: number;
   expiresAt: number;
   lastUsedAt: number;
@@ -24,11 +37,13 @@ interface ResultRecord {
 
 export interface UniversalMcpResultStoreOptions {
   maximumEntries?: number;
-  maximumTotalCharacters?: number;
+  maximumTotalBytes?: number;
   ttlMs?: number;
   now?: () => number;
   ownerProvider?: CapabilityCallContextProvider;
   compatibilityAuthority?: string;
+  metrics?: UniversalBrokerMetrics;
+  continuation?: SignedResourceContinuation;
 }
 
 export interface ParsedMcpResultUri {
@@ -42,12 +57,15 @@ export interface ParsedMcpResultUri {
 export class UniversalMcpResultStore {
   private readonly records = new Map<string, ResultRecord>();
   private readonly maximumEntries: number;
-  private readonly maximumTotalCharacters: number;
+  private readonly maximumTotalBytes: number;
   private readonly ttlMs: number;
   private readonly now: () => number;
+  private readonly continuation: SignedResourceContinuation;
   private readonly ownerProvider: CapabilityCallContextProvider;
-  private readonly reservations: SynchronousQuotaReservations;
-  private totalCharacters = 0;
+  private readonly metrics?: UniversalBrokerMetrics;
+  private readonly reservationsByPrincipal = new Map<string, SynchronousQuotaReservations>();
+  private readonly usageByPrincipal = new Map<string, { entries: number; bytes: number }>();
+  private totalBytes = 0;
 
   constructor(options: UniversalMcpResultStoreOptions = {}) {
     this.maximumEntries = boundedInteger(
@@ -56,11 +74,11 @@ export class UniversalMcpResultStore {
       1,
       10_000,
     );
-    this.maximumTotalCharacters = boundedInteger(
-      options.maximumTotalCharacters,
-      10_000_000,
-      1_000,
-      1_000_000_000,
+    this.maximumTotalBytes = boundedInteger(
+      options.maximumTotalBytes,
+      RESOURCE_DEFAULT_MCP_RESULT_MAX_BYTES,
+      1,
+      10 * 1024 * 1024 * 1024,
     );
     this.ttlMs = boundedInteger(
       options.ttlMs,
@@ -69,16 +87,15 @@ export class UniversalMcpResultStore {
       86_400_000,
     );
     this.now = options.now ?? Date.now;
+    this.continuation = options.continuation
+      ?? createEphemeralResourceContinuation({ now: this.now });
     const compatibilityOwner = createCapabilityCallContextFromTrustedPrincipal({
       principalKeyFingerprint: createHash("sha256")
         .update(options.compatibilityAuthority ?? "legacy-single-owner-mcp-result-store")
         .digest("hex"),
     });
     this.ownerProvider = options.ownerProvider ?? (() => compatibilityOwner);
-    this.reservations = new SynchronousQuotaReservations("mcp-result", {
-      entries: this.maximumEntries,
-      characters: this.maximumTotalCharacters,
-    });
+    this.metrics = options.metrics;
   }
 
   put(
@@ -89,36 +106,50 @@ export class UniversalMcpResultStore {
     resultId: string;
     resourceUri: string;
     characters: number;
+    bytes: number;
     expiresAt: string;
   } {
     const owner = this.owner(callContext);
     const canonicalRouteId = requireRouteId(routeId);
     const serialized = JSON.stringify(value) ?? "null";
+    const bytes = Buffer.byteLength(serialized, "utf8");
     this.pruneExpired();
-    const reservation = this.reservations.reserve(
-      { entries: this.records.size, characters: this.totalCharacters },
-      { entries: 1, characters: serialized.length },
-    );
+    const usage = this.usage(owner.principalKeyFingerprint);
+    let reservation: QuotaReservation;
+    try {
+      reservation = this.reservations(owner.principalKeyFingerprint).reserve(
+        usage,
+        { entries: 1, bytes },
+      );
+    } catch (error) {
+      this.recordQuotaRejection();
+      throw error;
+    }
     try {
       const now = this.now();
       const id = randomUUID();
       const record: ResultRecord = {
         id,
+        generation: randomUUID(),
         routeId: canonicalRouteId,
         principalKeyFingerprint: owner.principalKeyFingerprint,
         serialized,
+        bytes,
         createdAt: now,
         expiresAt: now + this.ttlMs,
         lastUsedAt: now,
       };
       reservation.commit(() => {
         this.records.set(id, record);
-        this.totalCharacters += serialized.length;
+        usage.entries += 1;
+        usage.bytes += bytes;
+        this.totalBytes += bytes;
       });
       return {
         resultId: id,
-        resourceUri: resultUri(canonicalRouteId, id, 0, 12_000),
+        resourceUri: resultUri(id),
         characters: serialized.length,
+        bytes,
         expiresAt: new Date(record.expiresAt).toISOString(),
       };
     } finally {
@@ -127,8 +158,36 @@ export class UniversalMcpResultStore {
   }
 
   readByUri(uri: string, callContext?: CapabilityCallContext): Record<string, unknown> {
+    const owner = this.owner(callContext);
     const parsed = parseResultUri(uri);
-    return this.read(parsed.id, parsed.offset, parsed.limit, uri, callContext, parsed.routeId);
+    if (!parsed.legacy && isResourceContinuationToken(parsed.id)) {
+      const verified = this.continuation.verify({
+        token: parsed.id,
+        principalKeyFingerprint: owner.principalKeyFingerprint,
+        resourceKind: "mcp-result",
+        resolveResource: (id) => {
+          const record = this.records.get(id);
+          return record
+            ? { generation: record.generation, expiresAtMs: record.expiresAt }
+            : undefined;
+        },
+      });
+      return this.read(
+        verified.resourceIdentity,
+        verified.offset,
+        verified.limit,
+        uri,
+        owner,
+      );
+    }
+    return this.read(
+      parsed.id,
+      parsed.offset,
+      parsed.limit,
+      parsed.legacy ? resultUri(parsed.id) : uri,
+      owner,
+      parsed.routeId,
+    );
   }
 
   read(
@@ -163,7 +222,7 @@ export class UniversalMcpResultStore {
     record.lastUsedAt = this.now();
     const text = record.serialized.slice(offset, offset + limit);
     const nextOffset = offset + text.length;
-    const canonicalUri = uri ?? resultUri(record.routeId, id, offset, limit);
+    const canonicalUri = uri ?? resultUri(id);
     return {
       uri: canonicalUri,
       mimeType: "application/json",
@@ -172,10 +231,10 @@ export class UniversalMcpResultStore {
       offset,
       charactersRead: text.length,
       totalCharacters: record.serialized.length,
+      totalBytes: record.bytes,
       truncated: nextOffset < record.serialized.length,
       ...(nextOffset < record.serialized.length ? {
-        nextOffset,
-        nextResourceUri: resultUri(record.routeId, id, nextOffset, limit),
+        nextResourceUri: this.continuationUri(record, nextOffset, limit),
       } : {}),
       expiresAt: new Date(record.expiresAt).toISOString(),
     };
@@ -183,16 +242,33 @@ export class UniversalMcpResultStore {
 
   clear(): void {
     this.records.clear();
-    this.totalCharacters = 0;
+    this.totalBytes = 0;
+    this.usageByPrincipal.clear();
+    this.reservationsByPrincipal.clear();
   }
 
-  stats(): { entries: number; totalCharacters: number } {
+  stats(): { entries: number; totalBytes: number } {
     this.pruneExpired();
-    return { entries: this.records.size, totalCharacters: this.totalCharacters };
+    return { entries: this.records.size, totalBytes: this.totalBytes };
   }
 
   private owner(callContext?: CapabilityCallContext): CapabilityCallContext {
     return requireCapabilityCallContext(callContext, this.ownerProvider);
+  }
+
+  private continuationUri(record: ResultRecord, offset: number, limit: number): string {
+    const token = this.continuation.issue({
+      binding: {
+        principalKeyFingerprint: record.principalKeyFingerprint,
+        resourceKind: "mcp-result",
+        resourceIdentity: record.id,
+        resourceGeneration: record.generation,
+      },
+      offset,
+      limit,
+      expiresAtMs: record.expiresAt,
+    });
+    return resultUri(token);
   }
 
   private assertOwner(record: ResultRecord, owner: CapabilityCallContext): void {
@@ -215,58 +291,89 @@ export class UniversalMcpResultStore {
     const record = this.records.get(id);
     if (!record) return;
     this.records.delete(id);
-    this.totalCharacters -= record.serialized.length;
+    this.totalBytes -= record.bytes;
+    const usage = this.usageByPrincipal.get(record.principalKeyFingerprint);
+    if (!usage) return;
+    usage.entries -= 1;
+    usage.bytes -= record.bytes;
+    if (usage.entries === 0 && usage.bytes === 0) {
+      const reservations = this.reservationsByPrincipal.get(record.principalKeyFingerprint);
+      if (!reservations || Object.values(reservations.pending()).every((value) => value === 0)) {
+        this.usageByPrincipal.delete(record.principalKeyFingerprint);
+        this.reservationsByPrincipal.delete(record.principalKeyFingerprint);
+      }
+    }
+  }
+
+  private usage(principalKeyFingerprint: string): { entries: number; bytes: number } {
+    let usage = this.usageByPrincipal.get(principalKeyFingerprint);
+    if (!usage) {
+      usage = { entries: 0, bytes: 0 };
+      this.usageByPrincipal.set(principalKeyFingerprint, usage);
+    }
+    return usage;
+  }
+
+  private reservations(principalKeyFingerprint: string): SynchronousQuotaReservations {
+    let reservations = this.reservationsByPrincipal.get(principalKeyFingerprint);
+    if (!reservations) {
+      reservations = new SynchronousQuotaReservations("mcp-result", {
+        entries: this.maximumEntries,
+        bytes: this.maximumTotalBytes,
+      });
+      this.reservationsByPrincipal.set(principalKeyFingerprint, reservations);
+    }
+    return reservations;
+  }
+
+  private recordQuotaRejection(): void {
+    try {
+      this.metrics?.recordQuotaRejection("mcp_result");
+    } catch {
+      // Retained-result quota rejection must not be masked by instrumentation failure.
+    }
   }
 }
 
 export function parseResultUri(uri: string): ParsedMcpResultUri {
-  let parsed: URL;
   try {
-    parsed = new URL(uri);
-  } catch {
-    throw new UniversalBrokerError("PRECONDITION_FAILED", `Invalid MCP result URI: ${uri}`);
+    const parsed = parseResourceUri(uri, { allowLegacyRead: true });
+    if (parsed.kind !== "mcp-result") {
+      throw new UniversalBrokerError("PRECONDITION_FAILED", `Not an MCP result URI: ${uri}`);
+    }
+    const legacyRouteId = parsed.legacy ? legacyResultRouteId(uri) : undefined;
+    return {
+      id: parsed.resultId,
+      ...(legacyRouteId === undefined ? {} : { routeId: legacyRouteId }),
+      offset: parsed.legacy ? parsed.offset ?? 0 : 0,
+      limit: parsed.legacy
+        ? boundedInteger(parsed.limit, 12_000, 1, 100_000)
+        : 12_000,
+      legacy: parsed.legacy,
+    };
+  } catch (error) {
+    if (error instanceof UniversalBrokerError) throw error;
+    if (error instanceof ResourceUriError) {
+      throw new UniversalBrokerError(
+        "PRECONDITION_FAILED",
+        `Invalid MCP result URI: ${uri}`,
+        { evidence: { reason: error.reason } },
+      );
+    }
+    throw error;
   }
-  if (parsed.protocol !== "devspace:") {
-    throw new UniversalBrokerError("PRECONDITION_FAILED", `Not an MCP result URI: ${uri}`);
-  }
-  const parts = parsed.pathname.replace(/^\/+/, "").split("/");
-  if (parsed.hostname === "mcp-result") {
-    const [id, rawOffset = "0", rawLimit = "12000"] = parts;
-    return parsedParts(uri, id, rawOffset, rawLimit, undefined, true);
-  }
-  if (parsed.hostname === "mcp" && parts[1] === "result") {
-    const [rawRouteId, _result, id, rawOffset = "0", rawLimit = "12000"] = parts;
-    return parsedParts(uri, id, rawOffset, rawLimit, decodeURIComponent(rawRouteId ?? ""), false);
-  }
-  throw new UniversalBrokerError("PRECONDITION_FAILED", `Not an MCP result URI: ${uri}`);
 }
 
-function parsedParts(
-  uri: string,
-  id: string | undefined,
-  rawOffset: string,
-  rawLimit: string,
-  routeId: string | undefined,
-  legacy: boolean,
-): ParsedMcpResultUri {
-  if (!id) throw new UniversalBrokerError("PRECONDITION_FAILED", `Missing result ID: ${uri}`);
-  if (!legacy) requireRouteId(routeId ?? "");
-  const offset = Number(rawOffset);
-  const limit = Number(rawLimit);
-  if (!Number.isSafeInteger(offset) || offset < 0) {
-    throw new UniversalBrokerError("PRECONDITION_FAILED", `Invalid result offset: ${uri}`);
-  }
-  return {
-    id,
-    ...(routeId === undefined ? {} : { routeId }),
-    offset,
-    limit: boundedInteger(limit, 12_000, 1, 100_000),
-    legacy,
-  };
+function legacyResultRouteId(uri: string): string | undefined {
+  const parsed = new URL(uri);
+  if (parsed.hostname !== "mcp") return undefined;
+  const [routeId, marker] = parsed.pathname.split("/").filter(Boolean);
+  if (marker !== "result" || !routeId) return undefined;
+  return requireRouteId(decodeURIComponent(routeId));
 }
 
-function resultUri(routeId: string, id: string, offset: number, limit: number): string {
-  return `devspace://mcp/${encodeURIComponent(routeId)}/result/${encodeURIComponent(id)}/${offset}/${limit}`;
+function resultUri(id: string): string {
+  return formatResourceUri({ kind: "mcp-result", resultId: id });
 }
 
 function requireRouteId(value: string): string {

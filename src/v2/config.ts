@@ -1,10 +1,11 @@
 import { homedir } from "node:os";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { ServerConfig } from "../config.js";
 import type { LoggingConfig } from "../logger.js";
 import type { OAuthConfig } from "../oauth-provider.js";
 import { expandHomePath } from "../roots.js";
 import type { PrincipalMode } from "./authority-principal.js";
+import { BASE_PRODUCT_PROFILE } from "./build-capabilities.js";
 import { UNIVERSAL_OWNER_SCOPES } from "./contracts.js";
 import {
   RESOURCE_DEFAULT_ARTIFACTS,
@@ -19,8 +20,10 @@ import {
   RESOURCE_DEFAULT_INLINE_OUTPUT_BYTES,
   RESOURCE_DEFAULT_MCP_CONNECTIONS,
   RESOURCE_DEFAULT_MCP_IDLE_TTL_MS,
+  RESOURCE_DEFAULT_MCP_RESULT_MAX_BYTES,
   RESOURCE_DEFAULT_PROCESSES,
 } from "./resource-defaults.js";
+import { RUNTIME_SCHEMA_GENERATION } from "./runtime-contract-identity.js";
 import {
   canonicalConfigDigest,
   loadUnifiedConfigSource,
@@ -50,7 +53,6 @@ const DEFAULT_MAX_RUNNING_PROCESSES_PER_TARGET = RESOURCE_DEFAULT_CONCURRENT_PRO
 const DEFAULT_PROCESS_BUFFER_CHARACTERS = RESOURCE_DEFAULT_INLINE_OUTPUT_BYTES;
 const DEFAULT_PROCESS_OUTPUT_MAX_BYTES = 100 * 1024 * 1024;
 const DEFAULT_COMPLETED_PROCESS_TTL_MS = RESOURCE_DEFAULT_COMPLETED_PROCESS_TTL_MS;
-const DEFAULT_SELF_RESTART_DELAY_MS = 2_000;
 const DEFAULT_SELF_RESTART_TIMEOUT_MS = 120_000;
 const DEFAULT_ARTIFACT_MAXIMUM_ENTRIES = RESOURCE_DEFAULT_ARTIFACTS;
 const DEFAULT_ARTIFACT_MAXIMUM_TOTAL_BYTES = 2 * 1024 * 1024 * 1024;
@@ -62,19 +64,21 @@ const DEFAULT_GUI_PAYLOAD_BUDGET_CHARACTERS = 12_000;
 const DEFAULT_DOWNSTREAM_MCP_MAXIMUM_SESSIONS = RESOURCE_DEFAULT_MCP_CONNECTIONS;
 const DEFAULT_DOWNSTREAM_MCP_SESSION_IDLE_TTL_MS = RESOURCE_DEFAULT_MCP_IDLE_TTL_MS;
 const DEFAULT_MCP_RESULT_MAXIMUM_ENTRIES = 64;
-const DEFAULT_MCP_RESULT_MAXIMUM_CHARACTERS = 10_000_000;
+const DEFAULT_MCP_RESULT_MAXIMUM_BYTES = RESOURCE_DEFAULT_MCP_RESULT_MAX_BYTES;
 const DEFAULT_MCP_RESULT_TTL_MS = 15 * 60_000;
 export const OAUTH_OFFLINE_ACCESS_SCOPE = "offline_access";
 
 export type UniversalBrokerDeploymentMode = "parallel" | "production";
 
 export interface UniversalBrokerNextConfig {
+  productProfile: typeof BASE_PRODUCT_PROFILE;
   serverConfig: ServerConfig;
   deploymentMode: UniversalBrokerDeploymentMode;
   host: string;
   port: number;
   managementHost: string;
   managementPort: number;
+  managementAuthorizationKeyRef: string;
   readyPath: string;
   publicBaseUrl: string;
   publicMcpUrl: string;
@@ -84,6 +88,9 @@ export interface UniversalBrokerNextConfig {
   artifactPathPrefix: string;
   stateDir: string;
   authorityStorePath: string;
+  connectorActivationJournalPath: string;
+  lifecycleFinalizationStorePath: string;
+  lifecycleFinalizationControlPath: string;
   authorityPrincipalMode: PrincipalMode;
   authorityOwnerInstanceId?: string;
   oauthStateDir: string;
@@ -104,7 +111,6 @@ export interface UniversalBrokerNextConfig {
   selfManagementDir: string;
   selfRestartPm2ProcessName: string;
   selfRestartExpectedScript?: string;
-  selfRestartDelayMs: number;
   selfRestartTimeoutMs: number;
   maxRunningProcesses: number;
   maximumProcessRecords: number;
@@ -113,6 +119,8 @@ export interface UniversalBrokerNextConfig {
   processOutputMaxBytes: number;
   completedProcessTtlMs: number;
   artifactStagingDir: string;
+  artifactCatalogPath: string;
+  artifactObjectRoot: string;
   artifactMaximumEntries: number;
   artifactMaximumTotalBytes: number;
   artifactMaximumFileBytes: number;
@@ -123,7 +131,7 @@ export interface UniversalBrokerNextConfig {
   downstreamMcpMaximumSessions: number;
   downstreamMcpSessionIdleTtlMs: number;
   mcpResultMaximumEntries: number;
-  mcpResultMaximumCharacters: number;
+  mcpResultMaximumBytes: number;
   mcpResultTtlMs: number;
   allowedHosts: string[];
   oauth: OAuthConfig;
@@ -132,20 +140,20 @@ export interface UniversalBrokerNextConfig {
   mcpSessionCleanupIntervalMs: number;
   maximumMcpSessions: number;
   canonicalConnectorName: string;
-  authorityDeployment: "in-process" | "sidecar";
+  authorityDeployment: "in-process";
+  authorityApprovalAssurance: "cooperative";
   authorityMode: "enforced" | "audit" | "disabled";
-  authorityEndpoint?: string;
   authorityStateDirectory: string;
   authorityR0FastPath: boolean;
-  authorityRequireHostAttestation: boolean;
   authorityTtlSeconds: Readonly<{ R1: number; R2: number; R3: number }>;
   authorityResourceLeaseTtlSeconds: number;
+  authorityResourceLeaseHeartbeatSeconds: number;
+  authorityResourceLeaseRecoveryGraceSeconds: number;
   authorityMaximumActionsPerPlan: number;
   authorityMaximumUses: Readonly<{ R1: number; R2: number; R3: number }>;
   oauthIssuer: string;
   oauthResource: string;
   oauthAllowOfflineAccess: boolean;
-  oauthSubjectClaimPolicy?: Readonly<{ claim: string; required: boolean }>;
   allowAnonymousSessionFallback: boolean;
   legacyBlanketScopeCompatibility: boolean;
   adminScopeEnabled: boolean;
@@ -153,6 +161,19 @@ export interface UniversalBrokerNextConfig {
   supervisorProcessManager: "pm2";
   supervisorRestartMaximumAttempts: number;
   supervisorRestartMaximumDelayMs: number;
+  cursorTtlMs: number;
+  cursorMaximumSnapshotsPerPrincipal: number;
+  cursorSigningKeyRef: string;
+  cursorPreviousSigningKeyRef?: string;
+  connectorDrainGraceSeconds: number;
+  rateLimit: Readonly<{
+    mode: "internal";
+    preAuth: Readonly<{ refillPerMinute: number; burst: number }>;
+    postAuth: Readonly<{ refillPerMinute: number; burst: number }>;
+    initialize: Readonly<{ refillPerMinute: number; burst: number }>;
+  }>;
+  auditSinkPath: string;
+  auditFlushIntervalMs: number;
   publicMetrics: boolean;
   publicHealth: boolean;
   redactSecrets: boolean;
@@ -195,18 +216,18 @@ export function loadUniversalBrokerNextConfig(
 
 type EnvironmentUniversalBrokerNextConfig = Omit<UniversalBrokerNextConfig,
   | "authorityMode"
-  | "authorityEndpoint"
+  | "authorityApprovalAssurance"
   | "authorityStateDirectory"
   | "authorityR0FastPath"
-  | "authorityRequireHostAttestation"
   | "authorityTtlSeconds"
   | "authorityResourceLeaseTtlSeconds"
+  | "authorityResourceLeaseHeartbeatSeconds"
+  | "authorityResourceLeaseRecoveryGraceSeconds"
   | "authorityMaximumActionsPerPlan"
   | "authorityMaximumUses"
   | "oauthIssuer"
   | "oauthResource"
   | "oauthAllowOfflineAccess"
-  | "oauthSubjectClaimPolicy"
   | "allowAnonymousSessionFallback"
   | "legacyBlanketScopeCompatibility"
   | "adminScopeEnabled"
@@ -291,6 +312,29 @@ function loadUniversalBrokerEnvironmentConfig(
   ) {
     throw new Error("DEVSPACE_NEXT_STATE_DIR must be separate from the production state directory.");
   }
+  const lifecycleFinalizationControlPath = resolve(expandHomePath(
+    env.DEVSPACE_NEXT_LIFECYCLE_FINALIZATION_CONTROL
+      ?? join(
+        dirname(stateDir),
+        `${basename(stateDir)}-finalization-control`,
+        "lifecycle-finalization-head.json",
+      ),
+  ));
+  if (basename(lifecycleFinalizationControlPath) !== "lifecycle-finalization-head.json") {
+    throw new Error(
+      "DEVSPACE_NEXT_LIFECYCLE_FINALIZATION_CONTROL must use the canonical lifecycle-finalization-head.json basename.",
+    );
+  }
+  const lifecycleControlRelativePath = relative(stateDir, lifecycleFinalizationControlPath);
+  if (
+    lifecycleControlRelativePath.length === 0
+    || (lifecycleControlRelativePath !== ".."
+      && !lifecycleControlRelativePath.startsWith(`..${sep}`))
+  ) {
+    throw new Error(
+      "DEVSPACE_NEXT_LIFECYCLE_FINALIZATION_CONTROL must stay outside DEVSPACE_NEXT_STATE_DIR.",
+    );
+  }
   const oauthStateDir = resolve(expandHomePath(
     env.DEVSPACE_NEXT_OAUTH_STATE_DIR
       ?? (deploymentMode === "production" ? base.stateDir : stateDir),
@@ -310,6 +354,58 @@ function loadUniversalBrokerEnvironmentConfig(
   }
   if (authorityStorePath === resolve(join(oauthStateDir, "devspace.sqlite"))) {
     throw new Error("DEVSPACE_NEXT_AUTHORITY_STORE must not reuse the OAuth database.");
+  }
+  const connectorActivationJournalPath = resolve(expandHomePath(
+    env.DEVSPACE_NEXT_CONNECTOR_ACTIVATION_JOURNAL
+      ?? join(stateDir, "connector-activation-journal.sqlite"),
+  ));
+  const connectorJournalRelativePath = relative(stateDir, connectorActivationJournalPath);
+  if (
+    connectorJournalRelativePath.length === 0
+    || connectorJournalRelativePath === ".."
+    || connectorJournalRelativePath.startsWith(`..${sep}`)
+    || isAbsolute(connectorJournalRelativePath)
+  ) {
+    throw new Error(
+      "DEVSPACE_NEXT_CONNECTOR_ACTIVATION_JOURNAL must stay inside DEVSPACE_NEXT_STATE_DIR.",
+    );
+  }
+  if (
+    connectorActivationJournalPath === authorityStorePath
+    || connectorActivationJournalPath === resolve(join(oauthStateDir, "devspace.sqlite"))
+  ) {
+    throw new Error(
+      "DEVSPACE_NEXT_CONNECTOR_ACTIVATION_JOURNAL must use a dedicated database path.",
+    );
+  }
+  const lifecycleFinalizationStorePath = resolve(expandHomePath(
+    env.DEVSPACE_NEXT_LIFECYCLE_FINALIZATION_STORE
+      ?? join(stateDir, "lifecycle.sqlite"),
+  ));
+  const lifecycleStoreRelativePath = relative(stateDir, lifecycleFinalizationStorePath);
+  if (
+    lifecycleStoreRelativePath.length === 0
+    || lifecycleStoreRelativePath === ".."
+    || lifecycleStoreRelativePath.startsWith(`..${sep}`)
+    || isAbsolute(lifecycleStoreRelativePath)
+  ) {
+    throw new Error(
+      "DEVSPACE_NEXT_LIFECYCLE_FINALIZATION_STORE must stay inside DEVSPACE_NEXT_STATE_DIR.",
+    );
+  }
+  if (basename(lifecycleFinalizationStorePath) !== "lifecycle.sqlite") {
+    throw new Error(
+      "DEVSPACE_NEXT_LIFECYCLE_FINALIZATION_STORE must use the canonical lifecycle.sqlite basename.",
+    );
+  }
+  if (
+    lifecycleFinalizationStorePath === authorityStorePath
+    || lifecycleFinalizationStorePath === connectorActivationJournalPath
+    || lifecycleFinalizationStorePath === resolve(join(oauthStateDir, "devspace.sqlite"))
+  ) {
+    throw new Error(
+      "DEVSPACE_NEXT_LIFECYCLE_FINALIZATION_STORE must use a dedicated database path.",
+    );
   }
   const authorityPrincipalMode = parsePrincipalMode(
     env.DEVSPACE_NEXT_AUTHORITY_PRINCIPAL_MODE,
@@ -358,6 +454,7 @@ function loadUniversalBrokerEnvironmentConfig(
   const buildDigest = parseOptionalDigest(env.DEVSPACE_BUILD_DIGEST);
 
   const config: EnvironmentUniversalBrokerNextConfig = {
+    productProfile: BASE_PRODUCT_PROFILE,
     serverConfig: base,
     deploymentMode,
     host,
@@ -373,6 +470,9 @@ function loadUniversalBrokerEnvironmentConfig(
     artifactPathPrefix,
     stateDir,
     authorityStorePath,
+    connectorActivationJournalPath,
+    lifecycleFinalizationStorePath,
+    lifecycleFinalizationControlPath,
     authorityPrincipalMode,
     authorityOwnerInstanceId,
     oauthStateDir,
@@ -457,12 +557,6 @@ function loadUniversalBrokerEnvironmentConfig(
     selfRestartExpectedScript: env.DEVSPACE_NEXT_PM2_EXPECTED_SCRIPT?.trim()
       ? resolve(expandHomePath(env.DEVSPACE_NEXT_PM2_EXPECTED_SCRIPT))
       : undefined,
-    selfRestartDelayMs: parseBoundedPositiveInteger(
-      env.DEVSPACE_NEXT_SELF_RESTART_DELAY_MS,
-      DEFAULT_SELF_RESTART_DELAY_MS,
-      "DEVSPACE_NEXT_SELF_RESTART_DELAY_MS",
-      15_000,
-    ),
     selfRestartTimeoutMs: parseBoundedPositiveInteger(
       env.DEVSPACE_NEXT_SELF_RESTART_TIMEOUT_MS,
       DEFAULT_SELF_RESTART_TIMEOUT_MS,
@@ -508,6 +602,12 @@ function loadUniversalBrokerEnvironmentConfig(
     artifactStagingDir: resolve(expandHomePath(
       env.DEVSPACE_NEXT_ARTIFACT_STAGING_DIR
         ?? join(stateDir, "artifacts"),
+    )),
+    artifactCatalogPath: resolve(expandHomePath(
+      env.DEVSPACE_NEXT_ARTIFACT_CATALOG ?? join(stateDir, "artifacts.sqlite"),
+    )),
+    artifactObjectRoot: resolve(expandHomePath(
+      env.DEVSPACE_NEXT_ARTIFACT_OBJECT_ROOT ?? join(stateDir, "artifact-objects"),
     )),
     artifactMaximumEntries: parseBoundedPositiveInteger(
       env.DEVSPACE_NEXT_ARTIFACT_MAXIMUM_ENTRIES,
@@ -569,17 +669,106 @@ function loadUniversalBrokerEnvironmentConfig(
       "DEVSPACE_NEXT_MCP_RESULT_MAXIMUM_ENTRIES",
       10_000,
     ),
-    mcpResultMaximumCharacters: parseBoundedPositiveInteger(
-      env.DEVSPACE_NEXT_MCP_RESULT_MAXIMUM_CHARACTERS,
-      DEFAULT_MCP_RESULT_MAXIMUM_CHARACTERS,
-      "DEVSPACE_NEXT_MCP_RESULT_MAXIMUM_CHARACTERS",
-      1_000_000_000,
+    mcpResultMaximumBytes: parseBoundedPositiveInteger(
+      env.DEVSPACE_NEXT_MCP_RESULT_MAXIMUM_BYTES,
+      DEFAULT_MCP_RESULT_MAXIMUM_BYTES,
+      "DEVSPACE_NEXT_MCP_RESULT_MAXIMUM_BYTES",
+      10 * 1024 * 1024 * 1024,
     ),
     mcpResultTtlMs: parseBoundedPositiveInteger(
       env.DEVSPACE_NEXT_MCP_RESULT_TTL_MS,
       DEFAULT_MCP_RESULT_TTL_MS,
       "DEVSPACE_NEXT_MCP_RESULT_TTL_MS",
       24 * 60 * 60_000,
+    ),
+    cursorTtlMs: parseBoundedPositiveInteger(
+      env.DEVSPACE_NEXT_CURSOR_TTL_MS,
+      10 * 60_000,
+      "DEVSPACE_NEXT_CURSOR_TTL_MS",
+      24 * 60 * 60_000,
+    ),
+    cursorMaximumSnapshotsPerPrincipal: parseBoundedPositiveInteger(
+      env.DEVSPACE_NEXT_CURSOR_MAXIMUM_SNAPSHOTS_PER_PRINCIPAL,
+      128,
+      "DEVSPACE_NEXT_CURSOR_MAXIMUM_SNAPSHOTS_PER_PRINCIPAL",
+      10_000,
+    ),
+    cursorSigningKeyRef: parseBoundedText(
+      env.DEVSPACE_NEXT_CURSOR_SIGNING_KEY_REF,
+      join(stateDir, "cursor-hmac-current.key"),
+      "DEVSPACE_NEXT_CURSOR_SIGNING_KEY_REF",
+      4_096,
+    ),
+    cursorPreviousSigningKeyRef: parseOptionalBoundedText(
+      env.DEVSPACE_NEXT_CURSOR_PREVIOUS_SIGNING_KEY_REF,
+      "DEVSPACE_NEXT_CURSOR_PREVIOUS_SIGNING_KEY_REF",
+      4_096,
+    ),
+    managementAuthorizationKeyRef: parseBoundedText(
+      env.DEVSPACE_NEXT_MANAGEMENT_AUTHORIZATION_KEY_REF,
+      join(stateDir, "management-authorization.key"),
+      "DEVSPACE_NEXT_MANAGEMENT_AUTHORIZATION_KEY_REF",
+      4_096,
+    ),
+    connectorDrainGraceSeconds: parseBoundedPositiveInteger(
+      env.DEVSPACE_NEXT_CONNECTOR_DRAIN_GRACE_SECONDS,
+      3_600,
+      "DEVSPACE_NEXT_CONNECTOR_DRAIN_GRACE_SECONDS",
+      86_400,
+    ),
+    rateLimit: Object.freeze({
+      mode: parseInternalRateLimitMode(env.DEVSPACE_NEXT_RATE_LIMIT_MODE),
+      preAuth: Object.freeze({
+        refillPerMinute: parseBoundedPositiveInteger(
+          env.DEVSPACE_NEXT_RATE_LIMIT_PRE_AUTH_REFILL_PER_MINUTE,
+          120,
+          "DEVSPACE_NEXT_RATE_LIMIT_PRE_AUTH_REFILL_PER_MINUTE",
+          1_000_000,
+        ),
+        burst: parseBoundedPositiveInteger(
+          env.DEVSPACE_NEXT_RATE_LIMIT_PRE_AUTH_BURST,
+          30,
+          "DEVSPACE_NEXT_RATE_LIMIT_PRE_AUTH_BURST",
+          1_000_000,
+        ),
+      }),
+      postAuth: Object.freeze({
+        refillPerMinute: parseBoundedPositiveInteger(
+          env.DEVSPACE_NEXT_RATE_LIMIT_POST_AUTH_REFILL_PER_MINUTE,
+          600,
+          "DEVSPACE_NEXT_RATE_LIMIT_POST_AUTH_REFILL_PER_MINUTE",
+          1_000_000,
+        ),
+        burst: parseBoundedPositiveInteger(
+          env.DEVSPACE_NEXT_RATE_LIMIT_POST_AUTH_BURST,
+          100,
+          "DEVSPACE_NEXT_RATE_LIMIT_POST_AUTH_BURST",
+          1_000_000,
+        ),
+      }),
+      initialize: Object.freeze({
+        refillPerMinute: parseBoundedPositiveInteger(
+          env.DEVSPACE_NEXT_RATE_LIMIT_INITIALIZE_REFILL_PER_MINUTE,
+          30,
+          "DEVSPACE_NEXT_RATE_LIMIT_INITIALIZE_REFILL_PER_MINUTE",
+          1_000_000,
+        ),
+        burst: parseBoundedPositiveInteger(
+          env.DEVSPACE_NEXT_RATE_LIMIT_INITIALIZE_BURST,
+          10,
+          "DEVSPACE_NEXT_RATE_LIMIT_INITIALIZE_BURST",
+          1_000_000,
+        ),
+      }),
+    }),
+    auditSinkPath: resolve(expandHomePath(
+      env.DEVSPACE_NEXT_AUDIT_SINK ?? join(stateDir, "audit", "operations.jsonl"),
+    )),
+    auditFlushIntervalMs: parseBoundedPositiveInteger(
+      env.DEVSPACE_NEXT_AUDIT_FLUSH_INTERVAL_MS,
+      250,
+      "DEVSPACE_NEXT_AUDIT_FLUSH_INTERVAL_MS",
+      60_000,
     ),
     allowedHosts,
     oauth: {
@@ -709,37 +898,30 @@ function finalizeUniversalBrokerConfig(
     throw new Error("Production configuration forbids anonymous or MCP-session principal fallback.");
   }
 
-  const oauthSubjectClaimPolicy = resolveSubjectClaimPolicy(document, env);
-  if (config.authorityPrincipalMode === "multi-user" && !oauthSubjectClaimPolicy) {
-    throw new Error(
-      "Multi-user authority requires a verified OAuth subject-claim policy; the current configuration does not supply one.",
-    );
+  if (env.DEVSPACE_NEXT_OAUTH_SUBJECT_CLAIM !== undefined) {
+    throw new Error("OAuth subject claim policy is unsupported by this BASE_SINGLE_OWNER build.");
   }
 
   const authorityMode = parseAuthorityMode(
     env.DEVSPACE_NEXT_AUTHORITY_MODE ?? document?.authority?.mode,
   );
-  const authorityEndpoint = parseOptionalBoundedText(
-    env.DEVSPACE_NEXT_AUTHORITY_ENDPOINT
-      ?? document?.authority?.endpoint
-      ?? undefined,
-    "authority.endpoint",
-    4_096,
+  if (env.DEVSPACE_NEXT_AUTHORITY_ENDPOINT !== undefined) {
+    throw new Error("External authority endpoints are unsupported by this BASE_SINGLE_OWNER build.");
+  }
+  const authorityApprovalAssurance = parseCooperativeApprovalAssurance(
+    env.DEVSPACE_NEXT_AUTHORITY_APPROVAL_ASSURANCE
+      ?? document?.authority?.approvalAssurance,
   );
   const authorityR0FastPath = parseBoolean(
     env.DEVSPACE_NEXT_AUTHORITY_R0_FAST_PATH,
     document?.authority?.r0FastPath ?? true,
     "DEVSPACE_NEXT_AUTHORITY_R0_FAST_PATH",
   );
-  const authorityRequireHostAttestation = parseBoolean(
-    env.DEVSPACE_NEXT_AUTHORITY_REQUIRE_HOST_ATTESTATION,
-    document?.authority?.requireHostAttestation ?? false,
-    "DEVSPACE_NEXT_AUTHORITY_REQUIRE_HOST_ATTESTATION",
-  );
-  if (authorityRequireHostAttestation) {
-    throw new Error(
-      "authority.requireHostAttestation cannot be enabled because a host attestation verifier is not configured.",
-    );
+  if (env.DEVSPACE_NEXT_AUTHORITY_REQUIRE_HOST_ATTESTATION !== undefined) {
+    throw new Error("Host attestation is unsupported by this BASE_SINGLE_OWNER build.");
+  }
+  if (env.DEVSPACE_NEXT_SELF_RESTART_DELAY_MS !== undefined) {
+    throw new Error("Self-restart delay is unsupported; restart requires transport ACK_FLUSHED evidence.");
   }
   const authorityTtlSeconds = Object.freeze({
     R1: parseBoundedPositiveInteger(
@@ -763,10 +945,25 @@ function finalizeUniversalBrokerConfig(
   });
   const authorityResourceLeaseTtlSeconds = parseBoundedPositiveInteger(
     env.DEVSPACE_NEXT_AUTHORITY_RESOURCE_LEASE_TTL_SECONDS,
-    document?.authority?.resourceLeaseTtlSeconds ?? 900,
+    document?.authority?.resourceLease?.ttlSeconds ?? 900,
     "DEVSPACE_NEXT_AUTHORITY_RESOURCE_LEASE_TTL_SECONDS",
     86_400,
   );
+  const authorityResourceLeaseHeartbeatSeconds = parseBoundedPositiveInteger(
+    env.DEVSPACE_NEXT_AUTHORITY_RESOURCE_LEASE_HEARTBEAT_SECONDS,
+    document?.authority?.resourceLease?.heartbeatSeconds ?? 30,
+    "DEVSPACE_NEXT_AUTHORITY_RESOURCE_LEASE_HEARTBEAT_SECONDS",
+    86_400,
+  );
+  const authorityResourceLeaseRecoveryGraceSeconds = parseBoundedPositiveInteger(
+    env.DEVSPACE_NEXT_AUTHORITY_RESOURCE_LEASE_RECOVERY_GRACE_SECONDS,
+    document?.authority?.resourceLease?.recoveryGraceSeconds ?? 60,
+    "DEVSPACE_NEXT_AUTHORITY_RESOURCE_LEASE_RECOVERY_GRACE_SECONDS",
+    86_400,
+  );
+  if (authorityResourceLeaseHeartbeatSeconds >= authorityResourceLeaseTtlSeconds) {
+    throw new Error("Authority resource lease heartbeat must be shorter than its TTL.");
+  }
   const authorityMaximumActionsPerPlan = parseBoundedPositiveInteger(
     env.DEVSPACE_NEXT_AUTHORITY_MAXIMUM_ACTIONS_PER_PLAN,
     document?.authority?.maximumActionsPerPlan ?? 64,
@@ -801,18 +998,6 @@ function finalizeUniversalBrokerConfig(
   }
   if (production && !authorityR0FastPath) {
     throw new Error("Production authority.r0FastPath must be true.");
-  }
-  if (config.authorityDeployment === "in-process" && authorityEndpoint) {
-    throw new Error("In-process authority must not declare an external authority endpoint.");
-  }
-  if (config.authorityDeployment === "sidecar") {
-    if (!authorityEndpoint) {
-      throw new Error("Sidecar authority deployment requires a private endpoint.");
-    }
-    assertPrivateEndpoint(authorityEndpoint, "authority endpoint");
-    throw new Error(
-      "Sidecar authority deployment is unsupported by this build; refusing to start without an in-process authority engine.",
-    );
   }
 
   const supervisorEndpoint = parseOptionalBoundedText(
@@ -892,9 +1077,23 @@ function finalizeUniversalBrokerConfig(
       ...capabilityScopes,
       ...(oauthAllowOfflineAccess ? [OAUTH_OFFLINE_ACCESS_SCOPE] : []),
     ],
+    canonicalConnector: {
+      name: config.canonicalConnectorName,
+      installationEpoch: parseBoundedPositiveInteger(
+        explicitEnvironment.DEVSPACE_OAUTH_CONNECTOR_INSTALLATION_EPOCH
+          ?? (document?.connector?.installationEpoch === undefined
+            ? undefined
+            : String(document.connector.installationEpoch)),
+        1,
+        "DEVSPACE_OAUTH_CONNECTOR_INSTALLATION_EPOCH",
+        Number.MAX_SAFE_INTEGER,
+      ),
+      schemaGeneration: RUNTIME_SCHEMA_GENERATION,
+    },
   };
   const canonicalConfig = freezeDeep({
     version: 2,
+    productProfile: BASE_PRODUCT_PROFILE,
     profile,
     server: {
       publicBaseUrl: config.publicBaseUrl,
@@ -913,7 +1112,6 @@ function finalizeUniversalBrokerConfig(
       resource: oauthResource,
       principalMode: config.authorityPrincipalMode,
       ownerInstanceId: config.authorityOwnerInstanceId,
-      subjectClaimPolicy: oauthSubjectClaimPolicy,
       capabilityScopes: [...capabilityScopes],
       allowOfflineAccess: oauthAllowOfflineAccess,
       legacyBlanketScopeCompatibility,
@@ -923,13 +1121,16 @@ function finalizeUniversalBrokerConfig(
     authority: {
       mode: authorityMode,
       deployment: config.authorityDeployment,
-      endpoint: authorityEndpoint ?? null,
+      approvalAssurance: authorityApprovalAssurance,
       stateDirectory: authorityStateDirectory,
       storePath: config.authorityStorePath,
       r0FastPath: authorityR0FastPath,
-      requireHostAttestation: authorityRequireHostAttestation,
       authorityTtlSeconds,
-      resourceLeaseTtlSeconds: authorityResourceLeaseTtlSeconds,
+      resourceLease: {
+        ttlSeconds: authorityResourceLeaseTtlSeconds,
+        heartbeatSeconds: authorityResourceLeaseHeartbeatSeconds,
+        recoveryGraceSeconds: authorityResourceLeaseRecoveryGraceSeconds,
+      },
       maximumActionsPerPlan: authorityMaximumActionsPerPlan,
       maximumUses: authorityMaximumUses,
     },
@@ -940,15 +1141,49 @@ function finalizeUniversalBrokerConfig(
       expectedScript: config.selfRestartExpectedScript,
       transactionDirectory: config.selfManagementDir,
       healthTimeoutMs: config.selfRestartTimeoutMs,
+      responseFlushRequired: true,
       restartPolicy: {
         maximumAttempts: supervisorRestartMaximumAttempts,
-        delayMs: config.selfRestartDelayMs,
         maximumDelayMs: supervisorRestartMaximumDelayMs,
       },
+    },
+    pagination: {
+      cursorTtlSeconds: config.cursorTtlMs / 1_000,
+      maximumSnapshotsPerPrincipal: config.cursorMaximumSnapshotsPerPrincipal,
+      signingKeyRef: config.cursorSigningKeyRef,
+      previousSigningKeyRef: config.cursorPreviousSigningKeyRef,
+    },
+    artifact: {
+      catalogPath: config.artifactCatalogPath,
+      objectRoot: config.artifactObjectRoot,
+      defaultTtlSeconds: config.artifactTtlMs / 1_000,
+      maximumArtifactBytes: config.artifactMaximumFileBytes,
+      maximumTotalBytes: config.artifactMaximumTotalBytes,
+    },
+    connector: {
+      canonicalName: config.canonicalConnectorName,
+      installationEpoch: oauth.canonicalConnector!.installationEpoch,
+      activationMode: "owner-approved",
+      drainGraceSeconds: config.connectorDrainGraceSeconds,
+    },
+    rateLimit: config.rateLimit,
+    management: {
+      bind: config.managementHost,
+      port: config.managementPort,
+      publicExposure: "deny",
+      authorizationKeyRef: config.managementAuthorizationKeyRef,
+    },
+    audit: {
+      sink: config.auditSinkPath,
+      flushIntervalMs: config.auditFlushIntervalMs,
+      rawArguments: false,
     },
     storage: {
       stateDirectory: config.stateDir,
       oauthStateDirectory: config.oauthStateDir,
+      connectorActivationJournal: config.connectorActivationJournalPath,
+      lifecycleFinalizationStore: config.lifecycleFinalizationStorePath,
+      lifecycleFinalizationControl: config.lifecycleFinalizationControlPath,
       artifactRoot: config.artifactStagingDir,
       processOutputRoot: config.processOutputDir,
       sshControlDirectory: config.sshControlDir,
@@ -965,6 +1200,7 @@ function finalizeUniversalBrokerConfig(
       processes: config.maximumProcessRecords,
       concurrentProcesses: config.maxRunningProcesses,
       mcpConnections: config.downstreamMcpMaximumSessions,
+      mcpRetainedResultBytes: config.mcpResultMaximumBytes,
       guiSessions: config.guiMaximumSessions,
       artifacts: config.artifactMaximumEntries,
       inlineOutputBytes: config.processBufferCharacters,
@@ -977,7 +1213,8 @@ function finalizeUniversalBrokerConfig(
       mcpIdleSeconds: config.downstreamMcpSessionIdleTtlMs / 1_000,
       guiSeconds: config.guiSessionTtlMs / 1_000,
       artifactSeconds: config.artifactTtlMs / 1_000,
-      cursorSnapshotSeconds: config.mcpResultTtlMs / 1_000,
+      cursorSnapshotSeconds: config.cursorTtlMs / 1_000,
+      mcpRetainedResultSeconds: config.mcpResultTtlMs / 1_000,
     },
     targets: unifiedTargets,
     mcpRoutes: unifiedMcpRoutes,
@@ -1011,18 +1248,18 @@ function finalizeUniversalBrokerConfig(
     oauth,
     logging,
     authorityMode,
-    ...(authorityEndpoint ? { authorityEndpoint } : {}),
+    authorityApprovalAssurance,
     authorityStateDirectory,
     authorityR0FastPath,
-    authorityRequireHostAttestation,
     authorityTtlSeconds,
     authorityResourceLeaseTtlSeconds,
+    authorityResourceLeaseHeartbeatSeconds,
+    authorityResourceLeaseRecoveryGraceSeconds,
     authorityMaximumActionsPerPlan,
     authorityMaximumUses,
     oauthIssuer,
     oauthResource,
     oauthAllowOfflineAccess,
-    ...(oauthSubjectClaimPolicy ? { oauthSubjectClaimPolicy } : {}),
     allowAnonymousSessionFallback,
     legacyBlanketScopeCompatibility,
     adminScopeEnabled,
@@ -1042,22 +1279,6 @@ function finalizeUniversalBrokerConfig(
     canonicalConfig,
     configDigest: canonicalConfigDigest(canonicalConfig),
   };
-}
-
-function resolveSubjectClaimPolicy(
-  document: UnifiedConfigDocument | undefined,
-  env: NodeJS.ProcessEnv,
-): Readonly<{ claim: string; required: boolean }> | undefined {
-  const environmentClaim = env.DEVSPACE_NEXT_OAUTH_SUBJECT_CLAIM?.trim();
-  const configured = environmentClaim
-    ? { claim: environmentClaim, required: true }
-    : document?.oauth?.subjectClaimPolicy;
-  if (!configured) return undefined;
-  const claim = parseBoundedText(configured.claim, "", "oauth.subjectClaimPolicy.claim", 128);
-  if (!new Set(["sub", "subject"]).has(claim)) {
-    throw new Error(`Unsupported OAuth subject claim policy: ${claim}`);
-  }
-  return Object.freeze({ claim, required: configured.required ?? true });
 }
 
 function parseCapabilityScopes(
@@ -1171,10 +1392,22 @@ function freezeDeep<T>(value: T): T {
   return value;
 }
 
-function parseAuthorityDeployment(value: string | undefined): "in-process" | "sidecar" {
+function parseAuthorityDeployment(value: string | undefined): "in-process" {
   const normalized = value?.trim() || "in-process";
-  if (normalized === "in-process" || normalized === "sidecar") return normalized;
-  throw new Error("DEVSPACE_NEXT_AUTHORITY_DEPLOYMENT must be in-process or sidecar.");
+  if (normalized === "in-process") return normalized;
+  throw new Error("This BASE_SINGLE_OWNER build supports only in-process authority deployment.");
+}
+
+function parseCooperativeApprovalAssurance(value: string | undefined): "cooperative" {
+  const normalized = value?.trim() || "cooperative";
+  if (normalized === "cooperative") return normalized;
+  throw new Error("This BASE_SINGLE_OWNER build supports only cooperative approval assurance.");
+}
+
+function parseInternalRateLimitMode(value: string | undefined): "internal" {
+  const normalized = value?.trim() || "internal";
+  if (normalized === "internal") return normalized;
+  throw new Error("This BASE_SINGLE_OWNER build requires the internal rate limiter.");
 }
 
 function parseOptionalDigest(value: string | undefined): string | undefined {
@@ -1247,9 +1480,9 @@ function parseOptionalBoundedText(
 
 function parsePrincipalMode(value: string | undefined): PrincipalMode {
   const normalized = value?.trim() || "single-owner";
-  if (normalized === "single-owner" || normalized === "multi-user") return normalized;
+  if (normalized === "single-owner") return normalized;
   throw new Error(
-    `Invalid DEVSPACE_NEXT_AUTHORITY_PRINCIPAL_MODE: ${normalized}; expected single-owner or multi-user`,
+    `Invalid DEVSPACE_NEXT_AUTHORITY_PRINCIPAL_MODE: ${normalized}; this build supports single-owner only`,
   );
 }
 

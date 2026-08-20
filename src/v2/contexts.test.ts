@@ -7,11 +7,13 @@ import test from "node:test";
 import { loadConfig } from "../config.js";
 import { UNIVERSAL_BROKER_BUDGETS } from "./contracts.js";
 import { createCapabilityCallContextFromTrustedPrincipal } from "./capability-call-context.js";
+import { SignedSnapshotCursorStore } from "./cursor-capability.js";
 import {
   ContextRegistry,
   contextErrorCode,
   contextPayloadCharacters,
 } from "./contexts.js";
+import { UniversalBrokerMetrics } from "./metrics.js";
 import { TargetRegistry } from "./targets.js";
 
 const OWNER_A = createCapabilityCallContextFromTrustedPrincipal({
@@ -155,7 +157,8 @@ test("context reuse is owner-aware and cross-owner rejection reaches zero target
 });
 
 test("the 129th context is rejected synchronously before context creation work", async (t) => {
-  const fixture = await createFixture(t, { maximumContexts: 128 });
+  const metrics = new UniversalBrokerMetrics();
+  const fixture = await createFixture(t, { maximumContexts: 128, metrics });
   let creationProviderCalls = 0;
   const internals = fixture.contexts as unknown as {
     discoverInitialInstructions: (...args: unknown[]) => Promise<unknown>;
@@ -179,6 +182,10 @@ test("the 129th context is rejected synchronously before context creation work",
   );
   assert.equal(creationProviderCalls, 128);
   assert.equal(fixture.contexts.stats().contexts, 128);
+  assert.match(
+    metrics.render({}),
+    /devspace_quota_rejections_total\{resource_kind="context"\} 1/u,
+  );
 });
 
 test("contexts retain unrelated-target stability and reject an exact-target generation change", async (t) => {
@@ -257,6 +264,68 @@ test("context.search is explicit and bounded", async (t) => {
   );
 });
 
+test("context.search cursor is owner/query/snapshot bound and never a plain offset", async (t) => {
+  const cursorStore = new SignedSnapshotCursorStore({
+    currentKey: { keyId: "context-test", secret: Buffer.alloc(32, 0x72) },
+    ttlMs: 60_000,
+    maximumSnapshotsPerPrincipal: 8,
+  });
+  const fixture = await createFixture(t, { cursorStore });
+  const project = join(fixture.root, "cursor-project");
+  for (const name of ["one", "two", "three"]) {
+    await mkdir(join(project, `cursor-${name}`), { recursive: true });
+    await writeFile(join(project, `cursor-${name}`, "AGENTS.md"), `cursor instruction ${name}\n`);
+  }
+  const opened = await fixture.contexts.open({ path: project }, OWNER_A);
+  const first = await fixture.contexts.search({
+    contextId: opened.contextId,
+    query: "cursor",
+    limit: 1,
+  }, OWNER_A);
+  assert.equal((first.results as unknown[]).length, 1);
+  assert.match(String(first.nextCursor), /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/u);
+  assert.equal(Number.isNaN(Number(first.nextCursor)), true);
+  const second = await fixture.contexts.search({
+    contextId: opened.contextId,
+    query: "cursor",
+    cursor: String(first.nextCursor),
+    limit: 1,
+  }, OWNER_A);
+  assert.equal((second.results as unknown[]).length, 1);
+  await assert.rejects(
+    fixture.contexts.search({
+      contextId: opened.contextId,
+      query: "different-query",
+      cursor: String(first.nextCursor),
+      limit: 1,
+    }, OWNER_A),
+    (error: unknown) => error instanceof Error
+      && "reason" in error
+      && error.reason === "CURSOR_INVALID",
+  );
+  await assert.rejects(
+    fixture.contexts.search({
+      contextId: opened.contextId,
+      query: "cursor",
+      cursor: String(first.nextCursor),
+      limit: 1,
+    }, OWNER_B),
+    (error: unknown) => contextErrorCode(error) === "AUTHORITY_PRINCIPAL_MISMATCH",
+  );
+  await writeFile(join(project, "cursor-two", "AGENTS.md"), "cursor instruction changed\n");
+  await assert.rejects(
+    fixture.contexts.search({
+      contextId: opened.contextId,
+      query: "cursor",
+      cursor: String(first.nextCursor),
+      limit: 1,
+    }, OWNER_A),
+    (error: unknown) => error instanceof Error
+      && "reason" in error
+      && error.reason === "CURSOR_STALE",
+  );
+});
+
 test("initial context trims references instead of exceeding the hard payload budget", async (t) => {
   const fixture = await createFixture(t);
   let project = fixture.root;
@@ -331,7 +400,8 @@ test("context worktree creates an isolated checkout, exposes a paged diff, and r
 });
 
 test("context close removes a clean managed worktree and enforces the worktree quota", async (t) => {
-  const fixture = await createFixture(t, { maximumWorktrees: 1 });
+  const metrics = new UniversalBrokerMetrics();
+  const fixture = await createFixture(t, { maximumWorktrees: 1, metrics });
   const project = join(fixture.root, "project");
   await mkdir(project);
   await gitInit(project);
@@ -346,6 +416,10 @@ test("context close removes a clean managed worktree and enforces the worktree q
   const closed = await fixture.contexts.close(opened.contextId);
   assert.equal((closed.worktree as { removed: boolean }).removed, true);
   await assert.rejects(access(openedRoot));
+  assert.match(
+    metrics.render({}),
+    /devspace_quota_rejections_total\{resource_kind="worktree"\} 1/u,
+  );
 });
 
 test("context worktree byte quota removes the rejected checkout without recording it", async (t) => {
@@ -451,6 +525,8 @@ async function createFixture(
     maximumWorktreeBytes?: number;
     idleTtlMs?: number;
     now?: () => number;
+    cursorStore?: SignedSnapshotCursorStore;
+    metrics?: UniversalBrokerMetrics;
   } = {},
 ): Promise<Fixture> {
   const root = await mkdtemp(join(tmpdir(), "devspace-v2-contexts-test-"));
@@ -477,6 +553,8 @@ async function createFixture(
     worktreeRoot: join(root, "v2-state", "worktrees"),
     maximumWorktrees: options.maximumWorktrees,
     maximumWorktreeBytes: options.maximumWorktreeBytes,
+    cursorStore: options.cursorStore,
+    metrics: options.metrics,
   });
   return { root, storePath, targets, contexts, serverConfig };
 }

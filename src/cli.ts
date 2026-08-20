@@ -237,9 +237,14 @@ async function serveUniversalBroker(env: NodeJS.ProcessEnv): Promise<void> {
     );
   }
 
-  const [{ createUniversalBrokerNextServer }, { loadUniversalBrokerNextConfig }] = await Promise.all([
+  const [
+    { createUniversalBrokerNextServer },
+    { loadUniversalBrokerNextConfig },
+    { createOpenAIIncomingArtifactAdapter },
+  ] = await Promise.all([
     import("./v2/http-server.js"),
     import("./v2/config.js"),
+    import("./incoming-artifacts.js"),
   ]);
   const baseConfig = loadConfig(env);
   const config = loadUniversalBrokerNextConfig(baseConfig, env);
@@ -255,7 +260,11 @@ async function serveUniversalBroker(env: NodeJS.ProcessEnv): Promise<void> {
       );
     }
   }
-  const { app, managementApp, close, targets } = createUniversalBrokerNextServer(config);
+  // Provider translation belongs at the executable Host edge. The Universal
+  // Broker Core itself has no provider-specific default or workflow.
+  const { app, managementApp, close, targets } = createUniversalBrokerNextServer(config, {
+    incomingArtifactAdapters: [createOpenAIIncomingArtifactAdapter()],
+  });
   const targetSnapshot = await targets.inspect();
   const httpServer = app.listen(config.port, config.host, () => {
     console.log(

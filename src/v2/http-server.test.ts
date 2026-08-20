@@ -1,17 +1,24 @@
 import assert from "node:assert/strict";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
-import type { AddressInfo } from "node:net";
+import { createServer, type AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
 import test from "node:test";
+import { FINALIZATION_STORE_SCHEMA_FINGERPRINT } from "../../scripts/lib/finalization-store-contract.mjs";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { loadConfig } from "../config.js";
 import type { IncomingArtifactAdapter } from "../incoming-artifacts.js";
-import { SqliteOAuthStore } from "../oauth-store.js";
+import {
+  type ConnectorActivationAuthorityProof,
+  type ConnectorActivationReceipt,
+  SqliteOAuthStore,
+  connectorActivationAuthorityActionFingerprint,
+  connectorActivationAuthorityResourceKeySha256,
+} from "../oauth-store.js";
 import { UNIVERSAL_OWNER_SCOPES, UNIVERSAL_TOOL_NAMES } from "./contracts.js";
 import type { GuiNodeRunner } from "./gui.js";
 import {
@@ -19,7 +26,49 @@ import {
   createUniversalBrokerNextServer,
 } from "./http-server.js";
 import { loadUniversalBrokerNextConfig, OAUTH_OFFLINE_ACCESS_SCOPE } from "./config.js";
+import {
+  loadExistingManagementAuthorizationKey,
+  managementAuthorizationHeader,
+} from "./management-authorization.js";
 import { UniversalSelfManagementService } from "./self-management.js";
+import { createRuntimeIdentity } from "./runtime-identity.js";
+import { connectorProductionRouteIdentityReadback } from "./connector-route-identity.js";
+
+function connectorActivationProofFixture(
+  receipt: ConnectorActivationReceipt,
+  label: string,
+): ConnectorActivationAuthorityProof {
+  const binding = {
+    receiptId: receipt.receiptId,
+    tupleDigest: receipt.tupleDigest,
+    activePreimageDigest: receipt.preimageDigest,
+    finalizationPlanDigest: `sha256:${createHash("sha256")
+      .update(`http-fixture-finalization-plan\0${label}`)
+      .digest("hex")}`,
+    canonicalName: receipt.tuple.canonicalName,
+  };
+  const claimedAtMs = Date.now();
+  return {
+    schemaVersion: 1,
+    authorityId: `authority_${randomUUID()}`,
+    actionClaimId: `authority_claim_${randomUUID()}`,
+    actionFingerprint: connectorActivationAuthorityActionFingerprint(binding),
+    resourceKeySha256: connectorActivationAuthorityResourceKeySha256(binding),
+    fencingToken: 1,
+    principalKeyFingerprint: createHash("sha256")
+      .update(`http-fixture-principal\0${label}`)
+      .digest("hex"),
+    risk: "R3",
+    claimState: "DISPATCHED",
+    approvalAssurance: "cooperative",
+    ...binding,
+    evidenceDigest: `sha256:${createHash("sha256")
+      .update(`http-fixture-owner-evidence\0${label}`)
+      .digest("hex")}`,
+    claimedAtMs,
+    dispatchedAtMs: claimedAtMs + 1,
+  };
+}
 
 function guiObservation(applicationName: string) {
   return {
@@ -119,12 +168,13 @@ async function callAuthorized(client: Client, input: AuthorizedCall) {
   const authorityId = await prepareAuthority(client, input);
   return client.callTool({
     name: input.tool,
-    arguments: { ...input.arguments, authorityId },
+    arguments: input.arguments,
+    _meta: { devspace: { authorityId } },
   });
 }
 
 test("granular scopes are mandatory and legacy compatibility cannot be re-enabled", async (t) => {
-  const root = await mkdtemp(join(tmpdir(), "devspace-v2-granular-scope-test-"));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "devspace-v2-granular-scope-test-")));
   t.after(() => rm(root, { recursive: true, force: true }));
   const base = loadConfig({
     DEVSPACE_CONFIG_DIR: join(root, "config"),
@@ -160,8 +210,110 @@ test("granular scopes are mandatory and legacy compatibility cannot be re-enable
   );
 });
 
+test("HTTP Core has no provider-specific incoming artifact adapter unless one is edge-injected", async (t) => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "devspace-v2-http-artifact-adapter-test-")));
+  const base = loadConfig({
+    DEVSPACE_CONFIG_DIR: join(root, "config"),
+    DEVSPACE_ALLOWED_ROOTS: root,
+    DEVSPACE_STATE_DIR: join(root, "legacy-state"),
+    DEVSPACE_WORKTREE_ROOT: join(root, "legacy-worktrees"),
+    DEVSPACE_OAUTH_OWNER_TOKEN: "v2-artifact-adapter-owner-not-a-real-secret",
+    DEVSPACE_HOST: "127.0.0.1",
+    DEVSPACE_PORT: "7676",
+    DEVSPACE_PUBLIC_BASE_URL: "http://127.0.0.1:7676",
+    DEVSPACE_LOG_LEVEL: "silent",
+  });
+  const config = loadUniversalBrokerNextConfig(base, {
+    DEVSPACE_NEXT_STATE_DIR: join(root, "state"),
+    DEVSPACE_NEXT_AUTHORITY_OWNER_INSTANCE_ID: "http-artifact-adapter-owner",
+  });
+  const running = createUniversalBrokerNextServer(config);
+  t.after(async () => {
+    await running.close();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  await assert.rejects(
+    running.artifacts.execute({
+      operation: "receive",
+      source: {
+        file: {
+          download_url: "https://example.com/provider-owned-file",
+          file_id: "file_provider_edge_fixture",
+        },
+      },
+    }),
+    (error: unknown) => {
+      assert.equal((error as { code?: string }).code, "PRECONDITION_FAILED");
+      assert.match(
+        error instanceof Error ? error.message : String(error),
+        /requires a trusted native file reference or URL/u,
+      );
+      return true;
+    },
+  );
+});
+
+test("HTTP OAuth registration uses the shared metrics registry for connector transitions", async (t) => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), "devspace-v2-http-oauth-metrics-")));
+  const base = loadConfig({
+    DEVSPACE_CONFIG_DIR: join(root, "config"),
+    DEVSPACE_ALLOWED_ROOTS: root,
+    DEVSPACE_STATE_DIR: join(root, "legacy-state"),
+    DEVSPACE_WORKTREE_ROOT: join(root, "legacy-worktrees"),
+    DEVSPACE_OAUTH_OWNER_TOKEN: "v2-oauth-metrics-owner-not-a-real-secret",
+    DEVSPACE_HOST: "127.0.0.1",
+    DEVSPACE_PORT: "7676",
+    DEVSPACE_PUBLIC_BASE_URL: "http://127.0.0.1:7676",
+    DEVSPACE_LOG_LEVEL: "silent",
+  });
+  const config = loadUniversalBrokerNextConfig(base, {
+    DEVSPACE_NEXT_STATE_DIR: join(root, "state"),
+    DEVSPACE_NEXT_AUTHORITY_OWNER_INSTANCE_ID: "http-oauth-metrics-owner",
+    DEVSPACE_NEXT_PUBLIC_BASE_URL: "http://127.0.0.1:17677/v2",
+  });
+  const running = createUniversalBrokerNextServer(config, { incomingArtifactAdapters: [] });
+  const httpServer = running.app.listen(0, "127.0.0.1");
+  const managementServer = running.managementApp.listen(0, "127.0.0.1");
+  await Promise.all([httpServer, managementServer].map((server) => (
+    new Promise<void>((resolve, reject) => {
+      server.once("listening", resolve);
+      server.once("error", reject);
+    })
+  )));
+  t.after(async () => {
+    await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+    await new Promise<void>((resolve) => managementServer.close(() => resolve()));
+    await running.close();
+    await rm(root, { recursive: true, force: true });
+  });
+
+  const address = httpServer.address() as AddressInfo;
+  const managementAddress = managementServer.address() as AddressInfo;
+  const origin = `http://127.0.0.1:${address.port}`;
+  const managementOrigin = `http://127.0.0.1:${managementAddress.port}`;
+  const registered = await fetch(`${origin}/register`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      redirect_uris: ["http://127.0.0.1/callback"],
+      client_name: "Metrics connector registration",
+      token_endpoint_auth_method: "none",
+      grant_types: ["authorization_code", "refresh_token"],
+      response_types: ["code"],
+    }),
+  });
+  assert.equal(registered.status, 201, await registered.text());
+  const metrics = await fetch(`${managementOrigin}${config.metricsPath}`);
+  assert.equal(metrics.status, 200);
+  assert.match(
+    await metrics.text(),
+    /devspace_connector_transitions_total\{from="NONE",result="pass",to="REGISTERED"\} 1/u,
+  );
+});
+
 test("production HTTP rejects legacy-scope tokens and accepts granular tokens", async (t) => {
-  const root = await mkdtemp(join(tmpdir(), "devspace-v2-production-oauth-test-"));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "devspace-v2-production-oauth-test-")));
   t.after(() => rm(root, { recursive: true, force: true }));
   const base = loadConfig({
     DEVSPACE_CONFIG_DIR: join(root, "config"),
@@ -199,18 +351,91 @@ test("production HTTP rejects legacy-scope tokens and accepts granular tokens", 
     grant_types: ["authorization_code", "refresh_token"],
     response_types: ["code"],
   }, config.oauth.allowedRedirectHosts);
+  const fixtureRuntimeIdentity = createRuntimeIdentity({
+    config,
+    sourceRevision: config.sourceRevision,
+    runtimeRevision: config.runtimeRevision,
+    ...(config.buildDigest ? { buildDigest: config.buildDigest } : {}),
+  });
+  const activateConnector = (clientId: string, label: string, installationEpoch: number) => {
+    const connectorInput = {
+      canonicalName: config.oauth.canonicalConnector!.name,
+      clientId,
+      installationEpoch,
+      schemaGeneration: config.oauth.canonicalConnector!.schemaGeneration,
+    };
+    const connector = store.ensureCandidateConnectorBinding(connectorInput);
+    const connectorTuple = {
+      ...connectorInput,
+      candidateBindingId: connector.bindingId,
+      authorityContractGeneration: fixtureRuntimeIdentity.authorityContractGeneration,
+      redirectUrisDigest: `sha256:${createHash("sha256").update(label).digest("hex")}`,
+      buildDigest: fixtureRuntimeIdentity.buildDigest,
+    };
+    store.markConnectorBindingVerified(connector.bindingId, {
+      authorityContractGeneration: connectorTuple.authorityContractGeneration,
+      redirectUrisDigest: connectorTuple.redirectUrisDigest,
+      buildDigest: connectorTuple.buildDigest,
+    });
+    const connectorReceipt = store.prepareConnectorActivation(connectorTuple, {
+      drainDeadlineAt: new Date(Date.now() + 60_000).toISOString(),
+      refreshAllowedDuringDrain: false,
+    });
+    store.activatePreparedConnector(
+      connectorReceipt.receiptId,
+      connectorTuple,
+      connectorActivationProofFixture(connectorReceipt, label),
+    );
+    return connector.bindingId;
+  };
+  const activeInstallationEpoch = config.oauth.canonicalConnector!.installationEpoch;
+  const activeBindingId = activateConnector(
+    registered.client_id,
+    "active-client-fixture",
+    activeInstallationEpoch,
+  );
+  const activeConnector = store.getConnectorBinding(activeBindingId)!;
+  const saveBoundAccessToken = (
+    token: string,
+    scopes: string[],
+    clientId: string,
+    binding: typeof activeConnector,
+  ) => {
+    const familyId = `family-${randomUUID()}`;
+    const expiresAt = Math.floor(Date.now() / 1000) + 300;
+    const connectorBinding = {
+      familyId,
+      connectorBindingId: binding.bindingId,
+      connectorDrainEpoch: binding.drainEpoch,
+      installationEpoch: binding.installationEpoch,
+      rotationSequence: 0,
+    };
+    store.saveTokenPair({
+      accessTokenHash: createHash("sha256").update(token).digest("base64url"),
+      accessToken: {
+        clientId,
+        scopes,
+        expiresAt,
+        resource: config.publicMcpUrl,
+        ...connectorBinding,
+      },
+      refreshTokenHash: createHash("sha256").update(`refresh-${token}`).digest("base64url"),
+      refreshToken: {
+        clientId,
+        scopes,
+        expiresAt,
+        resource: config.publicMcpUrl,
+        ...connectorBinding,
+      },
+    });
+  };
   for (const [token, scopes] of [
     [legacyToken, ["devspace"]],
     [granularToken, [...config.oauth.scopes]],
     [refreshedToken, [...config.oauth.scopes]],
     [readOnlyToken, ["devspace.read"]],
   ] as const) {
-    store.saveAccessToken(createHash("sha256").update(token).digest("base64url"), {
-      clientId: registered.client_id,
-      scopes: [...scopes],
-      expiresAt: Math.floor(Date.now() / 1000) + 300,
-      resource: config.publicMcpUrl,
-    });
+    saveBoundAccessToken(token, [...scopes], registered.client_id, activeConnector);
   }
   store.saveAccessToken(createHash("sha256").update(otherClientToken).digest("base64url"), {
     clientId: otherRegistered.client_id,
@@ -222,13 +447,37 @@ test("production HTTP rejects legacy-scope tokens and accepts granular tokens", 
 
   const running = createUniversalBrokerNextServer(config, { incomingArtifactAdapters: [] });
   const http = running.app.listen(0, "127.0.0.1");
-  await new Promise<void>((resolve, reject) => {
-    http.once("listening", resolve);
-    http.once("error", reject);
-  });
+  const management = running.managementApp.listen(0, "127.0.0.1");
+  await Promise.all([http, management].map((server) => new Promise<void>((resolve, reject) => {
+    server.once("listening", resolve);
+    server.once("error", reject);
+  })));
   const address = http.address() as AddressInfo;
+  const managementAddress = management.address() as AddressInfo;
   const endpoint = new URL(`http://127.0.0.1:${address.port}/mcp`);
   try {
+    const routeIdentityUrl = `http://127.0.0.1:${managementAddress.port}/route-identityz`;
+    const unauthorizedRouteIdentity = await fetch(routeIdentityUrl);
+    assert.equal(unauthorizedRouteIdentity.status, 401);
+    const managementKey = loadExistingManagementAuthorizationKey({
+      keyRef: config.managementAuthorizationKeyRef,
+      stateDir: config.stateDir,
+    });
+    const routeIdentity = await fetch(routeIdentityUrl, {
+      headers: { Authorization: managementAuthorizationHeader(managementKey) },
+    });
+    const routeIdentityBody = await routeIdentity.json();
+    assert.equal(routeIdentity.status, 200, JSON.stringify(routeIdentityBody));
+    assert.deepEqual(
+      routeIdentityBody,
+      connectorProductionRouteIdentityReadback({
+        runtimeIdentity: running.runtimeIdentity,
+        oauthResource: config.publicMcpUrl,
+        canonicalName: activeConnector.canonicalName,
+        bindingId: activeConnector.bindingId,
+      }),
+    );
+
     const rejectedTransport = new StreamableHTTPClientTransport(endpoint, {
       requestInit: { headers: { Authorization: `Bearer ${legacyToken}` } },
     });
@@ -313,17 +562,54 @@ test("production HTTP rejects legacy-scope tokens and accepts granular tokens", 
     });
     assert.equal(sessionlessExecution.status, 400);
 
-    const nonOpenAiSessionlessToolsList = await fetch(endpoint, {
+    const genericSessionlessToolsList = await fetch(endpoint, {
       method: "POST",
       headers: { ...sessionlessHeaders, "User-Agent": "generic-mcp-client/1.0.0" },
       body: JSON.stringify({
         jsonrpc: "2.0",
-        id: "generic-client-must-initialize",
+        id: "generic-client-sessionless-discovery",
         method: "tools/list",
         params: {},
       }),
     });
-    assert.equal(nonOpenAiSessionlessToolsList.status, 400);
+    assert.equal(genericSessionlessToolsList.status, 200);
+    const genericSessionlessToolsListBody = await genericSessionlessToolsList.json() as {
+      result?: { tools?: Array<{ name?: string }> };
+    };
+    assert.deepEqual(
+      genericSessionlessToolsListBody.result?.tools?.map((tool) => tool.name),
+      [...UNIVERSAL_TOOL_NAMES],
+    );
+    const genericSessionlessExecution = await fetch(endpoint, {
+      method: "POST",
+      headers: { ...sessionlessHeaders, "User-Agent": "generic-mcp-client/1.0.0" },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: "generic-execution-must-remain-session-bound",
+        method: "tools/call",
+        params: { name: "target", arguments: { operation: "list" } },
+      }),
+    });
+    assert.equal(genericSessionlessExecution.status, 400);
+    const genericMixedSessionlessBatch = await fetch(endpoint, {
+      method: "POST",
+      headers: { ...sessionlessHeaders, "User-Agent": "generic-mcp-client/1.0.0" },
+      body: JSON.stringify([
+        {
+          jsonrpc: "2.0",
+          id: "generic-discovery-part",
+          method: "tools/list",
+          params: {},
+        },
+        {
+          jsonrpc: "2.0",
+          id: "generic-execution-part",
+          method: "tools/call",
+          params: { name: "target", arguments: { operation: "list" } },
+        },
+      ]),
+    });
+    assert.equal(genericMixedSessionlessBatch.status, 400);
 
     const acceptedTransport = new StreamableHTTPClientTransport(endpoint, {
       requestInit: { headers: { Authorization: `Bearer ${granularToken}` } },
@@ -357,7 +643,8 @@ test("production HTTP rejects legacy-scope tokens and accepts granular tokens", 
     await nextSessionClient.connect(nextSessionTransport);
     const crossSessionWrite = await nextSessionClient.callTool({
       name: "fs",
-      arguments: { ...crossSessionArguments, authorityId: crossSessionAuthorityId },
+      arguments: crossSessionArguments,
+      _meta: { devspace: { authorityId: crossSessionAuthorityId } },
     });
     assert.notEqual(crossSessionWrite.isError, true, JSON.stringify(crossSessionWrite.structuredContent));
     assert.equal(await readFile(crossSessionPath, "utf8"), crossSessionArguments.content);
@@ -367,17 +654,8 @@ test("production HTTP rejects legacy-scope tokens and accepts granular tokens", 
       requestInit: { headers: { Authorization: `Bearer ${otherClientToken}` } },
     });
     const otherClient = new Client({ name: "different-oauth-authority-test", version: "1" });
-    await otherClient.connect(otherClientTransport);
-    const crossClientWrite = await otherClient.callTool({
-      name: "fs",
-      arguments: { ...crossSessionArguments, authorityId: crossSessionAuthorityId },
-    });
-    assert.equal(crossClientWrite.isError, true);
-    assert.equal(
-      (crossClientWrite.structuredContent as { error?: { code?: string } } | undefined)?.error?.code,
-      "AUTHORITY_PRINCIPAL_MISMATCH",
-    );
-    await otherClient.close();
+    await assert.rejects(otherClient.connect(otherClientTransport));
+    await Promise.allSettled([otherClient.close(), otherClientTransport.close()]);
 
     const readOnlyTransport = new StreamableHTTPClientTransport(endpoint, {
       requestInit: { headers: { Authorization: `Bearer ${readOnlyToken}` } },
@@ -386,7 +664,8 @@ test("production HTTP rejects legacy-scope tokens and accepts granular tokens", 
     await readOnlyClient.connect(readOnlyTransport);
     const authorityStatusBeforeScopeFailure = await readOnlyClient.callTool({
       name: "context",
-      arguments: { operation: "authority_status", authorityId: crossSessionAuthorityId },
+      arguments: { operation: "authority_status" },
+      _meta: { devspace: { authorityId: crossSessionAuthorityId } },
     });
     assert.notEqual(
       authorityStatusBeforeScopeFailure.isError,
@@ -401,7 +680,8 @@ test("production HTTP rejects legacy-scope tokens and accepts granular tokens", 
     );
     const scopeReducedWrite = await readOnlyClient.callTool({
       name: "fs",
-      arguments: { ...crossSessionArguments, authorityId: crossSessionAuthorityId },
+      arguments: crossSessionArguments,
+      _meta: { devspace: { authorityId: crossSessionAuthorityId } },
     });
     assert.equal(scopeReducedWrite.isError, true);
     assert.equal(
@@ -412,7 +692,8 @@ test("production HTTP rejects legacy-scope tokens and accepts granular tokens", 
     );
     const authorityStatusAfterScopeFailure = await readOnlyClient.callTool({
       name: "context",
-      arguments: { operation: "authority_status", authorityId: crossSessionAuthorityId },
+      arguments: { operation: "authority_status" },
+      _meta: { devspace: { authorityId: crossSessionAuthorityId } },
     });
     assert.equal(
       ((authorityStatusAfterScopeFailure.structuredContent as {
@@ -453,13 +734,14 @@ test("production HTTP rejects legacy-scope tokens and accepts granular tokens", 
     await readOnlyClient.close();
   } finally {
     await new Promise<void>((resolve) => http.close(() => resolve()));
+    await new Promise<void>((resolve) => management.close(() => resolve()));
     await running.close();
   }
 });
 
 test("parallel v2 HTTP service has an independent health endpoint and protected MCP endpoint", async (t) => {
-  const root = await mkdtemp(join(tmpdir(), "devspace-v2-http-test-"));
-  t.after(() => rm(root, { recursive: true, force: true }));
+  const root = await realpath(await mkdtemp(join(tmpdir(), "devspace-v2-http-test-")));
+  const publicPort = await availableLoopbackPort();
   const mcpRoutes = join(root, "mcp-routes.json");
   const targetsFile = join(root, "targets.json");
   await writeFile(mcpRoutes, JSON.stringify({
@@ -498,11 +780,58 @@ test("parallel v2 HTTP service has an independent health endpoint and protected 
     DEVSPACE_LOG_LEVEL: "silent",
   });
   const config = loadUniversalBrokerNextConfig(base, {
+    DEVSPACE_NEXT_PORT: String(publicPort),
     DEVSPACE_NEXT_PUBLIC_BASE_URL: "http://127.0.0.1:17677/v2",
     DEVSPACE_NEXT_AUTHORITY_OWNER_INSTANCE_ID: "http-parallel-test-owner",
     DEVSPACE_NEXT_MCP_ROUTES_FILE: mcpRoutes,
     DEVSPACE_NEXT_TARGETS_FILE: targetsFile,
+    DEVSPACE_NEXT_RATE_LIMIT_PRE_AUTH_BURST: "1000",
+    DEVSPACE_NEXT_RATE_LIMIT_POST_AUTH_BURST: "1000",
+    DEVSPACE_NEXT_RATE_LIMIT_INITIALIZE_BURST: "100",
   });
+  const fixtureRuntimeIdentity = createRuntimeIdentity({
+    config,
+    sourceRevision: config.sourceRevision,
+    runtimeRevision: config.runtimeRevision,
+    ...(config.buildDigest ? { buildDigest: config.buildDigest } : {}),
+  });
+  const connectorStore = new SqliteOAuthStore(config.oauthStateDir);
+  const connectorClient = connectorStore.registerClient({
+    redirect_uris: ["http://127.0.0.1/connector-callback"],
+    client_name: "Universal Broker v3 active connector fixture",
+    token_endpoint_auth_method: "none",
+    grant_types: ["authorization_code", "refresh_token"],
+    response_types: ["code"],
+  }, config.oauth.allowedRedirectHosts);
+  const connectorInput = {
+    canonicalName: config.oauth.canonicalConnector!.name,
+    clientId: connectorClient.client_id,
+    installationEpoch: config.oauth.canonicalConnector!.installationEpoch,
+    schemaGeneration: config.oauth.canonicalConnector!.schemaGeneration,
+  };
+  const connector = connectorStore.ensureCandidateConnectorBinding(connectorInput);
+  const connectorTuple = {
+    ...connectorInput,
+    candidateBindingId: connector.bindingId,
+    authorityContractGeneration: fixtureRuntimeIdentity.authorityContractGeneration,
+    redirectUrisDigest: `sha256:${createHash("sha256").update("http-fixture-redirects").digest("hex")}`,
+    buildDigest: fixtureRuntimeIdentity.buildDigest,
+  };
+  connectorStore.markConnectorBindingVerified(connector.bindingId, {
+    authorityContractGeneration: connectorTuple.authorityContractGeneration,
+    redirectUrisDigest: connectorTuple.redirectUrisDigest,
+    buildDigest: connectorTuple.buildDigest,
+  });
+  const connectorReceipt = connectorStore.prepareConnectorActivation(connectorTuple, {
+    drainDeadlineAt: new Date(Date.now() + 60_000).toISOString(),
+    refreshAllowedDuringDrain: false,
+  });
+  connectorStore.activatePreparedConnector(
+    connectorReceipt.receiptId,
+    connectorTuple,
+    connectorActivationProofFixture(connectorReceipt, "http-fixture-activation"),
+  );
+  connectorStore.close();
   const nativeArtifactAdapter: IncomingArtifactAdapter = {
     id: "http-fixture",
     canHandle(value) {
@@ -529,7 +858,7 @@ test("parallel v2 HTTP service has an independent health endpoint and protected 
         return {
           platform: "macos",
           accessibility: true,
-          screenCapture: "not_probed",
+          screenCapture: false,
           frontmostProcess: {
             name: guiState.application.name,
             pid: guiState.application.pid,
@@ -548,18 +877,28 @@ test("parallel v2 HTTP service has an independent health endpoint and protected 
     pm2Executable: "/usr/bin/true",
     localHealthUrl: "http://127.0.0.1:17691/healthz",
     expectedCwd: root,
-    defaultDelayMs: 750,
     timeoutMs: 10_000,
+    runtimeIdentity: fixtureRuntimeIdentity,
     launchWorker(request) {
       restartLaunches.push(request.transactionId);
     },
+    supervisorReadinessProbe: () => ({
+      state: "PASS",
+      evidence: {
+        controlChannel: "fixture-pm2-rpc",
+        processMatches: 1,
+        online: true,
+        cwdMatches: true,
+        scriptMatches: true,
+      },
+    }),
   });
   const running = createUniversalBrokerNextServer(config, {
     incomingArtifactAdapters: [nativeArtifactAdapter],
     guiRunner,
     selfManagement,
   });
-  const httpServer = running.app.listen(0, "127.0.0.1");
+  const httpServer = running.app.listen(config.port, "127.0.0.1");
   const managementServer = running.managementApp.listen(0, "127.0.0.1");
   await Promise.all([httpServer, managementServer].map((server) => (
     new Promise<void>((resolve, reject) => {
@@ -571,6 +910,7 @@ test("parallel v2 HTTP service has an independent health endpoint and protected 
     await new Promise<void>((resolve) => httpServer.close(() => resolve()));
     await new Promise<void>((resolve) => managementServer.close(() => resolve()));
     await running.close();
+    await rm(root, { recursive: true, force: true });
   });
 
   const address = httpServer.address() as AddressInfo;
@@ -590,6 +930,11 @@ test("parallel v2 HTTP service has an independent health endpoint and protected 
   assert.match(localMetricsText, /devspace_target_probe_cache_misses 0/u);
   assert.match(localMetricsText, /devspace_target_probe_coalesced 0/u);
   assert.match(localMetricsText, /devspace_target_probe_average_duration_ms 0/u);
+  const productionRateLimitBucketsBeforeDoctor = Number(
+    /^devspace_rate_limit_buckets ([0-9]+)$/mu.exec(localMetricsText)?.[1],
+  );
+  assert.equal(Number.isSafeInteger(productionRateLimitBucketsBeforeDoctor), true);
+  assert.ok(productionRateLimitBucketsBeforeDoctor >= 0);
   const health = await fetch(`${origin}/healthz-next`);
   assert.equal(health.status, 200);
   const healthBody = await health.json() as {
@@ -597,16 +942,242 @@ test("parallel v2 HTTP service has an independent health endpoint and protected 
     productVersion: string;
     schemaGeneration: string;
     authorityContractGeneration: string;
+    buildDigest: string;
     runtimeRevision: string;
     startedAt: string;
   };
   assert.equal(healthBody.status, "ok");
   assert.match(healthBody.schemaGeneration, /^sha256:/u);
   assert.match(healthBody.authorityContractGeneration, /^sha256:/u);
+  assert.equal(healthBody.buildDigest, fixtureRuntimeIdentity.buildDigest);
+  assert.equal("configDigest" in healthBody, false);
   assert.equal("targetGeneration" in healthBody, false);
   assert.equal("mcpRouteGeneration" in healthBody, false);
   const readiness = await fetch(`${managementOrigin}${config.readyPath}`);
-  assert.equal(readiness.status, 200);
+  const readinessBody = await readiness.json() as {
+    checks?: Array<{ id?: string; state?: string; evidence?: Record<string, unknown> }>;
+    identity?: { productProfile?: string; buildCapabilityDigest?: string };
+  };
+  assert.equal(readiness.status, 200, JSON.stringify(readinessBody));
+  assert.equal(readinessBody.identity?.productProfile, "BASE_SINGLE_OWNER");
+  const readinessChecks = new Map(readinessBody.checks?.map((check) => [check.id, check]));
+  for (const id of [
+    "config_build_capabilities",
+    "required_store_migrations",
+    "authority_artifact_readability",
+    "target_route_generation",
+    "canonical_connector",
+    "supervisor_control",
+    "rate_limit_identity",
+    "management_isolation",
+    "audit_sink",
+    "runtime_contract_identity",
+  ]) {
+    assert.equal(readinessChecks.has(id), true, id);
+    assert.equal(readinessChecks.get(id)?.state, "PASS", id);
+  }
+  const storeObservations = readinessChecks.get("required_store_migrations")?.evidence?.observations as
+    | Array<{ evidence?: Record<string, unknown> }>
+    | undefined;
+  assert.equal(
+    storeObservations?.some((observation) => (
+      observation.evidence?.storeId === "filesystem-sync"
+      && observation.evidence.path === join(config.stateDir, "filesystem-sync", "sync.sqlite")
+      && observation.evidence.exists === true
+      && observation.evidence.userVersion === 1
+      && observation.evidence.expectedUserVersion === 1
+    )),
+    true,
+  );
+  assert.equal(
+    storeObservations?.some((observation) => (
+      observation.evidence?.storeId === "connector-activation-journal"
+      && observation.evidence.path === config.connectorActivationJournalPath
+      && observation.evidence.exists === true
+      && observation.evidence.userVersion === 1
+      && observation.evidence.expectedUserVersion === 1
+    )),
+    true,
+  );
+  assert.equal(
+    storeObservations?.some((observation) => (
+      observation.evidence?.storeId === "lifecycle-finalization-store"
+      && observation.evidence.path === config.lifecycleFinalizationStorePath
+      && observation.evidence.controlPath === config.lifecycleFinalizationControlPath
+      && observation.evidence.schemaVersion === 2
+      && observation.evidence.schemaFingerprint === FINALIZATION_STORE_SCHEMA_FINGERPRINT
+      && observation.evidence.state === "DRAFT"
+      && observation.evidence.revision === 1
+      && observation.evidence.integrity === "ok"
+      && observation.evidence.foreignKeyViolations === 0
+    )),
+    true,
+  );
+  assert.equal(
+    storeObservations?.some((observation) => (
+      observation.evidence?.id === "connector-activation-journal-identity"
+      && observation.evidence.storePath === config.connectorActivationJournalPath
+      && observation.evidence.schemaVersion === 1
+      && typeof observation.evidence.schemaFingerprint === "string"
+      && typeof observation.evidence.migrationManifestDigest === "string"
+      && observation.evidence.snapshotPolicy === "PRESERVE_OUTSIDE_MUTABLE_ROLLBACK"
+      && observation.evidence.receiptReplayPolicy === "PREPARED_RECEIPT_PERMANENTLY_ONE_SHOT"
+    )),
+    true,
+  );
+  assert.equal(
+    storeObservations?.some((observation) => (
+      observation.evidence?.storeId === "main"
+      && observation.evidence.path === join(config.oauthStateDir, "devspace.sqlite")
+      && observation.evidence.complete === true
+      && observation.evidence.integrity === "ok"
+      && observation.evidence.foreignKeyViolations === 0
+    )),
+    true,
+  );
+  assert.equal(
+    (readinessChecks.get("audit_sink")?.evidence as { startupProof?: string } | undefined)?.startupProof,
+    "RECORDED",
+  );
+  assert.equal(
+    readinessChecks.get("rate_limit_identity")?.evidence?.sourcePolicy,
+    "loopback-direct-peer-plus-bounded-hop-count",
+  );
+  const expectedRateLimitPolicyDigest = String(
+    readinessChecks.get("rate_limit_identity")?.evidence?.policyDigest ?? "",
+  );
+  assert.match(expectedRateLimitPolicyDigest, /^sha256:[a-f0-9]{64}$/u);
+  const publicDoctor = await fetch(`${origin}/doctorz`, { method: "POST" });
+  assert.equal(publicDoctor.status, 404);
+  const forgedDoctorProbe = await fetch(`${origin}/healthz-next`, {
+    headers: { "x-devspace-internal-doctor-probe": "A".repeat(43) },
+  });
+  assert.equal(forgedDoctorProbe.status, 200);
+  assert.equal(
+    Number.isSafeInteger(Number(forgedDoctorProbe.headers.get("x-ratelimit-remaining"))),
+    true,
+  );
+  const rateStateBeforeDoctor = await fetch(`${origin}/healthz-next`);
+  assert.equal(rateStateBeforeDoctor.status, 200);
+  const rateLimitBeforeDoctor = Number(rateStateBeforeDoctor.headers.get("x-ratelimit-limit"));
+  const rateRemainingBeforeDoctor = Number(rateStateBeforeDoctor.headers.get("x-ratelimit-remaining"));
+  assert.equal(Number.isSafeInteger(rateRemainingBeforeDoctor), true);
+  const doctorGet = await fetch(`${managementOrigin}/doctorz`);
+  assert.equal(doctorGet.status, 405);
+  const unauthorizedDoctor = await fetch(`${managementOrigin}/doctorz`, { method: "POST" });
+  assert.equal(unauthorizedDoctor.status, 401);
+  const managementKey = loadExistingManagementAuthorizationKey({
+    keyRef: config.managementAuthorizationKeyRef,
+    stateDir: config.stateDir,
+  });
+  const parallelRouteIdentity = await fetch(`${managementOrigin}/route-identityz`, {
+    headers: { Authorization: managementAuthorizationHeader(managementKey) },
+  });
+  assert.equal(parallelRouteIdentity.status, 503);
+  assert.deepEqual(await parallelRouteIdentity.json(), {
+    schemaVersion: 1,
+    state: "UNAVAILABLE",
+    routeCount: 1,
+  });
+  const doctor = await fetch(`${managementOrigin}/doctorz`, {
+    method: "POST",
+    headers: { Authorization: managementAuthorizationHeader(managementKey) },
+  });
+  const doctorBody = await doctor.json() as {
+    status?: string;
+    releasePassClaimed?: boolean;
+    cleanup?: { state?: string; receiptDigest?: string };
+    checks?: Array<{
+      id?: string;
+      state?: string;
+      evidence?: Record<string, unknown> & { stores?: string[] };
+    }>;
+  };
+  assert.equal(doctor.status, 503, JSON.stringify(doctorBody));
+  assert.equal(doctorBody.releasePassClaimed, false);
+  assert.equal(doctorBody.cleanup?.state, "CLEANED");
+  assert.match(doctorBody.cleanup?.receiptDigest ?? "", /^sha256:[a-f0-9]{64}$/u);
+  const doctorChecks = new Map(doctorBody.checks?.map((check) => [check.id, check.state]));
+  for (const id of [
+    "authority_claim_receipt",
+    "connector_consistency",
+    "pm2_uniqueness",
+    "public_metrics_negative_probe",
+    "artifact_reconciliation",
+    "migration_manifest_scan",
+    "mutable_snapshot_capability",
+    "rate_canary",
+    "stale_lease_nonterminal_report",
+    "runtime_identity_readback",
+  ]) {
+    assert.equal(doctorChecks.has(id), true, id);
+  }
+  assert.equal(doctorChecks.get("authority_claim_receipt"), "PASS");
+  assert.equal(
+    doctorChecks.get("mutable_snapshot_capability"),
+    "PASS",
+    JSON.stringify(doctorBody.checks?.find((check) => check.id === "mutable_snapshot_capability")),
+  );
+  assert.equal(doctorChecks.get("rate_canary"), "PASS");
+  assert.equal(doctorChecks.get("public_metrics_negative_probe"), "PASS");
+  assert.equal(doctorChecks.get("artifact_reconciliation"), "PASS");
+  const migrationScan = doctorBody.checks?.find((check) => check.id === "migration_manifest_scan");
+  assert.equal(migrationScan?.state, "PASS");
+  assert.equal(migrationScan?.evidence?.stores?.includes("main"), true);
+  const secondDoctor = await fetch(`${managementOrigin}/doctorz`, {
+    method: "POST",
+    headers: { Authorization: managementAuthorizationHeader(managementKey) },
+  });
+  const secondDoctorBody = await secondDoctor.json() as typeof doctorBody;
+  assert.equal(secondDoctor.status, 503, JSON.stringify(secondDoctorBody));
+  assert.equal(secondDoctorBody.cleanup?.state, "CLEANED");
+  assert.match(secondDoctorBody.cleanup?.receiptDigest ?? "", /^sha256:[a-f0-9]{64}$/u);
+  assert.equal(
+    secondDoctorBody.checks?.find((check) => check.id === "rate_canary")?.state,
+    "PASS",
+  );
+  assert.equal(
+    secondDoctorBody.checks?.find((check) => check.id === "public_metrics_negative_probe")?.state,
+    "PASS",
+  );
+  const rateStateAfterDoctor = await fetch(`${origin}/healthz-next`);
+  assert.equal(rateStateAfterDoctor.status, 200);
+  assert.equal(
+    Number(rateStateAfterDoctor.headers.get("x-ratelimit-limit")),
+    rateLimitBeforeDoctor,
+  );
+  assert.equal(
+    Number(rateStateAfterDoctor.headers.get("x-ratelimit-remaining")),
+    rateRemainingBeforeDoctor - 1,
+    "deep-doctor self-probes must not consume production admission tokens",
+  );
+  const metricsAfterDoctor = await fetch(`${managementOrigin}${config.metricsPath}`);
+  assert.equal(metricsAfterDoctor.status, 200);
+  const metricsAfterDoctorText = await metricsAfterDoctor.text();
+  const productionRateLimitBucketsAfterDoctor = Number(
+    /^devspace_rate_limit_buckets ([0-9]+)$/mu.exec(metricsAfterDoctorText)?.[1],
+  );
+  assert.equal(
+    productionRateLimitBucketsAfterDoctor,
+    productionRateLimitBucketsBeforeDoctor,
+    "authorized deep-doctor runs must not retain production rate-limit buckets",
+  );
+  for (const report of [doctorBody, secondDoctorBody]) {
+    const evidence = report.checks?.find((check) => check.id === "rate_canary")?.evidence;
+    assert.equal(evidence?.isolation, "PER_RUN_DISPOSABLE_RATE_LIMITER");
+    assert.equal(evidence?.cleanupBinding, "deep-doctor-rate-canary-v1");
+    assert.equal(evidence?.policyDigest, expectedRateLimitPolicyDigest);
+    assert.equal(evidence?.isolatedBucketCountBefore, 0);
+    assert.equal(evidence?.isolatedBucketCountAfter, 1);
+  }
+  assert.match(
+    metricsAfterDoctorText,
+    /devspace_doctor_checks_total\{check="authority_claim_receipt",result="pass"\} 2/u,
+  );
+  assert.match(
+    metricsAfterDoctorText,
+    /devspace_doctor_duration_seconds_count\{result="UNKNOWN"\} 2/u,
+  );
 
   const authorizationMetadata = await fetch(
     `${origin}/.well-known/oauth-authorization-server`,
@@ -647,28 +1218,39 @@ test("parallel v2 HTTP service has an independent health endpoint and protected 
   const token = `v2-test-${randomUUID()}`;
   const readOnlyPlanningToken = `v2-read-only-${randomUUID()}`;
   const oauthStore = new SqliteOAuthStore(config.stateDir);
-  const registered = oauthStore.registerClient({
-    redirect_uris: ["http://127.0.0.1/callback"],
-    client_name: "Universal Broker v2 HTTP test",
-    token_endpoint_auth_method: "none",
-    grant_types: ["authorization_code", "refresh_token"],
-    response_types: ["code"],
-  }, config.oauth.allowedRedirectHosts);
-  oauthStore.saveAccessToken(createHash("sha256").update(token).digest("base64url"), {
-    clientId: registered.client_id,
-    scopes: config.oauth.scopes,
-    expiresAt: Math.floor(Date.now() / 1000) + 300,
-    resource: config.publicMcpUrl,
-  });
-  oauthStore.saveAccessToken(
-    createHash("sha256").update(readOnlyPlanningToken).digest("base64url"),
-    {
-      clientId: registered.client_id,
-      scopes: ["devspace.read"],
-      expiresAt: Math.floor(Date.now() / 1000) + 300,
-      resource: config.publicMcpUrl,
-    },
-  );
+  const registered = connectorClient;
+  const activeConnector = oauthStore.getActiveConnectorBinding(config.canonicalConnectorName)!;
+  const saveBoundAccessToken = (accessToken: string, scopes: string[]) => {
+    const familyId = `family-${randomUUID()}`;
+    const expiresAt = Math.floor(Date.now() / 1000) + 300;
+    const binding = {
+      familyId,
+      connectorBindingId: activeConnector.bindingId,
+      connectorDrainEpoch: activeConnector.drainEpoch,
+      installationEpoch: activeConnector.installationEpoch,
+      rotationSequence: 0,
+    };
+    oauthStore.saveTokenPair({
+      accessTokenHash: createHash("sha256").update(accessToken).digest("base64url"),
+      accessToken: {
+        clientId: registered.client_id,
+        scopes,
+        expiresAt,
+        resource: config.publicMcpUrl,
+        ...binding,
+      },
+      refreshTokenHash: createHash("sha256").update(`refresh-${accessToken}`).digest("base64url"),
+      refreshToken: {
+        clientId: registered.client_id,
+        scopes,
+        expiresAt,
+        resource: config.publicMcpUrl,
+        ...binding,
+      },
+    });
+  };
+  saveBoundAccessToken(token, config.oauth.scopes);
+  saveBoundAccessToken(readOnlyPlanningToken, ["devspace.read"]);
   oauthStore.close();
 
   const readOnlyPlanningTransport = new StreamableHTTPClientTransport(
@@ -775,7 +1357,8 @@ test("parallel v2 HTTP service has an independent health endpoint and protected 
     }, null, 2));
     const staleGeneration = await client.callTool({
       name: "fs",
-      arguments: { ...generationBoundArguments, authorityId: generationAuthorityId },
+      arguments: generationBoundArguments,
+      _meta: { devspace: { authorityId: generationAuthorityId } },
     });
     assert.equal(staleGeneration.isError, true);
     assert.equal(
@@ -918,6 +1501,12 @@ test("parallel v2 HTTP service has an independent health endpoint and protected 
       },
     });
     assert.notEqual(fileWrite.isError, true);
+    const metricsAfterAuthority = await fetch(`${managementOrigin}${config.metricsPath}`);
+    assert.equal(metricsAfterAuthority.status, 200);
+    assert.match(
+      await metricsAfterAuthority.text(),
+      /devspace_authority_checks_total\{result="pass",risk="R1"\} 1/u,
+    );
     const fileRead = await client.callTool({
       name: "fs",
       arguments: {
@@ -1020,7 +1609,8 @@ test("parallel v2 HTTP service has an independent health endpoint and protected 
     }, null, 2));
     const changedRouteResult = await client.callTool({
       name: "mcp",
-      arguments: { ...routeArgs, authorityId: routeAuthority },
+      arguments: routeArgs,
+      _meta: { devspace: { authorityId: routeAuthority } },
     });
     assert.equal(changedRouteResult.isError, true);
     assert.equal(
@@ -1053,12 +1643,24 @@ test("parallel v2 HTTP service has an independent health endpoint and protected 
     });
     assert.notEqual(restoredMcpWrite.isError, true);
 
+    const mcpResources = await client.callTool({
+      name: "mcp",
+      arguments: {
+        operation: "list_resources",
+        route: "fixture",
+      },
+    });
+    const mcpResourcesStructured = mcpResources.structuredContent as {
+      data?: { result?: { value?: { resources?: Array<{ uri?: string }> } } };
+    } | undefined;
+    const mcpResourceUri = mcpResourcesStructured?.data?.result?.value?.resources?.[0]?.uri;
+    assert.match(mcpResourceUri ?? "", /^devspace:\/\/v1\/mcp\/fixture\/resource\//u);
     const mcpResource = await client.callTool({
       name: "mcp",
       arguments: {
         operation: "read_resource",
         route: "fixture",
-        uri: "fixture://state",
+        uri: mcpResourceUri,
       },
     });
     assert.match(JSON.stringify(mcpResource.structuredContent), /http/);
@@ -1092,17 +1694,28 @@ test("parallel v2 HTTP service has an independent health endpoint and protected 
     } | undefined)?.data?.result;
     assert.equal(largeData?.truncated, true);
     assert.equal(typeof largeData?.resourceUri, "string");
-    const mcpResultResource = await client.readResource({ uri: largeData!.resourceUri! });
-    const mcpResultContent = mcpResultResource.contents[0];
-    assert.ok(mcpResultContent && "text" in mcpResultContent);
-    assert.match(mcpResultContent.text, /^\{"content"/);
-    assert.equal(mcpResultContent.text.length, 12_000);
-    const mcpResultMeta = mcpResultContent._meta as {
-      truncated?: boolean;
-      nextResourceUri?: string;
-    } | undefined;
-    assert.equal(mcpResultMeta?.truncated, true);
-    assert.equal(typeof mcpResultMeta?.nextResourceUri, "string");
+    const mcpResultPages: string[] = [];
+    let nextMcpResultUri: string | undefined = largeData!.resourceUri!;
+    let mcpResultPageCount = 0;
+    while (nextMcpResultUri) {
+      const page = await client.readResource({ uri: nextMcpResultUri });
+      const content = page.contents[0];
+      assert.ok(content && "text" in content);
+      mcpResultPages.push(content.text);
+      const meta = content._meta as {
+        truncated?: boolean;
+        nextResourceUri?: string;
+        nextOffset?: number;
+      } | undefined;
+      assert.equal(meta?.nextOffset, undefined);
+      nextMcpResultUri = meta?.nextResourceUri;
+      mcpResultPageCount += 1;
+      assert.ok(mcpResultPageCount <= 8, "retained MCP result paging must terminate");
+    }
+    const completeMcpResult = mcpResultPages.join("");
+    assert.match(completeMcpResult, /^\{"content"/);
+    assert.ok(completeMcpResult.length > 20_000);
+    assert.ok(mcpResultPageCount > 1);
 
     const mcpDelete = await callAuthorized(client, {
       taskId: "http-mcp-delete",
@@ -1186,7 +1799,7 @@ test("parallel v2 HTTP service has an independent health endpoint and protected 
       data?: { resourceUri?: string; downloadUrl?: string; immutable?: boolean };
     } | undefined)?.data;
     assert.equal(publishedData?.immutable, true);
-    assert.match(publishedData?.resourceUri ?? "", /^devspace:\/\/artifact\/[0-9a-f-]{36}$/u);
+    assert.match(publishedData?.resourceUri ?? "", /^devspace:\/\/v1\/artifact\/[0-9a-f-]{36}$/u);
     assert.match(publishedData?.downloadUrl ?? "", /^http:\/\/127\.0\.0\.1:17677\/v2\/artifacts-next\//u);
     const artifactResource = await client.readResource({ uri: publishedData!.resourceUri! });
     const artifactContent = artifactResource.contents[0];
@@ -1378,30 +1991,53 @@ test("parallel v2 HTTP service has an independent health endpoint and protected 
       arguments: {
         operation: "restart_broker",
         reason: "HTTP integration restart",
-        delayMs: 750,
       },
       risk: "R3",
     });
-    assert.notEqual(restartRequested.isError, true);
+    assert.notEqual(
+      restartRequested.isError,
+      true,
+      JSON.stringify(restartRequested.structuredContent),
+    );
     const restartData = (restartRequested.structuredContent as {
       data?: { transactionId?: string; state?: string; expectedDisconnect?: boolean };
     } | undefined)?.data;
-    assert.equal(restartData?.state, "REQUESTED");
+    assert.equal(restartData?.state, "RESPONSE_BOUND");
     assert.equal(restartData?.expectedDisconnect, true);
+    await waitFor(() => restartLaunches.length === 1, 2_000);
     assert.deepEqual(restartLaunches, [restartData!.transactionId!]);
     const restartStatus = await client.callTool({
       name: "process",
-      arguments: {
-        operation: "restart_status",
-        transactionId: restartData!.transactionId!,
-      },
+      arguments: { operation: "restart_status" },
+      _meta: { devspace: { transactionId: restartData!.transactionId! } },
     });
     const restartStatusData = (restartStatus.structuredContent as {
       data?: { state?: string; transactionId?: string };
     } | undefined)?.data;
-    assert.equal(restartStatusData?.state, "REQUESTED");
+    assert.equal(restartStatusData?.state, "ACK_FLUSHED");
     assert.equal(restartStatusData?.transactionId, restartData?.transactionId);
   } finally {
     await client.close();
   }
 });
+
+async function waitFor(predicate: () => boolean, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error("Timed out waiting for the expected HTTP lifecycle state.");
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+async function availableLoopbackPort(): Promise<number> {
+  const server = createServer();
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address() as AddressInfo;
+  await new Promise<void>((resolve, reject) => {
+    server.close((error) => error ? reject(error) : resolve());
+  });
+  return address.port;
+}

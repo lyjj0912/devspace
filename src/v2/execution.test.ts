@@ -5,8 +5,12 @@ import {
   chmod,
   mkdir,
   mkdtemp,
+  readFile,
   realpath,
+  readdir,
+  rename,
   rm,
+  truncate,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -38,6 +42,9 @@ import {
 import { UniversalBrokerError } from "./errors.js";
 import { TargetRegistry } from "./targets.js";
 import { createCapabilityCallContextFromTrustedPrincipal } from "./capability-call-context.js";
+import { SignedSnapshotCursorStore } from "./cursor-capability.js";
+import { UniversalBrokerMetrics } from "./metrics.js";
+import { SignedResourceContinuation } from "./resource-continuation.js";
 import type {
   DurableProcessAdapter,
   DurableProcessEvents,
@@ -169,10 +176,76 @@ test("process handles and listings are stable-principal owned with cross-princip
   assert.equal(killCalls, 1);
 });
 
+test("process.list uses owner-bound signed snapshots and rejects a changed process set", async (t) => {
+  const cursorStore = new SignedSnapshotCursorStore({
+    currentKey: { keyId: "process-test", secret: Buffer.alloc(32, 0x73) },
+    ttlMs: 60_000,
+    maximumSnapshotsPerPrincipal: 8,
+  });
+  const fixture = await createFixture(t, { cursorStore });
+  const ownerA = owner("process-cursor-owner-a");
+  const ownerB = owner("process-cursor-owner-b");
+  const started: string[] = [];
+  for (let index = 0; index < 3; index += 1) {
+    const process = await fixture.execution.execute({
+      cwd: fixture.root,
+      command: "sleep 30",
+      mode: "background",
+    }, undefined, undefined, ownerA);
+    started.push(process.processId);
+  }
+  const first = await fixture.execution.operate({ operation: "list", limit: 2 }, undefined, ownerA);
+  assert.equal((first.processes as unknown[]).length, 2);
+  assert.match(String(first.nextCursor), /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/u);
+  assert.equal(Number.isNaN(Number(first.nextCursor)), true);
+  const second = await fixture.execution.operate({
+    operation: "list",
+    cursor: String(first.nextCursor),
+    limit: 2,
+  }, undefined, ownerA);
+  assert.equal((second.processes as unknown[]).length, 1);
+  await assert.rejects(
+    fixture.execution.operate({
+      operation: "list",
+      cursor: String(first.nextCursor),
+      limit: 2,
+    }, undefined, ownerB),
+    (error: unknown) => error instanceof Error
+      && "reason" in error
+      && error.reason === "CURSOR_INVALID",
+  );
+  const added = await fixture.execution.execute({
+    cwd: fixture.root,
+    command: "sleep 30",
+    mode: "background",
+  }, undefined, undefined, ownerA);
+  started.push(added.processId);
+  await assert.rejects(
+    fixture.execution.operate({
+      operation: "list",
+      cursor: String(first.nextCursor),
+      limit: 2,
+    }, undefined, ownerA),
+    (error: unknown) => error instanceof Error
+      && "reason" in error
+      && error.reason === "CURSOR_STALE",
+  );
+  for (const processId of started) {
+    await fixture.execution.operate({
+      operation: "signal",
+      processId,
+      signal: "SIGTERM",
+      waitMs: 2_000,
+    }, undefined, ownerA);
+  }
+});
+
 test("process record quota rejects synchronously before a second provider spawn", async (t) => {
   let spawnCalls = 0;
+  const metrics = new UniversalBrokerMetrics();
   const fixture = await createFixture(t, {
     maxProcessRecords: 1,
+    metrics,
     spawnProcess: ((...args: Parameters<typeof spawn>) => {
       spawnCalls += 1;
       return spawn(...args);
@@ -195,6 +268,62 @@ test("process record quota rejects synchronously before a second provider spawn"
     (error: unknown) => brokerCode(error) === "RESOURCE_QUOTA_EXCEEDED",
   );
   assert.equal(spawnCalls, 1);
+  assert.match(
+    metrics.render({}),
+    /devspace_quota_rejections_total\{resource_kind="process"\} 1/u,
+  );
+});
+
+test("R0 foreground exec does not await process metadata fsync, while mutation launch does", async (t) => {
+  const stateStore = new ControllableProcessStateStore();
+  let spawnCalls = 0;
+  const fixture = await createFixture(t, {
+    processStateStore: stateStore,
+    spawnProcess: ((...args: Parameters<typeof spawn>) => {
+      spawnCalls += 1;
+      return spawn(...args);
+    }) as NonNullable<ExecutionPlaneOptions["spawnProcess"]>,
+  });
+  const internals = fixture.execution as unknown as {
+    drainPendingStateWrites(): Promise<void>;
+  };
+
+  const readOnlyBlocked = stateStore.blockNextSave();
+  const readOnly = fixture.execution.execute({
+    cwd: fixture.root,
+    command: "true",
+    mode: "foreground",
+    yieldMs: 2_000,
+  });
+  await readOnlyBlocked.started;
+  const readOnlyResult = await Promise.race([
+    readOnly,
+    new Promise<never>((_resolve, reject) => setTimeout(
+      () => reject(new Error("R0 exec waited for process metadata fsync")),
+      2_000,
+    )),
+  ]);
+  assert.equal(readOnlyResult.state, "EXITED");
+  assert.equal(spawnCalls, 1);
+  readOnlyBlocked.release();
+  await internals.drainPendingStateWrites();
+  assert.equal(stateStore.records.get(readOnlyResult.processId)?.state, "EXITED");
+  await fixture.execution.operate({ operation: "forget", processId: readOnlyResult.processId });
+
+  const mutationBlocked = stateStore.blockNextSave();
+  const mutation = fixture.execution.execute({
+    cwd: fixture.root,
+    command: "mkdir mutation-fsync-boundary",
+    mode: "foreground",
+    yieldMs: 2_000,
+  });
+  await mutationBlocked.started;
+  await new Promise<void>((resolvePromise) => setImmediate(resolvePromise));
+  assert.equal(spawnCalls, 1);
+  mutationBlocked.release();
+  const mutationResult = await mutation;
+  assert.equal(mutationResult.state, "EXITED");
+  assert.equal(spawnCalls, 2);
 });
 
 test("forget waits for in-flight state writes and fences later persistence", async (t) => {
@@ -271,6 +400,237 @@ test("durable process reattaches by manager handle plus PID/start token without 
   assert.equal(snapshot.pid, adapter.identity.pid);
   assert.equal(adapter.reattaches, 1);
   assert.equal(adapter.launches, 1);
+});
+
+test("signed process-output continuation survives append, exit, and durable restart", async (t) => {
+  let now = 1_800_000_000_000;
+  const continuation = new SignedResourceContinuation({
+    currentKey: { keyId: "process-output-test", secret: Buffer.alloc(32, 0x61) },
+    now: () => now,
+  });
+  const adapter = new FixtureDurableAdapter();
+  const ownerA = owner("process-output-owner-a");
+  const ownerB = owner("process-output-owner-b");
+  const fixture = await createFixture(t, {
+    durableAdapter: adapter,
+    now: () => now,
+    resourceContinuation: continuation,
+  });
+  const started = await fixture.execution.execute({
+    cwd: fixture.root,
+    command: "printf managed-by-fixture",
+    mode: "background",
+    durable: true,
+  }, undefined, undefined, ownerA);
+  const initialOutput = "a".repeat(1_048_576 + 32);
+  adapter.emitOutput("stdout", Buffer.from(initialOutput));
+
+  const first = await fixture.execution.readOutputResource(
+    started.resourceUri,
+    ownerA,
+  ) as ProcessOutputResourcePage;
+  assert.equal(first.text, initialOutput.slice(0, 1_048_576));
+  assert.match(String(first.nextResourceUri), /^devspace:\/\/v1\/process\/rc1\./u);
+  assert.equal("nextOffset" in first, false);
+
+  const continuationUri = String(first.nextResourceUri);
+  const tokenEnd = continuationUri.lastIndexOf("/output");
+  const tokenLast = continuationUri[tokenEnd - 1]!;
+  const tampered = `${continuationUri.slice(0, tokenEnd - 1)}${tokenLast === "A" ? "B" : "A"}${continuationUri.slice(tokenEnd)}`;
+  await assert.rejects(
+    fixture.execution.readOutputResource(tampered, ownerA),
+    (error: unknown) => cursorReason(error) === "CURSOR_INVALID",
+  );
+  await assert.rejects(
+    fixture.execution.readOutputResource(continuationUri, ownerB),
+    (error: unknown) => cursorReason(error) === "CURSOR_INVALID",
+  );
+
+  const appendedOutput = "b".repeat(96);
+  adapter.emitOutput("stderr", Buffer.from(appendedOutput));
+  now += 1_000;
+  adapter.emitExit(0);
+  await fixture.execution.close();
+
+  const persistedPath = join(
+    fixture.root,
+    "v2-state",
+    "processes",
+    `${started.processId}.json`,
+  );
+  const persisted = JSON.parse(await readFile(persistedPath, "utf8")) as Record<string, unknown>;
+  assert.match(String(persisted.outputGeneration), /^sha256:[a-f0-9]{64}$/u);
+  assert.match(String(persisted.outputIdentity), /^sha256:[a-f0-9]{64}$/u);
+  assert.equal(persisted.outputTruncated, false);
+  assert.equal(persisted.outputBytes, initialOutput.length + appendedOutput.length);
+
+  const recovered = new UniversalExecutionPlane({
+    targets: fixture.targets,
+    contexts: fixture.contexts,
+    outputDir: join(fixture.root, "v2-state", "process-output"),
+    sshControlDir: join(fixture.root, "v2-state", "ssh-control-recovered-output"),
+    durableAdapter: adapter,
+    resourceContinuation: continuation,
+    completedProcessTtlMs: 60_000,
+    now: () => now,
+  });
+  t.after(() => recovered.close());
+  const pages = [first.text];
+  let nextResourceUri: string | undefined = continuationUri;
+  while (nextResourceUri) {
+    const page = await recovered.readOutputResource(nextResourceUri, ownerA) as ProcessOutputResourcePage;
+    pages.push(page.text);
+    nextResourceUri = page.nextResourceUri;
+  }
+  assert.equal(pages.join(""), initialOutput + appendedOutput);
+
+  now += 60_001;
+  await assert.rejects(
+    recovered.readOutputResource(continuationUri, ownerA),
+    (error: unknown) => cursorReason(error) === "CURSOR_EXPIRED",
+  );
+  await recovered.operate({ operation: "forget", processId: started.processId }, undefined, ownerA);
+});
+
+test("process-output continuation becomes stale on bounded truncation and spool replacement", async (t) => {
+  const continuation = new SignedResourceContinuation({
+    currentKey: { keyId: "process-output-stale", secret: Buffer.alloc(32, 0x62) },
+    now: () => 1_800_000_100_000,
+  });
+  const adapter = new FixtureDurableAdapter();
+  const principal = owner("process-output-stale-owner");
+  const fixture = await createFixture(t, {
+    durableAdapter: adapter,
+    now: () => 1_800_000_100_000,
+    processOutputMaxBytes: 1_100,
+    resourceContinuation: continuation,
+  });
+  const started = await fixture.execution.execute({
+    cwd: fixture.root,
+    command: "printf managed-by-fixture",
+    mode: "background",
+    durable: true,
+  }, undefined, undefined, principal);
+  adapter.emitOutput("stdout", Buffer.from("a".repeat(600)));
+  const legacyFirst = await fixture.execution.readOutputResource(
+    `devspace://process/${started.processId}/output/0/100`,
+    principal,
+  ) as ProcessOutputResourcePage;
+  const beforeTruncation = String(legacyFirst.nextResourceUri);
+  adapter.emitOutput("stdout", Buffer.from("b".repeat(600)));
+  await assert.rejects(
+    fixture.execution.readOutputResource(beforeTruncation, principal),
+    (error: unknown) => cursorReason(error) === "CURSOR_STALE",
+  );
+
+  const afterTruncation = await fixture.execution.readOutputResource(
+    `devspace://process/${started.processId}/output/0/100`,
+    principal,
+  ) as ProcessOutputResourcePage;
+  const beforeByteRegression = String(afterTruncation.nextResourceUri);
+  const outputPath = join(fixture.root, "v2-state", "process-output", `${started.processId}.log`);
+  await truncate(outputPath, 50);
+  await assert.rejects(
+    fixture.execution.readOutputResource(beforeByteRegression, principal),
+    (error: unknown) => cursorReason(error) === "CURSOR_STALE",
+  );
+
+  const afterByteRegression = await fixture.execution.readOutputResource(
+    `devspace://process/${started.processId}/output/0/10`,
+    principal,
+  ) as ProcessOutputResourcePage;
+  const beforeReplacement = String(afterByteRegression.nextResourceUri);
+  await fixture.execution.close();
+  await rename(outputPath, `${outputPath}.replaced`);
+  await writeFile(outputPath, "replacement-output", { mode: 0o600 });
+  const recovered = new UniversalExecutionPlane({
+    targets: fixture.targets,
+    contexts: fixture.contexts,
+    outputDir: join(fixture.root, "v2-state", "process-output"),
+    sshControlDir: join(fixture.root, "v2-state", "ssh-control-stale-recovered"),
+    durableAdapter: adapter,
+    resourceContinuation: continuation,
+    completedProcessTtlMs: 60_000,
+    now: () => 1_800_000_100_000,
+  });
+  t.after(() => recovered.close());
+  await assert.rejects(
+    recovered.readOutputResource(beforeReplacement, principal),
+    (error: unknown) => cursorReason(error) === "CURSOR_STALE",
+  );
+});
+
+test("legacy process records upgrade output generation metadata and malformed generation is quarantined", async (t) => {
+  const continuation = new SignedResourceContinuation({
+    currentKey: { keyId: "process-output-legacy", secret: Buffer.alloc(32, 0x63) },
+    now: () => 1_800_000_200_000,
+  });
+  const adapter = new FixtureDurableAdapter();
+  const principal = owner("process-output-legacy-owner");
+  const fixture = await createFixture(t, {
+    durableAdapter: adapter,
+    now: () => 1_800_000_200_000,
+    resourceContinuation: continuation,
+  });
+  const started = await fixture.execution.execute({
+    cwd: fixture.root,
+    command: "printf managed-by-fixture",
+    mode: "background",
+    durable: true,
+  }, undefined, undefined, principal);
+  adapter.emitOutput("stdout", Buffer.from("legacy-output"));
+  await fixture.execution.close();
+
+  const stateDirectory = join(fixture.root, "v2-state", "processes");
+  const statePath = join(stateDirectory, `${started.processId}.json`);
+  const legacy = JSON.parse(await readFile(statePath, "utf8")) as Record<string, unknown>;
+  delete legacy.outputGeneration;
+  delete legacy.outputIdentity;
+  delete legacy.outputTruncated;
+  delete legacy.outputBytes;
+  legacy.checksum = processStateChecksum(legacy);
+  await writeFile(statePath, JSON.stringify(legacy), { mode: 0o600 });
+
+  const recovered = new UniversalExecutionPlane({
+    targets: fixture.targets,
+    contexts: fixture.contexts,
+    outputDir: join(fixture.root, "v2-state", "process-output"),
+    sshControlDir: join(fixture.root, "v2-state", "ssh-control-legacy"),
+    durableAdapter: adapter,
+    resourceContinuation: continuation,
+    completedProcessTtlMs: 60_000,
+    now: () => 1_800_000_200_000,
+  });
+  const snapshot = await recovered.operate({
+    operation: "poll",
+    processId: started.processId,
+  }, undefined, principal) as UniversalProcessSnapshot;
+  assert.equal(snapshot.state, "RUNNING");
+  await recovered.close();
+  const upgraded = JSON.parse(await readFile(statePath, "utf8")) as Record<string, unknown>;
+  assert.match(String(upgraded.outputGeneration), /^sha256:[a-f0-9]{64}$/u);
+  assert.match(String(upgraded.outputIdentity), /^sha256:[a-f0-9]{64}$/u);
+  assert.equal(upgraded.outputTruncated, false);
+  assert.equal(upgraded.outputBytes, "legacy-output".length);
+
+  upgraded.outputGeneration = "invalid-generation";
+  upgraded.checksum = processStateChecksum(upgraded);
+  await writeFile(statePath, JSON.stringify(upgraded), { mode: 0o600 });
+  const corrupt = new UniversalExecutionPlane({
+    targets: fixture.targets,
+    contexts: fixture.contexts,
+    outputDir: join(fixture.root, "v2-state", "process-output"),
+    sshControlDir: join(fixture.root, "v2-state", "ssh-control-corrupt"),
+    durableAdapter: adapter,
+    resourceContinuation: continuation,
+    now: () => 1_800_000_200_000,
+  });
+  t.after(() => corrupt.close());
+  await assert.rejects(
+    corrupt.operate({ operation: "list" }, undefined, principal),
+    (error: unknown) => brokerCode(error) === "STATE_CORRUPTED",
+  );
+  assert.equal((await readdir(stateDirectory)).some((name) => name.includes(".corrupt-")), true);
 });
 
 test("non-durable process after restart returns a typed non-reattachable failure", async (t) => {
@@ -967,16 +1327,27 @@ interface Fixture {
   execution: UniversalExecutionPlane;
 }
 
+interface ProcessOutputResourcePage extends Record<string, unknown> {
+  text: string;
+  nextResourceUri?: string;
+}
+
 async function createFixture(
   t: TestContext,
   overrides: Partial<{
     maxProcessRecords: number;
     maxRunningProcesses: number;
     processBufferCharacters: number;
+    processOutputMaxBytes: number;
+    completedProcessTtlMs: number;
+    now: () => number;
     spawnProcess: NonNullable<ExecutionPlaneOptions["spawnProcess"]>;
     envProfiles: UniversalEnvProfileRegistry;
     durableAdapter: DurableProcessAdapter;
     processStateStore: ProcessStateStore;
+    cursorStore: SignedSnapshotCursorStore;
+    resourceContinuation: SignedResourceContinuation;
+    metrics: UniversalBrokerMetrics;
   }> = {},
 ): Promise<Fixture> {
   const root = await mkdtemp(join(tmpdir(), "devspace-v2-exec-test-"));
@@ -1074,13 +1445,17 @@ async function createFixture(
     maxProcessRecords: overrides.maxProcessRecords,
     maxRunningProcessesPerTarget: 16,
     processBufferCharacters: overrides.processBufferCharacters ?? 1_000_000,
-    processOutputMaxBytes: 10_000_000,
-    completedProcessTtlMs: 60_000,
+    processOutputMaxBytes: overrides.processOutputMaxBytes ?? 10_000_000,
+    completedProcessTtlMs: overrides.completedProcessTtlMs ?? 60_000,
+    now: overrides.now,
     sshExecutable: fakeSsh,
     spawnProcess: overrides.spawnProcess,
     envProfiles: overrides.envProfiles,
     durableAdapter: overrides.durableAdapter,
     processStateStore: overrides.processStateStore,
+    cursorStore: overrides.cursorStore,
+    resourceContinuation: overrides.resourceContinuation,
+    metrics: overrides.metrics,
   });
   return { root, targetsPath, targets, contexts, execution: fixtureExecution };
 }
@@ -1158,6 +1533,30 @@ function brokerCode(error: unknown): string | undefined {
   return error instanceof UniversalBrokerError ? error.code : undefined;
 }
 
+function cursorReason(error: unknown): string | undefined {
+  return error instanceof Error && "reason" in error
+    ? String(error.reason)
+    : undefined;
+}
+
+function processStateChecksum(record: Record<string, unknown>): string {
+  const { checksum: _checksum, ...unsigned } = record;
+  return createHash("sha256").update(stableJsonForTest(unsigned)).digest("hex");
+}
+
+function stableJsonForTest(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJsonForTest).join(",")}]`;
+  if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    return `{${Object.keys(record)
+      .filter((key) => record[key] !== undefined)
+      .sort()
+      .map((key) => `${JSON.stringify(key)}:${stableJsonForTest(record[key])}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
+}
+
 function restoreEnvironment(name: string, value: string | undefined): void {
   if (value === undefined) delete process.env[name];
   else process.env[name] = value;
@@ -1171,22 +1570,43 @@ class FixtureDurableAdapter implements DurableProcessAdapter {
   };
   launches = 0;
   reattaches = 0;
+  private events?: DurableProcessEvents;
+  private state: "RUNNING" | "EXITED" = "RUNNING";
+  private exitCode = 0;
 
   async launch(
     _request: Parameters<DurableProcessAdapter["launch"]>[0],
-    _events: DurableProcessEvents,
+    events: DurableProcessEvents,
   ): Promise<DurableProcessHandle> {
     this.launches += 1;
+    this.events = events;
+    this.state = "RUNNING";
     return this.handle();
   }
 
   async reattach(
     identity: DurableProcessIdentity,
-    _events: DurableProcessEvents,
+    events: DurableProcessEvents,
   ): Promise<ReturnType<DurableProcessAdapter["reattach"]> extends Promise<infer T> ? T : never> {
     this.reattaches += 1;
     assert.deepEqual(identity, this.identity);
+    this.events = events;
+    if (this.state === "EXITED") {
+      return { state: "EXITED", identity: this.identity, exitCode: this.exitCode };
+    }
     return { state: "RUNNING", identity: this.identity, handle: this.handle() };
+  }
+
+  emitOutput(channel: "stdout" | "stderr" | "pty", data: Uint8Array): void {
+    assert.ok(this.events, "durable fixture must be launched before emitting output");
+    this.events.output(channel, data);
+  }
+
+  emitExit(exitCode: number, signal?: string): void {
+    assert.ok(this.events, "durable fixture must be launched before emitting exit");
+    this.state = "EXITED";
+    this.exitCode = exitCode;
+    this.events.exit(exitCode, signal);
   }
 
   private handle(): DurableProcessHandle {

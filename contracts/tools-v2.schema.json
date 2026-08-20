@@ -6,12 +6,20 @@
   "additionalProperties": false,
   "required": [
     "version",
+    "requestMetaSchema",
+    "resultOutputSchema",
     "tools",
     "budgets"
   ],
   "properties": {
     "version": {
       "const": "2.1.1"
+    },
+    "requestMetaSchema": {
+      "$ref": "#/$defs/requestMetaSchemaConstant"
+    },
+    "resultOutputSchema": {
+      "$ref": "#/$defs/resultOutputSchemaConstant"
     },
     "tools": {
       "type": "object",
@@ -91,7 +99,10 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "operations"
+        "operations",
+        "inputSchema",
+        "outputSchema",
+        "annotations"
       ],
       "properties": {
         "operations": {
@@ -102,7 +113,246 @@
             "type": "string",
             "minLength": 1
           }
+        },
+        "inputSchema": {
+          "type": "object"
+        },
+        "outputSchema": {
+          "type": "object"
+        },
+        "annotations": {
+          "type": "object"
         }
+      }
+    },
+    "requestMetaSchemaConstant": {
+      "const": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "requestId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "transactionId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "taskInstanceId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+          },
+          "authorityId": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "expectedSchemaGeneration": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "expectedAuthorityContractGeneration": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "expectedTargetGeneration": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          },
+          "expectedRouteGeneration": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 256
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "resultOutputSchemaConstant": {
+      "const": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+          "ok": {
+            "type": "boolean"
+          },
+          "operationId": {
+            "type": "string"
+          },
+          "data": {},
+          "warnings": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "propertyNames": {
+                "type": "string"
+              },
+              "additionalProperties": {}
+            }
+          },
+          "resourceUri": {
+            "type": "string"
+          },
+          "nextCursor": {
+            "type": "string"
+          },
+          "observedSchemaGeneration": {
+            "type": "string"
+          },
+          "observedAuthorityContractGeneration": {
+            "type": "string"
+          },
+          "observedTargetGeneration": {
+            "type": "string"
+          },
+          "observedRouteGeneration": {
+            "type": "string"
+          },
+          "error": {
+            "type": "object",
+            "properties": {
+              "code": {
+                "type": "string",
+                "enum": [
+                  "AUTHENTICATION_FAILED",
+                  "SCOPE_INSUFFICIENT",
+                  "CAPABILITY_UNAVAILABLE",
+                  "TARGET_NOT_FOUND",
+                  "TARGET_AMBIGUOUS",
+                  "TARGET_OFFLINE",
+                  "PATH_NOT_FOUND",
+                  "PATH_TYPE_MISMATCH",
+                  "PERMISSION_DENIED",
+                  "PRECONDITION_FAILED",
+                  "TRANSPORT_UNAVAILABLE",
+                  "TRANSPORT_INTERRUPTED",
+                  "EXECUTION_STATE_UNKNOWN",
+                  "PROCESS_NOT_FOUND",
+                  "MCP_ROUTE_NOT_FOUND",
+                  "MCP_TOOL_NOT_FOUND",
+                  "MCP_PROVIDER_ERROR",
+                  "MCP_CONNECTION_UNAVAILABLE",
+                  "MCP_RESULT_UNKNOWN",
+                  "DISPATCH_STATE_UNKNOWN",
+                  "HOST_ACTION_BLOCKED",
+                  "HOST_CAPABILITY_UNAVAILABLE",
+                  "HOST_ARTIFACT_CAPABILITY_UNAVAILABLE",
+                  "GUI_STATE_CHANGED",
+                  "OUTPUT_TRUNCATED",
+                  "RESOURCE_QUOTA_EXCEEDED",
+                  "RESOURCE_BUSY",
+                  "RATE_LIMITED",
+                  "CURSOR_INVALID",
+                  "CURSOR_EXPIRED",
+                  "CURSOR_STALE",
+                  "AUTHORITY_REQUIRED",
+                  "AUTHORITY_EXPIRED",
+                  "AUTHORITY_PRINCIPAL_MISMATCH",
+                  "AUTHORITY_ACTION_MISMATCH",
+                  "AUTHORITY_STALE",
+                  "AUTHORITY_STORE_UNAVAILABLE",
+                  "STATE_CORRUPTED",
+                  "INVALID_ARGUMENT",
+                  "RESOURCE_EXPIRED",
+                  "TARGET_IDENTITY_MISMATCH",
+                  "PROCESS_NOT_DURABLE",
+                  "GUI_GENERATION_MISMATCH",
+                  "SCHEMA_STALE",
+                  "AUTHORITY_STATE_UNCERTAIN",
+                  "AUTHORITY_MISMATCH",
+                  "AUTHORITY_CONSUMED",
+                  "ELEVATION_BLOCKED",
+                  "ELEVATION_DENIED",
+                  "SYNC_PLAN_STALE",
+                  "SYNC_CONFLICT",
+                  "RESTART_ACK_NOT_FLUSHED",
+                  "ARTIFACT_CATALOG_UNAVAILABLE",
+                  "ARTIFACT_EXPIRED",
+                  "PROFILE_UNSUPPORTED",
+                  "MIGRATION_CONFLICT",
+                  "ROLLBACK_STATE_UNKNOWN",
+                  "CONNECTOR_ACTIVATION_REQUIRED",
+                  "CONNECTOR_STATE_CONFLICT",
+                  "SUPERVISOR_UNAVAILABLE",
+                  "FINALIZATION_STAGE_CONFLICT"
+                ]
+              },
+              "message": {
+                "type": "string"
+              },
+              "retryable": {
+                "type": "boolean"
+              },
+              "dispatchState": {
+                "type": "string",
+                "enum": [
+                  "NOT_DISPATCHED",
+                  "CLAIMED",
+                  "DISPATCHED",
+                  "ACKNOWLEDGED",
+                  "UNKNOWN"
+                ]
+              },
+              "resourceKey": {
+                "type": "string"
+              },
+              "evidence": {
+                "type": "object",
+                "propertyNames": {
+                  "type": "string"
+                },
+                "additionalProperties": {}
+              },
+              "recovery": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "propertyNames": {
+                    "type": "string"
+                  },
+                  "additionalProperties": {}
+                }
+              },
+              "suggestions": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "propertyNames": {
+                    "type": "string"
+                  },
+                  "additionalProperties": {}
+                }
+              }
+            },
+            "required": [
+              "code",
+              "message",
+              "retryable",
+              "dispatchState"
+            ],
+            "additionalProperties": false
+          },
+          "audit": {
+            "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
+            "additionalProperties": {}
+          }
+        },
+        "required": [
+          "ok",
+          "operationId",
+          "observedSchemaGeneration",
+          "observedAuthorityContractGeneration"
+        ],
+        "additionalProperties": false
       }
     },
     "targetTool": {
@@ -118,6 +368,56 @@
                 "resolve",
                 "probe"
               ]
+            },
+            "inputSchema": {
+              "const": {
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "properties": {
+                  "operation": {
+                    "type": "string",
+                    "enum": [
+                      "list",
+                      "resolve",
+                      "probe"
+                    ]
+                  },
+                  "selector": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "targetId": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "refresh": {
+                    "type": "boolean"
+                  },
+                  "cursor": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 10000
+                  }
+                },
+                "required": [
+                  "operation"
+                ]
+              }
+            },
+            "outputSchema": {
+              "$ref": "#/$defs/resultOutputSchemaConstant"
+            },
+            "annotations": {
+              "const": {
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": true
+              }
             }
           }
         }
@@ -142,6 +442,166 @@
                 "invalidate_authority",
                 "release_authority"
               ]
+            },
+            "inputSchema": {
+              "const": {
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "properties": {
+                  "operation": {
+                    "type": "string",
+                    "enum": [
+                      "open",
+                      "search",
+                      "diff",
+                      "close",
+                      "authority_preview",
+                      "authorize",
+                      "authority_status",
+                      "invalidate_authority",
+                      "release_authority"
+                    ]
+                  },
+                  "contextId": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "target": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "path": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "mode": {
+                    "type": "string",
+                    "enum": [
+                      "existing",
+                      "worktree"
+                    ]
+                  },
+                  "baseRef": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "task": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "query": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "maxCharacters": {
+                    "type": "integer",
+                    "minimum": 100,
+                    "maximum": 100000
+                  },
+                  "taskLabel": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256
+                  },
+                  "taskId": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 256
+                  },
+                  "authorityText": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 8000
+                  },
+                  "actions": {
+                    "minItems": 1,
+                    "maxItems": 64,
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 128
+                        },
+                        "tool": {
+                          "type": "string",
+                          "enum": [
+                            "target",
+                            "context",
+                            "fs",
+                            "exec",
+                            "process",
+                            "mcp",
+                            "artifact",
+                            "gui"
+                          ]
+                        },
+                        "arguments": {
+                          "type": "object",
+                          "propertyNames": {
+                            "type": "string"
+                          },
+                          "additionalProperties": {}
+                        },
+                        "risk": {
+                          "type": "string",
+                          "enum": [
+                            "R0",
+                            "R1",
+                            "R2",
+                            "R3"
+                          ]
+                        },
+                        "uses": {
+                          "type": "integer",
+                          "minimum": 1,
+                          "maximum": 50
+                        }
+                      },
+                      "required": [
+                        "tool",
+                        "arguments"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "correctionText": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 8000
+                  },
+                  "expiresInSeconds": {
+                    "type": "integer",
+                    "minimum": 60,
+                    "maximum": 28800
+                  },
+                  "cursor": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 10000
+                  }
+                },
+                "required": [
+                  "operation"
+                ]
+              }
+            },
+            "outputSchema": {
+              "$ref": "#/$defs/resultOutputSchemaConstant"
+            },
+            "annotations": {
+              "const": {
+                "readOnlyHint": false,
+                "destructiveHint": true,
+                "idempotentHint": false,
+                "openWorldHint": true
+              }
             }
           }
         }
@@ -166,10 +626,173 @@
                 "copy",
                 "move",
                 "remove",
-                "restore",
                 "hash",
                 "sync"
               ]
+            },
+            "inputSchema": {
+              "const": {
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "properties": {
+                  "operation": {
+                    "type": "string",
+                    "enum": [
+                      "stat",
+                      "list",
+                      "read",
+                      "search",
+                      "write",
+                      "patch",
+                      "mkdir",
+                      "copy",
+                      "move",
+                      "remove",
+                      "hash",
+                      "sync"
+                    ]
+                  },
+                  "target": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "contextId": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "path": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "destination": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "content": {
+                    "type": "string"
+                  },
+                  "patch": {
+                    "type": "string"
+                  },
+                  "query": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "recursive": {
+                    "type": "boolean"
+                  },
+                  "overwrite": {
+                    "type": "boolean"
+                  },
+                  "expectedSha256": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "disposition": {
+                    "type": "string",
+                    "enum": [
+                      "trash",
+                      "permanent"
+                    ]
+                  },
+                  "sync": {
+                    "type": "object",
+                    "properties": {
+                      "phase": {
+                        "type": "string",
+                        "enum": [
+                          "plan",
+                          "apply"
+                        ]
+                      },
+                      "planId": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 256
+                      },
+                      "planDigest": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 256
+                      },
+                      "include": {
+                        "maxItems": 1024,
+                        "type": "array",
+                        "items": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 4096
+                        }
+                      },
+                      "exclude": {
+                        "maxItems": 1024,
+                        "type": "array",
+                        "items": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 4096
+                        }
+                      },
+                      "deleteMode": {
+                        "type": "string",
+                        "enum": [
+                          "none",
+                          "trash",
+                          "permanent"
+                        ]
+                      },
+                      "conflictStrategy": {
+                        "type": "string",
+                        "enum": [
+                          "fail",
+                          "source-wins"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "phase"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "finalSymlink": {
+                    "type": "string",
+                    "enum": [
+                      "follow",
+                      "preserve",
+                      "replace",
+                      "reject"
+                    ]
+                  },
+                  "offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "cursor": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 10000
+                  }
+                },
+                "required": [
+                  "operation"
+                ]
+              }
+            },
+            "outputSchema": {
+              "$ref": "#/$defs/resultOutputSchemaConstant"
+            },
+            "annotations": {
+              "const": {
+                "readOnlyHint": false,
+                "destructiveHint": true,
+                "idempotentHint": false,
+                "openWorldHint": true
+              }
             }
           }
         }
@@ -186,6 +809,72 @@
               "const": [
                 "run"
               ]
+            },
+            "inputSchema": {
+              "const": {
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "properties": {
+                  "target": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "contextId": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "cwd": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "command": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "tty": {
+                    "type": "boolean"
+                  },
+                  "mode": {
+                    "type": "string",
+                    "enum": [
+                      "auto",
+                      "foreground",
+                      "background"
+                    ]
+                  },
+                  "yieldMs": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 30000
+                  },
+                  "maxOutputChars": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 1000000
+                  },
+                  "envProfile": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "durable": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "command"
+                ]
+              }
+            },
+            "outputSchema": {
+              "$ref": "#/$defs/resultOutputSchemaConstant"
+            },
+            "annotations": {
+              "const": {
+                "readOnlyHint": false,
+                "destructiveHint": true,
+                "idempotentHint": false,
+                "openWorldHint": true
+              }
             }
           }
         }
@@ -210,6 +899,87 @@
                 "restart_broker",
                 "restart_status"
               ]
+            },
+            "inputSchema": {
+              "const": {
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "properties": {
+                  "operation": {
+                    "type": "string",
+                    "enum": [
+                      "poll",
+                      "write",
+                      "resize",
+                      "signal",
+                      "wait",
+                      "list",
+                      "forget",
+                      "restart_broker",
+                      "restart_status"
+                    ]
+                  },
+                  "processId": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "chars": {
+                    "type": "string"
+                  },
+                  "signal": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "columns": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 1000
+                  },
+                  "rows": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 1000
+                  },
+                  "reason": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 2000
+                  },
+                  "waitMs": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 110000
+                  },
+                  "maxOutputChars": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 1000000
+                  },
+                  "cursor": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 10000
+                  }
+                },
+                "required": [
+                  "operation"
+                ]
+              }
+            },
+            "outputSchema": {
+              "$ref": "#/$defs/resultOutputSchemaConstant"
+            },
+            "annotations": {
+              "const": {
+                "readOnlyHint": false,
+                "destructiveHint": true,
+                "idempotentHint": false,
+                "openWorldHint": true
+              }
             }
           }
         }
@@ -234,6 +1004,81 @@
                 "get_prompt",
                 "close"
               ]
+            },
+            "inputSchema": {
+              "const": {
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "properties": {
+                  "operation": {
+                    "type": "string",
+                    "enum": [
+                      "routes",
+                      "search_tools",
+                      "describe_tool",
+                      "invoke",
+                      "list_resources",
+                      "read_resource",
+                      "list_prompts",
+                      "get_prompt",
+                      "close"
+                    ]
+                  },
+                  "route": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "query": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "name": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "arguments": {
+                    "type": "object",
+                    "propertyNames": {
+                      "type": "string"
+                    },
+                    "additionalProperties": {}
+                  },
+                  "uri": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "cursor": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 10000
+                  },
+                  "responsePolicy": {
+                    "type": "object",
+                    "propertyNames": {
+                      "type": "string"
+                    },
+                    "additionalProperties": {}
+                  }
+                },
+                "required": [
+                  "operation"
+                ]
+              }
+            },
+            "outputSchema": {
+              "$ref": "#/$defs/resultOutputSchemaConstant"
+            },
+            "annotations": {
+              "const": {
+                "readOnlyHint": false,
+                "destructiveHint": true,
+                "idempotentHint": false,
+                "openWorldHint": true
+              }
             }
           }
         }
@@ -252,6 +1097,64 @@
                 "publish",
                 "copy"
               ]
+            },
+            "inputSchema": {
+              "const": {
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "properties": {
+                  "operation": {
+                    "type": "string",
+                    "enum": [
+                      "receive",
+                      "publish",
+                      "copy"
+                    ]
+                  },
+                  "source": {
+                    "type": "object",
+                    "propertyNames": {
+                      "type": "string"
+                    },
+                    "additionalProperties": {}
+                  },
+                  "destination": {
+                    "type": "object",
+                    "propertyNames": {
+                      "type": "string"
+                    },
+                    "additionalProperties": {}
+                  },
+                  "overwrite": {
+                    "type": "boolean"
+                  },
+                  "maxBytes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 9007199254740991
+                  },
+                  "ttlSeconds": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 86400
+                  }
+                },
+                "required": [
+                  "operation",
+                  "source"
+                ]
+              }
+            },
+            "outputSchema": {
+              "$ref": "#/$defs/resultOutputSchemaConstant"
+            },
+            "annotations": {
+              "const": {
+                "readOnlyHint": false,
+                "destructiveHint": true,
+                "idempotentHint": false,
+                "openWorldHint": true
+              }
             }
           }
         }
@@ -271,6 +1174,73 @@
                 "act",
                 "wait"
               ]
+            },
+            "inputSchema": {
+              "const": {
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "properties": {
+                  "operation": {
+                    "type": "string",
+                    "enum": [
+                      "capabilities",
+                      "observe",
+                      "act",
+                      "wait"
+                    ]
+                  },
+                  "target": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "sessionId": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "generation": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "action": {
+                    "type": "object",
+                    "propertyNames": {
+                      "type": "string"
+                    },
+                    "additionalProperties": {}
+                  },
+                  "timeoutMs": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 120000
+                  },
+                  "maxElements": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 1000
+                  },
+                  "focusPolicy": {
+                    "type": "string",
+                    "enum": [
+                      "preserve",
+                      "allow"
+                    ]
+                  }
+                },
+                "required": [
+                  "operation"
+                ]
+              }
+            },
+            "outputSchema": {
+              "$ref": "#/$defs/resultOutputSchemaConstant"
+            },
+            "annotations": {
+              "const": {
+                "readOnlyHint": false,
+                "destructiveHint": true,
+                "idempotentHint": false,
+                "openWorldHint": true
+              }
             }
           }
         }

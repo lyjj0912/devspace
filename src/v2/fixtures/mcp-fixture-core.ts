@@ -67,6 +67,22 @@ export function createFixtureMcpServer(): McpServer {
   );
 
   server.registerTool(
+    "large_schema",
+    {
+      title: "Large schema fixture",
+      description: "Expose an oversized schema for broker Resource Handle projection tests.",
+      inputSchema: {
+        payload: z.string().describe("schema-description-".repeat(2_000)),
+      },
+      annotations: { readOnlyHint: true, destructiveHint: false },
+    },
+    async ({ payload }) => ({
+      content: [{ type: "text", text: payload }],
+      structuredContent: { payload },
+    }),
+  );
+
+  server.registerTool(
     "provider_error",
     {
       title: "Provider error",

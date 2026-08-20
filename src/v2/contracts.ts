@@ -32,7 +32,6 @@ export const UNIVERSAL_TOOL_OPERATIONS = {
     "copy",
     "move",
     "remove",
-    "restore",
     "hash",
     "sync",
   ],
@@ -90,13 +89,16 @@ export const UNIVERSAL_ERROR_CODES = [
   "OUTPUT_TRUNCATED",
   "RESOURCE_QUOTA_EXCEEDED",
   "RESOURCE_BUSY",
+  "RATE_LIMITED",
+  "CURSOR_INVALID",
+  "CURSOR_EXPIRED",
+  "CURSOR_STALE",
   "AUTHORITY_REQUIRED",
   "AUTHORITY_EXPIRED",
   "AUTHORITY_PRINCIPAL_MISMATCH",
   "AUTHORITY_ACTION_MISMATCH",
   "AUTHORITY_STALE",
   "AUTHORITY_STORE_UNAVAILABLE",
-  "HUMAN_ATTESTATION_REQUIRED",
   "STATE_CORRUPTED",
   "INVALID_ARGUMENT",
   "RESOURCE_EXPIRED",
@@ -109,6 +111,16 @@ export const UNIVERSAL_ERROR_CODES = [
   "AUTHORITY_CONSUMED",
   "ELEVATION_BLOCKED",
   "ELEVATION_DENIED",
+  "SYNC_PLAN_STALE",
+  "SYNC_CONFLICT",
+  "RESTART_ACK_NOT_FLUSHED",
+  "ARTIFACT_CATALOG_UNAVAILABLE",
+  "ARTIFACT_EXPIRED",
+  "PROFILE_UNSUPPORTED",
+  "MIGRATION_CONFLICT",
+  "ROLLBACK_STATE_UNKNOWN",
+  "CONNECTOR_ACTIVATION_REQUIRED",
+  "CONNECTOR_STATE_CONFLICT",
   "SUPERVISOR_UNAVAILABLE",
   "FINALIZATION_STAGE_CONFLICT",
 ] as const;
@@ -151,6 +163,9 @@ export interface WarningRecord {
 
 export interface RuntimeIdentity {
   productVersion: string;
+  productProfile?: "BASE_SINGLE_OWNER";
+  buildCapabilityDigest?: string;
+  resourceUriVersion?: "v1";
   schemaGeneration: string;
   authorityContractGeneration: string;
   configDigest: string;
@@ -167,9 +182,9 @@ export interface UniversalRequestMeta {
   taskInstanceId?: string;
   authorityId?: string;
   expectedSchemaGeneration?: string;
+  expectedAuthorityContractGeneration?: string;
   expectedTargetGeneration?: string;
   expectedRouteGeneration?: string;
-  humanApprovalAttestation?: string;
 }
 
 export interface SuccessEnvelope<T> {
@@ -180,6 +195,7 @@ export interface SuccessEnvelope<T> {
   resourceUri?: string;
   nextCursor?: string;
   observedSchemaGeneration: string;
+  observedAuthorityContractGeneration: string;
   observedTargetGeneration?: string;
   observedRouteGeneration?: string;
 }
@@ -194,23 +210,24 @@ export const UNIVERSAL_REQUEST_META_INPUT_SCHEMA = {
   taskInstanceId: z.string().min(1).max(128).optional(),
   authorityId: z.string().min(1).max(256).optional(),
   expectedSchemaGeneration: z.string().min(1).max(256).optional(),
+  expectedAuthorityContractGeneration: z.string().min(1).max(256).optional(),
   expectedTargetGeneration: z.string().min(1).max(256).optional(),
   expectedRouteGeneration: z.string().min(1).max(256).optional(),
-  humanApprovalAttestation: z.string().min(1).max(16_384).optional(),
 } as const satisfies z.ZodRawShape;
 
 export const universalRequestMetaSchema = z.strictObject(
   UNIVERSAL_REQUEST_META_INPUT_SCHEMA,
 );
 
-export const universalResultOutputSchema: z.ZodRawShape = {
+export const UNIVERSAL_RESULT_OUTPUT_SCHEMA = {
   ok: z.boolean(),
   operationId: z.string(),
-  data: genericRecordSchema.optional(),
+  data: z.unknown().optional(),
   warnings: z.array(genericRecordSchema).optional(),
   resourceUri: z.string().optional(),
   nextCursor: z.string().optional(),
   observedSchemaGeneration: z.string(),
+  observedAuthorityContractGeneration: z.string(),
   observedTargetGeneration: z.string().optional(),
   observedRouteGeneration: z.string().optional(),
   error: z
@@ -225,7 +242,15 @@ export const universalResultOutputSchema: z.ZodRawShape = {
       suggestions: z.array(genericRecordSchema).optional(),
     })
     .optional(),
-};
+  audit: genericRecordSchema.optional(),
+} as const satisfies z.ZodRawShape;
+
+export const universalResultEnvelopeSchema = z.strictObject(
+  UNIVERSAL_RESULT_OUTPUT_SCHEMA,
+);
+
+export const universalResultOutputSchema: z.ZodRawShape =
+  UNIVERSAL_RESULT_OUTPUT_SCHEMA;
 
 export interface UniversalToolContract<TShape extends z.ZodRawShape = z.ZodRawShape> {
   title: string;
@@ -240,9 +265,8 @@ export interface UniversalToolContract<TShape extends z.ZodRawShape = z.ZodRawSh
 }
 
 const targetContract = {
-  title: "Resolve target",
-  description:
-    "List, resolve, or probe local and remote targets and capabilities.",
+  title: "Target",
+  description: "Discover targets.",
   inputSchema: {
     operation: z.enum(UNIVERSAL_TOOL_OPERATIONS.target),
     selector: z.string().min(1).optional(),
@@ -260,9 +284,8 @@ const targetContract = {
 } satisfies UniversalToolContract;
 
 const contextContract = {
-  title: "Manage context",
-  description:
-    "Manage project context and preview or prepare exact operation authority.",
+  title: "Context",
+  description: "Context and authority.",
   inputSchema: {
     operation: z.enum(UNIVERSAL_TOOL_OPERATIONS.context),
     contextId: z.string().min(1).optional(),
@@ -273,8 +296,6 @@ const contextContract = {
     task: z.string().min(1).optional(),
     query: z.string().min(1).optional(),
     maxCharacters: z.number().int().min(100).max(100_000).optional(),
-    authorityId: z.string().min(1).optional(),
-    taskInstanceId: z.string().min(1).max(128).optional(),
     taskLabel: z.string().min(1).max(256).optional(),
     taskId: z.string().min(1).max(256).optional(),
     authorityText: z.string().min(1).max(8_000).optional(),
@@ -298,10 +319,43 @@ const contextContract = {
   },
 } satisfies UniversalToolContract;
 
+const filesystemSyncInputSchema = z.strictObject({
+  phase: z.enum(["plan", "apply"]),
+  planId: z.string().min(1).max(256).optional(),
+  planDigest: z.string().min(1).max(256).optional(),
+  include: z.array(z.string().min(1).max(4_096)).max(1_024).optional(),
+  exclude: z.array(z.string().min(1).max(4_096)).max(1_024).optional(),
+  deleteMode: z.enum(["none", "trash", "permanent"]).optional(),
+  conflictStrategy: z.enum(["fail", "source-wins"]).optional(),
+}).superRefine((sync, context) => {
+  if (sync.phase === "apply") {
+    if (!sync.planId) {
+      context.addIssue({ code: "custom", path: ["planId"], message: "planId is required for apply" });
+    }
+    if (!sync.planDigest) {
+      context.addIssue({ code: "custom", path: ["planDigest"], message: "planDigest is required for apply" });
+    }
+    for (const field of ["include", "exclude", "deleteMode", "conflictStrategy"] as const) {
+      if (sync[field] !== undefined) {
+        context.addIssue({
+          code: "custom",
+          path: [field],
+          message: "apply accepts only planId and planDigest",
+        });
+      }
+    }
+  } else {
+    for (const field of ["planId", "planDigest"] as const) {
+      if (sync[field] !== undefined) {
+        context.addIssue({ code: "custom", path: [field], message: "plan does not accept apply bindings" });
+      }
+    }
+  }
+});
+
 const fsContract = {
-  title: "Operate on files",
-  description:
-    "Read or atomically mutate local and remote files.",
+  title: "Filesystem",
+  description: "Target files.",
   inputSchema: {
     operation: z.enum(UNIVERSAL_TOOL_OPERATIONS.fs),
     target: z.string().min(1).optional(),
@@ -315,9 +369,9 @@ const fsContract = {
     overwrite: z.boolean().optional(),
     expectedSha256: z.string().min(1).optional(),
     disposition: z.enum(["trash", "permanent"]).optional(),
-    trashId: z.string().min(1).optional(),
+    sync: filesystemSyncInputSchema.optional(),
     finalSymlink: z.enum(["follow", "preserve", "replace", "reject"]).optional(),
-    authorityId: z.string().min(1).optional(),
+    offset: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional(),
     cursor: cursorSchema,
     limit: limitSchema,
   },
@@ -330,9 +384,8 @@ const fsContract = {
 } satisfies UniversalToolContract;
 
 const execContract = {
-  title: "Execute command",
-  description:
-    "Run a command as the configured local or SSH target user.",
+  title: "Execute",
+  description: "Run a command.",
   inputSchema: {
     target: z.string().min(1).optional(),
     contextId: z.string().min(1).optional(),
@@ -344,7 +397,6 @@ const execContract = {
     maxOutputChars: z.number().int().min(1).max(1_000_000).optional(),
     envProfile: z.string().min(1).optional(),
     durable: z.boolean().optional(),
-    authorityId: z.string().min(1).optional(),
   },
   annotations: {
     readOnlyHint: false,
@@ -355,9 +407,8 @@ const execContract = {
 } satisfies UniversalToolContract;
 
 const processContract = {
-  title: "Manage process",
-  description:
-    "Operate managed processes returned by exec.",
+  title: "Process",
+  description: "Managed processes.",
   inputSchema: {
     operation: z.enum(UNIVERSAL_TOOL_OPERATIONS.process),
     processId: z.string().min(1).optional(),
@@ -365,10 +416,7 @@ const processContract = {
     signal: z.string().min(1).optional(),
     columns: z.number().int().min(1).max(1_000).optional(),
     rows: z.number().int().min(1).max(1_000).optional(),
-    authorityId: z.string().min(1).optional(),
-    transactionId: z.string().min(1).max(128).optional(),
     reason: z.string().min(1).max(2_000).optional(),
-    delayMs: z.number().int().min(750).max(15_000).optional(),
     waitMs: z.number().int().min(0).max(110_000).optional(),
     maxOutputChars: z.number().int().min(1).max(1_000_000).optional(),
     cursor: cursorSchema,
@@ -383,9 +431,8 @@ const processContract = {
 } satisfies UniversalToolContract;
 
 const mcpContract = {
-  title: "Use MCP route",
-  description:
-    "Discover or invoke configured MCP routes.",
+  title: "MCP",
+  description: "MCP routes.",
   inputSchema: {
     operation: z.enum(UNIVERSAL_TOOL_OPERATIONS.mcp),
     route: z.string().min(1).optional(),
@@ -396,7 +443,6 @@ const mcpContract = {
     cursor: cursorSchema,
     limit: limitSchema,
     responsePolicy: genericRecordSchema.optional(),
-    authorityId: z.string().min(1).optional(),
   },
   annotations: {
     readOnlyHint: false,
@@ -407,9 +453,8 @@ const mcpContract = {
 } satisfies UniversalToolContract;
 
 const artifactContract = {
-  title: "Transfer artifact",
-  description:
-    "Receive, publish, or copy verified file artifacts.",
+  title: "Artifact",
+  description: "Transfer artifacts.",
   inputSchema: {
     operation: z.enum(UNIVERSAL_TOOL_OPERATIONS.artifact),
     source: genericRecordSchema,
@@ -417,7 +462,6 @@ const artifactContract = {
     overwrite: z.boolean().optional(),
     maxBytes: z.number().int().min(1).optional(),
     ttlSeconds: z.number().int().min(1).max(86_400).optional(),
-    authorityId: z.string().min(1).optional(),
   },
   annotations: {
     readOnlyHint: false,
@@ -428,9 +472,8 @@ const artifactContract = {
 } satisfies UniversalToolContract;
 
 const guiContract = {
-  title: "Operate GUI",
-  description:
-    "Observe or act through a bounded operating-system GUI session.",
+  title: "GUI",
+  description: "Accessible GUI.",
   inputSchema: {
     operation: z.enum(UNIVERSAL_TOOL_OPERATIONS.gui),
     target: z.string().min(1).optional(),
@@ -440,7 +483,6 @@ const guiContract = {
     timeoutMs: z.number().int().min(0).max(120_000).optional(),
     maxElements: z.number().int().min(1).max(1_000).optional(),
     focusPolicy: z.enum(["preserve", "allow"]).optional(),
-    authorityId: z.string().min(1).optional(),
   },
   annotations: {
     readOnlyHint: false,

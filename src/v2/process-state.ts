@@ -25,14 +25,37 @@ export interface PersistentProcessRecord {
   errorCode?: string;
   errorMessage?: string;
   outputPath: string;
+  /** Optional only while reading schema-v1 records written before signed output continuation. */
+  outputGeneration?: string;
+  /** Stable identity of the global spool file; absent only on legacy records. */
+  outputIdentity?: string;
+  /** Remembers a bounded-retention truncation across broker restart. */
+  outputTruncated?: boolean;
+  /** Last durably observed logical byte count; used to detect spool byte regression. */
+  outputBytes?: number;
   durable: boolean;
   durableIdentity?: DurableProcessIdentity;
   checksum: string;
 }
 
+export type WritableProcessRecord = Omit<
+  PersistentProcessRecord,
+  | "schemaVersion"
+  | "checksum"
+  | "outputGeneration"
+  | "outputIdentity"
+  | "outputTruncated"
+  | "outputBytes"
+> & {
+  outputGeneration: string;
+  outputIdentity: string;
+  outputTruncated: boolean;
+  outputBytes: number;
+};
+
 export interface ProcessStateStore {
   loadAll(): Promise<PersistentProcessRecord[]>;
-  save(record: Omit<PersistentProcessRecord, "schemaVersion" | "checksum">): Promise<void>;
+  save(record: WritableProcessRecord): Promise<void>;
   delete(processId: string): Promise<void>;
 }
 
@@ -63,7 +86,7 @@ export class FileProcessStateStore implements ProcessStateStore {
   }
 
   async save(
-    input: Omit<PersistentProcessRecord, "schemaVersion" | "checksum">,
+    input: WritableProcessRecord,
   ): Promise<void> {
     await mkdir(this.directory, { recursive: true, mode: 0o700 });
     const unsigned = { schemaVersion: PROCESS_STATE_SCHEMA_VERSION as 1, ...input };
@@ -117,11 +140,22 @@ function assertRecord(record: PersistentProcessRecord, path: string): void {
     || typeof record.principalKeyFingerprint !== "string"
     || typeof record.outputPath !== "string"
     || typeof record.checksum !== "string"
+    || (record.outputGeneration !== undefined && !isSha256Identity(record.outputGeneration))
+    || (record.outputIdentity !== undefined && !isSha256Identity(record.outputIdentity))
+    || (record.outputTruncated !== undefined && typeof record.outputTruncated !== "boolean")
+    || (
+      record.outputBytes !== undefined
+      && (!Number.isSafeInteger(record.outputBytes) || record.outputBytes < 0)
+    )
   ) {
     throw new Error(`Invalid process state shape: ${path}`);
   }
   const { checksum: observed, ...unsigned } = record;
   if (observed !== checksum(unsigned)) throw new Error(`Process state checksum mismatch: ${path}`);
+}
+
+function isSha256Identity(value: unknown): value is string {
+  return typeof value === "string" && /^sha256:[a-f0-9]{64}$/u.test(value);
 }
 
 function checksum(value: unknown): string {

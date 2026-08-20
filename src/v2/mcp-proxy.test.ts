@@ -21,6 +21,8 @@ import { OperationAuthorityRegistry, actionFingerprint } from "./authority.js";
 import { mcpAction, minimumAuthorityRisk } from "./authority-policy.js";
 import { TargetRegistry } from "./targets.js";
 import { createCapabilityCallContextFromTrustedPrincipal } from "./capability-call-context.js";
+import { SignedSnapshotCursorStore } from "./cursor-capability.js";
+import { UniversalBrokerMetrics } from "./metrics.js";
 
 test("generic local-stdio proxy discovers, invokes, mutates, and pages downstream MCP", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "devspace-v2-mcp-proxy-"));
@@ -56,6 +58,20 @@ test("generic local-stdio proxy discovers, invokes, mutates, and pages downstrea
     name: "write_value",
   });
   assert.match(JSON.stringify(described), /inputSchema/);
+  const oversizedDescription = await proxy.execute({
+    operation: "describe_tool",
+    route: "fixture",
+    name: "large_schema",
+    responsePolicy: { maxCharacters: 500, preserveFullResult: true },
+  });
+  const oversizedProjection = oversizedDescription.result as { resourceUri?: string; truncated?: boolean };
+  assert.equal(oversizedProjection.truncated, true);
+  assert.match(oversizedProjection.resourceUri ?? "", /^devspace:\/\/v1\/mcp-result\//u);
+  const oversizedSchemaResource = await proxy.execute({
+    operation: "read_resource",
+    uri: oversizedProjection.resourceUri,
+  });
+  assert.match(JSON.stringify(oversizedSchemaResource), /schema-description-/u);
 
   const write = await proxy.execute({
     operation: "invoke",
@@ -73,13 +89,18 @@ test("generic local-stdio proxy discovers, invokes, mutates, and pages downstrea
   assert.match(JSON.stringify(read), /stored/);
 
   const resources = await proxy.execute({ operation: "list_resources", route: "fixture" });
-  assert.match(JSON.stringify(resources), /fixture:\/\/state/);
+  const resourceUri = (((resources.result as {
+    value: { resources: Array<{ uri: string }> };
+  }).value.resources)[0]?.uri);
+  assert.match(resourceUri ?? "", /^devspace:\/\/v1\/mcp\/fixture\/resource\//u);
+  assert.doesNotMatch(JSON.stringify(resources), /fixture:\/\/state/u);
   const resource = await proxy.execute({
     operation: "read_resource",
     route: "fixture",
-    uri: "fixture://state",
+    uri: resourceUri,
   });
   assert.match(JSON.stringify(resource), /alpha/);
+  assert.doesNotMatch(JSON.stringify(resource), /fixture:\/\/state/u);
   const prompts = await proxy.execute({ operation: "list_prompts", route: "fixture" });
   assert.match(JSON.stringify(prompts), /fixture_prompt/);
   const prompt = await proxy.execute({
@@ -119,6 +140,318 @@ test("generic local-stdio proxy discovers, invokes, mutates, and pages downstrea
   });
   const closed = await proxy.execute({ operation: "close", route: "fixture" });
   assert.equal(closed.closed, true);
+});
+
+test("downstream MCP session quota rejection emits finite metrics without provider dispatch", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-v2-mcp-session-quota-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const routePath = join(root, "routes.json");
+  await writeRouteFile(routePath, {
+    a: {
+      displayName: "Route A",
+      transport: "local-stdio",
+      command: process.execPath,
+      args: ["--version"],
+    },
+    b: {
+      displayName: "Route B",
+      transport: "local-stdio",
+      command: process.execPath,
+      args: ["--version"],
+    },
+  });
+  const metrics = new UniversalBrokerMetrics();
+  let providerSessions = 0;
+  const proxy = new UniversalMcpProxy(
+    new UniversalMcpRouteRegistry(routePath),
+    new TargetRegistry({ configPath: join(root, "targets.json") }),
+    {
+      sshControlDir: join(root, "ssh"),
+      maximumSessions: 1,
+      metrics,
+      clientFactory: async (route) => {
+        providerSessions += 1;
+        return {
+          route,
+          routeFingerprint: route.generation,
+          client: {
+            listTools: async () => ({ tools: [{ name: "read_exact" }] }),
+            close: async () => undefined,
+          } as unknown as Client,
+          transport: { close: async () => undefined } as DownstreamMcpSession["transport"],
+          connectedAt: Date.now(),
+          lastUsedAt: Date.now(),
+          activeCalls: 0,
+        };
+      },
+    },
+  );
+  t.after(() => proxy.close());
+
+  await proxy.execute({ operation: "describe_tool", route: "a", name: "read_exact" });
+  await assert.rejects(
+    proxy.execute({ operation: "describe_tool", route: "b", name: "read_exact" }),
+    hasCode("RESOURCE_QUOTA_EXCEEDED"),
+  );
+  assert.equal(providerSessions, 1);
+  assert.match(
+    metrics.render({}),
+    /devspace_quota_rejections_total\{resource_kind="mcp_session"\} 1/u,
+  );
+});
+
+test("MCP list and search operations use owner-bound broker cursors, never provider cursors", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-v2-mcp-cursors-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const routePath = join(root, "routes.json");
+  await writeRouteFile(routePath, Object.fromEntries(["a", "b", "c"].map((id) => [id, {
+    displayName: `Route ${id}`,
+    transport: "local-stdio",
+    command: process.execPath,
+    args: ["--version"],
+  }])));
+  const providerResourceCursors: Array<string | undefined> = [];
+  const providerPromptCursors: Array<string | undefined> = [];
+  const cursorStore = new SignedSnapshotCursorStore({
+    currentKey: { keyId: "mcp-current", secret: Buffer.alloc(32, 7) },
+    ttlMs: 60_000,
+    maximumSnapshotsPerPrincipal: 32,
+  });
+  const proxy = new UniversalMcpProxy(
+    new UniversalMcpRouteRegistry(routePath),
+    new TargetRegistry({ configPath: join(root, "targets.json") }),
+    {
+      sshControlDir: join(root, "ssh"),
+      cursorStore,
+      clientFactory: async (route) => ({
+        route,
+        routeFingerprint: route.generation,
+        client: {
+          listTools: async () => ({ tools: [
+            { name: "read_a", description: "read fixture a" },
+            { name: "read_b", description: "read fixture b" },
+            { name: "read_c", description: "read fixture c" },
+          ] }),
+          listResources: async (params?: { cursor?: string }) => {
+            providerResourceCursors.push(params?.cursor);
+            return params?.cursor === "provider-resource-2"
+              ? { resources: [{ uri: "fixture://3", name: "resource-3" }] }
+              : {
+                  resources: [
+                    { uri: "fixture://1", name: "resource-1" },
+                    { uri: "fixture://2", name: "resource-2" },
+                  ],
+                  nextCursor: "provider-resource-2",
+                };
+          },
+          listResourceTemplates: async () => ({ resourceTemplates: [] }),
+          listPrompts: async (params?: { cursor?: string }) => {
+            providerPromptCursors.push(params?.cursor);
+            return params?.cursor === "provider-prompt-2"
+              ? { prompts: [{ name: "prompt-3" }] }
+              : {
+                  prompts: [{ name: "prompt-1" }, { name: "prompt-2" }],
+                  nextCursor: "provider-prompt-2",
+                };
+          },
+          close: async () => undefined,
+        } as unknown as Client,
+        transport: { close: async () => undefined } as DownstreamMcpSession["transport"],
+        connectedAt: Date.now(),
+        lastUsedAt: Date.now(),
+        activeCalls: 0,
+      }),
+    },
+  );
+  t.after(() => proxy.close());
+  const principalA = owner("mcp-cursor-owner-a");
+  const principalB = owner("mcp-cursor-owner-b");
+
+  const routePage1 = await proxy.execute({ operation: "routes", limit: 2 }, principalA);
+  assert.deepEqual((routePage1.routes as Array<{ routeId: string }>).map((route) => route.routeId), ["a", "b"]);
+  assert.equal(typeof routePage1.nextCursor, "string");
+  assert.equal(/^\d+$/u.test(String(routePage1.nextCursor)), false);
+  const routePage2 = await proxy.execute({
+    operation: "routes",
+    limit: 2,
+    cursor: String(routePage1.nextCursor),
+  }, principalA);
+  assert.deepEqual((routePage2.routes as Array<{ routeId: string }>).map((route) => route.routeId), ["c"]);
+  await assert.rejects(
+    proxy.execute({ operation: "routes", limit: 2, cursor: String(routePage1.nextCursor) }, principalB),
+    (error: unknown) => Boolean(
+      error
+      && typeof error === "object"
+      && "reason" in error
+      && error.reason === "CURSOR_INVALID",
+    ),
+  );
+
+  const tools1 = await proxy.execute({ operation: "search_tools", route: "a", query: "read", limit: 2 }, principalA);
+  const tools2 = await proxy.execute({
+    operation: "search_tools",
+    route: "a",
+    query: "read",
+    limit: 2,
+    cursor: String(tools1.nextCursor),
+  }, principalA);
+  assert.equal((tools1.tools as unknown[]).length, 2);
+  assert.equal((tools2.tools as unknown[]).length, 1);
+
+  const resources1 = await proxy.execute({ operation: "list_resources", route: "a", limit: 2 }, principalA);
+  const resources2 = await proxy.execute({
+    operation: "list_resources",
+    route: "a",
+    limit: 2,
+    cursor: String(resources1.nextCursor),
+  }, principalA);
+  assert.equal((((resources1.result as { value: { resources: unknown[] } }).value.resources)).length, 2);
+  assert.equal((((resources2.result as { value: { resources: unknown[] } }).value.resources)).length, 1);
+  assert.deepEqual(providerResourceCursors, [undefined, "provider-resource-2", undefined, "provider-resource-2"]);
+  assert.equal(providerResourceCursors.includes(String(resources1.nextCursor)), false);
+
+  const prompts1 = await proxy.execute({ operation: "list_prompts", route: "a", limit: 2 }, principalA);
+  const prompts2 = await proxy.execute({
+    operation: "list_prompts",
+    route: "a",
+    limit: 2,
+    cursor: String(prompts1.nextCursor),
+  }, principalA);
+  assert.equal((((prompts1.result as { value: { prompts: unknown[] } }).value.prompts)).length, 2);
+  assert.equal((((prompts2.result as { value: { prompts: unknown[] } }).value.prompts)).length, 1);
+  assert.deepEqual(providerPromptCursors, [undefined, "provider-prompt-2", undefined, "provider-prompt-2"]);
+  assert.equal(providerPromptCursors.includes(String(prompts1.nextCursor)), false);
+});
+
+test("downstream MCP resources use owner, route-generation, and TTL-bound broker handles", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-v2-mcp-resource-handles-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const routePath = join(root, "routes.json");
+  const routeConfig = (displayName: string) => ({
+    fixture: {
+      displayName,
+      aliases: ["resource alias"],
+      transport: "local-stdio",
+      command: process.execPath,
+      args: ["--version"],
+    },
+  });
+  await writeRouteFile(routePath, routeConfig("Fixture"));
+  let now = 1_000;
+  let providerListingUri = "fixture://state";
+  let providerLists = 0;
+  const providerReads: string[] = [];
+  const proxy = new UniversalMcpProxy(
+    new UniversalMcpRouteRegistry(routePath),
+    new TargetRegistry({ configPath: join(root, "targets.json") }),
+    {
+      sshControlDir: join(root, "ssh"),
+      now: () => now,
+      resourceHandleTtlMs: 1_000,
+      maximumResourceHandles: 1,
+      clientFactory: async (route) => ({
+        route,
+        routeFingerprint: route.generation,
+        client: {
+          listResources: async () => {
+            providerLists += 1;
+            return {
+              resources: [{ uri: providerListingUri, name: "Fixture state" }],
+            };
+          },
+          listResourceTemplates: async () => ({
+            resourceTemplates: [{
+              uriTemplate: "fixture://state/{key}",
+              name: "Fixture template",
+              description: "Templated state lookup",
+            }],
+          }),
+          readResource: async ({ uri }: { uri: string }) => {
+            providerReads.push(uri);
+            return {
+              contents: [{ uri, mimeType: "text/plain", text: "fixture state" }],
+            };
+          },
+          close: async () => undefined,
+        } as unknown as Client,
+        transport: { close: async () => undefined } as DownstreamMcpSession["transport"],
+        connectedAt: now,
+        lastUsedAt: now,
+        activeCalls: 0,
+      }),
+    },
+  );
+  t.after(() => proxy.close());
+  const principalA = owner("mcp-resource-owner-a");
+  const principalB = owner("mcp-resource-owner-b");
+
+  const listed = await proxy.execute({ operation: "list_resources", route: "fixture", limit: 1 }, principalA);
+  const listedValue = (listed.result as {
+    value: {
+      resources: Array<{ uri: string }>;
+      resourceTemplates: Array<Record<string, unknown>>;
+    };
+  }).value;
+  const uri = listedValue.resources[0]!.uri;
+  assert.match(uri, /^devspace:\/\/v1\/mcp\/fixture\/resource\/[0-9a-f-]+$/u);
+  assert.equal(JSON.stringify(listed).includes("fixture://"), false);
+  assert.equal("uriTemplate" in listedValue.resourceTemplates[0]!, false);
+
+  const read = await proxy.execute({
+    operation: "read_resource",
+    route: "resource alias",
+    uri,
+  }, principalA);
+  assert.deepEqual(providerReads, ["fixture://state"]);
+  assert.equal(JSON.stringify(read).includes("fixture://state"), false);
+  assert.match(
+    String((((read.result as { value: { contents: Array<{ uri: string }> } }).value.contents)[0]?.uri)),
+    /^devspace:\/\/v1\/mcp\/fixture\/resource\//u,
+  );
+
+  providerListingUri = "fixture://different-state";
+  await assert.rejects(
+    proxy.execute({ operation: "list_resources", route: "fixture", limit: 1 }, principalA),
+    hasCode("RESOURCE_QUOTA_EXCEEDED"),
+  );
+  assert.equal(providerLists, 1);
+  await proxy.execute({ operation: "read_resource", uri }, principalA);
+  assert.deepEqual(providerReads, ["fixture://state", "fixture://state"]);
+
+  const legacyUri = uri.replace("devspace://v1/mcp/", "devspace://mcp/");
+  await proxy.execute({ operation: "read_resource", uri: legacyUri }, principalA);
+  assert.deepEqual(providerReads, ["fixture://state", "fixture://state", "fixture://state"]);
+
+  await assert.rejects(
+    proxy.execute({ operation: "read_resource", uri }, principalB),
+    hasCode("AUTHORITY_PRINCIPAL_MISMATCH"),
+  );
+  await assert.rejects(
+    proxy.execute({ operation: "read_resource", uri: "fixture://state" }, principalA),
+    hasCode("PRECONDITION_FAILED"),
+  );
+  assert.equal(providerReads.length, 3);
+
+  now = 2_001;
+  await assert.rejects(
+    proxy.execute({ operation: "read_resource", uri }, principalA),
+    hasCode("RESOURCE_EXPIRED"),
+  );
+  assert.equal(providerReads.length, 3);
+
+  now = 3_000;
+  providerListingUri = "fixture://state";
+  const refreshed = await proxy.execute({ operation: "list_resources", route: "fixture", limit: 1 }, principalA);
+  const refreshedUri = (((refreshed.result as {
+    value: { resources: Array<{ uri: string }> };
+  }).value.resources)[0]!.uri);
+  assert.equal(providerLists, 2);
+  await writeRouteFile(routePath, routeConfig("Fixture generation two"));
+  await assert.rejects(
+    proxy.execute({ operation: "read_resource", uri: refreshedUri }, principalA),
+    hasCode("AUTHORITY_STALE"),
+  );
+  assert.equal(providerReads.length, 3);
 });
 
 test("local stdio MCP routes inherit the runtime no-elevation boundary", { skip: process.platform !== "darwin" }, async (t) => {

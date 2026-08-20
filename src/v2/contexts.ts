@@ -36,7 +36,9 @@ import {
   type CapabilityCallContext,
   type CapabilityCallContextProvider,
 } from "./capability-call-context.js";
+import type { SignedSnapshotCursorStore } from "./cursor-capability.js";
 import { UniversalBrokerError } from "./errors.js";
+import type { UniversalBrokerMetrics } from "./metrics.js";
 import {
   SynchronousQuotaReservations,
   type QuotaReservation,
@@ -145,6 +147,8 @@ export interface ContextRegistryOptions {
   ownerProvider?: CapabilityCallContextProvider;
   tombstoneTtlMs?: number;
   execute?: typeof execFileAsync;
+  cursorStore?: SignedSnapshotCursorStore;
+  metrics?: UniversalBrokerMetrics;
 }
 
 export class ContextRegistry {
@@ -168,6 +172,7 @@ export class ContextRegistry {
   private readonly reservations: SynchronousQuotaReservations;
   private readonly worktreeReservations: SynchronousQuotaReservations;
   private readonly execute: typeof execFileAsync;
+  private readonly metrics?: UniversalBrokerMetrics;
   private loaded = false;
   private loadPromise?: Promise<void>;
   private mutationQueue: Promise<void> = Promise.resolve();
@@ -217,6 +222,7 @@ export class ContextRegistry {
       entries: this.maximumWorktrees,
     });
     this.execute = options.execute ?? execFileAsync;
+    this.metrics = options.metrics;
   }
 
   async open(input: {
@@ -292,15 +298,24 @@ export class ContextRegistry {
       ...skills.map((skill) => ({ type: "skill", ...skill })),
       ...instructions.map((instruction) => ({ type: "instruction", ...instruction })),
     ];
-    const offset = parseCursor(input.cursor);
     const limit = Math.min(Math.max(input.limit ?? 20, 1), MAX_SEARCH_RESULTS);
-    const page = combined.slice(offset, offset + limit);
-    const nextOffset = offset + page.length;
+    const page = this.options.cursorStore
+      ? contextSearchCursorPage(
+          this.options.cursorStore,
+          owner,
+          record,
+          target.generation,
+          query,
+          combined,
+          input.cursor,
+          limit,
+        )
+      : contextSearchUnpagedResult(combined, input.cursor, limit);
     return {
       ...(record ? { contextId: record.contextId } : {}),
       query,
-      results: page,
-      ...(nextOffset < combined.length ? { nextCursor: String(nextOffset) } : {}),
+      results: page.results,
+      ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
     };
   }
 
@@ -503,6 +518,7 @@ export class ContextRegistry {
       );
     } catch (error) {
       contextReservation.release();
+      this.recordQuotaRejection("worktree");
       throw error;
     }
     let created: CreatedWorktree | undefined;
@@ -521,6 +537,7 @@ export class ContextRegistry {
       const currentBytes = await this.managedWorktreeBytes(target.id) + createdBytes;
       if (currentBytes > this.maximumWorktreeBytes) {
         await this.removeCreatedWorktree(target, created).catch(() => undefined);
+        this.recordQuotaRejection("worktree");
         throw new UniversalBrokerError(
           "RESOURCE_QUOTA_EXCEEDED",
           `Managed worktree byte quota exceeded: ${this.maximumWorktreeBytes}`,
@@ -1264,10 +1281,23 @@ export class ContextRegistry {
   }
 
   private reserveContext() {
-    return this.reservations.reserve(
-      { entries: this.contexts.size },
-      { entries: 1 },
-    );
+    try {
+      return this.reservations.reserve(
+        { entries: this.contexts.size },
+        { entries: 1 },
+      );
+    } catch (error) {
+      this.recordQuotaRejection("context");
+      throw error;
+    }
+  }
+
+  private recordQuotaRejection(resourceKind: "context" | "worktree"): void {
+    try {
+      this.metrics?.recordQuotaRejection(resourceKind);
+    } catch {
+      // Quota rejection remains authoritative even if instrumentation fails.
+    }
   }
 
   private refreshExpiry(record: ContextRecord): void {
@@ -1334,6 +1364,7 @@ export class ContextRegistry {
       }
     }
     if (parsed.contexts.length > this.maximumContexts) {
+      this.recordQuotaRejection("context");
       throw new UniversalBrokerError(
         "PRECONDITION_FAILED",
         "Context store exceeds the configured active context quota.",
@@ -1845,13 +1876,60 @@ function fitInitialContextPayload(input: ContextOpenResult): ContextOpenResult {
   return result;
 }
 
-function parseCursor(cursor: string | undefined): number {
-  if (cursor === undefined) return 0;
-  const parsed = Number(cursor);
-  if (!Number.isInteger(parsed) || parsed < 0) {
-    throw new UniversalBrokerError("PRECONDITION_FAILED", `Invalid context cursor: ${cursor}`);
+function contextSearchCursorPage(
+  store: SignedSnapshotCursorStore,
+  owner: CapabilityCallContext,
+  record: ContextRecord | undefined,
+  targetGeneration: string,
+  query: string,
+  combined: Array<Record<string, unknown>>,
+  cursor: string | undefined,
+  limit: number,
+): { results: Array<Record<string, unknown>>; nextCursor?: string } {
+  const serialized = combined.map((entry) => JSON.stringify(entry));
+  const snapshotGeneration = createHash("sha256")
+    .update(JSON.stringify(serialized))
+    .digest("hex");
+  const binding = {
+    principalKeyFingerprint: owner.principalKeyFingerprint,
+    resourceKind: "context.search",
+    resourceIdentityDigest: createHash("sha256").update(JSON.stringify({
+      contextId: record?.contextId ?? "global",
+      targetGeneration,
+      instructionSetHash: record?.instructionSetHash ?? "none",
+    })).digest("hex"),
+    queryDigest: createHash("sha256").update(normalizeText(query)).digest("hex"),
+    snapshotGeneration,
+  };
+  const cursorPage = cursor
+    ? store.continueSnapshot({ cursor, binding, limit })
+    : store.createSnapshot({ binding, orderedItemIdentities: serialized, limit });
+  const results = cursorPage.itemIdentities.map((identity) => {
+    const parsed: unknown = JSON.parse(identity);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new UniversalBrokerError(
+        "CURSOR_STALE",
+        "Context search snapshot contains an invalid result identity.",
+        { evidence: { resourceKind: "context.search", providerDispatchCount: 0 } },
+      );
+    }
+    return parsed as Record<string, unknown>;
+  });
+  return { results, ...(cursorPage.nextCursor ? { nextCursor: cursorPage.nextCursor } : {}) };
+}
+
+function contextSearchUnpagedResult(
+  combined: Array<Record<string, unknown>>,
+  cursor: string | undefined,
+  limit: number,
+): { results: Array<Record<string, unknown>>; nextCursor?: string } {
+  if (cursor !== undefined || combined.length > limit) {
+    throw new UniversalBrokerError(
+      "CAPABILITY_UNAVAILABLE",
+      "Context search pagination requires a configured signed cursor service.",
+    );
   }
-  return parsed;
+  return { results: combined };
 }
 
 function boundedContextInteger(

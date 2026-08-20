@@ -17,7 +17,8 @@ import {
   type UniversalMcpRoute,
   type UniversalMcpRouteRegistry,
 } from "./mcp-routes.js";
-import { UniversalMcpResultStore } from "./mcp-result-store.js";
+import { parseResultUri, UniversalMcpResultStore } from "./mcp-result-store.js";
+import type { UniversalBrokerMetrics } from "./metrics.js";
 import { prepareSshControlPath } from "./ssh-control.js";
 import { posixRemoteUserOnlyRunner, wrapLocalUserOnlyExecution } from "./no-elevation.js";
 import { assertTargetCapability, type TargetRegistry } from "./targets.js";
@@ -29,11 +30,16 @@ import {
   type CapabilityCallContext,
   type CapabilityCallContextProvider,
 } from "./capability-call-context.js";
-import { SynchronousQuotaReservations } from "./quota-reservations.js";
+import type { SignedSnapshotCursorStore } from "./cursor-capability.js";
+import {
+  SynchronousQuotaReservations,
+  type QuotaReservation,
+} from "./quota-reservations.js";
 import {
   RESOURCE_DEFAULT_MCP_CONNECTIONS,
   RESOURCE_DEFAULT_MCP_IDLE_TTL_MS,
 } from "./resource-defaults.js";
+import { formatResourceUri, parseResourceUri, ResourceUriError } from "./resource-uri.js";
 
 export type UniversalMcpOperation =
   | "routes"
@@ -92,14 +98,25 @@ export interface PreparedMcpInvocation {
 
 export interface UniversalMcpOperationalObserver {
   reconnect(event: {
-    routeId: string;
+    transport: UniversalMcpRoute["transport"];
     operation: string;
     result: "pass" | "fail";
   }): void;
   connection(event: {
-    routeId: string;
+    transport: UniversalMcpRoute["transport"];
     state: "connected" | "disconnected";
   }): void;
+}
+
+interface DownstreamResourceHandle {
+  opaque: string;
+  stableKey: string;
+  principalKeyFingerprint: string;
+  routeId: string;
+  routeGeneration: string;
+  providerUri: string;
+  createdAt: number;
+  expiresAt: number;
 }
 
 export interface UniversalMcpProxyOptions {
@@ -121,6 +138,10 @@ export interface UniversalMcpProxyOptions {
   clientFactory?: (route: UniversalMcpRoute) => Promise<DownstreamMcpSession>;
   now?: () => number;
   ownerProvider?: CapabilityCallContextProvider;
+  cursorStore?: SignedSnapshotCursorStore;
+  maximumResourceHandles?: number;
+  resourceHandleTtlMs?: number;
+  metrics?: UniversalBrokerMetrics;
 }
 
 export class UniversalMcpProxy {
@@ -128,9 +149,15 @@ export class UniversalMcpProxy {
   private readonly maximumSessions: number;
   private readonly defaultSessionIdleTtlMs: number;
   private readonly results: UniversalMcpResultStore;
+  private readonly resourceHandles = new Map<string, DownstreamResourceHandle>();
+  private readonly resourceHandleByStableKey = new Map<string, string>();
+  private readonly maximumResourceHandles: number;
+  private readonly resourceHandleTtlMs: number;
   private readonly now: () => number;
   private readonly ownerProvider: CapabilityCallContextProvider;
   private readonly reservations: SynchronousQuotaReservations;
+  private readonly resourceHandleReservations: SynchronousQuotaReservations;
+  private readonly metrics?: UniversalBrokerMetrics;
   private readonly observedConnections = new WeakSet<object>();
   private operationalObserver?: UniversalMcpOperationalObserver;
   private closed = false;
@@ -155,6 +182,20 @@ export class UniversalMcpProxy {
       "defaultSessionIdleTtlMs",
     );
     this.results = options.resultStore ?? new UniversalMcpResultStore();
+    this.maximumResourceHandles = boundedInteger(
+      options.maximumResourceHandles,
+      4_096,
+      1,
+      10_000,
+      "maximumResourceHandles",
+    );
+    this.resourceHandleTtlMs = boundedInteger(
+      options.resourceHandleTtlMs,
+      RESOURCE_DEFAULT_MCP_IDLE_TTL_MS,
+      1_000,
+      86_400_000,
+      "resourceHandleTtlMs",
+    );
     this.now = options.now ?? Date.now;
     const compatibilityOwner = createCapabilityCallContextFromTrustedPrincipal({
       principalKeyFingerprint: createHash("sha256")
@@ -168,6 +209,11 @@ export class UniversalMcpProxy {
     this.reservations = new SynchronousQuotaReservations("downstream-mcp-session", {
       entries: this.maximumSessions,
     });
+    this.resourceHandleReservations = new SynchronousQuotaReservations(
+      "downstream-mcp-resource-handle",
+      { entries: this.maximumResourceHandles },
+    );
+    this.metrics = options.metrics;
   }
 
   setOperationalObserver(observer: UniversalMcpOperationalObserver | undefined): void {
@@ -185,7 +231,23 @@ export class UniversalMcpProxy {
     switch (input.operation) {
       case "routes":
         rejectUnrelatedRouteGeneration(requestMeta, "routes");
-        return this.routes.list();
+        const routeSnapshot = await this.routes.inspect();
+        const routePage = mcpCursorPage({
+          store: this.options.cursorStore,
+          owner,
+          resourceKind: "mcp.routes",
+          resourceIdentityDigest: createHash("sha256").update("mcp-route-registry").digest("hex"),
+          queryDigest: createHash("sha256").update("all-routes").digest("hex"),
+          snapshotGeneration: routeSnapshot.generation,
+          records: routeSnapshot.routes.map(routeSummary),
+          cursor: input.cursor,
+          limit: boundedInteger(input.limit, 50, 1, 200, "limit"),
+        });
+        return {
+          generation: routeSnapshot.generation,
+          routes: routePage.records,
+          ...(routePage.nextCursor ? { nextCursor: routePage.nextCursor } : {}),
+        };
       case "close":
         return this.closeRoute(input.route, owner, requestMeta.expectedRouteGeneration);
       case "search_tools":
@@ -202,19 +264,33 @@ export class UniversalMcpProxy {
             `${session.route.id} tools/list`,
           );
           const limit = boundedInteger(input.limit, 5, 1, 5, "limit");
+          const tools = listed.tools
+            .map((tool) => ({
+              name: tool.name,
+              title: tool.title,
+              description: tool.description,
+              annotations: tool.annotations,
+              score: scoreTool(tool, query),
+            }))
+            .filter((tool) => tool.score > 0)
+            .sort((left, right) => right.score - left.score || left.name.localeCompare(right.name));
+          const page = mcpCursorPage({
+            store: this.options.cursorStore,
+            owner,
+            resourceKind: "mcp.search_tools",
+            resourceIdentityDigest: createHash("sha256")
+              .update(`${session.route.id}\0${session.routeFingerprint}`)
+              .digest("hex"),
+            queryDigest: createHash("sha256").update(query.normalize("NFKC")).digest("hex"),
+            snapshotGeneration: createHash("sha256").update(stableJson(tools)).digest("hex"),
+            records: tools,
+            cursor: input.cursor,
+            limit,
+          });
           return {
             route: routeSummary(session.route),
-            tools: listed.tools
-              .map((tool) => ({
-                name: tool.name,
-                title: tool.title,
-                description: tool.description,
-                annotations: tool.annotations,
-                score: scoreTool(tool, query),
-              }))
-              .filter((tool) => tool.score > 0)
-              .sort((left, right) => right.score - left.score || left.name.localeCompare(right.name))
-              .slice(0, limit),
+            tools: page.records,
+            ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
           };
           },
         );
@@ -251,43 +327,89 @@ export class UniversalMcpProxy {
         );
       case "invoke":
         return (await this.prepareInvocation(input, owner, requestMeta)).execute();
-      case "list_resources":
-        return this.withSession(
+      case "list_resources": {
+        const resourceLimit = boundedInteger(input.limit, 50, 1, 200, "limit");
+        this.pruneResourceHandles();
+        const handleReservation = this.resourceHandleReservations.reserve(
+          { entries: this.resourceHandles.size },
+          { entries: resourceLimit },
+        );
+        try {
+          return await this.withSession(
           input.route,
           "list_resources",
           owner,
           requestMeta.expectedRouteGeneration,
           async (session) => {
-          const [resources, templates] = await timed(
+          const [resources, resourceTemplates] = await timed(
             Promise.all([
-              session.client.listResources(input.cursor ? { cursor: input.cursor } : undefined),
-              session.client.listResourceTemplates(),
+              collectProviderPages(
+                async (cursor) => {
+                  const response = await session.client.listResources(cursor ? { cursor } : undefined);
+                  return { items: response.resources, nextCursor: response.nextCursor };
+                },
+                `${session.route.id} resources/list`,
+              ),
+              collectProviderPages(
+                async (cursor) => {
+                  const response = await session.client.listResourceTemplates(cursor ? { cursor } : undefined);
+                  return { items: response.resourceTemplates, nextCursor: response.nextCursor };
+                },
+                `${session.route.id} resources/templates/list`,
+              ),
             ]),
             session.route.callTimeoutMs,
             `${session.route.id} resources/list`,
           );
+          const records = providerRecords(resources, "resources");
+          const templates = providerRecords(resourceTemplates, "resource templates");
+          const page = mcpCursorPage({
+            store: this.options.cursorStore,
+            owner,
+            resourceKind: "mcp.list_resources",
+            resourceIdentityDigest: createHash("sha256")
+              .update(`${session.route.id}\0${session.routeFingerprint}`)
+              .digest("hex"),
+            queryDigest: createHash("sha256").update("resources").digest("hex"),
+            snapshotGeneration: createHash("sha256")
+              .update(stableJson({ records, templates }))
+              .digest("hex"),
+            records,
+            cursor: input.cursor,
+            limit: resourceLimit,
+          });
+          let issuedResources: Record<string, unknown>[] = [];
+          handleReservation.commit(() => {
+            issuedResources = this.issueListedResourceHandles(page.records, session, owner);
+          });
           return {
             route: routeSummary(session.route),
             result: this.project(
-              { resources, resourceTemplates: templates },
-              withLimit(input.responsePolicy, input.limit),
+              {
+                resources: issuedResources,
+                resourceTemplates: templates.map(safeResourceTemplateDescriptor),
+              },
+              input.responsePolicy,
               session.route.id,
               owner,
             ),
+            ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
           };
           },
         );
+        } finally {
+          handleReservation.release();
+        }
+      }
       case "read_resource":
         const requestedUri = input.uri;
-        if (requestedUri !== undefined && (
-          requestedUri.startsWith("devspace://mcp-result/")
-          || /^devspace:\/\/mcp\/[^/]+\/result\//u.test(requestedUri)
-        )) {
+        if (requestedUri !== undefined && isStoredMcpResultUri(requestedUri)) {
+          const page = this.results.readByUri(requestedUri, owner);
           if (requestMeta.expectedRouteGeneration !== undefined) {
-            const routeId = canonicalResultRouteId(requestedUri);
-            if (!routeId) {
-              rejectUnrelatedRouteGeneration(requestMeta, "legacy stored-result read");
-            }
+            const routeId = requireText(
+              typeof page.routeId === "string" ? page.routeId : undefined,
+              "Stored MCP result is missing its route binding.",
+            );
             const route = await this.routes.resolve(routeId);
             assertExpectedProxyRouteGeneration(
               requestMeta.expectedRouteGeneration,
@@ -295,23 +417,33 @@ export class UniversalMcpProxy {
               route.id,
             );
           }
-          return this.results.readByUri(requestedUri, owner);
+          return page;
         }
+        const handle = this.resolveResourceHandle(
+          requireText(input.uri, "mcp.read_resource requires uri."),
+          owner,
+        );
+        assertExpectedProxyRouteGeneration(
+          requestMeta.expectedRouteGeneration,
+          handle.routeGeneration,
+          handle.routeId,
+        );
+        await this.assertResourceHandleSelector(input.route, handle);
         return this.withSession(
-          input.route,
+          handle.routeId,
           "read_resource",
           owner,
-          requestMeta.expectedRouteGeneration,
+          handle.routeGeneration,
           async (session) => {
-          const uri = requireText(input.uri, "mcp.read_resource requires uri.");
           const response = await timed(
-            session.client.readResource({ uri }),
+            session.client.readResource({ uri: handle.providerUri }),
             session.route.callTimeoutMs,
             `${session.route.id} resources/read`,
           );
+          const brokerResponse = this.issueReadResourceHandles(response, handle, session);
           return {
             route: routeSummary(session.route),
-            result: this.project(response, input.responsePolicy, session.route.id, owner),
+            result: this.project(brokerResponse, input.responsePolicy, session.route.id, owner),
           };
           },
         );
@@ -322,19 +454,40 @@ export class UniversalMcpProxy {
           owner,
           requestMeta.expectedRouteGeneration,
           async (session) => {
-          const response = await timed(
-            session.client.listPrompts(input.cursor ? { cursor: input.cursor } : undefined),
+          const prompts = await timed(
+            collectProviderPages(
+              async (cursor) => {
+                const response = await session.client.listPrompts(cursor ? { cursor } : undefined);
+                return { items: response.prompts, nextCursor: response.nextCursor };
+              },
+              `${session.route.id} prompts/list`,
+            ),
             session.route.callTimeoutMs,
             `${session.route.id} prompts/list`,
           );
+          const records = providerRecords(prompts, "prompts");
+          const page = mcpCursorPage({
+            store: this.options.cursorStore,
+            owner,
+            resourceKind: "mcp.list_prompts",
+            resourceIdentityDigest: createHash("sha256")
+              .update(`${session.route.id}\0${session.routeFingerprint}`)
+              .digest("hex"),
+            queryDigest: createHash("sha256").update("prompts").digest("hex"),
+            snapshotGeneration: createHash("sha256").update(stableJson(records)).digest("hex"),
+            records,
+            cursor: input.cursor,
+            limit: boundedInteger(input.limit, 50, 1, 200, "limit"),
+          });
           return {
             route: routeSummary(session.route),
             result: this.project(
-              response,
-              withLimit(input.responsePolicy, input.limit),
+              { prompts: page.records },
+              input.responsePolicy,
               session.route.id,
               owner,
             ),
+            ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
           };
           },
         );
@@ -405,6 +558,7 @@ export class UniversalMcpProxy {
         if (!isExactNotConnected(error)) throw error;
         const previous = session;
         const routeId = previous.route.id;
+        const transport = previous.route.transport;
         this.releaseSession(previous);
         await this.evict(previous.cacheKey!, previous);
         reconnects += 1;
@@ -420,9 +574,9 @@ export class UniversalMcpProxy {
             session.route.callTimeoutMs,
             `${session.route.id} tools/list after reconnect`,
           );
-          this.observeReconnect(routeId, "prepare_invocation", "pass");
+          this.observeReconnect(transport, "prepare_invocation", "pass");
         } catch (reconnectError) {
-          this.observeReconnect(routeId, "prepare_invocation", "fail");
+          this.observeReconnect(transport, "prepare_invocation", "fail");
           throw reconnectError;
         }
       }
@@ -529,12 +683,203 @@ export class UniversalMcpProxy {
     return this.results.readByUri(uri, this.owner(callContext));
   }
 
+  private issueListedResourceHandles(
+    records: Record<string, unknown>[],
+    session: DownstreamMcpSession,
+    owner: CapabilityCallContext,
+  ): Record<string, unknown>[] {
+    const providerUris = records.map((record, index) => requireProviderResourceUri(
+      record.uri,
+      `Downstream MCP resource ${index} is missing a valid URI.`,
+    ));
+    const issuedUris = this.issueResourceHandles(providerUris, session, owner);
+    return records.map((record, index) => ({
+      ...record,
+      uri: issuedUris[index],
+    }));
+  }
+
+  private issueReadResourceHandles(
+    response: unknown,
+    handle: DownstreamResourceHandle,
+    session: DownstreamMcpSession,
+  ): Record<string, unknown> {
+    if (!isRecord(response) || !Array.isArray(response.contents)) {
+      throw new UniversalBrokerError(
+        "MCP_PROVIDER_ERROR",
+        `MCP route ${session.route.id} returned an invalid resource response.`,
+        { evidence: { routeId: session.route.id } },
+      );
+    }
+    if (response.contents.length > 1_000) {
+      throw new UniversalBrokerError(
+        "RESOURCE_QUOTA_EXCEEDED",
+        `MCP route ${session.route.id} returned too many resource contents.`,
+        { evidence: { routeId: session.route.id, maximumItems: 1_000 } },
+      );
+    }
+    const contents = providerRecords(response.contents, "resource contents");
+    for (const [index, content] of contents.entries()) {
+      const providerUri = requireProviderResourceUri(
+        content.uri,
+        `Downstream MCP resource content ${index} is missing a valid URI.`,
+      );
+      if (providerUri !== handle.providerUri) {
+        throw new UniversalBrokerError(
+          "MCP_PROVIDER_ERROR",
+          `MCP route ${session.route.id} returned content for a different resource URI.`,
+          { evidence: { routeId: session.route.id, itemIndex: index } },
+        );
+      }
+    }
+    const issuedUri = resourceHandleUri(handle);
+    return {
+      contents: contents.map((content) => ({
+        ...content,
+        uri: issuedUri,
+      })),
+    };
+  }
+
+  private issueResourceHandles(
+    providerUris: string[],
+    session: DownstreamMcpSession,
+    owner: CapabilityCallContext,
+  ): string[] {
+    this.pruneResourceHandles();
+    const stableKeys = providerUris.map((providerUri) => downstreamResourceStableKey(
+      owner.principalKeyFingerprint,
+      session.route.id,
+      session.routeFingerprint,
+      providerUri,
+    ));
+    const newStableKeys = new Set(stableKeys.filter((stableKey) => {
+      const opaque = this.resourceHandleByStableKey.get(stableKey);
+      return opaque === undefined || !this.resourceHandles.has(opaque);
+    }));
+    if (this.resourceHandles.size + newStableKeys.size > this.maximumResourceHandles) {
+      throw new UniversalBrokerError(
+        "RESOURCE_QUOTA_EXCEEDED",
+        "Downstream MCP resource handle quota exceeded.",
+        {
+          evidence: {
+            resource: "downstream-mcp-resource-handle",
+            used: this.resourceHandles.size,
+            requested: newStableKeys.size,
+            maximum: this.maximumResourceHandles,
+          },
+        },
+      );
+    }
+    const now = this.now();
+    return providerUris.map((providerUri, index) => {
+      const stableKey = stableKeys[index]!;
+      const existingOpaque = this.resourceHandleByStableKey.get(stableKey);
+      const existing = existingOpaque ? this.resourceHandles.get(existingOpaque) : undefined;
+      if (existing) return resourceHandleUri(existing);
+      const handle: DownstreamResourceHandle = {
+        opaque: randomUUID(),
+        stableKey,
+        principalKeyFingerprint: owner.principalKeyFingerprint,
+        routeId: session.route.id,
+        routeGeneration: session.routeFingerprint,
+        providerUri,
+        createdAt: now,
+        expiresAt: now + this.resourceHandleTtlMs,
+      };
+      this.resourceHandles.set(handle.opaque, handle);
+      this.resourceHandleByStableKey.set(stableKey, handle.opaque);
+      return resourceHandleUri(handle);
+    });
+  }
+
+  private resolveResourceHandle(
+    uri: string,
+    owner: CapabilityCallContext,
+  ): DownstreamResourceHandle {
+    let parsed;
+    try {
+      parsed = parseResourceUri(uri, { allowLegacyRead: true });
+    } catch (error) {
+      if (error instanceof ResourceUriError) {
+        throw new UniversalBrokerError(
+          "PRECONDITION_FAILED",
+          "MCP resource URI is invalid or unsupported.",
+          { evidence: { reason: error.reason, providerDispatchCount: 0 } },
+        );
+      }
+      throw error;
+    }
+    if (parsed.kind !== "mcp-resource") {
+      throw new UniversalBrokerError(
+        "PRECONDITION_FAILED",
+        "mcp.read_resource requires a downstream MCP resource handle.",
+        { evidence: { providerDispatchCount: 0 } },
+      );
+    }
+    this.pruneResourceHandles();
+    const handle = this.resourceHandles.get(parsed.opaque);
+    if (!handle) {
+      throw new UniversalBrokerError(
+        "RESOURCE_EXPIRED",
+        "Downstream MCP resource handle is unknown or expired.",
+        { evidence: { routeId: parsed.routeId, providerDispatchCount: 0 } },
+      );
+    }
+    if (handle.routeId !== parsed.routeId) {
+      throw new UniversalBrokerError(
+        "PRECONDITION_FAILED",
+        "MCP resource handle route binding is invalid.",
+        { evidence: { routeId: parsed.routeId, providerDispatchCount: 0 } },
+      );
+    }
+    if (handle.principalKeyFingerprint !== owner.principalKeyFingerprint) {
+      throw new UniversalBrokerError(
+        "AUTHORITY_PRINCIPAL_MISMATCH",
+        "Downstream MCP resource belongs to a different authenticated principal.",
+        { evidence: { routeId: handle.routeId, providerDispatchCount: 0 } },
+      );
+    }
+    return handle;
+  }
+
+  private async assertResourceHandleSelector(
+    selector: string | undefined,
+    handle: DownstreamResourceHandle,
+  ): Promise<void> {
+    let current: UniversalMcpRoute;
+    let currentGeneration: string;
+    try {
+      current = await this.routes.resolve(handle.routeId);
+      currentGeneration = await this.routeExecutionGeneration(current);
+    } catch (error) {
+      throw staleResourceHandleRoute(handle, undefined, error);
+    }
+    if (currentGeneration !== handle.routeGeneration) {
+      throw staleResourceHandleRoute(handle, currentGeneration);
+    }
+    if (selector === undefined) return;
+    let selected: UniversalMcpRoute;
+    let selectedGeneration: string;
+    try {
+      selected = await this.routes.resolve(selector);
+      selectedGeneration = await this.routeExecutionGeneration(selected);
+    } catch (error) {
+      throw staleResourceHandleRoute(handle, undefined, error);
+    }
+    if (selected.id !== handle.routeId || selectedGeneration !== handle.routeGeneration) {
+      throw staleResourceHandleRoute(handle, selectedGeneration);
+    }
+  }
+
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
     const pending = [...this.sessions.values()];
     this.sessions.clear();
     this.results.clear();
+    this.resourceHandles.clear();
+    this.resourceHandleByStableKey.clear();
     await Promise.allSettled(pending.map(async (sessionPromise) => {
       const session = await sessionPromise.catch(() => undefined);
       if (session) await this.closeObservedSession(session);
@@ -561,6 +906,11 @@ export class UniversalMcpProxy {
       activeCalls: resolved.reduce((total, entry) => total + entry.activeCalls, 0),
       routes: resolved.sort((left, right) => (left.routeId ?? "").localeCompare(right.routeId ?? "")),
       results: this.results.stats(),
+      resourceHandles: {
+        entries: this.resourceHandles.size,
+        maximumEntries: this.maximumResourceHandles,
+        ttlMs: this.resourceHandleTtlMs,
+      },
     };
   }
 
@@ -590,6 +940,7 @@ export class UniversalMcpProxy {
         if (!isExactNotConnected(error)) throw error;
         const previous = session;
         const routeId = previous.route.id;
+        const transport = previous.route.transport;
         this.releaseSession(previous);
         await this.evict(previous.cacheKey!, previous);
         try {
@@ -601,14 +952,14 @@ export class UniversalMcpProxy {
           );
           const result = await callback(session);
           session.livenessVerified = true;
-          this.observeReconnect(routeId, operation, "pass");
+          this.observeReconnect(transport, operation, "pass");
           return {
             ...result,
             livenessVerified: true,
             connectionGeneration: session.connectionGeneration,
           };
         } catch (reconnectError) {
-          this.observeReconnect(routeId, operation, "fail");
+          this.observeReconnect(transport, operation, "fail");
           throw reconnectError;
         }
       }
@@ -685,6 +1036,7 @@ export class UniversalMcpProxy {
       if (isExactNotConnected(error) && allowReconnect) {
         const previous = session;
         const routeId = previous.route.id;
+        const transport = previous.route.transport;
         this.releaseSession(previous);
         await this.evict(previous.cacheKey!, previous);
         let replacement: DownstreamMcpSession | undefined;
@@ -702,9 +1054,9 @@ export class UniversalMcpProxy {
           );
           replacement.livenessVerified = true;
           session = replacement;
-          this.observeReconnect(routeId, "prepared_invocation_revalidation", "pass");
+          this.observeReconnect(transport, "prepared_invocation_revalidation", "pass");
         } catch (replacementError) {
-          this.observeReconnect(routeId, "prepared_invocation_revalidation", "fail");
+          this.observeReconnect(transport, "prepared_invocation_revalidation", "fail");
           if (replacement) {
             this.releaseSession(replacement);
             await this.evict(replacement.cacheKey!, replacement);
@@ -898,10 +1250,16 @@ export class UniversalMcpProxy {
       if (resolved) await this.closeObservedSession(resolved);
       this.sessions.delete(cacheKey);
     }
-    const reservation = this.reservations.reserve(
-      { entries: this.sessions.size },
-      { entries: 1 },
-    );
+    let reservation: QuotaReservation;
+    try {
+      reservation = this.reservations.reserve(
+        { entries: this.sessions.size },
+        { entries: 1 },
+      );
+    } catch (error) {
+      this.recordQuotaRejection("mcp_session");
+      throw error;
+    }
     const connectionGeneration = `mcpconn_${randomUUID()}`;
     let pending!: Promise<DownstreamMcpSession>;
     try {
@@ -1176,6 +1534,7 @@ export class UniversalMcpProxy {
   }
 
   private async pruneIdle(): Promise<void> {
+    this.pruneResourceHandles();
     const now = this.now();
     for (const [cacheKey, pending] of [...this.sessions]) {
       const session = await pending.catch(() => undefined);
@@ -1184,6 +1543,22 @@ export class UniversalMcpProxy {
       if (session.activeCalls === 0 && session.lastUsedAt + ttl <= now) {
         await this.closeSessionByKey(cacheKey);
       }
+    }
+  }
+
+  private pruneResourceHandles(): void {
+    const now = this.now();
+    for (const handle of this.resourceHandles.values()) {
+      if (handle.expiresAt <= now) this.deleteResourceHandle(handle);
+    }
+  }
+
+  private deleteResourceHandle(handle: DownstreamResourceHandle): void {
+    if (this.resourceHandles.get(handle.opaque) === handle) {
+      this.resourceHandles.delete(handle.opaque);
+    }
+    if (this.resourceHandleByStableKey.get(handle.stableKey) === handle.opaque) {
+      this.resourceHandleByStableKey.delete(handle.stableKey);
     }
   }
 
@@ -1236,19 +1611,19 @@ export class UniversalMcpProxy {
       this.observedConnections.delete(session);
     }
     try {
-      this.operationalObserver?.connection({ routeId: session.route.id, state });
+      this.operationalObserver?.connection({ transport: session.route.transport, state });
     } catch {
       // Observability cannot change downstream transport state.
     }
   }
 
   private observeReconnect(
-    routeId: string,
+    transport: UniversalMcpRoute["transport"],
     operation: string,
     result: "pass" | "fail",
   ): void {
     try {
-      this.operationalObserver?.reconnect({ routeId, operation, result });
+      this.operationalObserver?.reconnect({ transport, operation, result });
     } catch {
       // Observability cannot replace the reconnect result.
     }
@@ -1262,6 +1637,14 @@ export class UniversalMcpProxy {
 
   private owner(callContext?: CapabilityCallContext): CapabilityCallContext {
     return requireCapabilityCallContext(callContext, this.ownerProvider);
+  }
+
+  private recordQuotaRejection(resourceKind: "mcp_session"): void {
+    try {
+      this.metrics?.recordQuotaRejection(resourceKind);
+    } catch {
+      // MCP quota rejection must not be masked by instrumentation failure.
+    }
   }
 }
 
@@ -1329,14 +1712,88 @@ function rejectUnrelatedRouteGeneration(
   );
 }
 
-function canonicalResultRouteId(uri: string): string | undefined {
-  if (!uri.startsWith("devspace://mcp/")) return undefined;
+function safeResourceTemplateDescriptor(template: Record<string, unknown>): Record<string, unknown> {
+  const descriptor: Record<string, unknown> = {
+    resourceProxyAvailable: false,
+  };
+  for (const field of ["name", "title", "description", "mimeType", "annotations"] as const) {
+    if (template[field] !== undefined) descriptor[field] = template[field];
+  }
+  if (typeof template.uriTemplate === "string") {
+    descriptor.providerTemplateSha256 = createHash("sha256")
+      .update(template.uriTemplate)
+      .digest("hex");
+  }
+  return descriptor;
+}
+
+function requireProviderResourceUri(value: unknown, message: string): string {
+  if (typeof value !== "string" || value.length === 0 || value.length > 16_384 || value.includes("\0")) {
+    throw new UniversalBrokerError("MCP_PROVIDER_ERROR", message);
+  }
   try {
-    const parsed = new URL(uri);
-    const [routeId, marker] = parsed.pathname.split("/").filter(Boolean);
-    return marker === "result" && routeId ? decodeURIComponent(routeId) : undefined;
+    const parsed = new URL(value);
+    if (!parsed.protocol) throw new Error("missing protocol");
   } catch {
-    return undefined;
+    throw new UniversalBrokerError("MCP_PROVIDER_ERROR", message);
+  }
+  return value;
+}
+
+function downstreamResourceStableKey(
+  principalKeyFingerprint: string,
+  routeId: string,
+  routeGeneration: string,
+  providerUri: string,
+): string {
+  return createHash("sha256")
+    .update(stableJson({
+      principalKeyFingerprint,
+      routeId,
+      routeGeneration,
+      providerUri,
+    }))
+    .digest("hex");
+}
+
+function resourceHandleUri(handle: DownstreamResourceHandle): string {
+  return formatResourceUri({
+    kind: "mcp-resource",
+    routeId: handle.routeId,
+    opaque: handle.opaque,
+  });
+}
+
+function staleResourceHandleRoute(
+  handle: DownstreamResourceHandle,
+  observedRouteGeneration?: string,
+  cause?: unknown,
+): UniversalBrokerError {
+  return new UniversalBrokerError(
+    "AUTHORITY_STALE",
+    `Downstream MCP resource route ${handle.routeId} changed after the handle was issued.`,
+    {
+      evidence: {
+        routeId: handle.routeId,
+        expectedRouteGeneration: handle.routeGeneration,
+        ...(observedRouteGeneration ? { observedRouteGeneration } : {}),
+        ...(cause instanceof UniversalBrokerError ? { causeCode: cause.code } : {}),
+        providerDispatchCount: 0,
+      },
+    },
+  );
+}
+
+function isStoredMcpResultUri(uri: string): boolean {
+  if (!uri.startsWith("devspace://v1/mcp-result/")
+      && !uri.startsWith("devspace://mcp-result/")
+      && !/^devspace:\/\/mcp\/[^/]+\/result\//u.test(uri)) {
+    return false;
+  }
+  try {
+    return parseResultUri(uri).id.length > 0;
+  } catch {
+    return false;
   }
 }
 
@@ -1586,6 +2043,119 @@ function requireDownstreamTool<T extends { name: string }>(
     );
   }
   return tool as T & Record<string, unknown>;
+}
+
+const MAX_DOWNSTREAM_LIST_PAGES = 64;
+const MAX_DOWNSTREAM_LIST_ITEMS = 10_000;
+
+async function collectProviderPages<T>(
+  fetchPage: (cursor?: string) => Promise<{ items: readonly T[]; nextCursor?: string }>,
+  label: string,
+): Promise<T[]> {
+  const items: T[] = [];
+  const seenCursors = new Set<string>();
+  let cursor: string | undefined;
+  for (let page = 0; page < MAX_DOWNSTREAM_LIST_PAGES; page += 1) {
+    const response = await fetchPage(cursor);
+    if (!Array.isArray(response.items)) {
+      throw new UniversalBrokerError(
+        "MCP_PROVIDER_ERROR",
+        `${label} returned an invalid item page.`,
+        { evidence: { providerDispatchCount: page + 1 } },
+      );
+    }
+    items.push(...response.items);
+    if (items.length > MAX_DOWNSTREAM_LIST_ITEMS) {
+      throw new UniversalBrokerError(
+        "RESOURCE_QUOTA_EXCEEDED",
+        `${label} exceeded the broker snapshot item limit.`,
+        {
+          evidence: {
+            maximumItems: MAX_DOWNSTREAM_LIST_ITEMS,
+            providerDispatchCount: page + 1,
+          },
+        },
+      );
+    }
+    const nextCursor = response.nextCursor;
+    if (!nextCursor) return items;
+    if (seenCursors.has(nextCursor)) {
+      throw new UniversalBrokerError(
+        "MCP_PROVIDER_ERROR",
+        `${label} repeated a downstream cursor.`,
+        { evidence: { providerDispatchCount: page + 1 } },
+      );
+    }
+    seenCursors.add(nextCursor);
+    cursor = nextCursor;
+  }
+  throw new UniversalBrokerError(
+    "RESOURCE_QUOTA_EXCEEDED",
+    `${label} exceeded the broker page limit.`,
+    { evidence: { maximumPages: MAX_DOWNSTREAM_LIST_PAGES } },
+  );
+}
+
+function providerRecords(items: readonly unknown[], label: string): Record<string, unknown>[] {
+  return items.map((item, index) => {
+    if (!isRecord(item)) {
+      throw new UniversalBrokerError(
+        "MCP_PROVIDER_ERROR",
+        `Downstream MCP ${label} item is invalid.`,
+        { evidence: { itemIndex: index } },
+      );
+    }
+    return item;
+  });
+}
+
+function mcpCursorPage<T extends Record<string, unknown>>(input: {
+  store?: SignedSnapshotCursorStore;
+  owner: CapabilityCallContext;
+  resourceKind: string;
+  resourceIdentityDigest: string;
+  queryDigest: string;
+  snapshotGeneration: string;
+  records: T[];
+  cursor?: string;
+  limit: number;
+}): { records: T[]; nextCursor?: string } {
+  if (!input.store) {
+    if (input.cursor !== undefined || input.records.length > input.limit) {
+      throw new UniversalBrokerError(
+        "CAPABILITY_UNAVAILABLE",
+        `${input.resourceKind} pagination requires a configured signed cursor service.`,
+      );
+    }
+    return { records: input.records };
+  }
+  const serialized = input.records.map(stableJson);
+  const binding = {
+    principalKeyFingerprint: input.owner.principalKeyFingerprint,
+    resourceKind: input.resourceKind,
+    resourceIdentityDigest: input.resourceIdentityDigest,
+    queryDigest: input.queryDigest,
+    snapshotGeneration: input.snapshotGeneration,
+  };
+  const page = input.cursor
+    ? input.store.continueSnapshot({ cursor: input.cursor, binding, limit: input.limit })
+    : input.store.createSnapshot({
+        binding,
+        orderedItemIdentities: serialized,
+        limit: input.limit,
+      });
+  const records = page.itemIdentities.map((identity) => {
+    const parsed: unknown = JSON.parse(identity);
+    if (!isRecord(parsed)) {
+      throw new UniversalBrokerError(
+        "CURSOR_STALE",
+        `${input.resourceKind} snapshot contains an invalid item identity.`,
+        { evidence: { resourceKind: input.resourceKind, providerDispatchCount: 0 } },
+      );
+    }
+    return parsed as T;
+  });
+  return { records, ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}) };
 }
 
 function stableJson(value: unknown): string {

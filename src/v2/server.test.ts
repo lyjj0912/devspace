@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -26,14 +26,25 @@ import type { ContextRegistry } from "./contexts.js";
 import { UniversalBrokerMetrics } from "./metrics.js";
 import {
   EXEC_RISK_CLASSIFIER_GENERATION,
+  filesystemAction,
   minimumAuthorityRisk,
 } from "./authority-policy.js";
+import {
+  resolveAuthorityPrincipal,
+  type AuthorityPrincipalConfiguration,
+} from "./authority-principal.js";
 import type {
   ExecuteCommandInput,
   PreparedExecExecutionBinding,
   UniversalExecutionPlane,
   UniversalProcessSnapshot,
 } from "./execution.js";
+import {
+  UniversalFilesystemService,
+  type UniversalFilesystemInput,
+} from "./filesystem.js";
+import { RecoverableFilesystemTrash } from "./filesystem-trash.js";
+import { createLocalFilesystemSyncAdapter } from "./filesystem-sync.js";
 import { prepareExecExecutionBinding } from "./execution.js";
 import {
   downstreamMcpToolContractSha256,
@@ -41,6 +52,7 @@ import {
   UniversalMcpProxy,
 } from "./mcp-proxy.js";
 import { UniversalMcpRouteRegistry } from "./mcp-routes.js";
+import { OperationAuditSink } from "./operation-audit.js";
 import { createUniversalBrokerMcpServer } from "./server.js";
 import { TargetRegistry, type TargetDefinition } from "./targets.js";
 
@@ -118,6 +130,21 @@ test("configured R0 tools authenticate before provider access without touching a
       resourceProviderCalls += 1;
       throw new Error("Unauthenticated MCP resources must not reach the provider.");
     },
+    async execute(_input: unknown, callContext?: CapabilityCallContext) {
+      requireCapabilityCallContext(callContext);
+      resourceProviderCalls += 1;
+      return {
+        result: {
+          value: {
+            contents: [{
+              uri: "devspace://v1/mcp/fixture/resource/opaque-test",
+              mimeType: "text/plain",
+              text: "proxied fixture",
+            }],
+          },
+        },
+      };
+    },
   } as unknown as UniversalMcpProxy;
   const contexts = {
     readDiffResource() {
@@ -147,9 +174,10 @@ test("configured R0 tools authenticate before provider access without touching a
   const send = clientTransport.send.bind(clientTransport);
   let authInfo: AuthInfo | undefined;
   const protectedResourceUris = [
-    "devspace://process/process-test/output/0/10",
-    "devspace://mcp/fixture/result/result-test/0/10",
-    "devspace://context-diff/diff-test/0/10",
+    "devspace://v1/process/process-test/output",
+    "devspace://v1/mcp/fixture/resource/opaque-test",
+    "devspace://v1/mcp-result/result-test",
+    "devspace://v1/context-diff/diff-test",
   ];
   clientTransport.send = (message, options) => send(message, {
     ...options,
@@ -213,6 +241,11 @@ test("configured R0 tools authenticate before provider access without touching a
     assert.equal(toolErrorCode(insufficientScope), "SCOPE_INSUFFICIENT");
     assert.equal(providerCalls, 0);
     assert.equal(authorityStoreBoundaryCalls, 0);
+    const mcpResource = await client.readResource({
+      uri: "devspace://v1/mcp/fixture/resource/opaque-test",
+    });
+    assert.equal((mcpResource.contents[0] as { text?: string } | undefined)?.text, "proxied fixture");
+    assert.equal(resourceProviderCalls, 1);
 
     authInfo = {
       ...authInfo,
@@ -244,18 +277,415 @@ test("configured R0 tools authenticate before provider access without touching a
     const renderedMetrics = metrics.render({});
     assert.match(
       renderedMetrics,
-      /devspace_requests_total\{operation="list",result="fail",tool="target"\} 3/u,
+      /devspace_requests_total\{error_code="AUTHENTICATION_FAILED",operation="list",result="fail",tool="target"\} 1/u,
     );
     assert.match(
       renderedMetrics,
-      /devspace_requests_total\{operation="list",result="pass",tool="target"\} 1/u,
+      /devspace_requests_total\{error_code="SCOPE_INSUFFICIENT",operation="list",result="fail",tool="target"\} 2/u,
     );
     assert.match(
       renderedMetrics,
-      /devspace_requests_total\{operation="list",result="pass",tool="process"\} 1/u,
+      /devspace_requests_total\{error_code="none",operation="list",result="pass",tool="target"\} 1/u,
+    );
+    assert.match(
+      renderedMetrics,
+      /devspace_requests_total\{error_code="none",operation="list",result="pass",tool="process"\} 1/u,
     );
   } finally {
     await Promise.allSettled([client.close(), server.close()]);
+  }
+});
+
+test("server audit event links the durable authority receipt digest", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-v2-server-audit-link-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const targetsPath = join(root, "targets.json");
+  await writeFile(targetsPath, JSON.stringify({
+    version: 1,
+    targets: {
+      local: {
+        displayName: "Local",
+        aliases: ["local"],
+        transport: "local",
+        platform: "macos",
+        shell: "zsh",
+      },
+    },
+  }, null, 2));
+  const targets = new TargetRegistry({ configPath: targetsPath });
+  const contexts = {} as ContextRegistry;
+  let providerDispatches = 0;
+  const filesystem = {
+    async execute(_input: UniversalFilesystemInput, callContext?: CapabilityCallContext) {
+      requireCapabilityCallContext(callContext);
+      providerDispatches += 1;
+      return {
+        state: "UPDATED",
+        targetId: "local",
+        bytesWritten: 11,
+      };
+    },
+  } as unknown as UniversalFilesystemService;
+  const metrics = new UniversalBrokerMetrics();
+  const operationAudit = new OperationAuditSink({
+    path: join(root, "audit", "operations.ndjson"),
+    flushIntervalMs: 60_000,
+  });
+  t.after(() => operationAudit.close());
+  const authorityStorePath = join(root, "authority.sqlite");
+  const authority = new OperationAuthorityRegistry({
+    minimumRisk: minimumAuthorityRisk,
+    storePath: authorityStorePath,
+    instanceId: "server-audit-link-owner",
+    metrics,
+  });
+  t.after(() => authority.close());
+  const resource = new URL("https://broker.example.test/mcp");
+  const authorityPrincipal: AuthorityPrincipalConfiguration = {
+    environment: "production",
+    mode: "single-owner",
+    issuer: "https://issuer.example.test/",
+    resource: resource.href,
+    ownerInstanceId: "server-audit-link-principal",
+  };
+  const authInfo: AuthInfo = {
+    token: "server-audit-link-token",
+    clientId: "server-audit-link-client",
+    resource,
+    scopes: ["devspace.read", "devspace.write"],
+  };
+  const principal = resolveAuthorityPrincipal({ authInfo }, authorityPrincipal).fingerprint;
+  const input: UniversalFilesystemInput = {
+    operation: "write",
+    target: "local",
+    path: "/tmp/raw-audit-link-path-must-not-leak.txt",
+    content: "hello audit",
+    overwrite: true,
+  };
+  const targetBinding = await targets.resolveWithGeneration("local");
+  const descriptor = filesystemAction(input, targetBinding.target.id);
+  const boundDescriptor = {
+    ...descriptor,
+    parameters: {
+      ...(descriptor.parameters ?? {}),
+      targetGeneration: targetBinding.generation,
+    },
+  };
+  const created = authority.create({
+    authorityText: "Allow exactly one fake filesystem write for audit linkage.",
+    actions: [{ descriptor: boundDescriptor }],
+  }, principal);
+  const server = createUniversalBrokerMcpServer({
+    targets,
+    contexts,
+    filesystem,
+    authority,
+    authorityPrincipal,
+    metrics,
+    operationAudit,
+  });
+  const client = new Client({ name: "server-audit-link-test", version: "1.0.0" });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const send = clientTransport.send.bind(clientTransport);
+  clientTransport.send = (message, options) => send(message, { ...options, authInfo });
+  await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
+
+  try {
+    const result = await client.callTool({
+      name: "fs",
+      arguments: { ...input },
+      _meta: { devspace: { authorityId: String(created.authorityId) } },
+    });
+    assert.notEqual(result.isError, true, JSON.stringify(result.structuredContent));
+    assert.equal(providerDispatches, 1);
+    await operationAudit.close();
+    const status = authority.status(String(created.authorityId), principal) as {
+      receipts: Array<{
+        receiptDigest: string;
+        state: string;
+        auditState?: string;
+        auditEventDigest?: string;
+      }>;
+    };
+    const receiptDigest = status.receipts[0]?.receiptDigest;
+    assert.match(receiptDigest ?? "", /^sha256:[a-f0-9]{64}$/u);
+    assert.equal(status.receipts[0]?.state, "PASS");
+
+    const auditText = await readFile(join(root, "audit", "operations.ndjson"), "utf8");
+    assert.equal(auditText.includes("raw-audit-link-path-must-not-leak"), false);
+    assert.equal(auditText.includes("hello audit"), false);
+    assert.equal(auditText.includes("Allow exactly one fake"), false);
+    const auditRecords = auditText.trim().split("\n")
+      .map((line) => JSON.parse(line)) as Array<Record<string, unknown>>;
+    const auditRecord = auditRecords.find((record) => record.receiptDigest === receiptDigest);
+    assert.ok(auditRecord);
+    assert.match(String(auditRecord.eventDigest), /^sha256:[a-f0-9]{64}$/u);
+    assert.equal(status.receipts[0]?.auditState, "RECORDED");
+    assert.equal(status.receipts[0]?.auditEventDigest, auditRecord.eventDigest);
+    authority.close();
+    const reopened = new OperationAuthorityRegistry({
+      minimumRisk: minimumAuthorityRisk,
+      storePath: authorityStorePath,
+      instanceId: "server-audit-link-readback",
+    });
+    const reopenedStatus = reopened.status(String(created.authorityId), principal) as {
+      receipts: Array<{ auditState?: string; auditEventDigest?: string }>;
+    };
+    assert.equal(reopenedStatus.receipts[0]?.auditState, "RECORDED");
+    assert.equal(reopenedStatus.receipts[0]?.auditEventDigest, auditRecord.eventDigest);
+    reopened.close();
+    assert.match(
+      metrics.render({}),
+      /devspace_authority_claims_total\{risk="R1",state="PASS"\} 1/u,
+    );
+  } finally {
+    await Promise.allSettled([client.close(), server.close()]);
+  }
+});
+
+test("permanent fs.sync apply is bound to exact R3 authority before deletion dispatch", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-v3-sync-r3-server-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const source = join(root, "source");
+  const destination = join(root, "destination");
+  await mkdir(source, { recursive: true });
+  await mkdir(destination, { recursive: true });
+  await writeFile(join(destination, "delete.txt"), "delete\n");
+  const targets = new TargetRegistry({ configPath: join(root, "missing-targets.json") });
+  const contexts = {} as ContextRegistry;
+  let deleteDispatches = 0;
+  const trashRoot = join(root, "filesystem-trash");
+  const trash = new RecoverableFilesystemTrash(trashRoot);
+  const baseSyncAdapter = createLocalFilesystemSyncAdapter("local", trash);
+  const filesystem = new UniversalFilesystemService(
+    targets,
+    contexts,
+    {} as UniversalExecutionPlane,
+    {
+      sshControlDir: join(root, "ssh"),
+      trashRoot,
+      syncAdapter: {
+        ...baseSyncAdapter,
+        applyOperation: async (input) => {
+          if (input.operation.kind === "DELETE_ENTRY") deleteDispatches += 1;
+          return baseSyncAdapter.applyOperation(input);
+        },
+      },
+    },
+  );
+  const authority = new OperationAuthorityRegistry({
+    minimumRisk: minimumAuthorityRisk,
+    storePath: join(root, "authority.sqlite"),
+    instanceId: "sync-r3-server-authority",
+  });
+  t.after(() => authority.close());
+  const resource = new URL("https://broker.example.test/mcp");
+  const authorityPrincipal: AuthorityPrincipalConfiguration = {
+    environment: "production",
+    mode: "single-owner",
+    issuer: "https://issuer.example.test/",
+    resource: resource.href,
+    ownerInstanceId: "sync-r3-server-owner",
+  };
+  const server = createUniversalBrokerMcpServer({
+    targets,
+    contexts,
+    filesystem,
+    authority,
+    authorityPrincipal,
+  });
+  const client = new Client({ name: "sync-r3-server-test", version: "1.0.0" });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const send = clientTransport.send.bind(clientTransport);
+  const authInfo: AuthInfo = {
+    token: "sync-r3-server-token",
+    clientId: "sync-r3-server-client",
+    resource,
+    scopes: ["devspace.read", "devspace.write"],
+  };
+  clientTransport.send = (message, options) => send(message, { ...options, authInfo });
+  await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
+
+  try {
+    const planned = await client.callTool({
+      name: "fs",
+      arguments: {
+        operation: "sync",
+        target: "local",
+        path: source,
+        destination,
+        sync: { phase: "plan", deleteMode: "permanent" },
+      },
+    });
+    assert.notEqual(planned.isError, true, JSON.stringify(planned.structuredContent));
+    const plan = (planned.structuredContent as {
+      data?: { planId?: string; planDigest?: string };
+    } | undefined)?.data;
+    assert.match(plan?.planId ?? "", /^sync_plan_/u);
+    assert.match(plan?.planDigest ?? "", /^[a-f0-9]{64}$/u);
+    const applyArguments = {
+      operation: "sync",
+      target: "local",
+      path: source,
+      destination,
+      sync: {
+        phase: "apply",
+        planId: plan!.planId!,
+        planDigest: plan!.planDigest!,
+      },
+    };
+    assert.deepEqual(Object.keys(applyArguments.sync), ["phase", "planId", "planDigest"]);
+
+    const blocked = await client.callTool({ name: "fs", arguments: applyArguments });
+    assert.equal(toolErrorCode(blocked), "AUTHORITY_REQUIRED");
+    assert.equal(deleteDispatches, 0);
+    assert.equal(await readFile(join(destination, "delete.txt"), "utf8"), "delete\n");
+
+    const prepared = await client.callTool({
+      name: "context",
+      arguments: {
+        operation: "authorize",
+        taskId: "sync-r3-server-task",
+        authorityText: "Permanently delete only the entries in this exact immutable sync plan.",
+        actions: [{ tool: "fs", arguments: applyArguments }],
+      },
+    });
+    assert.notEqual(prepared.isError, true, JSON.stringify(prepared.structuredContent));
+    const preparedData = (prepared.structuredContent as {
+      data?: {
+        authorityId?: string;
+        actions?: Array<{ risk?: string; maximumUses?: number }>;
+      };
+    } | undefined)?.data;
+    assert.equal(preparedData?.actions?.[0]?.risk, "R3");
+    assert.equal(preparedData?.actions?.[0]?.maximumUses, 1);
+
+    const applied = await client.callTool({
+      name: "fs",
+      arguments: applyArguments,
+      _meta: { devspace: { authorityId: preparedData!.authorityId! } },
+    });
+    assert.notEqual(applied.isError, true, JSON.stringify(applied.structuredContent));
+    assert.equal(deleteDispatches, 1);
+    await assert.rejects(readFile(join(destination, "delete.txt"), "utf8"), { code: "ENOENT" });
+  } finally {
+    await Promise.allSettled([client.close(), server.close()]);
+  }
+});
+
+test("audit sink failure preserves successful mutation result and marks receipt audit state", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-v2-audit-failure-boundary-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const targetsPath = join(root, "targets.json");
+  await writeFile(targetsPath, JSON.stringify({
+    version: 1,
+    targets: {
+      local: {
+        displayName: "Local",
+        aliases: ["local"],
+        transport: "local",
+        platform: "macos",
+        shell: "zsh",
+      },
+    },
+  }, null, 2));
+  const targets = new TargetRegistry({ configPath: targetsPath });
+  const contexts = {} as ContextRegistry;
+  let providerDispatches = 0;
+  const filesystem = {
+    async execute(_input: UniversalFilesystemInput, callContext?: CapabilityCallContext) {
+      requireCapabilityCallContext(callContext);
+      providerDispatches += 1;
+      return {
+        state: "UPDATED",
+        targetId: "local",
+        bytesWritten: 12,
+      };
+    },
+  } as unknown as UniversalFilesystemService;
+  const auditDirectory = join(root, "audit-as-directory");
+  await mkdir(auditDirectory);
+  const operationAudit = new OperationAuditSink({ path: auditDirectory });
+  const authority = new OperationAuthorityRegistry({
+    minimumRisk: minimumAuthorityRisk,
+    storePath: join(root, "authority.sqlite"),
+    instanceId: "server-audit-failure-owner",
+  });
+  t.after(() => authority.close());
+  const resource = new URL("https://broker.example.test/mcp");
+  const authorityPrincipal: AuthorityPrincipalConfiguration = {
+    environment: "production",
+    mode: "single-owner",
+    issuer: "https://issuer.example.test/",
+    resource: resource.href,
+    ownerInstanceId: "server-audit-failure-principal",
+  };
+  const authInfo: AuthInfo = {
+    token: "server-audit-failure-token",
+    clientId: "server-audit-failure-client",
+    resource,
+    scopes: ["devspace.read", "devspace.write"],
+  };
+  const principal = resolveAuthorityPrincipal({ authInfo }, authorityPrincipal).fingerprint;
+  const input: UniversalFilesystemInput = {
+    operation: "write",
+    target: "local",
+    path: "/tmp/raw-audit-failure-path-must-not-leak.txt",
+    content: "hello failure",
+    overwrite: true,
+  };
+  const targetBinding = await targets.resolveWithGeneration("local");
+  const descriptor = filesystemAction(input, targetBinding.target.id);
+  const boundDescriptor = {
+    ...descriptor,
+    parameters: {
+      ...(descriptor.parameters ?? {}),
+      targetGeneration: targetBinding.generation,
+    },
+  };
+  const created = authority.create({
+    authorityText: "Allow exactly one fake filesystem write even if audit recording fails.",
+    actions: [{ descriptor: boundDescriptor }],
+  }, principal);
+  const server = createUniversalBrokerMcpServer({
+    targets,
+    contexts,
+    filesystem,
+    authority,
+    authorityPrincipal,
+    operationAudit,
+  });
+  const client = new Client({ name: "server-audit-failure-test", version: "1.0.0" });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const send = clientTransport.send.bind(clientTransport);
+  clientTransport.send = (message, options) => send(message, { ...options, authInfo });
+  await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
+
+  try {
+    const result = await client.callTool({
+      name: "fs",
+      arguments: { ...input },
+      _meta: { devspace: { authorityId: String(created.authorityId) } },
+    });
+    assert.notEqual(result.isError, true, JSON.stringify(result.structuredContent));
+    assert.equal(providerDispatches, 1);
+    const structured = result.structuredContent as {
+      audit?: { status?: string; authorityReceiptAuditState?: string };
+    };
+    assert.equal(structured.audit?.status, "SINK_FAILED");
+    assert.equal(structured.audit?.authorityReceiptAuditState, "SINK_FAILED");
+    const status = authority.status(String(created.authorityId), principal) as {
+      receipts: Array<{
+        state: string;
+        auditState?: string;
+        auditEventDigest?: string;
+      }>;
+    };
+    assert.equal(status.receipts[0]?.state, "PASS");
+    assert.equal(status.receipts[0]?.auditState, "SINK_FAILED");
+    assert.equal(status.receipts[0]?.auditEventDigest, undefined);
+  } finally {
+    await Promise.allSettled([client.close(), server.close(), operationAudit.close()]);
   }
 });
 
@@ -497,7 +927,7 @@ test("public exec passes its exact target and classifier binding into the execut
         outputTruncated: false,
         outputBytes: 0,
         outputFileTruncated: false,
-        resourceUri: "devspace://process/proc_binding/output/0/0",
+        resourceUri: "devspace://v1/process/proc_binding/output",
         exitCode: 0,
       };
     },
@@ -561,6 +991,90 @@ test("public exec passes its exact target and classifier binding into the execut
   }
 });
 
+test("candidate connector permits R0 canaries but rejects authority and mutation before dispatch", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-v3-candidate-gate-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const targets = new TargetRegistry({ configPath: join(root, "missing-targets.json") });
+  let providerCalls = 0;
+  const execution = {
+    async prepareAuthorityBinding(input: ExecuteCommandInput, target: TargetDefinition, generation: string) {
+      return prepareExecExecutionBinding(input, target, generation);
+    },
+    async execute() {
+      providerCalls += 1;
+      throw new Error("Candidate connector mutation must not reach execution.");
+    },
+    async operate() {
+      return { processes: [] };
+    },
+    async readOutput() {
+      return { text: "", totalBytes: 0, truncated: false };
+    },
+  } as unknown as UniversalExecutionPlane;
+  const contexts = {
+    async get() {
+      throw new Error("Candidate authority rejection must precede context lookup.");
+    },
+  } as unknown as ContextRegistry;
+  const resource = new URL("https://broker.example.test/mcp");
+  const server = createUniversalBrokerMcpServer({
+    targets,
+    contexts,
+    execution,
+    authorityPrincipal: {
+      environment: "production",
+      mode: "single-owner",
+      issuer: "https://issuer.example.test/",
+      resource: resource.href,
+      ownerInstanceId: "candidate-gate-owner",
+    },
+  });
+  const client = new Client({ name: "candidate-gate-test", version: "1.0.0" });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const send = clientTransport.send.bind(clientTransport);
+  const authInfo: AuthInfo = {
+    token: "candidate-gate-token",
+    clientId: "candidate-gate-client",
+    resource,
+    scopes: ["devspace.read", "devspace.write", "devspace.exec"],
+    extra: {
+      devspaceConnector: {
+        bindingId: "connector-candidate-fixture",
+        state: "CANDIDATE",
+        activationRequired: true,
+      },
+    },
+  };
+  clientTransport.send = (message, options) => send(message, { ...options, authInfo });
+  await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
+  try {
+    const listed = await client.callTool({ name: "target", arguments: { operation: "list" } });
+    assert.notEqual(listed.isError, true, JSON.stringify(listed.structuredContent));
+
+    const authorize = await client.callTool({
+      name: "context",
+      arguments: {
+        operation: "authorize",
+        authorityText: "Attempt candidate mutation authority.",
+        actions: [{
+          tool: "exec",
+          arguments: { target: "local", cwd: root, command: "touch candidate-blocked" },
+        }],
+      },
+    });
+    assert.equal(toolErrorCode(authorize), "CONNECTOR_ACTIVATION_REQUIRED");
+
+    const mutation = await client.callTool({
+      name: "exec",
+      arguments: { target: "local", cwd: root, command: "touch candidate-blocked" },
+    });
+    assert.equal(toolErrorCode(mutation), "CONNECTOR_ACTIVATION_REQUIRED");
+    assert.equal(providerCalls, 0);
+  } finally {
+    await Promise.allSettled([client.close(), server.close()]);
+  }
+});
+
 test("public stopped signal cancels and reclaims while authority mismatch keeps provider calls at zero", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "devspace-v2-process-cancel-server-"));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -586,7 +1100,7 @@ test("public stopped signal cancels and reclaims while authority mismatch keeps 
     outputTruncated: false,
     outputBytes: 0,
     outputFileTruncated: false,
-    resourceUri: "devspace://process/proc_stopped/output/0/0",
+    resourceUri: "devspace://v1/process/proc_stopped/output",
     exitCode: 0,
   };
   const execution = {
@@ -667,14 +1181,15 @@ test("public stopped signal cancels and reclaims while authority mismatch keeps 
         operation: "signal",
         processId: "proc_stopped",
         signal: "SIGTERM",
-        authorityId,
       },
+      _meta: { devspace: { authorityId } },
     });
     assert.notEqual(stopped.isError, true, JSON.stringify(stopped.structuredContent));
     assert.equal(providerCalls, 0);
     const status = await client.callTool({
       name: "context",
-      arguments: { operation: "authority_status", authorityId },
+      arguments: { operation: "authority_status" },
+      _meta: { devspace: { authorityId } },
     });
     const statusData = (status.structuredContent as {
       data?: {
@@ -692,8 +1207,8 @@ test("public stopped signal cancels and reclaims while authority mismatch keeps 
         operation: "signal",
         processId: "proc_stopped",
         signal: "SIGKILL",
-        authorityId,
       },
+      _meta: { devspace: { authorityId } },
     });
     assert.equal(mismatch.isError, true);
     assert.equal(toolErrorCode(mismatch), "AUTHORITY_ACTION_MISMATCH");

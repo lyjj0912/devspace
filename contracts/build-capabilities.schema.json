@@ -1,0 +1,148 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://devspace.local/contracts/build-capabilities.schema.json",
+  "title": "DevSpace Universal Broker Build Capability Manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "productVersion",
+    "productProfile",
+    "schemaGeneration",
+    "authorityContractGeneration",
+    "supportedProfiles",
+    "supportedOperations",
+    "resourceUriVersion",
+    "buildDigest",
+    "capabilityDigest"
+  ],
+  "properties": {
+    "productVersion": {
+      "const": "2.1.1"
+    },
+    "productProfile": {
+      "const": "BASE_SINGLE_OWNER"
+    },
+    "schemaGeneration": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "authorityContractGeneration": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "supportedProfiles": {
+      "const": [
+        "BASE_SINGLE_OWNER"
+      ]
+    },
+    "supportedOperations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "target",
+        "context",
+        "fs",
+        "exec",
+        "process",
+        "mcp",
+        "artifact",
+        "gui"
+      ],
+      "properties": {
+        "target": {
+          "const": [
+            "list",
+            "resolve",
+            "probe"
+          ]
+        },
+        "context": {
+          "const": [
+            "open",
+            "search",
+            "diff",
+            "close",
+            "authority_preview",
+            "authorize",
+            "authority_status",
+            "invalidate_authority",
+            "release_authority"
+          ]
+        },
+        "fs": {
+          "const": [
+            "stat",
+            "list",
+            "read",
+            "search",
+            "write",
+            "patch",
+            "mkdir",
+            "copy",
+            "move",
+            "remove",
+            "hash",
+            "sync"
+          ]
+        },
+        "exec": {
+          "const": [
+            "run"
+          ]
+        },
+        "process": {
+          "const": [
+            "poll",
+            "write",
+            "resize",
+            "signal",
+            "wait",
+            "list",
+            "forget",
+            "restart_broker",
+            "restart_status"
+          ]
+        },
+        "mcp": {
+          "const": [
+            "routes",
+            "search_tools",
+            "describe_tool",
+            "invoke",
+            "list_resources",
+            "read_resource",
+            "list_prompts",
+            "get_prompt",
+            "close"
+          ]
+        },
+        "artifact": {
+          "const": [
+            "receive",
+            "publish",
+            "copy"
+          ]
+        },
+        "gui": {
+          "const": [
+            "capabilities",
+            "observe",
+            "act",
+            "wait"
+          ]
+        }
+      }
+    },
+    "resourceUriVersion": {
+      "const": "v1"
+    },
+    "buildDigest": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "capabilityDigest": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    }
+  }
+}

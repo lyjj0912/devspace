@@ -13,6 +13,7 @@ test("universal result helpers preserve stable operation and error contracts", (
     operationId: "op_success",
     data: { value: 1 },
     observedSchemaGeneration: `sha256:${"0".repeat(64)}`,
+    observedAuthorityContractGeneration: `sha256:${"0".repeat(64)}`,
   });
 
   const failure = failedToolResult(new UniversalBrokerError(
@@ -36,5 +37,6 @@ test("universal result helpers preserve stable operation and error contracts", (
       recovery: [{ targetId: "local" }],
     },
     observedSchemaGeneration: `sha256:${"0".repeat(64)}`,
+    observedAuthorityContractGeneration: `sha256:${"0".repeat(64)}`,
   });
 });

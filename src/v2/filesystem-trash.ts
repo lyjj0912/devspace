@@ -1,7 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
 import {
-  cp,
   lstat,
   mkdir,
   open,
@@ -11,8 +10,6 @@ import {
   rename,
   rm,
   stat,
-  symlink,
-  unlink,
   writeFile,
 } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
@@ -21,7 +18,8 @@ import { UniversalBrokerError } from "./errors.js";
 import {
   captureFilesystemPreimage,
   safeMoveFile,
-  type AtomicPublicationHooks,
+  nodeAtomicFilesystemOperations,
+  type AtomicFilesystemOperations,
 } from "./filesystem-atomic.js";
 
 interface TrashMetadata {
@@ -37,7 +35,7 @@ interface TrashMetadata {
 export class RecoverableFilesystemTrash {
   constructor(
     private readonly root: string,
-    private readonly hooks?: AtomicPublicationHooks,
+    private readonly filesystem: AtomicFilesystemOperations = nodeAtomicFilesystemOperations,
   ) {}
 
   async trash(
@@ -77,7 +75,7 @@ export class RecoverableFilesystemTrash {
     };
     await writeMetadata(entry, metadata);
     try {
-      await moveRecoverably(source, payload, type, digest, this.hooks);
+      await moveRecoverably(source, payload, type, digest, this.filesystem);
       metadata.state = "AVAILABLE";
       await writeMetadata(entry, metadata);
       await syncDirectory(this.root);
@@ -87,11 +85,10 @@ export class RecoverableFilesystemTrash {
         disposition: "trash",
         recoverable: true,
         trashId,
-        restoreOperation: "restore",
       };
     } catch (error) {
-      const sourceStillExists = (await captureFilesystemPreimage(source)).exists;
-      if (sourceStillExists) await rm(entry, { recursive: true, force: true }).catch(() => undefined);
+      const sourceStillExists = (await captureFilesystemPreimage(source, this.filesystem)).exists;
+      if (sourceStillExists) await this.filesystem.rm(entry, { recursive: true, force: true }).catch(() => undefined);
       throw error;
     }
   }
@@ -119,7 +116,7 @@ export class RecoverableFilesystemTrash {
         { evidence: { trashId: input.trashId, expectedDigest: metadata.digest, actualDigest } },
       );
     }
-    const existing = await captureFilesystemPreimage(destination);
+    const existing = await captureFilesystemPreimage(destination, this.filesystem);
     if (existing.exists && !input.overwrite) {
       throw new UniversalBrokerError(
         "PRECONDITION_FAILED",
@@ -138,10 +135,10 @@ export class RecoverableFilesystemTrash {
       destination,
       metadata.type,
       metadata.digest,
-      this.hooks,
+      this.filesystem,
       input.overwrite,
     );
-    await rm(entry, { recursive: true, force: true });
+    await this.filesystem.rm(entry, { recursive: true, force: true });
     await syncDirectory(this.root);
     return {
       trashId: input.trashId,
@@ -158,11 +155,11 @@ async function moveRecoverably(
   destination: string,
   type: TrashMetadata["type"],
   expectedDigest: string,
-  hooks?: AtomicPublicationHooks,
+  filesystem: AtomicFilesystemOperations,
   overwrite = false,
 ): Promise<void> {
   if (type === "file") {
-    const moved = await safeMoveFile(source, destination, { overwrite, hooks });
+    const moved = await safeMoveFile(source, destination, { overwrite, filesystem });
     if (moved.sha256 !== expectedDigest) {
       throw new UniversalBrokerError(
         "PRECONDITION_FAILED",
@@ -172,37 +169,35 @@ async function moveRecoverably(
     return;
   }
   if (type === "symlink") {
-    if ((await captureFilesystemPreimage(destination)).exists) {
+    if ((await captureFilesystemPreimage(destination, filesystem)).exists) {
       throw new UniversalBrokerError("PRECONDITION_FAILED", `Destination exists: ${destination}`);
     }
-    const target = await readlink(source);
-    await symlink(target, destination);
+    const target = await filesystem.readlink(source);
+    await filesystem.symlink(target, destination);
     if (await pathDigest(destination, type) !== expectedDigest) {
-      await unlink(destination).catch(() => undefined);
+      await filesystem.unlink(destination).catch(() => undefined);
       throw new UniversalBrokerError("PRECONDITION_FAILED", "Symlink copy verification failed.");
     }
-    await unlink(source);
+    await filesystem.unlink(source);
     return;
   }
 
-  if ((await captureFilesystemPreimage(destination)).exists) {
+  if ((await captureFilesystemPreimage(destination, filesystem)).exists) {
     throw new UniversalBrokerError("PRECONDITION_FAILED", `Destination exists: ${destination}`);
   }
   try {
-    if (hooks?.forceCrossDevice) throw nodeError("EXDEV", "forced EXDEV");
-    await rename(source, destination);
+    await filesystem.rename(source, destination);
     return;
   } catch (error) {
     if (!isNodeError(error, "EXDEV")) throw error;
   }
-  await cp(source, destination, {
+  await filesystem.cp(source, destination, {
     recursive: true,
     force: false,
     errorOnExist: true,
     dereference: false,
     preserveTimestamps: true,
   });
-  await hooks?.afterCrossDevicePublication?.({ source, destination });
   const [sourceDigest, destinationDigest] = await Promise.all([
     pathDigest(source, type),
     pathDigest(destination, type),
@@ -214,7 +209,7 @@ async function moveRecoverably(
       { evidence: { source, destination, sourceDigest, destinationDigest, expectedDigest } },
     );
   }
-  await rm(source, { recursive: true, force: false });
+  await filesystem.rm(source, { recursive: true, force: false });
 }
 
 async function pathDigest(path: string, type: TrashMetadata["type"]): Promise<string> {
@@ -323,10 +318,6 @@ function pathTypeMismatch(path: string, expected: string): UniversalBrokerError 
     `Expected ${expected}: ${path}`,
     { evidence: { path, expected } },
   );
-}
-
-function nodeError(code: string, message: string): NodeJS.ErrnoException {
-  return Object.assign(new Error(message), { code });
 }
 
 function isNodeError(error: unknown, code: string): error is NodeJS.ErrnoException {

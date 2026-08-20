@@ -3,7 +3,10 @@ import {
   DurableAuthorityStore,
   type DurableActionClaimState,
   type DurableAuthorityRecord,
+  type DurableAuthorityReceiptAuditState,
   type DurableAuthorityTaskRecord,
+  type DurableResourceLeaseHeartbeat,
+  type DurableResourceReconciliationOutcome,
   type DurableResourceLeaseState,
 } from "./authority-store.js";
 import {
@@ -13,6 +16,7 @@ import {
   type UniversalToolName,
 } from "./contracts.js";
 import { UniversalBrokerError } from "./errors.js";
+import type { UniversalBrokerMetrics } from "./metrics.js";
 
 export { UNIVERSAL_AUTHORITY_RISKS as AUTHORITY_RISK_CLASSES };
 export type { AuthorityRiskClass };
@@ -42,6 +46,11 @@ export interface CreateOperationAuthorityInput {
   expiresInSeconds?: number;
 }
 
+export interface CreateConnectorActivationAuthorityInput {
+  authorityText: string;
+  descriptor: AuthorityActionDescriptor;
+}
+
 export interface AuthorityGrant {
   authorityId: string;
   actionId: string;
@@ -51,6 +60,23 @@ export interface AuthorityGrant {
   fingerprint: string;
   resourceKeySha256: string;
   fencingToken: number;
+  leaseExpiresAtMs: number;
+  claimedAtMs: number;
+  dispatchedAtMs?: number;
+}
+
+export interface AuthorityCompletionReceipt {
+  actionClaimId: string;
+  useId: string;
+  receiptDigest: string;
+  state: DurableActionClaimState;
+  result: DurableActionClaimState;
+  leaseState: DurableResourceLeaseState;
+  completedAt?: string;
+  auditState?: DurableAuthorityReceiptAuditState;
+  auditEventDigest?: string;
+  auditRecordedAt?: string;
+  auditErrorCode?: string;
 }
 
 interface StoredAuthorityAction {
@@ -97,6 +123,20 @@ interface AuthorityReceipt {
   leaseState: DurableResourceLeaseState;
   providerCallCount?: number;
   evidence?: Record<string, unknown>;
+  auditState?: DurableAuthorityReceiptAuditState;
+  auditEventDigest?: string;
+  auditReceiptDigest?: string;
+  auditRecordedAtMs?: number;
+  auditErrorCode?: string;
+}
+
+export interface AuthorityReceiptAuditResultInput {
+  authorityId: string;
+  actionClaimId: string;
+  receiptDigest: string;
+  status: DurableAuthorityReceiptAuditState;
+  auditEventDigest?: string;
+  errorCode?: string;
 }
 
 export interface OperationAuthorityRegistryOptions {
@@ -104,7 +144,17 @@ export interface OperationAuthorityRegistryOptions {
   minimumRisk?: (action: AuthorityActionDescriptor) => AuthorityRiskClass;
   storePath?: string;
   instanceId?: string;
+  resourceLeaseTtlMs?: number;
+  resourceLeaseHeartbeatMs?: number;
+  resourceLeaseRecoveryGraceMs?: number;
+  leaseHeartbeatScheduler?: AuthorityLeaseHeartbeatScheduler;
+  metrics?: UniversalBrokerMetrics;
 }
+
+export type AuthorityLeaseHeartbeatScheduler = (
+  callback: () => void,
+  intervalMs: number,
+) => () => void;
 
 const DEFAULT_AUTHORITY_TTL_SECONDS = 15 * 60;
 const MAXIMUM_AUTHORITY_TTL_SECONDS = 8 * 60 * 60;
@@ -115,11 +165,42 @@ const MAXIMUM_RECEIPTS = 256;
 const MAXIMUM_ACTIVE_AUTHORITIES = 4_096;
 const MAXIMUM_ACTIVE_AUTHORITIES_PER_SCOPE = 512;
 const AUTHORITY_RECEIPT_RETENTION_MS = 24 * 60 * 60_000;
+const DEFAULT_RESOURCE_LEASE_TTL_MS = 15 * 60_000;
+const DEFAULT_RESOURCE_LEASE_HEARTBEAT_MS = 30_000;
+const DEFAULT_RESOURCE_LEASE_RECOVERY_GRACE_MS = 60_000;
+const MAXIMUM_RESOURCE_LEASE_INTERVAL_MS = 24 * 60 * 60_000;
 const ACTIVE_AUTHORITY_INSTANCE_COUNTS = new Map<string, number>();
 
 export interface ProvenNotDispatched {
   providerCallCount: 0;
   proof: string;
+}
+
+export interface ResourceLeaseReconciliationInput {
+  principalKeyFingerprint: string;
+  resourceKeySha256: string;
+  actionClaimId: string;
+  fencingToken: number;
+  outcome: DurableResourceReconciliationOutcome;
+  evidenceDigest: string;
+}
+
+export interface RecoveredConnectorActivationPassInput {
+  principalKeyFingerprint: string;
+  authorityId: string;
+  actionClaimId: string;
+  actionFingerprint: string;
+  resourceKeySha256: string;
+  fencingToken: number;
+  oauthProofDigest: string;
+  evidenceDigest: string;
+}
+
+export interface RecoveredConnectorActivationAuthorityReceipt
+  extends AuthorityCompletionReceipt {
+  recovered: true;
+  oauthProofDigest: string;
+  reconciliationEvidenceDigest: string;
 }
 
 export type OperationDispatchPhase =
@@ -138,6 +219,7 @@ export type OperationDispatchPhase =
 export class OperationAuthorityDispatchController {
   private grantValue: AuthorityGrant | undefined;
   private phaseValue: OperationDispatchPhase = "READY";
+  private stopLeaseHeartbeat: (() => void) | undefined;
 
   constructor(
     private readonly registry: OperationAuthorityRegistry,
@@ -189,34 +271,64 @@ export class OperationAuthorityDispatchController {
         `Authority dispatch cannot cross the provider boundary from ${this.phaseValue}.`,
       );
     }
-    this.registry.markDispatched(grant);
+    const stopLeaseHeartbeat = this.registry.startAutomaticLeaseHeartbeat(() => this.heartbeat());
+    try {
+      this.registry.markDispatched(grant);
+    } catch (error) {
+      stopLeaseHeartbeat();
+      throw error;
+    }
+    this.stopLeaseHeartbeat = stopLeaseHeartbeat;
     this.phaseValue = "DISPATCHED";
     return grant;
   }
 
-  cancelNotDispatched(proof: ProvenNotDispatched): void {
+  heartbeat(): DurableResourceLeaseHeartbeat {
+    const grant = this.grantValue;
+    if (!grant || (this.phaseValue !== "CLAIMED" && this.phaseValue !== "DISPATCHED")) {
+      throw new UniversalBrokerError(
+        "AUTHORITY_STATE_UNCERTAIN",
+        `A resource lease cannot heartbeat from ${this.phaseValue}.`,
+      );
+    }
+    return this.registry.heartbeatResourceLease(grant);
+  }
+
+  cancelNotDispatched(proof: ProvenNotDispatched): AuthorityCompletionReceipt {
     if (proof.providerCallCount !== 0 || this.phaseValue !== "CLAIMED" || !this.grantValue) {
       throw new UniversalBrokerError(
         "AUTHORITY_STATE_UNCERTAIN",
         "A claim can be cancelled only before DISPATCHED with independently proven provider call count zero.",
       );
     }
-    this.registry.cancelNotDispatched(this.grantValue, proof);
+    const receipt = this.registry.cancelNotDispatched(this.grantValue, proof);
     this.phaseValue = "CANCELLED_NOT_DISPATCHED";
+    this.stopAutomaticLeaseHeartbeat();
+    return receipt;
   }
 
   complete(
     state: "PASS" | "FAIL" | "UNCERTAIN",
     evidence?: Record<string, unknown>,
-  ): void {
+  ): AuthorityCompletionReceipt {
     if (this.phaseValue !== "DISPATCHED" || !this.grantValue) {
       throw new UniversalBrokerError(
         "AUTHORITY_STATE_UNCERTAIN",
         `A claim cannot terminalize as ${state} before the durable DISPATCHED barrier.`,
       );
     }
-    this.registry.completeClaim(this.grantValue, state, evidence);
-    this.phaseValue = state;
+    try {
+      const receipt = this.registry.completeClaim(this.grantValue, state, evidence);
+      this.phaseValue = state;
+      return receipt;
+    } finally {
+      this.stopAutomaticLeaseHeartbeat();
+    }
+  }
+
+  private stopAutomaticLeaseHeartbeat(): void {
+    this.stopLeaseHeartbeat?.();
+    this.stopLeaseHeartbeat = undefined;
   }
 }
 
@@ -231,6 +343,10 @@ export class OperationAuthorityRegistry {
   private readonly authorityIdsByFingerprint = new Map<string, string>();
   private readonly recoveredPendingUses: number;
   private readonly instanceId: string;
+  private readonly resourceLeaseHeartbeatMs: number;
+  private readonly leaseHeartbeatScheduler: AuthorityLeaseHeartbeatScheduler;
+  private readonly activeLeaseHeartbeatStops = new Set<() => void>();
+  private metrics: UniversalBrokerMetrics | undefined;
   private closed = false;
   private previews = 0;
 
@@ -238,6 +354,23 @@ export class OperationAuthorityRegistry {
     this.now = options.now ?? Date.now;
     this.minimumRisk = options.minimumRisk ?? (() => "R1");
     this.instanceId = options.instanceId ?? `authority_run_${randomUUID()}`;
+    const resourceLeaseTtlMs = options.resourceLeaseTtlMs ?? DEFAULT_RESOURCE_LEASE_TTL_MS;
+    this.resourceLeaseHeartbeatMs = boundedLeaseInterval(
+      options.resourceLeaseHeartbeatMs
+        ?? Math.min(DEFAULT_RESOURCE_LEASE_HEARTBEAT_MS, Math.max(1, Math.floor(resourceLeaseTtlMs / 3))),
+      "resourceLeaseHeartbeatMs",
+    );
+    const resourceLeaseRecoveryGraceMs = boundedLeaseInterval(
+      options.resourceLeaseRecoveryGraceMs ?? DEFAULT_RESOURCE_LEASE_RECOVERY_GRACE_MS,
+      "resourceLeaseRecoveryGraceMs",
+      true,
+    );
+    if (this.resourceLeaseHeartbeatMs >= resourceLeaseTtlMs) {
+      throw new Error("resourceLeaseHeartbeatMs must be shorter than resourceLeaseTtlMs.");
+    }
+    this.leaseHeartbeatScheduler = options.leaseHeartbeatScheduler
+      ?? defaultAuthorityLeaseHeartbeatScheduler;
+    this.metrics = options.metrics;
     retainAuthorityInstance(this.instanceId);
     try {
       this.store = new DurableAuthorityStore(
@@ -245,11 +378,18 @@ export class OperationAuthorityRegistry {
         this.now(),
         this.instanceId,
         [...ACTIVE_AUTHORITY_INSTANCE_COUNTS.keys()],
+        resourceLeaseTtlMs,
+        resourceLeaseRecoveryGraceMs,
+        Math.min(
+          MAXIMUM_RESOURCE_LEASE_INTERVAL_MS,
+          this.resourceLeaseHeartbeatMs * 2,
+        ),
       );
     } catch (error) {
       this.store = undefined;
       this.storeFailure = authorityStoreFailure(error);
       this.recoveredPendingUses = 0;
+      this.recordAuthorityStoreFailure("create");
       return;
     }
     this.storeFailure = undefined;
@@ -273,9 +413,43 @@ export class OperationAuthorityRegistry {
     this.pruneExpired();
   }
 
+  setOperationalMetrics(metrics: UniversalBrokerMetrics | undefined): void {
+    this.metrics = metrics;
+  }
+
   create(
     input: CreateOperationAuthorityInput,
     principalKeyFingerprint: string,
+  ): Record<string, unknown> {
+    return this.createAuthority(input, principalKeyFingerprint, false);
+  }
+
+  /**
+   * Mints the one internal R3 grant used by the owner-authenticated connector
+   * finalization boundary. This operation is intentionally absent from the
+   * public eight-tool contract and cannot be requested through context.authorize.
+   */
+  createConnectorActivationAuthority(
+    input: CreateConnectorActivationAuthorityInput,
+    principalKeyFingerprint: string,
+  ): Record<string, unknown> {
+    assertConnectorActivationAuthorityDescriptor(input.descriptor);
+    return this.createAuthority({
+      authorityText: input.authorityText,
+      actions: [{
+        id: "connector-activation-finalize",
+        descriptor: input.descriptor,
+        risk: "R3",
+        uses: 1,
+      }],
+      expiresInSeconds: 5 * 60,
+    }, principalKeyFingerprint, true);
+  }
+
+  private createAuthority(
+    input: CreateOperationAuthorityInput,
+    principalKeyFingerprint: string,
+    allowConnectorActivation: boolean,
   ): Record<string, unknown> {
     this.pruneExpired();
     const principal = requiredPrincipalFingerprint(principalKeyFingerprint);
@@ -291,7 +465,9 @@ export class OperationAuthorityRegistry {
         `context.authorize requires 1 through ${MAXIMUM_ACTIONS} exact actions.`,
       );
     }
-    const actions = input.actions.map((action, index) => this.prepareAction(action, index, false));
+    const actions = input.actions.map((action, index) => (
+      this.prepareAction(action, index, false, allowConnectorActivation)
+    ));
     assertUniqueActionIds(actions);
     assertUniqueActionFingerprints(actions);
     const expiresInSeconds = boundedInteger(
@@ -354,6 +530,7 @@ export class OperationAuthorityRegistry {
         createdAtMs,
       );
     } catch (error) {
+      this.recordAuthorityStoreFailure("create");
       if (error instanceof UniversalBrokerError) throw error;
       throw new UniversalBrokerError(
         "AUTHORITY_STORE_UNAVAILABLE",
@@ -447,6 +624,7 @@ export class OperationAuthorityRegistry {
     if (requiredRisk === "R0") return undefined;
     this.pruneExpired();
     if (!authorityId) {
+      this.recordAuthorityCheckMetric(requiredRisk, "fail");
       throw new UniversalBrokerError(
         "AUTHORITY_REQUIRED",
         `${action.tool}.${action.operation} requires ${requiredRisk} task authority. Prepare it with context.authorize and pass authorityId.`,
@@ -456,11 +634,13 @@ export class OperationAuthorityRegistry {
     const authority = this.authorities.get(authorityId);
     if (!authority) {
       if (this.staleAuthorityIds.has(authorityId)) {
+        this.recordAuthorityCheckMetric(requiredRisk, "fail");
         throw new UniversalBrokerError(
           "AUTHORITY_STALE",
           `Task authority is stale after a correction: ${authorityId}`,
         );
       }
+      this.recordAuthorityCheckMetric(requiredRisk, "fail");
       throw new UniversalBrokerError(
         "AUTHORITY_EXPIRED",
         `Task authority is unknown, released, stale, or expired: ${authorityId}`,
@@ -468,6 +648,7 @@ export class OperationAuthorityRegistry {
     }
     const principal = requiredPrincipalFingerprint(principalKeyFingerprint);
     if (authority.principalKeyFingerprint !== principal) {
+      this.recordAuthorityCheckMetric(requiredRisk, "fail");
       throw new UniversalBrokerError(
         "AUTHORITY_PRINCIPAL_MISMATCH",
         "Task authority belongs to a different stable authenticated principal.",
@@ -481,6 +662,7 @@ export class OperationAuthorityRegistry {
     ) {
       this.staleAuthorityIds.add(authority.authorityId);
       this.remove(authority, false);
+      this.recordAuthorityCheckMetric(requiredRisk, "fail");
       throw new UniversalBrokerError(
         "AUTHORITY_STALE",
         `Task authority is stale after a correction: ${authorityId}`,
@@ -490,6 +672,7 @@ export class OperationAuthorityRegistry {
       if (this.authorityIdsByFingerprint.get(authority.fingerprint) === authority.authorityId) {
         this.authorityIdsByFingerprint.delete(authority.fingerprint);
       }
+      this.recordAuthorityCheckMetric(requiredRisk, "fail");
       throw new UniversalBrokerError(
         "AUTHORITY_EXPIRED",
         `Task authority expired: ${authorityId}`,
@@ -498,6 +681,7 @@ export class OperationAuthorityRegistry {
     const fingerprint = actionFingerprint(action);
     const candidates = authority.actions.filter((candidate) => candidate.fingerprint === fingerprint);
     if (candidates.length !== 1) {
+      this.recordAuthorityCheckMetric(requiredRisk, "fail");
       throw new UniversalBrokerError(
         "AUTHORITY_ACTION_MISMATCH",
         `Task authority does not contain exactly one matching ${action.tool}.${action.operation} action.`,
@@ -513,12 +697,14 @@ export class OperationAuthorityRegistry {
     }
     const selected = candidates[0]!;
     if (riskRank(selected.risk) < riskRank(requiredRisk)) {
+      this.recordAuthorityCheckMetric(requiredRisk, "fail");
       throw new UniversalBrokerError(
         "AUTHORITY_ACTION_MISMATCH",
         `Task authority action ${selected.id} is ${selected.risk}, but ${requiredRisk} is required.`,
       );
     }
     if (selected.consumedUses >= selected.maximumUses) {
+      this.recordAuthorityCheckMetric(requiredRisk, "fail");
       throw new UniversalBrokerError(
         "AUTHORITY_CONSUMED",
         `Task authority action is fully consumed: ${selected.id}`,
@@ -548,6 +734,8 @@ export class OperationAuthorityRegistry {
         maximumReceipts: MAXIMUM_RECEIPTS,
       });
     } catch (error) {
+      this.recordAuthorityCheckMetric(requiredRisk, "fail");
+      this.recordAuthorityStoreFailure("claim");
       if (error instanceof UniversalBrokerError) throw error;
       throw new UniversalBrokerError(
         "AUTHORITY_STATE_UNCERTAIN",
@@ -562,6 +750,7 @@ export class OperationAuthorityRegistry {
       );
     }
     if (!reservation.ok) {
+      this.recordAuthorityCheckMetric(requiredRisk, "fail");
       switch (reservation.code) {
         case "AUTHORITY_EXPIRED":
           this.remove(authority, false);
@@ -600,6 +789,7 @@ export class OperationAuthorityRegistry {
             },
           );
         case "RESOURCE_QUOTA_EXCEEDED":
+          this.recordQuotaRejection("authority_receipt");
           throw new UniversalBrokerError(
             "RESOURCE_QUOTA_EXCEEDED",
             "Task authority has too many in-flight reservations; wait for terminal receipts.",
@@ -611,6 +801,7 @@ export class OperationAuthorityRegistry {
             },
           );
         case "RESOURCE_BUSY":
+          this.recordResourceLeaseEvent("busy");
           throw new UniversalBrokerError(
             "RESOURCE_BUSY",
             "Another writer holds or froze the exact resource lease.",
@@ -636,6 +827,8 @@ export class OperationAuthorityRegistry {
       fingerprint,
       resourceKeySha256: reservation.resourceKeySha256,
       fencingToken: reservation.fencingToken,
+      leaseExpiresAtMs: reservation.leaseExpiresAtMs,
+      claimedAtMs,
     };
     const receipt: AuthorityReceipt = {
       actionClaimId: grant.actionClaimId,
@@ -653,14 +846,17 @@ export class OperationAuthorityRegistry {
       leaseState: "ACTIVE",
     };
     authority.receipts = trimReceipts([...authority.receipts, receipt]);
+    this.recordAuthorityCheckMetric(requiredRisk, "pass");
+    this.recordAuthorityClaimMetric(requiredRisk, "CLAIMED");
+    this.recordResourceLeaseEvent("acquired");
     return grant;
   }
 
   markDispatched(grant: AuthorityGrant): void {
     const dispatchedAtMs = this.now();
-    let marked: boolean;
+    let dispatchedLease: DurableResourceLeaseHeartbeat | undefined;
     try {
-      marked = this.requireStore().markClaimDispatched({
+      dispatchedLease = this.requireStore().markClaimDispatched({
         authorityId: grant.authorityId,
         actionClaimId: grant.actionClaimId,
         resourceKeySha256: grant.resourceKeySha256,
@@ -668,6 +864,7 @@ export class OperationAuthorityRegistry {
         dispatchedAtMs,
       });
     } catch (error) {
+      this.recordAuthorityStoreFailure("dispatch");
       if (error instanceof UniversalBrokerError) throw error;
       throw new UniversalBrokerError(
         "AUTHORITY_STORE_UNAVAILABLE",
@@ -675,21 +872,55 @@ export class OperationAuthorityRegistry {
         { evidence: { persistenceError: error instanceof Error ? error.name : "UNKNOWN_ERROR" } },
       );
     }
-    if (!marked) {
+    if (!dispatchedLease) {
       throw new UniversalBrokerError(
         "AUTHORITY_STATE_UNCERTAIN",
         "The claim could not cross the durable DISPATCHED barrier with its current fencing token.",
       );
     }
+    grant.leaseExpiresAtMs = dispatchedLease.expiresAtMs;
+    grant.dispatchedAtMs = dispatchedAtMs;
     this.updateReceipt(grant, (receipt) => ({
       ...receipt,
       dispatchedAtMs,
       state: "DISPATCHED",
       result: "DISPATCHED",
     }));
+    this.recordAuthorityClaimMetric(grant.risk, "DISPATCHED");
+    this.recordResourceLeaseEvent("dispatched");
   }
 
-  cancelNotDispatched(grant: AuthorityGrant, proof: ProvenNotDispatched): void {
+  heartbeatResourceLease(grant: AuthorityGrant): DurableResourceLeaseHeartbeat {
+    const heartbeatAtMs = this.now();
+    let heartbeat: DurableResourceLeaseHeartbeat | undefined;
+    try {
+      heartbeat = this.requireStore().heartbeatResourceLease({
+        authorityId: grant.authorityId,
+        actionClaimId: grant.actionClaimId,
+        resourceKeySha256: grant.resourceKeySha256,
+        fencingToken: grant.fencingToken,
+        heartbeatAtMs,
+      });
+    } catch (error) {
+      this.recordAuthorityStoreFailure("heartbeat");
+      throw new UniversalBrokerError(
+        "AUTHORITY_STORE_UNAVAILABLE",
+        "The durable resource lease heartbeat could not be written.",
+        { evidence: { persistenceError: error instanceof Error ? error.name : "UNKNOWN_ERROR" } },
+      );
+    }
+    if (!heartbeat) {
+      throw new UniversalBrokerError(
+        "AUTHORITY_STATE_UNCERTAIN",
+        "The resource lease is no longer ACTIVE for this owner and fencing token.",
+      );
+    }
+    grant.leaseExpiresAtMs = heartbeat.expiresAtMs;
+    this.recordResourceLeaseEvent("heartbeat");
+    return heartbeat;
+  }
+
+  cancelNotDispatched(grant: AuthorityGrant, proof: ProvenNotDispatched): AuthorityCompletionReceipt {
     const completedAtMs = this.now();
     let cancelled: boolean;
     try {
@@ -704,6 +935,7 @@ export class OperationAuthorityRegistry {
         maximumReceipts: MAXIMUM_RECEIPTS,
       });
     } catch (error) {
+      this.recordAuthorityStoreFailure("cancel");
       if (error instanceof UniversalBrokerError) throw error;
       throw new UniversalBrokerError(
         "AUTHORITY_STATE_UNCERTAIN",
@@ -732,24 +964,27 @@ export class OperationAuthorityRegistry {
         cancellationProofCode: proof.proof,
       },
     }));
+    this.recordAuthorityClaimMetric(grant.risk, "CANCELLED_NOT_DISPATCHED");
+    this.recordResourceLeaseEvent("released");
+    return this.completionReceipt(grant);
   }
 
   record(
     grant: AuthorityGrant | undefined,
     result: "PASS" | "FAIL" | "UNCERTAIN",
     evidence?: Record<string, unknown>,
-  ): void {
-    if (!grant) return;
+  ): AuthorityCompletionReceipt | undefined {
+    if (!grant) return undefined;
     const receipt = this.findReceipt(grant);
     if (!receipt || receipt.state === "CLAIMED") this.markDispatched(grant);
-    this.completeClaim(grant, result, evidence);
+    return this.completeClaim(grant, result, evidence);
   }
 
   completeClaim(
     grant: AuthorityGrant,
     result: "PASS" | "FAIL" | "UNCERTAIN",
     evidence?: Record<string, unknown>,
-  ): void {
+  ): AuthorityCompletionReceipt {
     const completedAtMs = this.now();
     const boundedEvidence = evidence ? boundedRecord(evidence, 4_000) : undefined;
     let finalized: boolean;
@@ -770,6 +1005,7 @@ export class OperationAuthorityRegistry {
         maximumReceipts: MAXIMUM_RECEIPTS,
       });
     } catch (error) {
+      this.recordAuthorityStoreFailure("complete");
       const sealed = this.trySealUncertain(grant, completedAtMs, "RECEIPT_WRITE_FAILED");
       if (sealed) {
         this.updateReceipt(grant, (receipt) => ({
@@ -777,7 +1013,7 @@ export class OperationAuthorityRegistry {
           completedAtMs,
           state: "UNCERTAIN",
           result: "UNCERTAIN",
-          leaseState: "FROZEN",
+          leaseState: "RECOVERY_REQUIRED",
           providerCallCount: 1,
           evidence: { errorCode: "AUTHORITY_STATE_UNCERTAIN", reasonCode: "RECEIPT_WRITE_FAILED" },
         }));
@@ -811,10 +1047,248 @@ export class OperationAuthorityRegistry {
       completedAtMs,
       state: result,
       result,
-      leaseState: result === "UNCERTAIN" ? "FROZEN" : "RELEASED",
+      leaseState: result === "UNCERTAIN" ? "RECOVERY_REQUIRED" : "RELEASED",
       providerCallCount: 1,
       ...(boundedEvidence ? { evidence: boundedEvidence } : {}),
     }));
+    this.recordAuthorityClaimMetric(grant.risk, result);
+    this.recordResourceLeaseEvent(result === "UNCERTAIN" ? "recovery_required" : "released");
+    return this.completionReceipt(grant);
+  }
+
+  recordReceiptAuditResult(input: AuthorityReceiptAuditResultInput): AuthorityCompletionReceipt | undefined {
+    const authorityId = requiredText(input.authorityId, "authorityId is required.", 256);
+    const actionClaimId = requiredText(input.actionClaimId, "actionClaimId is required.", 256);
+    const receiptDigest = requiredSha256Digest(input.receiptDigest, "receiptDigest");
+    if (input.status !== "RECORDED" && input.status !== "SINK_FAILED") {
+      throw new UniversalBrokerError("PRECONDITION_FAILED", "Receipt audit status is invalid.");
+    }
+    const auditEventDigest = input.status === "RECORDED"
+      ? requiredSha256Digest(input.auditEventDigest, "auditEventDigest")
+      : undefined;
+    const errorCode = input.status === "SINK_FAILED"
+      ? safeAuthorityCode(input.errorCode) ?? "AUDIT_SINK_FAILED"
+      : undefined;
+    let recorded: ReturnType<DurableAuthorityStore["recordClaimAuditResult"]>;
+    try {
+      recorded = this.requireStore().recordClaimAuditResult({
+        authorityId,
+        actionClaimId,
+        receiptDigest,
+        status: input.status,
+        ...(auditEventDigest ? { auditEventDigest } : {}),
+        ...(errorCode ? { errorCode } : {}),
+        recordedAtMs: this.now(),
+      });
+    } catch (error) {
+      this.recordAuthorityStoreFailure("audit");
+      throw new UniversalBrokerError(
+        "AUTHORITY_STATE_UNCERTAIN",
+        "The audit cross-reference could not be durably attached to the authority receipt.",
+        {
+          evidence: {
+            authorityId,
+            persistenceError: error instanceof Error ? error.name : "UNKNOWN_ERROR",
+          },
+        },
+      );
+    }
+    if (!recorded.ok) {
+      throw new UniversalBrokerError(
+        recorded.code,
+        recorded.code === "PRECONDITION_FAILED"
+          ? "The audit cross-reference request is invalid."
+          : "The authority receipt already has a different audit cross-reference.",
+        { evidence: { authorityId, actionClaimId } },
+      );
+    }
+    this.updateReceiptByClaim(authorityId, actionClaimId, (receipt) => ({
+      ...receipt,
+      auditState: recorded.auditState,
+      ...(recorded.auditEventDigest ? { auditEventDigest: recorded.auditEventDigest } : {}),
+      auditReceiptDigest: receiptDigest,
+      auditRecordedAtMs: recorded.auditRecordedAtMs,
+      ...(errorCode ? { auditErrorCode: errorCode } : {}),
+    }));
+    const authority = this.authorities.get(authorityId);
+    const receipt = authority?.receipts.find((candidate) => candidate.actionClaimId === actionClaimId);
+    return authority && receipt
+      ? this.presentCompletionReceipt(authority, receipt)
+      : undefined;
+  }
+
+  reconcileResourceLease(input: ResourceLeaseReconciliationInput): Record<string, unknown> {
+    const principalKeyFingerprint = requiredPrincipalFingerprint(input.principalKeyFingerprint);
+    if (!/^[a-f0-9]{64}$/u.test(input.resourceKeySha256)) {
+      throw new UniversalBrokerError("PRECONDITION_FAILED", "resourceKeySha256 is invalid.");
+    }
+    if (!/^[a-f0-9]{64}$/u.test(input.evidenceDigest) || /^0{64}$/u.test(input.evidenceDigest)) {
+      throw new UniversalBrokerError("PRECONDITION_FAILED", "A non-zero reconciliation evidence digest is required.");
+    }
+    if (!Number.isSafeInteger(input.fencingToken) || input.fencingToken < 1) {
+      throw new UniversalBrokerError("PRECONDITION_FAILED", "fencingToken is invalid.");
+    }
+    const reconciledAtMs = this.now();
+    let result: ReturnType<DurableAuthorityStore["reconcileResourceLease"]>;
+    try {
+      result = this.requireStore().reconcileResourceLease({
+        principalKeyFingerprint,
+        resourceKeySha256: input.resourceKeySha256,
+        actionClaimId: requiredText(input.actionClaimId, "actionClaimId is required.", 256),
+        fencingToken: input.fencingToken,
+        outcome: input.outcome,
+        evidenceDigest: input.evidenceDigest,
+        reconciledAtMs,
+      });
+    } catch (error) {
+      this.recordAuthorityStoreFailure("reconcile");
+      throw new UniversalBrokerError(
+        "AUTHORITY_STORE_UNAVAILABLE",
+        "The resource reconciliation receipt could not be committed.",
+        { evidence: { persistenceError: error instanceof Error ? error.name : "UNKNOWN_ERROR" } },
+      );
+    }
+    if (!result.ok) {
+      if (result.code === "AUTHORITY_PRINCIPAL_MISMATCH") {
+        throw new UniversalBrokerError(
+          "AUTHORITY_PRINCIPAL_MISMATCH",
+          "The resource lease belongs to a different stable principal.",
+        );
+      }
+      throw new UniversalBrokerError(
+        result.code === "PRECONDITION_FAILED" ? "PRECONDITION_FAILED" : "AUTHORITY_STATE_UNCERTAIN",
+        result.code === "PRECONDITION_FAILED"
+          ? "Resource reconciliation evidence is invalid."
+          : "The resource lease is not awaiting reconciliation for this fencing token.",
+      );
+    }
+    for (const authority of this.authorities.values()) {
+      const receipt = authority.receipts.find((candidate) => (
+        candidate.actionClaimId === input.actionClaimId
+        && candidate.resourceKeySha256 === input.resourceKeySha256
+        && candidate.fencingToken === input.fencingToken
+      ));
+      if (receipt) receipt.leaseState = "RELEASED";
+    }
+    this.recordResourceLeaseEvent("reconciled");
+    return {
+      released: true,
+      resourceKeySha256: input.resourceKeySha256,
+      fencingToken: result.fencingToken,
+      outcome: input.outcome,
+      evidenceDigest: input.evidenceDigest,
+      reconciledAt: new Date(result.releasedAtMs).toISOString(),
+    };
+  }
+
+  /**
+   * Specialized cross-store recovery for connector activation only. The caller
+   * must first prove the exact OAuth activation-authority receipt; this method
+   * atomically changes the matching UNCERTAIN claim and frozen lease to PASS.
+   */
+  terminalizeRecoveredConnectorActivationClaimPass(
+    input: RecoveredConnectorActivationPassInput,
+  ): RecoveredConnectorActivationAuthorityReceipt {
+    const principalKeyFingerprint = requiredPrincipalFingerprint(input.principalKeyFingerprint);
+    const authorityId = requiredText(input.authorityId, "authorityId is required.", 256);
+    const actionClaimId = requiredText(input.actionClaimId, "actionClaimId is required.", 256);
+    if (!/^[a-f0-9]{64}$/u.test(input.actionFingerprint)) {
+      throw new UniversalBrokerError("PRECONDITION_FAILED", "actionFingerprint is invalid.");
+    }
+    if (!/^[a-f0-9]{64}$/u.test(input.resourceKeySha256)) {
+      throw new UniversalBrokerError("PRECONDITION_FAILED", "resourceKeySha256 is invalid.");
+    }
+    if (!Number.isSafeInteger(input.fencingToken) || input.fencingToken < 1) {
+      throw new UniversalBrokerError("PRECONDITION_FAILED", "fencingToken is invalid.");
+    }
+    const oauthProofDigest = requiredSha256Digest(input.oauthProofDigest, "oauthProofDigest");
+    const evidenceDigest = requiredSha256Digest(input.evidenceDigest, "evidenceDigest");
+    const recoveredAtMs = this.now();
+    const reconciliationEvidenceSha256 = sha256(stableJson({
+      schemaVersion: 1,
+      operation: CONNECTOR_ACTIVATION_OPERATION,
+      principalKeyFingerprint,
+      authorityId,
+      actionClaimId,
+      actionFingerprint: input.actionFingerprint,
+      resourceKeySha256: input.resourceKeySha256,
+      fencingToken: input.fencingToken,
+      oauthProofDigest,
+      evidenceDigest,
+      outcome: "PASS",
+    }));
+    let result: ReturnType<DurableAuthorityStore["terminalizeRecoveredConnectorActivationPass"]>;
+    try {
+      result = this.requireStore().terminalizeRecoveredConnectorActivationPass({
+        principalKeyFingerprint,
+        authorityId,
+        actionClaimId,
+        actionFingerprint: input.actionFingerprint,
+        resourceKeySha256: input.resourceKeySha256,
+        fencingToken: input.fencingToken,
+        oauthProofDigest,
+        reconciliationEvidenceSha256,
+        recoveredAtMs,
+      });
+    } catch (error) {
+      this.recordAuthorityStoreFailure("reconcile");
+      throw new UniversalBrokerError(
+        "AUTHORITY_STORE_UNAVAILABLE",
+        "The recovered connector activation receipt could not be atomically terminalized.",
+        { evidence: { persistenceError: error instanceof Error ? error.name : "UNKNOWN_ERROR" } },
+      );
+    }
+    if (!result.ok) {
+      const code = result.code === "AUTHORITY_PRINCIPAL_MISMATCH"
+        ? "AUTHORITY_PRINCIPAL_MISMATCH"
+        : result.code === "AUTHORITY_ACTION_MISMATCH"
+          ? "AUTHORITY_ACTION_MISMATCH"
+          : result.code === "PRECONDITION_FAILED"
+            ? "PRECONDITION_FAILED"
+            : "AUTHORITY_STATE_UNCERTAIN";
+      throw new UniversalBrokerError(
+        code,
+        code === "AUTHORITY_PRINCIPAL_MISMATCH"
+          ? "The recovered connector activation belongs to a different stable principal."
+          : code === "AUTHORITY_ACTION_MISMATCH"
+            ? "The recovered claim is not the exact internal connector activation action."
+            : code === "PRECONDITION_FAILED"
+              ? "Recovered connector activation evidence is invalid."
+              : "The connector activation claim is not awaiting exact OAuth receipt recovery.",
+      );
+    }
+    const durable = this.requireStore().load().authorities.find(
+      (candidate) => candidate.authorityId === authorityId,
+    );
+    if (!durable) {
+      throw new UniversalBrokerError(
+        "AUTHORITY_STATE_UNCERTAIN",
+        "The recovered connector activation authority could not be read back.",
+      );
+    }
+    const refreshed = this.fromDurable(durable);
+    this.authorities.set(authorityId, refreshed);
+    const receipt = refreshed.receipts.find((candidate) => candidate.actionClaimId === actionClaimId);
+    if (!receipt
+      || receipt.state !== "PASS"
+      || receipt.result !== "PASS"
+      || receipt.leaseState !== "RELEASED"
+      || receipt.actionFingerprint !== input.actionFingerprint
+      || receipt.resourceKeySha256 !== input.resourceKeySha256
+      || receipt.fencingToken !== input.fencingToken) {
+      throw new UniversalBrokerError(
+        "AUTHORITY_STATE_UNCERTAIN",
+        "Recovered connector activation PASS readback is incomplete.",
+      );
+    }
+    this.recordAuthorityClaimMetric("R3", "PASS");
+    this.recordResourceLeaseEvent("reconciled");
+    return {
+      ...this.presentCompletionReceipt(refreshed, receipt),
+      recovered: true,
+      oauthProofDigest,
+      reconciliationEvidenceDigest: `sha256:${result.reconciliationEvidenceSha256}`,
+    };
   }
 
   status(authorityId: string, principalKeyFingerprint: string): Record<string, unknown> {
@@ -870,6 +1344,7 @@ export class OperationAuthorityRegistry {
     try {
       correction = this.requireStore().incrementTaskCorrectionEpoch(taskId, principal, this.now());
     } catch (error) {
+      this.recordAuthorityStoreFailure("invalidate");
       if (error instanceof UniversalBrokerError) throw error;
       throw new UniversalBrokerError(
         "AUTHORITY_STORE_UNAVAILABLE",
@@ -933,6 +1408,7 @@ export class OperationAuthorityRegistry {
         correctionEpoch: authority.correctionEpoch,
       });
     } catch (error) {
+      this.recordAuthorityStoreFailure("release");
       if (error instanceof UniversalBrokerError) throw error;
       throw new UniversalBrokerError(
         "AUTHORITY_STATE_UNCERTAIN",
@@ -985,6 +1461,15 @@ export class OperationAuthorityRegistry {
 
   stats(): Record<string, unknown> {
     this.pruneExpired();
+    return this.statsSnapshot();
+  }
+
+  /** Side-effect-free observation for readiness and other pure management probes. */
+  readOnlyStats(): Record<string, unknown> {
+    return this.statsSnapshot();
+  }
+
+  private statsSnapshot(): Record<string, unknown> {
     return {
       authorities: this.authorities.size,
       tasks: this.requireStore().taskCount(),
@@ -1008,8 +1493,37 @@ export class OperationAuthorityRegistry {
   close(): void {
     if (this.closed) return;
     this.closed = true;
+    for (const stop of [...this.activeLeaseHeartbeatStops]) stop();
     this.store?.close(this.now());
     releaseAuthorityInstance(this.instanceId);
+  }
+
+  startAutomaticLeaseHeartbeat(heartbeat: () => void): () => void {
+    if (this.closed) {
+      throw new UniversalBrokerError(
+        "AUTHORITY_STORE_UNAVAILABLE",
+        "The authority registry is closed; a resource lease heartbeat cannot be scheduled.",
+      );
+    }
+    let stopped = false;
+    let cancelScheduled: (() => void) | undefined;
+    const stop = () => {
+      if (stopped) return;
+      stopped = true;
+      cancelScheduled?.();
+      this.activeLeaseHeartbeatStops.delete(stop);
+    };
+    cancelScheduled = this.leaseHeartbeatScheduler(() => {
+      if (stopped || this.closed) return;
+      try {
+        heartbeat();
+      } catch {
+        // The synchronous heartbeat path records the bounded store failure metric.
+        // A later tick may recover; owner death + expiry + grace still prevents takeover.
+      }
+    }, this.resourceLeaseHeartbeatMs);
+    this.activeLeaseHeartbeatStops.add(stop);
+    return stop;
   }
 
   private requireStore(): DurableAuthorityStore {
@@ -1018,6 +1532,35 @@ export class OperationAuthorityRegistry {
       "AUTHORITY_STORE_UNAVAILABLE",
       "The durable authority store is unavailable.",
     );
+  }
+
+  private recordAuthorityCheckMetric(risk: AuthorityRiskClass, result: "pass" | "fail"): void {
+    this.recordMetric((metrics) => metrics.recordAuthorityCheck(risk, result));
+  }
+
+  private recordAuthorityClaimMetric(risk: AuthorityRiskClass, state: DurableActionClaimState): void {
+    this.recordMetric((metrics) => metrics.recordAuthorityClaim(risk, state));
+  }
+
+  private recordAuthorityStoreFailure(operation: string): void {
+    this.recordMetric((metrics) => metrics.recordAuthorityStoreFailure(operation));
+  }
+
+  private recordResourceLeaseEvent(event: string): void {
+    this.recordMetric((metrics) => metrics.recordResourceLeaseEvent(event));
+  }
+
+  private recordQuotaRejection(resourceKind: string): void {
+    this.recordMetric((metrics) => metrics.recordQuotaRejection(resourceKind));
+  }
+
+  private recordMetric(update: (metrics: UniversalBrokerMetrics) => void): void {
+    if (!this.metrics) return;
+    try {
+      update(this.metrics);
+    } catch {
+      // Observability must never replace authority semantics.
+    }
   }
 
   private findReceipt(grant: AuthorityGrant): AuthorityReceipt | undefined {
@@ -1041,6 +1584,67 @@ export class OperationAuthorityRegistry {
       update(authority.receipts[index]!),
       ...authority.receipts.slice(index + 1),
     ]);
+  }
+
+  private updateReceiptByClaim(
+    authorityId: string,
+    actionClaimId: string,
+    update: (receipt: AuthorityReceipt) => AuthorityReceipt,
+  ): void {
+    const authority = this.authorities.get(authorityId);
+    if (!authority) return;
+    const index = authority.receipts.findIndex(
+      (receipt) => receipt.actionClaimId === actionClaimId,
+    );
+    if (index < 0) return;
+    authority.receipts = trimReceipts([
+      ...authority.receipts.slice(0, index),
+      update(authority.receipts[index]!),
+      ...authority.receipts.slice(index + 1),
+    ]);
+  }
+
+  private completionReceipt(grant: AuthorityGrant): AuthorityCompletionReceipt {
+    let authority = this.authorities.get(grant.authorityId);
+    if (!authority) {
+      const durable = this.requireStore().load().authorities.find(
+        (candidate) => candidate.authorityId === grant.authorityId,
+      );
+      authority = durable ? this.fromDurable(durable) : undefined;
+    }
+    const receipt = authority?.receipts.find(
+      (candidate) => candidate.actionClaimId === grant.actionClaimId,
+    );
+    if (!authority || !receipt) {
+      throw new UniversalBrokerError(
+        "AUTHORITY_STATE_UNCERTAIN",
+        "The authority receipt could not be read back after completion.",
+      );
+    }
+    return this.presentCompletionReceipt(authority, receipt);
+  }
+
+  private presentCompletionReceipt(
+    authority: StoredOperationAuthority,
+    receipt: AuthorityReceipt,
+  ): AuthorityCompletionReceipt {
+    return {
+      actionClaimId: receipt.actionClaimId,
+      useId: receipt.useId,
+      receiptDigest: authorityReceiptDigest(authority, receipt),
+      state: receipt.state,
+      result: receipt.result,
+      leaseState: receipt.leaseState,
+      ...(receipt.completedAtMs === undefined
+        ? {}
+        : { completedAt: new Date(receipt.completedAtMs).toISOString() }),
+      ...(receipt.auditState ? { auditState: receipt.auditState } : {}),
+      ...(receipt.auditEventDigest ? { auditEventDigest: receipt.auditEventDigest } : {}),
+      ...(receipt.auditRecordedAtMs === undefined
+        ? {}
+        : { auditRecordedAt: new Date(receipt.auditRecordedAtMs).toISOString() }),
+      ...(receipt.auditErrorCode ? { auditErrorCode: receipt.auditErrorCode } : {}),
+    };
   }
 
   private trySealUncertain(
@@ -1069,6 +1673,7 @@ export class OperationAuthorityRegistry {
     action: RequestedAuthorityAction,
     index: number,
     allowR0: boolean,
+    allowConnectorActivation = false,
   ): StoredAuthorityAction {
     if (!action || typeof action !== "object") {
       throw new UniversalBrokerError("PRECONDITION_FAILED", `Invalid authority action at index ${index}.`);
@@ -1082,13 +1687,15 @@ export class OperationAuthorityRegistry {
       ...(source.parameters ? { parameters: boundedParameters(source.parameters, index) } : {}),
     };
     const operations = UNIVERSAL_TOOL_OPERATIONS[descriptor.tool] as readonly string[];
-    if (!operations.includes(descriptor.operation)) {
+    const connectorActivation = allowConnectorActivation
+      && isConnectorActivationAuthorityDescriptor(descriptor);
+    if (!operations.includes(descriptor.operation) && !connectorActivation) {
       throw new UniversalBrokerError(
         "PRECONDITION_FAILED",
         `Authority action ${index} uses unsupported operation ${descriptor.tool}.${descriptor.operation}.`,
       );
     }
-    const minimumRisk = this.minimumRisk(descriptor);
+    const minimumRisk = connectorActivation ? "R3" : this.minimumRisk(descriptor);
     if (minimumRisk === "R0" && !allowR0) {
       throw new UniversalBrokerError(
         "PRECONDITION_FAILED",
@@ -1154,6 +1761,7 @@ export class OperationAuthorityRegistry {
       receipts: authority.receipts.map((receipt) => ({
         actionClaimId: receipt.actionClaimId,
         useId: receipt.useId,
+        receiptDigest: authorityReceiptDigest(authority, receipt),
         actionId: receipt.actionId,
         resourceKeySha256: receipt.resourceKeySha256,
         fencingToken: receipt.fencingToken,
@@ -1173,6 +1781,12 @@ export class OperationAuthorityRegistry {
         ...(receipt.providerCallCount === undefined
           ? {}
           : { providerCallCount: receipt.providerCallCount }),
+        ...(receipt.auditState ? { auditState: receipt.auditState } : {}),
+        ...(receipt.auditEventDigest ? { auditEventDigest: receipt.auditEventDigest } : {}),
+        ...(receipt.auditRecordedAtMs === undefined
+          ? {}
+          : { auditRecordedAt: new Date(receipt.auditRecordedAtMs).toISOString() }),
+        ...(receipt.auditErrorCode ? { auditErrorCode: receipt.auditErrorCode } : {}),
         ...(receipt.evidence ? { evidence: receipt.evidence } : {}),
       })),
     };
@@ -1216,6 +1830,7 @@ export class OperationAuthorityRegistry {
     try {
       this.requireStore().saveTask(task);
     } catch (error) {
+      this.recordAuthorityStoreFailure("task");
       if (error instanceof UniversalBrokerError) throw error;
       throw new UniversalBrokerError(
         "AUTHORITY_STORE_UNAVAILABLE",
@@ -1356,6 +1971,11 @@ export class OperationAuthorityRegistry {
           ...(typeof receipt.evidence?.reasonCode === "string"
             ? { reasonCode: receipt.evidence.reasonCode }
             : {}),
+          ...(receipt.auditState ? { auditState: receipt.auditState } : {}),
+          ...(receipt.auditEventDigest ? { auditEventDigest: receipt.auditEventDigest } : {}),
+          ...(receipt.auditReceiptDigest ? { auditReceiptDigest: receipt.auditReceiptDigest } : {}),
+          ...(receipt.auditRecordedAtMs === undefined ? {} : { auditRecordedAtMs: receipt.auditRecordedAtMs }),
+          ...(receipt.auditErrorCode ? { auditErrorCode: receipt.auditErrorCode } : {}),
         };
       }),
     };
@@ -1413,6 +2033,11 @@ export class OperationAuthorityRegistry {
               },
             }
           : {}),
+        ...(receipt.auditState ? { auditState: receipt.auditState } : {}),
+        ...(receipt.auditEventDigest ? { auditEventDigest: receipt.auditEventDigest } : {}),
+        ...(receipt.auditReceiptDigest ? { auditReceiptDigest: receipt.auditReceiptDigest } : {}),
+        ...(receipt.auditRecordedAtMs === undefined ? {} : { auditRecordedAtMs: receipt.auditRecordedAtMs }),
+        ...(receipt.auditErrorCode ? { auditErrorCode: receipt.auditErrorCode } : {}),
       })),
     };
   }
@@ -1437,8 +2062,89 @@ export function actionResourceKeySha256(action: AuthorityActionDescriptor): stri
   }));
 }
 
+function authorityReceiptDigest(
+  authority: StoredOperationAuthority,
+  receipt: AuthorityReceipt,
+): string {
+  return `sha256:${sha256(stableJson({
+    schemaVersion: 1,
+    authorityId: authority.authorityId,
+    actionClaimId: receipt.actionClaimId,
+    useId: receipt.useId,
+    actionId: persistentActionKey(receipt.actionFingerprint),
+    taskInstanceId: receipt.taskInstanceId,
+    principalKeyFingerprint: receipt.principalKeyFingerprint,
+    actionFingerprint: receipt.actionFingerprint,
+    resourceKeySha256: receipt.resourceKeySha256,
+    fencingToken: receipt.fencingToken,
+    claimedAtMs: receipt.claimedAtMs,
+    reservedAtMs: receipt.reservedAtMs,
+    ...(receipt.dispatchedAtMs === undefined ? {} : { dispatchedAtMs: receipt.dispatchedAtMs }),
+    ...(receipt.completedAtMs === undefined ? {} : { completedAtMs: receipt.completedAtMs }),
+    state: receipt.state,
+    result: receipt.result,
+    leaseState: receipt.leaseState,
+    ...(receipt.providerCallCount === undefined ? {} : { providerCallCount: receipt.providerCallCount }),
+    ...(typeof receipt.evidence?.errorCode === "string"
+      ? { errorCode: receipt.evidence.errorCode }
+      : {}),
+    ...(typeof receipt.evidence?.reasonCode === "string"
+      ? { reasonCode: receipt.evidence.reasonCode }
+      : {}),
+  }))}`;
+}
+
 export function authorityRiskAtLeast(actual: AuthorityRiskClass, required: AuthorityRiskClass): boolean {
   return riskRank(actual) >= riskRank(required);
+}
+
+const CONNECTOR_ACTIVATION_OPERATION = "connector_activation_finalize";
+const CONNECTOR_ACTIVATION_PARAMETER_KEYS = [
+  "activePreimageDigest",
+  "canonicalName",
+  "finalizationPlanDigest",
+  "receiptId",
+  "tupleDigest",
+] as const;
+const SHA256_DIGEST_PATTERN = /^sha256:[a-f0-9]{64}$/u;
+const CONNECTOR_CANONICAL_NAME_PATTERN = /^[A-Za-z][A-Za-z0-9._-]{0,127}$/u;
+
+function assertConnectorActivationAuthorityDescriptor(action: AuthorityActionDescriptor): void {
+  if (!isConnectorActivationAuthorityDescriptor(action)) {
+    throw new UniversalBrokerError(
+      "PRECONDITION_FAILED",
+      "Connector activation authority requires the exact internal R3 activation descriptor.",
+    );
+  }
+}
+
+function isConnectorActivationAuthorityDescriptor(action: AuthorityActionDescriptor): boolean {
+  if (
+    action.tool !== "context"
+    || action.operation !== CONNECTOR_ACTIVATION_OPERATION
+    || typeof action.target !== "string"
+    || !CONNECTOR_CANONICAL_NAME_PATTERN.test(action.target)
+    || action.resource !== `connector:${action.target}`
+    || !action.parameters
+  ) {
+    return false;
+  }
+  const keys = Object.keys(action.parameters).sort();
+  if (
+    keys.length !== CONNECTOR_ACTIVATION_PARAMETER_KEYS.length
+    || keys.some((key, index) => key !== CONNECTOR_ACTIVATION_PARAMETER_KEYS[index])
+    || action.parameters.canonicalName !== action.target
+    || typeof action.parameters.receiptId !== "string"
+    || action.parameters.receiptId.length < 1
+    || action.parameters.receiptId.length > 256
+  ) {
+    return false;
+  }
+  return [
+    action.parameters.tupleDigest,
+    action.parameters.activePreimageDigest,
+    action.parameters.finalizationPlanDigest,
+  ].every((value) => typeof value === "string" && SHA256_DIGEST_PATTERN.test(value));
 }
 
 function normalizeAction(action: AuthorityActionDescriptor): Record<string, unknown> {
@@ -1457,7 +2163,7 @@ function normalizeValue(value: unknown): unknown {
     return Object.fromEntries(
       Object.entries(value as Record<string, unknown>)
         .filter(([, child]) => child !== undefined)
-        .sort(([left], [right]) => left.localeCompare(right))
+        .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
         .map(([key, child]) => [key, normalizeValue(child)]),
     );
   }
@@ -1533,6 +2239,30 @@ function trimReceipts(receipts: AuthorityReceipt[]): AuthorityReceipt[] {
     (receipt) => ["CLAIMED", "DISPATCHED", "UNCERTAIN"].includes(receipt.state)
       || retainedTerminalIds.has(receipt.actionClaimId),
   );
+}
+
+function boundedLeaseInterval(
+  value: number,
+  name: string,
+  allowZero = false,
+): number {
+  if (
+    !Number.isSafeInteger(value)
+    || value < (allowZero ? 0 : 1)
+    || value > MAXIMUM_RESOURCE_LEASE_INTERVAL_MS
+  ) {
+    throw new Error(`${name} must be a bounded ${allowZero ? "non-negative" : "positive"} safe integer.`);
+  }
+  return value;
+}
+
+function defaultAuthorityLeaseHeartbeatScheduler(
+  callback: () => void,
+  intervalMs: number,
+): () => void {
+  const timer = setInterval(callback, intervalMs);
+  timer.unref();
+  return () => clearInterval(timer);
 }
 
 function retainAuthorityInstance(instanceId: string): void {
@@ -1624,6 +2354,19 @@ function requiredText(value: string | undefined, message: string, maximum: numbe
     );
   }
   return normalized;
+}
+
+function requiredSha256Digest(value: string | undefined, name: string): string {
+  const normalized = value?.trim().toLowerCase();
+  if (!normalized || !/^sha256:[a-f0-9]{64}$/u.test(normalized)) {
+    throw new UniversalBrokerError("PRECONDITION_FAILED", `${name} must be a SHA-256 digest.`);
+  }
+  return normalized;
+}
+
+function safeAuthorityCode(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  return /^[A-Z][A-Z0-9_.:-]{0,127}$/u.test(value) ? value : undefined;
 }
 
 function optionalText(

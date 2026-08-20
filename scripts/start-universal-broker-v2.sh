@@ -40,4 +40,27 @@ if [[ -z "${DEVSPACE_NEXT_PM2_EXPECTED_SCRIPT-}" && -n "$expected_script_fallbac
 fi
 
 unset DEVSPACE_OAUTH_OWNER_TOKEN
+if [[ "${DEVSPACE_V2_DEPLOYMENT_MODE-}" == production ]]; then
+  runtime_package_root="${DEVSPACE_RUNTIME_PACKAGE_ROOT:?Production runtime package root is required}"
+  runtime_dependency_root="${DEVSPACE_RUNTIME_DEPENDENCY_ROOT:?Production runtime dependency root is required}"
+  runtime_dependency_evidence="${DEVSPACE_RUNTIME_DEPENDENCY_EVIDENCE:?Production runtime dependency evidence is required}"
+  runtime_dependency_evidence_sha256="${DEVSPACE_EXPECTED_RUNTIME_DEPENDENCY_EVIDENCE_SHA256:?Production runtime dependency evidence digest is required}"
+  runtime_manifest="${DEVSPACE_RELEASE_MANIFEST:?Production release manifest is required}"
+  runtime_manifest_sha256="${DEVSPACE_EXPECTED_RELEASE_MANIFEST_SHA256:?Production release manifest digest is required}"
+  [[ "$(cd "$runtime_package_root" && pwd -P)" == "$repo" ]] || {
+    echo "Production runtime package root does not match the executing package: $runtime_package_root" >&2
+    exit 1
+  }
+  [[ "$(cd "$(dirname "$runtime_manifest")" && pwd -P)/$(basename "$runtime_manifest")" == "$repo/BUILD-MANIFEST.json" ]] || {
+    echo "Production release manifest does not belong to the executing package: $runtime_manifest" >&2
+    exit 1
+  }
+  node "$repo/scripts/release-artifacts.mjs" verify-runtime-command \
+    --package "$repo" --runtime-root "$repo" --entrypoint "${DEVSPACE_NEXT_PM2_EXPECTED_SCRIPT:?Production PM2 entrypoint is required}" \
+    --manifest-sha256 "$runtime_manifest_sha256" >/dev/null
+  node "$repo/scripts/release-artifacts.mjs" verify-runtime-dependencies \
+    --package "$repo" --dependency-root "$runtime_dependency_root" \
+    --evidence "$runtime_dependency_evidence" --evidence-sha256 "$runtime_dependency_evidence_sha256" >/dev/null
+  exec node --import "$repo/scripts/lib/runtime-dependency-loader.mjs" "$repo/dist/cli.js" serve-next
+fi
 exec node "$repo/dist/cli.js" serve-next

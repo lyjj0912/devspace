@@ -24,6 +24,7 @@ import {
   authorityActionFromToolCall,
   commandRisk,
   execAction,
+  filesystemAction,
   mcpRisk,
   minimumAuthorityRisk,
   processAction,
@@ -35,12 +36,16 @@ function registry(
   now: { value: number } = { value: Date.now() },
   storePath?: string,
   instanceId?: string,
+  resourceLeaseTtlMs?: number,
 ) {
   return new OperationAuthorityRegistry({
     now: () => now.value,
     minimumRisk: minimumAuthorityRisk,
     ...(storePath ? { storePath } : {}),
     ...(instanceId ? { instanceId } : {}),
+    ...(resourceLeaseTtlMs === undefined ? {} : { resourceLeaseTtlMs }),
+    resourceLeaseRecoveryGraceMs: 0,
+    leaseHeartbeatScheduler: () => () => undefined,
   });
 }
 
@@ -72,6 +77,45 @@ test("stable principal survives token scope changes and ten transport sessions",
     },
   }, SINGLE_OWNER_PRINCIPAL);
   assert.notEqual(otherClient.fingerprint, fingerprints[0]);
+});
+
+test("one coherent authority batch dispatches bounded R1 and R2 actions independently", () => {
+  const authority = registry();
+  const principal = "coherent-r1-r2-batch-principal";
+  const write = authorityActionFromToolCall("fs", {
+    operation: "write",
+    target: "local",
+    path: "/tmp/coherent-r1-r2-batch.txt",
+    content: "bounded\n",
+  });
+  const commit = authorityActionFromToolCall("exec", {
+    target: "local",
+    cwd: "/tmp",
+    command: "git commit -m coherent-r1-r2-batch",
+    mode: "foreground",
+  });
+  const created = authority.create({
+    taskId: "coherent-r1-r2-batch",
+    authorityText: "Apply this exact local write and commit as one bounded plan.",
+    actions: [
+      { id: "write", descriptor: write, risk: "R1", uses: 1 },
+      { id: "commit", descriptor: commit, risk: "R2", uses: 1 },
+    ],
+  }, principal);
+  const authorityId = String(created.authorityId);
+  const writeDispatch = authority.prepareDispatch(authorityId, principal, write, "R1");
+  writeDispatch.markDispatched();
+  writeDispatch.complete("PASS", { batchStep: "write" });
+  const commitDispatch = authority.prepareDispatch(authorityId, principal, commit, "R2");
+  commitDispatch.markDispatched();
+  commitDispatch.complete("PASS", { batchStep: "commit" });
+  const status = authority.status(authorityId, principal) as {
+    actions: Array<{ id: string; consumedUses: number }>;
+    receipts: Array<{ result: string }>;
+  };
+  assert.deepEqual(status.actions.map(({ consumedUses }) => consumedUses), [1, 1]);
+  assert.deepEqual(status.receipts.map(({ result }) => result), ["PASS", "PASS"]);
+  authority.close();
 });
 
 test("production principal fails closed without clientId and never uses session fallback", () => {
@@ -218,7 +262,7 @@ test("legacy clientId-sessionId authority scopes are backed up and quarantined",
   migrated.close();
 
   const verified = new Database(storePath, { readonly: true, fileMustExist: true });
-  assert.equal(verified.pragma("user_version", { simple: true }), 5);
+  assert.equal(verified.pragma("user_version", { simple: true }), 7);
   const quarantine = verified.prepare(
     `select authority_id, reason, backup_sha256
        from operation_authority_legacy_quarantine`,
@@ -254,7 +298,7 @@ test("legacy clientId-sessionId authority scopes are backed up and quarantined",
   );
 });
 
-test("schema v3 migrates to v5 with verified backup and quarantines unrecoverable resource bindings", async (t) => {
+test("schema v3 migrates to v7 with verified backup and quarantines unrecoverable resource bindings", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "devspace-authority-v3-migration-"));
   t.after(async () => rm(root, { recursive: true, force: true }));
   const storePath = join(root, "authority.sqlite");
@@ -367,7 +411,7 @@ test("schema v3 migrates to v5 with verified backup and quarantines unrecoverabl
   );
   legacy.close();
 
-  const migrated = registry(now, storePath, "v5-migration-owner");
+  const migrated = registry(now, storePath, "v7-migration-owner");
   const status = migrated.status("authority_v3_fixture", principal) as {
     receipts: Array<{
       state: string;
@@ -377,7 +421,7 @@ test("schema v3 migrates to v5 with verified backup and quarantines unrecoverabl
     }>;
   };
   assert.equal(status.receipts[0]?.state, "UNCERTAIN");
-  assert.equal(status.receipts[0]?.leaseState, "FROZEN");
+  assert.equal(status.receipts[0]?.leaseState, "RECOVERY_REQUIRED");
   assert.match(status.receipts[0]?.resourceKeySha256 ?? "", /^[a-f0-9]{64}$/u);
   assert.equal(status.receipts[0]?.evidence?.reasonCode, "LEGACY_PENDING_CLAIM_MIGRATED");
   assert.throws(
@@ -387,7 +431,7 @@ test("schema v3 migrates to v5 with verified backup and quarantines unrecoverabl
   migrated.close();
 
   const verified = new Database(storePath, { readonly: true, fileMustExist: true });
-  assert.equal(verified.pragma("user_version", { simple: true }), 5);
+  assert.equal(verified.pragma("user_version", { simple: true }), 7);
   assert.equal(verified.pragma("integrity_check", { simple: true }), "ok");
   assert.deepEqual(verified.pragma("foreign_key_check"), []);
   const migration = verified.prepare(
@@ -422,7 +466,7 @@ test("schema v3 migrates to v5 with verified backup and quarantines unrecoverabl
     reason: quarantine.reason,
   }, {
     from: 3,
-    to: 5,
+    to: 7,
     source: "ok",
     backup: "ok",
     post: "ok",
@@ -444,6 +488,116 @@ test("schema v3 migrates to v5 with verified backup and quarantines unrecoverabl
     const bytes = await readFile(path).catch(() => undefined);
     if (bytes) assert.equal(bytes.includes(Buffer.from(rawSecret)), false, path);
   }
+});
+
+test("schema v5 lease rows migrate atomically to TTL and reconciliation state", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-authority-v5-lease-migration-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const storePath = join(root, "authority.sqlite");
+  const now = { value: 1_787_020_000_000 };
+  const principal = "v5-lease-migration-principal";
+  const descriptor = authorityActionFromToolCall("fs", {
+    operation: "write",
+    target: "local",
+    path: "/tmp/v5-lease-migration.txt",
+    content: "migration\n",
+  });
+  const seed = registry(now, storePath, "v5-lease-seed", 5_000);
+  const created = seed.create({
+    taskId: "v5-lease-migration-task",
+    authorityText: "Seed an uncertain lease for migration.",
+    actions: [{ descriptor }],
+  }, principal);
+  const dispatch = seed.prepareDispatch(String(created.authorityId), principal, descriptor, "R1");
+  const claim = dispatch.claim();
+  dispatch.markDispatched();
+  dispatch.complete("UNCERTAIN", { reasonCode: "V5_FIXTURE_UNCERTAIN" });
+  seed.close();
+
+  const legacy = new Database(storePath);
+  legacy.pragma("foreign_keys = OFF");
+  legacy.exec(`
+    drop trigger if exists operation_authority_resource_leases_exact_insert;
+    drop trigger if exists operation_authority_resource_leases_exact_update;
+    drop index if exists operation_authority_resource_leases_task_idx;
+    drop index if exists operation_authority_resource_leases_expiry_idx;
+    alter table operation_authority_resource_leases rename to v6_resource_leases_fixture;
+    create table operation_authority_resource_leases (
+      resource_key_sha256 text primary key check (length(resource_key_sha256) = 64),
+      task_instance_id text not null,
+      principal_key_fingerprint text not null,
+      authority_id text not null,
+      action_id text not null,
+      action_claim_id text not null,
+      fencing_token integer not null check (fencing_token >= 1),
+      lease_state text not null check (lease_state in ('ACTIVE', 'FROZEN')),
+      acquired_at_ms integer not null,
+      updated_at_ms integer not null,
+      foreign key (task_instance_id) references operation_authority_tasks(task_instance_id),
+      foreign key (authority_id, action_id) references operation_authority_actions(authority_id, action_id),
+      foreign key (action_claim_id) references operation_authority_claims(action_claim_id)
+    );
+    create index operation_authority_resource_leases_task_idx
+      on operation_authority_resource_leases(task_instance_id, lease_state);
+    insert into operation_authority_resource_leases
+    select resource_key_sha256, task_instance_id, principal_key_fingerprint,
+           authority_id, action_id, action_claim_id, fencing_token,
+           case when lease_state = 'RECOVERY_REQUIRED' then 'FROZEN' else lease_state end,
+           acquired_at_ms, updated_at_ms
+      from v6_resource_leases_fixture;
+    drop table v6_resource_leases_fixture;
+    pragma user_version = 5;
+  `);
+  legacy.pragma("foreign_keys = ON");
+  legacy.close();
+
+  now.value += 1;
+  const migrated = registry(now, storePath, "v5-lease-migrated", 5_000);
+  const status = migrated.status(String(created.authorityId), principal) as {
+    receipts: Array<{ leaseState: string }>;
+  };
+  assert.equal(status.receipts[0]?.leaseState, "RECOVERY_REQUIRED");
+  migrated.close();
+
+  const verified = new Database(storePath, { readonly: true, fileMustExist: true });
+  assert.equal(verified.pragma("user_version", { simple: true }), 7);
+  const lease = verified.prepare(`
+    select owner_instance_id as ownerInstanceId, heartbeat_at_ms as heartbeatAtMs,
+           expires_at_ms as expiresAtMs, lease_state as leaseState,
+           reconciliation_state as reconciliationState, recovery_reason as recoveryReason
+      from operation_authority_resource_leases where resource_key_sha256 = ?
+  `).get(claim.resourceKeySha256) as {
+    ownerInstanceId: string;
+    heartbeatAtMs: number;
+    expiresAtMs: number;
+    leaseState: string;
+    reconciliationState: string;
+    recoveryReason: string;
+  };
+  const migration = verified.prepare(`
+    select from_schema_version as fromVersion, to_schema_version as toVersion,
+           source_integrity_check as sourceIntegrity,
+           backup_integrity_check as backupIntegrity,
+           post_integrity_check as postIntegrity, foreign_key_violations as foreignKeyViolations
+      from operation_authority_migrations where from_schema_version = 5
+  `).get() as Record<string, unknown>;
+  verified.close();
+  assert.deepEqual(lease, {
+    ownerInstanceId: "v5-lease-seed",
+    heartbeatAtMs: now.value - 1,
+    expiresAtMs: now.value - 1 + 5_000,
+    leaseState: "RECOVERY_REQUIRED",
+    reconciliationState: "PENDING",
+    recoveryReason: "V5_FROZEN_LEASE_MIGRATED",
+  });
+  assert.deepEqual(migration, {
+    fromVersion: 5,
+    toVersion: 7,
+    sourceIntegrity: "ok",
+    backupIntegrity: "ok",
+    postIntegrity: "ok",
+    foreignKeyViolations: 0,
+  });
 });
 
 test("exact R1 authority is principal-bound, receipted, and bounded by uses", () => {
@@ -481,6 +635,123 @@ test("exact R1 authority is principal-bound, receipted, and bounded by uses", ()
   );
   const status = authority.status(authorityId, "client-a:session-a");
   assert.equal((status.receipts as unknown[]).length, 2);
+});
+
+test("authority completion returns a durable receipt digest that survives reopen", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-authority-receipt-digest-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const storePath = join(root, "authority.sqlite");
+  const now = { value: 1_787_066_000_000 };
+  const principal = "receipt-digest-principal";
+  const descriptor = authorityActionFromToolCall("fs", {
+    operation: "write",
+    target: "local",
+    path: "/tmp/raw-secret-path-must-not-leak.txt",
+    content: "raw-secret-content-must-not-leak\n",
+  });
+  const owner = registry(now, storePath, "receipt-digest-owner");
+  const created = owner.create({
+    taskId: "receipt-digest-task",
+    authorityText: "Persist and link the exact receipt digest without raw authority text.",
+    actions: [{ descriptor }],
+  }, principal);
+  const authorityId = String(created.authorityId);
+  const dispatch = owner.prepareDispatch(authorityId, principal, descriptor, "R1");
+  dispatch.claim();
+  dispatch.markDispatched();
+  const completion = dispatch.complete("PASS", { reasonCode: "RECEIPT_DIGEST_TEST" });
+  assert.match(completion.receiptDigest, /^sha256:[a-f0-9]{64}$/u);
+  const status = owner.status(authorityId, principal) as {
+    receipts: Array<{ receiptDigest: string; state: string; evidence?: { reasonCode?: string } }>;
+  };
+  assert.equal(status.receipts[0]?.receiptDigest, completion.receiptDigest);
+  assert.equal(status.receipts[0]?.state, "PASS");
+  assert.equal(status.receipts[0]?.evidence?.reasonCode, "RECEIPT_DIGEST_TEST");
+  assert.doesNotMatch(JSON.stringify(status), /raw-secret|authority text/iu);
+  owner.close();
+
+  const sqlite = new Database(storePath, { readonly: true, fileMustExist: true });
+  const persisted = sqlite.prepare(`
+    select state, provider_call_count as providerCallCount, reason_code as reasonCode
+      from operation_authority_claims
+     where authority_id = ?
+  `).get(authorityId) as { state: string; providerCallCount: number; reasonCode: string };
+  sqlite.close();
+  assert.deepEqual(persisted, {
+    state: "PASS",
+    providerCallCount: 1,
+    reasonCode: "RECEIPT_DIGEST_TEST",
+  });
+
+  const reopened = registry(now, storePath, "receipt-digest-readback");
+  const reopenedStatus = reopened.status(authorityId, principal) as {
+    receipts: Array<{ receiptDigest: string; state: string }>;
+  };
+  assert.equal(reopenedStatus.receipts[0]?.receiptDigest, completion.receiptDigest);
+  assert.equal(reopenedStatus.receipts[0]?.state, "PASS");
+  reopened.close();
+});
+
+test("receipt audit event digest is durable and rejects replay with a different event", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-authority-audit-cross-reference-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const storePath = join(root, "authority.sqlite");
+  const now = { value: 1_787_066_100_000 };
+  const principal = "audit-cross-reference-principal";
+  const descriptor = authorityActionFromToolCall("fs", {
+    operation: "write",
+    target: "local",
+    path: "/tmp/raw-audit-cross-reference-secret.txt",
+    content: "raw-audit-cross-reference-secret\n",
+  });
+  const authority = registry(now, storePath, "audit-cross-reference-owner");
+  const created = authority.create({
+    taskId: "audit-cross-reference-task",
+    authorityText: "Persist a bidirectional receipt to audit-event digest reference.",
+    actions: [{ descriptor }],
+  }, principal);
+  const authorityId = String(created.authorityId);
+  const dispatch = authority.prepareDispatch(authorityId, principal, descriptor, "R1");
+  dispatch.claim();
+  dispatch.markDispatched();
+  const completion = dispatch.complete("PASS", { reasonCode: "AUDIT_LINK_TEST" });
+  const eventDigest = `sha256:${"c".repeat(64)}`;
+  authority.recordReceiptAuditResult({
+    authorityId,
+    actionClaimId: completion.actionClaimId,
+    receiptDigest: completion.receiptDigest,
+    status: "RECORDED",
+    auditEventDigest: eventDigest,
+  });
+  const status = authority.status(authorityId, principal) as {
+    receipts: Array<{
+      receiptDigest: string;
+      auditState?: string;
+      auditEventDigest?: string;
+    }>;
+  };
+  assert.equal(status.receipts[0]?.receiptDigest, completion.receiptDigest);
+  assert.equal(status.receipts[0]?.auditState, "RECORDED");
+  assert.equal(status.receipts[0]?.auditEventDigest, eventDigest);
+  assert.throws(
+    () => authority.recordReceiptAuditResult({
+      authorityId,
+      actionClaimId: completion.actionClaimId,
+      receiptDigest: completion.receiptDigest,
+      status: "RECORDED",
+      auditEventDigest: `sha256:${"d".repeat(64)}`,
+    }),
+    (error: unknown) => code(error) === "AUTHORITY_STATE_UNCERTAIN",
+  );
+  authority.close();
+
+  const reopened = registry(now, storePath, "audit-cross-reference-readback");
+  const reopenedStatus = reopened.status(authorityId, principal) as {
+    receipts: Array<{ auditState?: string; auditEventDigest?: string }>;
+  };
+  assert.equal(reopenedStatus.receipts[0]?.auditState, "RECORDED");
+  assert.equal(reopenedStatus.receipts[0]?.auditEventDigest, eventDigest);
+  reopened.close();
 });
 
 test("re-authorizing a consumed exact action creates a fresh authority", () => {
@@ -534,6 +805,47 @@ test("filesystem authority binds context identity and payload hashes", () => {
   });
   assert.notEqual(actionFingerprint(a), actionFingerprint(b));
   assert.notEqual(actionFingerprint(a), actionFingerprint(c));
+});
+
+test("filesystem sync authority binds the immutable plan and destination mutation domain", () => {
+  const plan = authorityActionFromToolCall("fs", {
+    operation: "sync",
+    target: "local",
+    path: "/tmp/source",
+    destination: "/tmp/destination",
+    sync: {
+      phase: "plan",
+      include: ["**/*.ts"],
+      exclude: ["node_modules/**"],
+      deleteMode: "trash",
+      conflictStrategy: "fail",
+    },
+  });
+  const applyInput = {
+    operation: "sync",
+    target: "local",
+    path: "/tmp/source",
+    destination: "/tmp/destination",
+    sync: {
+      phase: "apply",
+      planId: "sync_plan_00000000-0000-0000-0000-000000000000",
+      planDigest: "a".repeat(64),
+    },
+  } as const;
+  const apply = authorityActionFromToolCall("fs", applyInput);
+  const changed = filesystemAction(applyInput, "local", {
+    syncPlanDigest: "b".repeat(64),
+    syncDeleteMode: "permanent",
+  });
+
+  assert.equal(plan.resource, "/tmp/destination");
+  assert.equal(apply.resource, "/tmp/destination");
+  assert.equal(minimumAuthorityRisk(plan), "R0");
+  assert.equal(minimumAuthorityRisk(apply), "R1");
+  assert.equal(minimumAuthorityRisk(changed), "R3");
+  assert.notEqual(actionFingerprint(plan), actionFingerprint(apply));
+  assert.notEqual(actionFingerprint(apply), actionFingerprint(changed));
+  assert.equal(actionResourceKeySha256(apply), actionResourceKeySha256(changed));
 });
 
 test("exact action fingerprints bind every mutation dispatch dimension", () => {
@@ -669,7 +981,7 @@ test("verified-dead CLAIMED action recovers as cancelled and reclaimed without p
     name: "read_only_fixture",
     arguments: { credential: rawSecret, query: `payload-${rawSecret}` },
   });
-  const first = registry(now, storePath, "process-generation-a");
+  const first = registry(now, storePath, "process-generation-a", 500);
   const created = first.create({
     taskId: `task-${rawSecret}`,
     authorityText: `Dispatch exactly once using ${rawSecret}.`,
@@ -690,7 +1002,7 @@ test("verified-dead CLAIMED action recovers as cancelled and reclaimed without p
   first.close();
 
   now.value += 1_000;
-  const recovered = registry(now, storePath, "process-generation-b");
+  const recovered = registry(now, storePath, "process-generation-b", 500);
   const status = recovered.status(authorityId, scopeId) as {
     actions: Array<{ consumedUses: number }>;
     receipts: Array<{ result: string; evidence?: { errorCode?: string; reasonCode?: string } }>;
@@ -733,7 +1045,7 @@ test("restart after authority expiry still cancels a verified-zero CLAIMED use w
     command: "git push origin expired-recovery-test",
     mode: "foreground",
   });
-  const first = registry(now, storePath, "expired-process-a");
+  const first = registry(now, storePath, "expired-process-a", 1_000);
   const created = first.create({
     taskId: "expired-recovery",
     authorityText: "Dispatch this exact action once before expiry.",
@@ -745,7 +1057,7 @@ test("restart after authority expiry still cancels a verified-zero CLAIMED use w
   first.close();
 
   now.value += 61_000;
-  const recovered = registry(now, storePath, "expired-process-b");
+  const recovered = registry(now, storePath, "expired-process-b", 1_000);
   const status = recovered.status(authorityId, scopeId) as {
     expired: boolean;
     actions: Array<{ consumedUses: number }>;
@@ -864,7 +1176,7 @@ test("a live owner in another OS process cannot be recovered or fenced out", asy
     path: "/tmp/cross-process-live.txt",
     content: "live\n",
   });
-  const owner = registry(now, storePath, "cross-process-live-owner-a");
+  const owner = registry(now, storePath, "cross-process-live-owner-a", 1_000);
   const created = owner.create({
     taskId: "cross-process-live-task",
     authorityText: "Keep the live parent writer active.",
@@ -930,6 +1242,7 @@ test("verified-dead owner cancels CLAIMED but freezes DISPATCHED without replay"
         storePath: process.env.B2_STORE_PATH,
         instanceId: "dead-owner-child-" + state.toLowerCase(),
         now: () => Number(process.env.B2_NOW_MS),
+        resourceLeaseTtlMs: 1_000,
       });
       const created = owner.create({
         taskId: "dead-owner-task-" + state.toLowerCase(),
@@ -954,7 +1267,7 @@ test("verified-dead owner cancels CLAIMED but freezes DISPATCHED without replay"
     }) as { authorityId: string };
 
     const now = { value: childNow + 60_000 };
-    const recovered = registry(now, storePath, `dead-owner-parent-${crashState.toLowerCase()}`);
+    const recovered = registry(now, storePath, `dead-owner-parent-${crashState.toLowerCase()}`, 1_000);
     const status = recovered.status(childResult.authorityId, principal) as {
       actions: Array<{ consumedUses: number }>;
       receipts: Array<{ state: string; leaseState: string; providerCallCount?: number }>;
@@ -978,7 +1291,7 @@ test("verified-dead owner cancels CLAIMED but freezes DISPATCHED without replay"
     } else {
       assert.equal(status.actions[0]?.consumedUses, 1);
       assert.equal(status.receipts[0]?.state, "UNCERTAIN");
-      assert.equal(status.receipts[0]?.leaseState, "FROZEN");
+      assert.equal(status.receipts[0]?.leaseState, "RECOVERY_REQUIRED");
       assert.throws(
         () => recovered.prepareDispatch(
           childResult.authorityId,
@@ -1083,6 +1396,415 @@ test("resource leases have validated foreign-key ownership", async (t) => {
   assert.equal(foreignKeys.some((key) => key.table === "operation_authority_tasks"), true);
   assert.equal(foreignKeys.some((key) => key.table === "operation_authority_actions"), true);
   assert.equal(foreignKeys.some((key) => key.table === "operation_authority_claims"), true);
+});
+
+test("resource lease TTL is durable, heartbeat extends it, and pre-expiry recovery is forbidden", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-authority-lease-heartbeat-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const storePath = join(root, "authority.sqlite");
+  const now = { value: 1_787_064_950_000 };
+  const principal = "lease-heartbeat-principal";
+  const firstAction = authorityActionFromToolCall("fs", {
+    operation: "write",
+    target: "local",
+    path: "/tmp/lease-heartbeat.txt",
+    content: "first\n",
+  });
+  const replacementAction = authorityActionFromToolCall("fs", {
+    operation: "patch",
+    target: "local",
+    path: "/tmp/lease-heartbeat.txt",
+    patch: "*** Begin Patch\n*** Update File: lease-heartbeat.txt\n@@\n-first\n+second\n*** End Patch",
+  });
+  const owner = registry(now, storePath, "lease-heartbeat-owner", 100);
+  const created = owner.create({
+    taskId: "lease-heartbeat-task",
+    authorityText: "Hold the exact resource through a bounded heartbeat.",
+    actions: [{ descriptor: firstAction }],
+  }, principal);
+  const dispatch = owner.prepareDispatch(String(created.authorityId), principal, firstAction, "R1");
+  const firstClaim = dispatch.claim();
+
+  let database = new Database(storePath, { readonly: true, fileMustExist: true });
+  let lease = database.prepare(`
+    select owner_instance_id as ownerInstanceId, heartbeat_at_ms as heartbeatAtMs,
+           expires_at_ms as expiresAtMs, lease_state as leaseState,
+           reconciliation_state as reconciliationState
+      from operation_authority_resource_leases where resource_key_sha256 = ?
+  `).get(firstClaim.resourceKeySha256) as {
+    ownerInstanceId: string;
+    heartbeatAtMs: number;
+    expiresAtMs: number;
+    leaseState: string;
+    reconciliationState: string;
+  };
+  database.close();
+  assert.deepEqual(lease, {
+    ownerInstanceId: "lease-heartbeat-owner",
+    heartbeatAtMs: now.value,
+    expiresAtMs: now.value + 100,
+    leaseState: "ACTIVE",
+    reconciliationState: "NOT_REQUIRED",
+  });
+
+  now.value += 80;
+  const heartbeat = dispatch.heartbeat();
+  assert.equal(heartbeat.expiresAtMs, now.value + 100);
+  database = new Database(storePath, { readonly: true, fileMustExist: true });
+  lease = database.prepare(`
+    select owner_instance_id as ownerInstanceId, heartbeat_at_ms as heartbeatAtMs,
+           expires_at_ms as expiresAtMs, lease_state as leaseState,
+           reconciliation_state as reconciliationState
+      from operation_authority_resource_leases where resource_key_sha256 = ?
+  `).get(firstClaim.resourceKeySha256) as typeof lease;
+  database.close();
+  assert.equal(lease.heartbeatAtMs, now.value);
+  assert.equal(lease.expiresAtMs, now.value + 100);
+  owner.close();
+
+  now.value += 99;
+  const beforeExpiry = registry(now, storePath, "lease-before-expiry", 100);
+  const beforeStatus = beforeExpiry.status(String(created.authorityId), principal) as {
+    receipts: Array<{ state: string; leaseState: string }>;
+  };
+  assert.equal(beforeStatus.receipts[0]?.state, "CLAIMED");
+  assert.equal(beforeStatus.receipts[0]?.leaseState, "ACTIVE");
+  const replacement = beforeExpiry.create({
+    taskId: "lease-heartbeat-replacement",
+    authorityText: "Attempt the same resource only after lawful recovery.",
+    actions: [{ descriptor: replacementAction }],
+  }, principal);
+  assert.throws(
+    () => beforeExpiry.prepareDispatch(
+      String(replacement.authorityId), principal, replacementAction, "R1",
+    ).claim(),
+    (error: unknown) => code(error) === "RESOURCE_BUSY",
+  );
+  beforeExpiry.close();
+
+  now.value += 2;
+  const recovered = registry(now, storePath, "lease-after-expiry", 100);
+  const recoveredStatus = recovered.status(String(created.authorityId), principal) as {
+    receipts: Array<{ state: string; leaseState: string }>;
+  };
+  assert.equal(recoveredStatus.receipts[0]?.state, "CANCELLED_NOT_DISPATCHED");
+  assert.equal(recoveredStatus.receipts[0]?.leaseState, "RELEASED");
+  const retry = recovered.prepareDispatch(
+    String(replacement.authorityId), principal, replacementAction, "R1",
+  );
+  const replacementClaim = retry.claim();
+  assert.ok(replacementClaim.fencingToken > firstClaim.fencingToken);
+  retry.cancelNotDispatched({ providerCallCount: 0, proof: "LEASE_HEARTBEAT_RETRY_ZERO" });
+  recovered.close();
+});
+
+test("configured lease heartbeat runs automatically and stops at terminalization or registry close", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-authority-automatic-heartbeat-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const storePath = join(root, "authority.sqlite");
+  const now = { value: 1_787_064_965_000 };
+  const scheduled: Array<() => void> = [];
+  const intervals: number[] = [];
+  let cancellations = 0;
+  const authority = new OperationAuthorityRegistry({
+    now: () => now.value,
+    minimumRisk: minimumAuthorityRisk,
+    storePath,
+    instanceId: "automatic-heartbeat-owner",
+    resourceLeaseTtlMs: 100,
+    resourceLeaseHeartbeatMs: 25,
+    resourceLeaseRecoveryGraceMs: 50,
+    leaseHeartbeatScheduler(callback, intervalMs) {
+      scheduled.push(callback);
+      intervals.push(intervalMs);
+      let cancelled = false;
+      return () => {
+        if (cancelled) return;
+        cancelled = true;
+        cancellations += 1;
+      };
+    },
+  });
+  const firstAction = authorityActionFromToolCall("fs", {
+    operation: "write",
+    target: "local",
+    path: "/tmp/automatic-heartbeat-a.txt",
+    content: "first\n",
+  });
+  const secondAction = authorityActionFromToolCall("fs", {
+    operation: "write",
+    target: "local",
+    path: "/tmp/automatic-heartbeat-b.txt",
+    content: "second\n",
+  });
+  const created = authority.create({
+    taskId: "automatic-heartbeat-task",
+    authorityText: "Exercise configured automatic lease renewal and cleanup.",
+    actions: [{ descriptor: firstAction }, { descriptor: secondAction }],
+  }, "automatic-heartbeat-principal");
+  const first = authority.prepareDispatch(
+    String(created.authorityId),
+    "automatic-heartbeat-principal",
+    firstAction,
+    "R1",
+  );
+  const firstGrant = first.markDispatched();
+  assert.deepEqual(intervals, [25]);
+  now.value += 25;
+  scheduled[0]?.();
+  assert.equal(firstGrant.leaseExpiresAtMs, now.value + 100);
+  const database = new Database(storePath, { readonly: true, fileMustExist: true });
+  const renewed = database.prepare(`
+    select heartbeat_at_ms as heartbeatAtMs, expires_at_ms as expiresAtMs
+      from operation_authority_resource_leases where resource_key_sha256 = ?
+  `).get(firstGrant.resourceKeySha256) as { heartbeatAtMs: number; expiresAtMs: number };
+  database.close();
+  assert.deepEqual(renewed, { heartbeatAtMs: now.value, expiresAtMs: now.value + 100 });
+  first.complete("PASS");
+  assert.equal(cancellations, 1);
+
+  const second = authority.prepareDispatch(
+    String(created.authorityId),
+    "automatic-heartbeat-principal",
+    secondAction,
+    "R1",
+  );
+  second.markDispatched();
+  assert.deepEqual(intervals, [25, 25]);
+  authority.close();
+  assert.equal(cancellations, 2);
+});
+
+test("heartbeat scheduler setup failure stays pre-dispatch and permits proven-zero cancellation", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-authority-heartbeat-scheduler-failure-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const authority = new OperationAuthorityRegistry({
+    minimumRisk: minimumAuthorityRisk,
+    storePath: join(root, "authority.sqlite"),
+    instanceId: "heartbeat-scheduler-failure-owner",
+    resourceLeaseTtlMs: 100,
+    resourceLeaseHeartbeatMs: 25,
+    resourceLeaseRecoveryGraceMs: 50,
+    leaseHeartbeatScheduler() {
+      throw new Error("injected heartbeat scheduler setup failure");
+    },
+  });
+  const principal = "heartbeat-scheduler-failure-principal";
+  const action = authorityActionFromToolCall("fs", {
+    operation: "write",
+    target: "local",
+    path: "/tmp/heartbeat-scheduler-failure.txt",
+    content: "provider-call-zero\n",
+  });
+  const created = authority.create({
+    taskId: "heartbeat-scheduler-failure-task",
+    authorityText: "Fail before DISPATCHED if automatic lease renewal cannot be installed.",
+    actions: [{ descriptor: action }],
+  }, principal);
+  const dispatch = authority.prepareDispatch(String(created.authorityId), principal, action, "R1");
+  assert.throws(
+    () => dispatch.markDispatched(),
+    /injected heartbeat scheduler setup failure/u,
+  );
+  assert.equal(dispatch.phase, "CLAIMED");
+  const receipt = dispatch.cancelNotDispatched({
+    providerCallCount: 0,
+    proof: "HEARTBEAT_SCHEDULER_SETUP_PROVIDER_ZERO",
+  });
+  assert.equal(receipt.state, "CANCELLED_NOT_DISPATCHED");
+  const status = authority.status(String(created.authorityId), principal) as {
+    receipts: Array<{ state: string; leaseState: string; providerCallCount?: number }>;
+  };
+  assert.equal(status.receipts[0]?.state, "CANCELLED_NOT_DISPATCHED");
+  assert.equal(status.receipts[0]?.leaseState, "RELEASED");
+  assert.equal(status.receipts[0]?.providerCallCount, 0);
+  authority.close();
+});
+
+test("resource lease recovery grace delays verified-dead takeover after expiry", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-authority-recovery-grace-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const storePath = join(root, "authority.sqlite");
+  const now = { value: 1_787_064_970_000 };
+  const principal = "recovery-grace-principal";
+  const action = authorityActionFromToolCall("fs", {
+    operation: "write",
+    target: "local",
+    path: "/tmp/recovery-grace.txt",
+    content: "grace\n",
+  });
+  const options = (instanceId: string) => ({
+    now: () => now.value,
+    minimumRisk: minimumAuthorityRisk,
+    storePath,
+    instanceId,
+    resourceLeaseTtlMs: 100,
+    resourceLeaseHeartbeatMs: 25,
+    resourceLeaseRecoveryGraceMs: 50,
+  });
+  const owner = new OperationAuthorityRegistry(options("recovery-grace-owner"));
+  const created = owner.create({
+    taskId: "recovery-grace-task",
+    authorityText: "Recover only after expiry plus the configured grace period.",
+    actions: [{ descriptor: action }],
+  }, principal);
+  owner.prepareDispatch(String(created.authorityId), principal, action, "R1").claim();
+  owner.close();
+
+  now.value += 149;
+  const beforeGrace = new OperationAuthorityRegistry(options("recovery-grace-before"));
+  const beforeStatus = beforeGrace.status(String(created.authorityId), principal) as {
+    receipts: Array<{ state: string; leaseState: string }>;
+  };
+  assert.equal(beforeStatus.receipts[0]?.state, "CLAIMED");
+  assert.equal(beforeStatus.receipts[0]?.leaseState, "ACTIVE");
+  beforeGrace.close();
+
+  now.value += 2;
+  const afterGrace = new OperationAuthorityRegistry(options("recovery-grace-after"));
+  const afterStatus = afterGrace.status(String(created.authorityId), principal) as {
+    receipts: Array<{ state: string; leaseState: string }>;
+  };
+  assert.equal(afterStatus.receipts[0]?.state, "CANCELLED_NOT_DISPATCHED");
+  assert.equal(afterStatus.receipts[0]?.leaseState, "RELEASED");
+  afterGrace.close();
+});
+
+test("expired live owner cannot be fenced out, but a dead dispatched owner requires reconciliation", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-authority-lease-reconcile-"));
+  t.after(async () => rm(root, { recursive: true, force: true }));
+  const liveStorePath = join(root, "live.sqlite");
+  const now = { value: 1_787_064_975_000 };
+  const principal = "lease-reconcile-principal";
+  const firstAction = authorityActionFromToolCall("fs", {
+    operation: "write",
+    target: "local",
+    path: "/tmp/lease-reconcile.txt",
+    content: "first\n",
+  });
+  const replacementAction = authorityActionFromToolCall("fs", {
+    operation: "patch",
+    target: "local",
+    path: "/tmp/lease-reconcile.txt",
+    patch: "*** Begin Patch\n*** Update File: lease-reconcile.txt\n@@\n-first\n+second\n*** End Patch",
+  });
+
+  const liveOwner = registry(now, liveStorePath, "lease-live-owner", 50);
+  const liveCreated = liveOwner.create({
+    taskId: "lease-live-task",
+    authorityText: "A live process retains its writer lease after TTL until it heartbeats.",
+    actions: [{ descriptor: firstAction }],
+  }, principal);
+  const liveDispatch = liveOwner.prepareDispatch(
+    String(liveCreated.authorityId), principal, firstAction, "R1",
+  );
+  liveDispatch.claim();
+  now.value += 100;
+  const contender = registry(now, liveStorePath, "lease-live-contender", 50);
+  const liveReplacement = contender.create({
+    taskId: "lease-live-contender-task",
+    authorityText: "Do not take over from a verified-live writer.",
+    actions: [{ descriptor: replacementAction }],
+  }, principal);
+  assert.throws(
+    () => contender.prepareDispatch(
+      String(liveReplacement.authorityId), principal, replacementAction, "R1",
+    ).claim(),
+    (error: unknown) => code(error) === "RESOURCE_BUSY",
+  );
+  assert.equal(liveDispatch.heartbeat().expiresAtMs, now.value + 50);
+  liveDispatch.cancelNotDispatched({ providerCallCount: 0, proof: "LIVE_OWNER_ZERO" });
+  contender.close();
+  liveOwner.close();
+
+  const recoveryStorePath = join(root, "recovery.sqlite");
+  const deadNow = { value: 1_787_064_980_000 };
+  const deadOwner = registry(deadNow, recoveryStorePath, "lease-dead-owner", 50);
+  const deadCreated = deadOwner.create({
+    taskId: "lease-dead-task",
+    authorityText: "Require reconciliation after a dispatched writer dies.",
+    actions: [{ descriptor: firstAction }],
+  }, principal);
+  const deadDispatch = deadOwner.prepareDispatch(
+    String(deadCreated.authorityId), principal, firstAction, "R1",
+  );
+  const deadClaim = deadDispatch.claim();
+  deadNow.value += 25;
+  const dispatchedGrant = deadDispatch.markDispatched();
+  assert.equal(dispatchedGrant.leaseExpiresAtMs, deadNow.value + 50);
+  deadOwner.close();
+  deadNow.value += 51;
+
+  const recovered = registry(deadNow, recoveryStorePath, "lease-recovery-owner", 50);
+  const status = recovered.status(String(deadCreated.authorityId), principal) as {
+    receipts: Array<{ state: string; leaseState: string }>;
+  };
+  assert.equal(status.receipts[0]?.state, "UNCERTAIN");
+  assert.equal(status.receipts[0]?.leaseState, "RECOVERY_REQUIRED");
+  const replacement = recovered.create({
+    taskId: "lease-recovery-replacement",
+    authorityText: "Take over only after verified resource reconciliation.",
+    actions: [{ descriptor: replacementAction }],
+  }, principal);
+  assert.throws(
+    () => recovered.prepareDispatch(
+      String(replacement.authorityId), principal, replacementAction, "R1",
+    ).claim(),
+    (error: unknown) => code(error) === "RESOURCE_BUSY",
+  );
+  assert.throws(
+    () => recovered.reconcileResourceLease({
+      principalKeyFingerprint: principal,
+      resourceKeySha256: deadClaim.resourceKeySha256,
+      actionClaimId: deadClaim.actionClaimId,
+      fencingToken: deadClaim.fencingToken,
+      outcome: "RESOURCE_VERIFIED",
+      evidenceDigest: "0".repeat(64),
+    }),
+    (error: unknown) => code(error) === "PRECONDITION_FAILED",
+  );
+  const evidenceDigest = createHash("sha256")
+    .update("verified post-readback fixture")
+    .digest("hex");
+  assert.throws(
+    () => recovered.reconcileResourceLease({
+      principalKeyFingerprint: principal,
+      resourceKeySha256: deadClaim.resourceKeySha256,
+      actionClaimId: deadClaim.actionClaimId,
+      fencingToken: deadClaim.fencingToken,
+      outcome: "INVALID_RECONCILIATION_OUTCOME" as never,
+      evidenceDigest,
+    }),
+    (error: unknown) => code(error) === "PRECONDITION_FAILED",
+  );
+  const reconciliation = recovered.reconcileResourceLease({
+    principalKeyFingerprint: principal,
+    resourceKeySha256: deadClaim.resourceKeySha256,
+    actionClaimId: deadClaim.actionClaimId,
+    fencingToken: deadClaim.fencingToken,
+    outcome: "RESOURCE_VERIFIED",
+    evidenceDigest,
+  });
+  assert.equal(reconciliation.released, true);
+
+  const next = recovered.prepareDispatch(
+    String(replacement.authorityId), principal, replacementAction, "R1",
+  );
+  const nextClaim = next.claim();
+  assert.ok(nextClaim.fencingToken > deadClaim.fencingToken);
+  const store = (recovered as unknown as { store: DurableAuthorityStore }).store;
+  assert.equal(store.terminalizeClaim({
+    authorityId: deadClaim.authorityId,
+    actionClaimId: deadClaim.actionClaimId,
+    resourceKeySha256: deadClaim.resourceKeySha256,
+    fencingToken: deadClaim.fencingToken,
+    completedAtMs: deadNow.value,
+    state: "FAIL",
+    errorCode: "STALE_WRITER_AFTER_RECONCILIATION",
+    maximumReceipts: 256,
+  }), false);
+  next.cancelNotDispatched({ providerCallCount: 0, proof: "RECOVERY_REPLACEMENT_ZERO" });
+  recovered.close();
 });
 
 test("atomic claim, use, and resource lease admit one writer and advance the fence after release", async (t) => {
@@ -1349,7 +2071,7 @@ test("restart cancels CLAIMED and freezes DISPATCHED crashes without replay", as
       cwd: `/tmp/${crashState.toLowerCase()}`,
       command: `git push origin ${crashState.toLowerCase()}-crash`,
     });
-    const first = registry(now, storePath, `${crashState.toLowerCase()}-owner-a`);
+    const first = registry(now, storePath, `${crashState.toLowerCase()}-owner-a`, 2);
     const created = first.create({
       taskId: `${crashState.toLowerCase()}-crash-task`,
       authorityText: `Crash at ${crashState} without replay.`,
@@ -1365,8 +2087,8 @@ test("restart cancels CLAIMED and freezes DISPATCHED crashes without replay", as
     }
     first.close();
 
-    now.value += 1;
-    const recovered = registry(now, storePath, `${crashState.toLowerCase()}-owner-b`);
+    now.value += 2;
+    const recovered = registry(now, storePath, `${crashState.toLowerCase()}-owner-b`, 2);
     const status = recovered.status(authorityId, principal) as {
       receipts: Array<{ state: string; leaseState: string; evidence?: { reasonCode?: string } }>;
     };
@@ -1374,7 +2096,10 @@ test("restart cancels CLAIMED and freezes DISPATCHED crashes without replay", as
       status.receipts[0]?.state,
       crashState === "CLAIMED" ? "CANCELLED_NOT_DISPATCHED" : "UNCERTAIN",
     );
-    assert.equal(status.receipts[0]?.leaseState, crashState === "CLAIMED" ? "RELEASED" : "FROZEN");
+    assert.equal(
+      status.receipts[0]?.leaseState,
+      crashState === "CLAIMED" ? "RELEASED" : "RECOVERY_REQUIRED",
+    );
     assert.equal(
       status.receipts[0]?.evidence?.reasonCode,
       crashState === "CLAIMED"
@@ -1452,7 +2177,7 @@ test("persistent terminal SQL fault rolls back receipt and lease, then restart f
   t.after(async () => rm(root, { recursive: true, force: true }));
   const storePath = join(root, "authority.sqlite");
   const now = { value: 1_787_068_000_000 };
-  const authority = registry(now, storePath, "terminal-fault-owner-a");
+  const authority = registry(now, storePath, "terminal-fault-owner-a", 2);
   const principal = "receipt-fault-principal";
   const descriptor = authorityActionFromToolCall("fs", {
     operation: "write",
@@ -1514,13 +2239,13 @@ test("persistent terminal SQL fault rolls back receipt and lease, then restart f
   fault.exec("drop trigger fail_terminal_lease_update");
   fault.close();
 
-  now.value += 1;
-  const recovered = registry(now, storePath, "terminal-fault-owner-b");
+  now.value += 2;
+  const recovered = registry(now, storePath, "terminal-fault-owner-b", 2);
   const status = recovered.status(String(created.authorityId), principal) as {
     receipts: Array<{ state: string; leaseState: string; evidence?: { reasonCode?: string } }>;
   };
   assert.equal(status.receipts[0]?.state, "UNCERTAIN");
-  assert.equal(status.receipts[0]?.leaseState, "FROZEN");
+  assert.equal(status.receipts[0]?.leaseState, "RECOVERY_REQUIRED");
   assert.equal(status.receipts[0]?.evidence?.reasonCode, "NONTERMINAL_CLAIM_RECOVERED");
   assert.throws(
     () => recovered.prepareDispatch(String(created.authorityId), principal, descriptor, "R1").claim(),
@@ -1828,6 +2553,162 @@ test("authority preview classifies exact actions without creating or consuming a
     }, "client:session"),
     /Duplicate exact authority actions.*combine repeated identical calls/u,
   );
+});
+
+test("connector activation authority is internal-only, exact, R3, and one-shot", () => {
+  const authority = registry();
+  const digest = (character: string) => `sha256:${character.repeat(64)}`;
+  const descriptor = {
+    tool: "context" as const,
+    operation: "connector_activation_finalize",
+    target: "myDevSpace",
+    resource: "connector:myDevSpace",
+    parameters: {
+      receiptId: "connector-activation-receipt-1",
+      tupleDigest: digest("a"),
+      activePreimageDigest: digest("b"),
+      finalizationPlanDigest: digest("c"),
+      canonicalName: "myDevSpace",
+    },
+  };
+
+  assert.throws(
+    () => authority.create({
+      authorityText: "Attempt to expose the internal activation operation.",
+      actions: [{ descriptor, risk: "R3", uses: 1 }],
+    }, "d".repeat(64)),
+    /unsupported operation context\.connector_activation_finalize/u,
+  );
+  assert.throws(
+    () => authority.preview([{ descriptor }]),
+    /unsupported operation context\.connector_activation_finalize/u,
+  );
+  assert.throws(
+    () => authority.createConnectorActivationAuthority({
+      authorityText: "Approve the exact prepared connector activation.",
+      descriptor: {
+        ...descriptor,
+        parameters: { ...descriptor.parameters, canonicalName: "otherConnector" },
+      },
+    }, "d".repeat(64)),
+    /exact internal R3 activation descriptor/u,
+  );
+
+  const created = authority.createConnectorActivationAuthority({
+    authorityText: "Approve the exact prepared connector activation.",
+    descriptor,
+  }, "d".repeat(64)) as {
+    authorityId: string;
+    actions: Array<{ risk: string; maximumUses: number; consumedUses: number }>;
+  };
+  assert.deepEqual(created.actions.map(({ risk, maximumUses, consumedUses }) => ({
+    risk,
+    maximumUses,
+    consumedUses,
+  })), [{ risk: "R3", maximumUses: 1, consumedUses: 0 }]);
+
+  const dispatch = authority.prepareDispatch(
+    created.authorityId,
+    "d".repeat(64),
+    descriptor,
+    "R3",
+  );
+  const grant = dispatch.claim();
+  assert.equal(grant.risk, "R3");
+  dispatch.markDispatched();
+  assert.equal(dispatch.complete("PASS", { reasonCode: "CONNECTOR_ACTIVATED" }).state, "PASS");
+  assert.throws(
+    () => authority.prepareDispatch(
+      created.authorityId,
+      "d".repeat(64),
+      descriptor,
+      "R3",
+    ).claim(),
+    (error: unknown) => code(error) === "AUTHORITY_CONSUMED",
+  );
+  authority.close();
+});
+
+test("recovered connector activation exact OAuth receipt atomically terminalizes UNCERTAIN to PASS", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-connector-activation-recovery-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const storePath = join(root, "authority.sqlite");
+  const now = { value: 1_700_000_000_000 };
+  const principal = "d".repeat(64);
+  const digest = (character: string) => `sha256:${character.repeat(64)}`;
+  const descriptor = {
+    tool: "context" as const,
+    operation: "connector_activation_finalize",
+    target: "myDevSpace",
+    resource: "connector:myDevSpace",
+    parameters: {
+      receiptId: "connector-activation-recovery-receipt",
+      tupleDigest: digest("a"),
+      activePreimageDigest: digest("b"),
+      finalizationPlanDigest: digest("c"),
+      canonicalName: "myDevSpace",
+    },
+  };
+  const first = registry(now, storePath, "connector-recovery-owner-a", 2);
+  const created = first.createConnectorActivationAuthority({
+    authorityText: "Approve this exact recovered connector activation once.",
+    descriptor,
+  }, principal) as { authorityId: string };
+  const dispatch = first.prepareDispatch(created.authorityId, principal, descriptor, "R3");
+  const grant = dispatch.claim();
+  dispatch.markDispatched();
+  const uncertain = dispatch.complete("UNCERTAIN", {
+    reasonCode: "CONNECTOR_ACTIVATION_PROCESS_CRASH",
+  });
+  assert.equal(uncertain.state, "UNCERTAIN");
+  assert.equal(uncertain.leaseState, "RECOVERY_REQUIRED");
+  first.close();
+
+  now.value += 10;
+  const recovered = registry(now, storePath, "connector-recovery-owner-b", 2);
+  const recoveryInput = {
+    principalKeyFingerprint: principal,
+    authorityId: created.authorityId,
+    actionClaimId: grant.actionClaimId,
+    actionFingerprint: grant.fingerprint,
+    resourceKeySha256: grant.resourceKeySha256,
+    fencingToken: grant.fencingToken,
+    oauthProofDigest: digest("e"),
+    evidenceDigest: digest("f"),
+  };
+  const completed = recovered.terminalizeRecoveredConnectorActivationClaimPass(recoveryInput);
+  assert.equal(completed.state, "PASS");
+  assert.equal(completed.result, "PASS");
+  assert.equal(completed.leaseState, "RELEASED");
+  assert.equal(completed.recovered, true);
+  assert.equal(completed.oauthProofDigest, recoveryInput.oauthProofDigest);
+  assert.match(completed.reconciliationEvidenceDigest, /^sha256:[a-f0-9]{64}$/u);
+
+  const idempotent = recovered.terminalizeRecoveredConnectorActivationClaimPass(recoveryInput);
+  assert.equal(idempotent.receiptDigest, completed.receiptDigest);
+  assert.equal(idempotent.completedAt, completed.completedAt);
+  assert.throws(
+    () => recovered.terminalizeRecoveredConnectorActivationClaimPass({
+      ...recoveryInput,
+      oauthProofDigest: digest("9"),
+    }),
+    (error: unknown) => code(error) === "AUTHORITY_STATE_UNCERTAIN",
+  );
+  assert.throws(
+    () => recovered.terminalizeRecoveredConnectorActivationClaimPass({
+      ...recoveryInput,
+      principalKeyFingerprint: "8".repeat(64),
+    }),
+    (error: unknown) => code(error) === "AUTHORITY_PRINCIPAL_MISMATCH",
+  );
+  const status = recovered.status(created.authorityId, principal) as {
+    receipts: Array<{ state: string; result: string; leaseState: string }>;
+  };
+  assert.deepEqual(
+    status.receipts.map(({ state, result, leaseState }) => ({ state, result, leaseState })),
+    [{ state: "PASS", result: "PASS", leaseState: "RELEASED" }],
+  );
+  recovered.close();
 });
 
 test("R0 actions cannot be wrapped in authority and elevation commands fail closed", () => {
@@ -2178,6 +3059,39 @@ test("exec and process policy binds exact execution dimensions and raises mutati
   );
   assert.notEqual(actionFingerprint(localResize), actionFingerprint(changedGenerationResize));
   assert.notEqual(actionFingerprint(localResize), actionFingerprint(remoteResize));
+});
+
+test("readOnlyStats never performs expiry cleanup writes", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-authority-readiness-stats-"));
+  const storePath = join(root, "authority.sqlite");
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const now = { value: 0 };
+  const authority = registry(now, storePath, "readiness-stats-owner");
+  t.after(() => authority.close());
+  authority.create({
+    authorityText: "Authorize one expired readiness fixture.",
+    expiresInSeconds: 60,
+    actions: [{
+      descriptor: authorityActionFromToolCall("fs", {
+        operation: "write",
+        target: "local",
+        path: join(root, "fixture.txt"),
+        content: "fixture",
+      }),
+    }],
+  }, "a".repeat(64));
+  now.value = 3 * 24 * 60 * 60_000;
+  const fault = new Database(storePath);
+  fault.exec(`
+    create trigger block_readiness_expiry_delete
+    before delete on operation_authorities
+    begin
+      select raise(abort, 'readiness-delete-blocked');
+    end;
+  `);
+  fault.close();
+  assert.doesNotThrow(() => authority.readOnlyStats());
+  assert.throws(() => authority.stats(), /readiness-delete-blocked/u);
 });
 
 function code(error: unknown): string | undefined {

@@ -40,7 +40,8 @@
         "git",
         "gui",
         "mcp",
-        "durableProcess"
+        "durableProcess",
+        "filesystem"
       ],
       "properties": {
         "fs": { "type": "boolean" },
@@ -51,7 +52,31 @@
         "git": { "type": "boolean" },
         "gui": { "type": "boolean" },
         "mcp": { "type": "boolean" },
-        "durableProcess": { "type": "boolean" }
+        "durableProcess": { "type": "boolean" },
+        "filesystem": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "atomicReplace",
+            "atomicNoReplace",
+            "renameExchange",
+            "directoryFsync",
+            "hardlinkPublish",
+            "trash",
+            "reflink",
+            "sparseCopy"
+          ],
+          "properties": {
+            "atomicReplace": { "type": "boolean" },
+            "atomicNoReplace": { "type": "boolean" },
+            "renameExchange": { "type": "boolean" },
+            "directoryFsync": { "type": "boolean" },
+            "hardlinkPublish": { "type": "boolean" },
+            "trash": { "type": "boolean" },
+            "reflink": { "type": "boolean" },
+            "sparseCopy": { "type": "boolean" }
+          }
+        }
       }
     },
     "reason": { "type": "string", "minLength": 1, "maxLength": 1000 },

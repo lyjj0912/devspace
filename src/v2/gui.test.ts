@@ -28,6 +28,7 @@ test("gui capabilities and observe create a bounded generation session", async (
   const capabilities = await fixture.gui.execute({ operation: "capabilities" });
   assert.equal(capabilities.available, true);
   assert.equal(capabilities.targetId, "local");
+  assert.equal(capabilities.screenCapture, false);
 
   const observed = await fixture.gui.execute({
     operation: "observe",
@@ -158,6 +159,7 @@ test("gui sessions expire and configured non-macOS targets fail explicitly", asy
   });
   assert.equal(capabilities.available, false);
   assert.equal(capabilities.platform, "linux");
+  assert.equal(capabilities.screenCapture, false);
 });
 
 test("gui capabilities report configured remote TCC denial as unavailable without advertising usability", async (t) => {
@@ -171,6 +173,7 @@ test("gui capabilities report configured remote TCC denial as unavailable withou
   assert.equal(capabilities.configured, true);
   assert.equal(capabilities.available, false);
   assert.equal(capabilities.guiMode, "ssh-stdio");
+  assert.equal(capabilities.screenCapture, false);
   assert.match(String(capabilities.reason), /Accessibility|TCC/i);
 });
 
@@ -183,6 +186,7 @@ test("gui capabilities include a reason when the node reports accessibility=fals
   });
   assert.equal(capabilities.configured, true);
   assert.equal(capabilities.available, false);
+  assert.equal(capabilities.screenCapture, false);
   assert.match(String(capabilities.reason), /Accessibility/i);
 });
 
@@ -312,7 +316,7 @@ class FixtureGuiRunner implements GuiNodeRunner {
       return {
         platform: "macos",
         accessibility: !this.disabledTargets.has(target.id),
-        screenCapture: "not_probed",
+        screenCapture: false,
         frontmostProcess: { name: this.state.application.name, pid: this.state.application.pid },
       };
     }

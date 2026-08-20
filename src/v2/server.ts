@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import {
   McpServer,
   ResourceTemplate,
@@ -87,6 +88,7 @@ import {
   targetSummary,
 } from "./targets.js";
 import type { UniversalBrokerMetrics } from "./metrics.js";
+import type { OperationAuditSink } from "./operation-audit.js";
 
 export interface UniversalBrokerServices {
   targets?: TargetRegistry;
@@ -101,11 +103,15 @@ export interface UniversalBrokerServices {
   selfManagement?: UniversalSelfManagementService;
   runtimeIdentity?: RuntimeIdentity;
   metrics?: UniversalBrokerMetrics;
+  operationAudit?: OperationAuditSink;
 }
 
 interface UniversalBrokerRequestBoundary {
   runtimeIdentity?: RuntimeIdentity;
   metrics?: UniversalBrokerMetrics;
+  operationAudit?: OperationAuditSink;
+  authority?: OperationAuthorityRegistry;
+  authorityPrincipal?: AuthorityPrincipalResolver;
 }
 
 export function createUniversalBrokerMcpServer(
@@ -123,6 +129,7 @@ export function createUniversalBrokerMcpServer(
   );
   const authority = services.authority ?? new OperationAuthorityRegistry({
     minimumRisk: minimumAuthorityRisk,
+    metrics: services.metrics,
   });
   const principalConfiguration = services.authorityPrincipal ?? {
     environment: "production",
@@ -134,19 +141,25 @@ export function createUniversalBrokerMcpServer(
   const requestBoundary: UniversalBrokerRequestBoundary = {
     runtimeIdentity: services.runtimeIdentity,
     metrics: services.metrics,
+    operationAudit: services.operationAudit,
+    authority,
+    authorityPrincipal,
   };
 
   if (services.mcpProxy && services.metrics) {
     services.mcpProxy.setOperationalObserver?.({
-      reconnect: ({ routeId, result }) => services.metrics!.recordMcpReconnect(routeId, result),
-      connection: ({ routeId, state }) => services.metrics!.recordMcpConnection(routeId, state),
+      reconnect: ({ transport, result }) => services.metrics!.recordMcpReconnect(transport, result),
+      connection: ({ transport, state }) => services.metrics!.recordMcpConnection(transport, state),
     });
   }
 
   if (services.execution) {
     registerProcessOutputResource(server, services.execution, authorityPrincipal);
   }
-  if (services.mcpProxy) registerMcpResultResource(server, services.mcpProxy, authorityPrincipal);
+  if (services.mcpProxy) {
+    registerMcpResourceProxy(server, services.mcpProxy, authorityPrincipal);
+    registerMcpResultResource(server, services.mcpProxy, authorityPrincipal);
+  }
   if (services.contexts) registerContextDiffResource(server, services.contexts, authorityPrincipal);
   if (services.artifacts) registerArtifactResource(server, services.artifacts, authorityPrincipal);
 
@@ -159,6 +172,7 @@ export function createUniversalBrokerMcpServer(
         services.contexts,
         services.targets,
         services.execution,
+        services.filesystem,
         services.mcpProxy,
         services.gui,
         authority,
@@ -277,6 +291,7 @@ function registerGuiTool(
         action,
         risk,
         () => gui.execute(typed, authenticated.callContext),
+        { auditObservation: observation, authInfo: authenticated.authInfo },
       );
       return successfulToolResult(data, undefined, guiSummaryText(typed.operation, data));
       },
@@ -349,6 +364,7 @@ function registerArtifactTool(
         normalized.action,
         normalized.risk,
         () => artifacts.execute(typed, authenticated.callContext),
+        { auditObservation: observation, authInfo: authenticated.authInfo },
       );
       const result = successfulToolResult(
         data,
@@ -443,7 +459,11 @@ function registerMcpTool(
           (dispatch) => preparedInvocation
             ? preparedInvocation.execute(dispatch)
             : proxy.execute(typed, authenticated.callContext, requestMeta),
-          { adapterBoundary: Boolean(preparedInvocation) },
+          {
+            adapterBoundary: Boolean(preparedInvocation),
+            auditObservation: observation,
+            authInfo: authenticated.authInfo,
+          },
         );
       } finally {
         preparedInvocation?.release();
@@ -487,7 +507,7 @@ function registerFilesystemTool(
       const authenticated = requireAuthenticatedPrincipal(extra, authorityPrincipal);
       requireScope(
         authenticated.authInfo,
-        isFilesystemMutation(input.operation) ? "devspace.write" : "devspace.read",
+        isFilesystemMutation(input.operation, input.sync?.phase) ? "devspace.write" : "devspace.read",
       );
       const typed = mergeOperationRequestMeta(input, requestMeta) as UniversalFilesystemInput;
       assertGenerationApplicability(requestMeta, "fs", typed.operation, {
@@ -502,8 +522,27 @@ function registerFilesystemTool(
         authenticated.callContext,
       );
       assertTargetGeneration(requestMeta, targetBinding.generation, observation);
+      const syncBinding = typed.operation === "sync" && typed.sync?.phase === "apply"
+        ? await filesystem.prepareSyncAuthorityBinding(typed, authenticated.callContext)
+        : undefined;
+      if (
+        syncBinding
+        && (
+          syncBinding.targetId !== targetBinding.target.id
+          || syncBinding.targetGeneration !== targetBinding.generation
+        )
+      ) {
+        throw new UniversalBrokerError(
+          "SYNC_PLAN_STALE",
+          "The immutable filesystem sync plan no longer matches the selected target generation.",
+          { evidence: { planId: syncBinding.planId, targetId: syncBinding.targetId } },
+        );
+      }
       const action = bindTargetAuthority(
-        filesystemAction(typed, targetBinding.target.id),
+        filesystemAction(typed, targetBinding.target.id, syncBinding ? {
+          syncPlanDigest: syncBinding.planDigest,
+          syncDeleteMode: syncBinding.deleteMode,
+        } : undefined),
         targetBinding,
       );
       const risk = filesystemRisk(
@@ -518,6 +557,7 @@ function registerFilesystemTool(
         action,
         risk,
         () => filesystem.execute(typed, authenticated.callContext),
+        { auditObservation: observation, authInfo: authenticated.authInfo },
       );
       return successfulToolResult(
         data,
@@ -598,7 +638,11 @@ function registerExecTool(
           dispatch,
           authenticated.callContext,
         ),
-        { adapterBoundary: true },
+        {
+          adapterBoundary: true,
+          auditObservation: observation,
+          authInfo: authenticated.authInfo,
+        },
       );
       return successfulToolResult(
         data,
@@ -688,10 +732,18 @@ function registerProcessTool(
         async (dispatch) => {
           if (typed.operation === "restart_broker") {
             if (!selfManagement) return unavailableSelfManagement("restart_broker");
-            return selfManagement.requestRestart({
+            if (extra.requestId === undefined) {
+              throw new UniversalBrokerError(
+                "RESTART_ACK_NOT_FLUSHED",
+                "Broker restart requires an exact response request identifier.",
+              );
+            }
+            const prepared = await selfManagement.requestRestart({
               reason: typed.reason,
-              delayMs: typed.delayMs,
+              ownerFingerprint: authenticated.principalKeyFingerprint,
+              authorityId: typed.authorityId!,
             });
+            return selfManagement.bindResponse(prepared.transactionId, extra.requestId);
           }
           if (typed.operation === "restart_status") {
             if (!selfManagement) return unavailableSelfManagement("restart_status");
@@ -705,7 +757,11 @@ function registerProcessTool(
           }
           return execution.operate(typed, dispatch, authenticated.callContext);
         },
-        { adapterBoundary: processOperationNeedsBinding(typed.operation) },
+        {
+          adapterBoundary: processOperationNeedsBinding(typed.operation),
+          auditObservation: observation,
+          authInfo: authenticated.authInfo,
+        },
       );
       const text = typed.operation === "list"
         ? `Managed processes: ${Array.isArray(data.processes) ? data.processes.length : 0}`
@@ -743,7 +799,7 @@ function registerProcessOutputResource(
   server.registerResource(
     "Universal Broker process output",
     new ResourceTemplate(
-      "devspace://process/{processId}/output/{offset}/{limit}",
+      "devspace://v1/process/{processId}/output",
       { list: undefined },
     ),
     {
@@ -751,30 +807,18 @@ function registerProcessOutputResource(
       description: "Bounded UTF-8 chunk from the full output retained for a managed process.",
       mimeType: "text/plain",
     },
-    async (uri, variables, extra) => {
+    async (uri, _variables, extra) => {
       const authenticated = requireAuthenticatedPrincipal(extra, authorityPrincipal);
       requireScope(authenticated.authInfo, "devspace.exec");
-      const processId = templateVariable(variables.processId, "processId");
-      const offset = numericTemplateVariable(variables.offset, "offset", 0, Number.MAX_SAFE_INTEGER);
-      const limit = numericTemplateVariable(variables.limit, "limit", 1, 1_048_576);
-      const chunk = await execution.readOutput(
-        processId,
-        offset,
-        limit,
-        authenticated.callContext,
-      );
+      const page = await execution.readOutputResource(uri.href, authenticated.callContext);
       return {
         contents: [{
-          uri: uri.href,
+          uri: String(page.uri ?? uri.href),
           mimeType: "text/plain",
-          text: chunk.text,
-          _meta: {
-            processId,
-            offset,
-            nextOffset: chunk.nextOffset,
-            totalBytes: chunk.totalBytes,
-            truncated: chunk.truncated,
-          },
+          text: String(page.text ?? ""),
+          _meta: Object.fromEntries(
+            Object.entries(page).filter(([key]) => !["uri", "mimeType", "text"].includes(key)),
+          ),
         }],
       };
     },
@@ -789,7 +833,7 @@ function registerMcpResultResource(
   server.registerResource(
     "Universal Broker MCP result",
     new ResourceTemplate(
-      "devspace://mcp/{routeId}/result/{resultId}/{offset}/{limit}",
+      "devspace://v1/mcp-result/{resultId}",
       { list: undefined },
     ),
     {
@@ -815,6 +859,86 @@ function registerMcpResultResource(
   );
 }
 
+function registerMcpResourceProxy(
+  server: McpServer,
+  proxy: UniversalMcpProxy,
+  authorityPrincipal: AuthorityPrincipalResolver,
+): void {
+  server.registerResource(
+    "Universal Broker downstream MCP resource",
+    new ResourceTemplate(
+      "devspace://v1/mcp/{routeId}/resource/{opaque}",
+      { list: undefined },
+    ),
+    {
+      title: "Owner-bound downstream MCP resource",
+      description: "Broker-proxied downstream MCP content bound to its owner, route generation, and expiry.",
+    },
+    async (uri, _variables, extra) => {
+      const authenticated = requireAuthenticatedPrincipal(extra, authorityPrincipal);
+      requireScope(authenticated.authInfo, "devspace.mcp");
+      const response = await proxy.execute(
+        { operation: "read_resource", uri: uri.href },
+        authenticated.callContext,
+      );
+      const projected = recordValue(response.result);
+      const value = recordValue(projected?.value);
+      if (!value || !Array.isArray(value.contents)) {
+        throw new UniversalBrokerError(
+          "STATE_CORRUPTED",
+          "Downstream MCP resource proxy returned an invalid content envelope.",
+        );
+      }
+      return {
+        contents: value.contents.map(resourceContentFromProxy),
+      };
+    },
+  );
+}
+
+function resourceContentFromProxy(value: unknown): {
+  uri: string;
+  mimeType?: string;
+  text: string;
+  _meta?: Record<string, unknown>;
+} | {
+  uri: string;
+  mimeType?: string;
+  blob: string;
+  _meta?: Record<string, unknown>;
+} {
+  const record = recordValue(value);
+  if (!record || typeof record.uri !== "string") {
+    throw new UniversalBrokerError(
+      "STATE_CORRUPTED",
+      "Downstream MCP resource content is invalid.",
+    );
+  }
+  const metadata = Object.fromEntries(
+    Object.entries(record).filter(([key]) => !["uri", "mimeType", "text", "blob"].includes(key)),
+  );
+  if (typeof record.text === "string") {
+    return {
+      uri: record.uri,
+      ...(typeof record.mimeType === "string" ? { mimeType: record.mimeType } : {}),
+      text: record.text,
+      ...(Object.keys(metadata).length > 0 ? { _meta: metadata } : {}),
+    };
+  }
+  if (typeof record.blob === "string") {
+    return {
+      uri: record.uri,
+      ...(typeof record.mimeType === "string" ? { mimeType: record.mimeType } : {}),
+      blob: record.blob,
+      ...(Object.keys(metadata).length > 0 ? { _meta: metadata } : {}),
+    };
+  }
+  throw new UniversalBrokerError(
+    "STATE_CORRUPTED",
+    "Downstream MCP resource content has neither text nor blob data.",
+  );
+}
+
 function registerArtifactResource(
   server: McpServer,
   artifacts: UniversalArtifactService,
@@ -822,7 +946,7 @@ function registerArtifactResource(
 ): void {
   server.registerResource(
     "Universal Broker artifact",
-    new ResourceTemplate("devspace://artifact/{artifactId}", { list: undefined }),
+    new ResourceTemplate("devspace://v1/artifact/{artifactId}", { list: undefined }),
     {
       title: "Immutable artifact content",
       description: "Owner-bound bytes from an immutable Universal Broker CAS artifact.",
@@ -884,7 +1008,7 @@ function registerTargetTool(
       });
       switch (operation) {
         case "list": {
-          const data = await targets.list({ cursor, limit });
+          const data = await targets.list({ cursor, limit }, authenticated.callContext);
           return successfulToolResult(data, undefined, targetListText(data.targets));
         }
         case "resolve": {
@@ -919,6 +1043,7 @@ function registerContextTool(
   contexts: ContextRegistry,
   targets: TargetRegistry,
   execution: UniversalExecutionPlane | undefined,
+  filesystem: UniversalFilesystemService | undefined,
   mcpProxy: UniversalMcpProxy | undefined,
   gui: UniversalGuiService | undefined,
   authority: OperationAuthorityRegistry,
@@ -993,6 +1118,7 @@ function registerContextTool(
             targets,
             contexts,
             execution,
+            filesystem,
             mcpProxy,
             gui,
             authenticated.callContext,
@@ -1006,12 +1132,14 @@ function registerContextTool(
           );
         }
         case "authorize": {
+          requireActivatedConnectorForRisk(authenticated.authInfo, "R1");
           requireAuthorityPlanningInputScopes(authenticated.authInfo, actions);
           const normalizedActions = await normalizeRequestedAuthorityActions(
             actions,
             targets,
             contexts,
             execution,
+            filesystem,
             mcpProxy,
             gui,
             authenticated.callContext,
@@ -1041,6 +1169,7 @@ function registerContextTool(
           return successfulToolResult(data, undefined, `Task authority status: ${authorityId}`);
         }
         case "invalidate_authority": {
+          requireActivatedConnectorForRisk(authenticated.authInfo, "R1");
           const data = authority.invalidate(
             principal(),
             taskInstanceId ?? "",
@@ -1053,6 +1182,7 @@ function registerContextTool(
           );
         }
         case "release_authority": {
+          requireActivatedConnectorForRisk(authenticated.authInfo, "R1");
           if (!authorityId) {
             throw new UniversalBrokerError(
               "PRECONDITION_FAILED",
@@ -1075,6 +1205,7 @@ function registerContextTool(
               { target, path, mode, baseRef, task },
               authenticated.callContext,
             ),
+            { auditObservation: observation, authInfo: authenticated.authInfo },
           );
           return successfulToolResult(
             data,
@@ -1109,6 +1240,7 @@ function registerContextTool(
             action,
             minimumAuthorityRisk(action),
             () => contexts.close(contextId, authenticated.callContext),
+            { auditObservation: observation, authInfo: authenticated.authInfo },
           );
           return successfulToolResult(data, undefined, `Closed context ${contextId}.`);
         }
@@ -1143,7 +1275,7 @@ function registerContextDiffResource(
   server.registerResource(
     "Universal Broker context diff",
     new ResourceTemplate(
-      "devspace://context-diff/{diffId}/{offset}/{limit}",
+      "devspace://v1/context-diff/{diffId}",
       { list: undefined },
     ),
     {
@@ -1184,6 +1316,16 @@ interface AuthenticatedAuthorityRequest {
 interface GenerationObservation {
   targetGeneration?: string;
   routeGeneration?: string;
+  audit?: {
+    principalFingerprint: string;
+    authorityId?: string;
+    action: AuthorityActionDescriptor;
+    risk: AuthorityRiskClass;
+    claimState?: string;
+    dispatchState: "NOT_DISPATCHED" | "CLAIMED" | "DISPATCHED" | "ACKNOWLEDGED" | "UNKNOWN";
+    actionClaimId?: string;
+    receiptDigest?: string;
+  };
 }
 
 async function executeMeasuredUniversalTool(
@@ -1198,32 +1340,239 @@ async function executeMeasuredUniversalTool(
 ): Promise<CallToolResult> {
   const startedAt = performance.now();
   const observation: GenerationObservation = {};
+  let requestMeta: UniversalRequestMeta = {};
   const result = await executeUniversalTool(async () => {
-    const requestMeta = requestMetaFromExtra(extra);
+    requestMeta = requestMetaFromExtra(extra);
     assertSchemaGeneration(requestMeta, boundary.runtimeIdentity);
-    assertHumanApprovalVerifier(requestMeta);
+    assertAuthorityContractGeneration(requestMeta, boundary.runtimeIdentity);
     return callback(requestMeta, observation);
   });
   applyObservedGenerations(result, boundary.runtimeIdentity, observation);
-  const metrics = boundary.metrics;
-  if (!metrics) return result;
   const measured = measuredToolResult(result, tool);
-  try {
-    metrics.recordToolRequest(tool, operation, measured.result, performance.now() - startedAt);
-    if (measured.result === "unknown") {
-      metrics.recordDispatchUnknown(measured.transport);
+  const metrics = boundary.metrics;
+  if (metrics) {
+    try {
+      metrics.recordToolRequest(
+        tool,
+        operation,
+        measured.result,
+        performance.now() - startedAt,
+        measured.errorCode,
+      );
+      if (measured.result === "unknown") {
+        metrics.recordDispatchUnknown(measured.transport);
+      }
+    } catch {
+      // Instrumentation must never replace the bounded tool result.
     }
-  } catch {
-    // Instrumentation must never replace the bounded tool result.
   }
+  await recordOperationAudit(
+    boundary,
+    tool,
+    operation,
+    extra,
+    requestMeta,
+    observation,
+    result,
+    measured.result,
+  );
   return result;
+}
+
+async function recordOperationAudit(
+  boundary: UniversalBrokerRequestBoundary,
+  tool: UniversalToolName,
+  operation: string,
+  extra: AuthorityRequestExtra,
+  requestMeta: UniversalRequestMeta,
+  observation: GenerationObservation,
+  result: CallToolResult,
+  measuredResult: "pass" | "fail" | "unknown",
+): Promise<void> {
+  const sink = boundary.operationAudit;
+  if (!sink) return;
+  let receiptDigest = observation.audit?.receiptDigest;
+  let actionClaimId = observation.audit?.actionClaimId;
+  try {
+    const envelope = recordValue(result.structuredContent);
+    const error = recordValue(envelope?.error);
+    const operationId = typeof envelope?.operationId === "string"
+      ? envelope.operationId
+      : `op_${String(extra.requestId ?? "unknown")}`;
+    const principalFingerprint = observation.audit?.principalFingerprint
+      ?? boundary.authorityPrincipal?.(extra);
+    if (!principalFingerprint) return;
+    const action = observation.audit?.action;
+    const routeId = tool === "mcp" && typeof action?.resource === "string"
+      ? action.resource
+      : undefined;
+    const outcomePromise = sink.record({
+      operationId,
+      correlationId: requestMeta.requestId ?? String(extra.requestId ?? operationId),
+      principalFingerprint,
+      ...(requestMeta.taskInstanceId ? { taskInstanceId: requestMeta.taskInstanceId } : {}),
+      ...(observation.audit?.authorityId ?? requestMeta.authorityId
+        ? { authorityId: observation.audit?.authorityId ?? requestMeta.authorityId }
+        : {}),
+      ...(action ? { action } : {}),
+      ...(typeof action?.target === "string" ? { targetId: action.target } : {}),
+      ...(observation.targetGeneration
+        ? { targetGeneration: auditDigest(observation.targetGeneration) }
+        : {}),
+      ...(routeId ? { routeId } : {}),
+      ...(observation.routeGeneration ? { routeGeneration: auditDigest(observation.routeGeneration) } : {}),
+      tool,
+      operation,
+      risk: observation.audit?.risk ?? "R0",
+      ...(observation.audit?.claimState ? { claimState: observation.audit.claimState } : {}),
+      dispatchState: typeof error?.dispatchState === "string"
+        ? error.dispatchState
+        : observation.audit?.dispatchState ?? "NOT_DISPATCHED",
+      result: measuredResult,
+      ...(typeof error?.code === "string" ? { errorCode: error.code } : {}),
+      ...(observation.audit?.receiptDigest
+        ? { receiptDigest: observation.audit.receiptDigest }
+        : {}),
+    });
+    if (!receiptDigest || !actionClaimId || !observation.audit?.authorityId || !boundary.authority) {
+      void outcomePromise.then((outcome) => {
+        recordAuditMetric(boundary, outcome.status === "RECORDED" ? "recorded" : "sink_failed");
+      }).catch(() => recordAuditMetric(boundary, "sink_failed"));
+      return;
+    }
+    // A provider mutation may return only after its audit event is durable. R0
+    // observations retain the configured batching policy and are drained on
+    // graceful shutdown, but an authority receipt forces this exact batch now.
+    await sink.flush().catch(() => undefined);
+    const outcome = await outcomePromise;
+    recordAuditMetric(boundary, outcome.status === "RECORDED" ? "recorded" : "sink_failed");
+    const linked = attachReceiptAuditResult(
+      boundary,
+      observation,
+      outcome.status === "RECORDED"
+        ? {
+            status: "RECORDED",
+            receiptDigest,
+            actionClaimId,
+            eventDigest: outcome.eventDigest,
+          }
+        : {
+            status: "SINK_FAILED",
+            receiptDigest,
+            actionClaimId,
+            errorCode: "AUDIT_SINK_FAILED",
+          },
+    );
+    attachAuditMetadata(result, {
+      status: outcome.status,
+      ...(outcome.status === "RECORDED" ? { eventDigest: outcome.eventDigest } : {}),
+      ...(receiptDigest ? { receiptDigest } : {}),
+      ...(linked.authorityReceiptAuditState
+        ? { authorityReceiptAuditState: linked.authorityReceiptAuditState }
+        : {}),
+      ...(linked.authorityReceiptAuditEventDigest
+        ? { authorityReceiptAuditEventDigest: linked.authorityReceiptAuditEventDigest }
+        : {}),
+      ...(linked.errorCode ? { authorityReceiptAuditErrorCode: linked.errorCode } : {}),
+    });
+  } catch {
+    recordAuditMetric(boundary, "sink_failed");
+    const linked = attachReceiptAuditResult(boundary, observation, {
+      status: "SINK_FAILED",
+      receiptDigest,
+      actionClaimId,
+      errorCode: "AUDIT_RECORD_FAILED",
+    });
+    attachAuditMetadata(result, {
+      status: "SINK_FAILED",
+      ...(receiptDigest ? { receiptDigest } : {}),
+      ...(linked.authorityReceiptAuditState
+        ? { authorityReceiptAuditState: linked.authorityReceiptAuditState }
+        : {}),
+      ...(linked.errorCode ? { authorityReceiptAuditErrorCode: linked.errorCode } : {}),
+    });
+  }
+}
+
+function recordAuditMetric(
+  boundary: UniversalBrokerRequestBoundary,
+  result: "recorded" | "sink_failed",
+): void {
+  try {
+    boundary.metrics?.recordAuditResult(result);
+  } catch {
+    // Audit/metrics failure must never replace a provider result.
+  }
+}
+
+function attachReceiptAuditResult(
+  boundary: UniversalBrokerRequestBoundary,
+  observation: GenerationObservation,
+  input: {
+    status: "RECORDED" | "SINK_FAILED";
+    receiptDigest?: string;
+    actionClaimId?: string;
+    eventDigest?: string;
+    errorCode?: string;
+  },
+): {
+  authorityReceiptAuditState?: string;
+  authorityReceiptAuditEventDigest?: string;
+  errorCode?: string;
+} {
+  const audit = observation.audit;
+  if (
+    !boundary.authority
+    || !audit?.authorityId
+    || !input.actionClaimId
+    || !input.receiptDigest
+  ) return {};
+  try {
+    const receipt = boundary.authority.recordReceiptAuditResult({
+      authorityId: audit.authorityId,
+      actionClaimId: input.actionClaimId,
+      receiptDigest: input.receiptDigest,
+      status: input.status,
+      ...(input.eventDigest ? { auditEventDigest: input.eventDigest } : {}),
+      ...(input.errorCode ? { errorCode: input.errorCode } : {}),
+    });
+    return {
+      authorityReceiptAuditState: receipt?.auditState ?? input.status,
+      ...(receipt?.auditEventDigest
+        ? { authorityReceiptAuditEventDigest: receipt.auditEventDigest }
+        : {}),
+    };
+  } catch (error) {
+    return {
+      errorCode: error instanceof UniversalBrokerError
+        ? error.code
+        : "AUTHORITY_STATE_UNCERTAIN",
+    };
+  }
+}
+
+function attachAuditMetadata(
+  result: CallToolResult,
+  audit: Record<string, unknown>,
+): void {
+  const envelope = recordValue(result.structuredContent);
+  if (!envelope) return;
+  envelope.audit = {
+    ...(recordValue(envelope.audit) ?? {}),
+    ...audit,
+  };
 }
 
 function requestMetaFromExtra(extra: AuthorityRequestExtra): UniversalRequestMeta {
   const candidate = extra._meta?.devspace;
-  if (candidate === undefined) return {};
+  if (candidate === undefined) return { requestId: `request_${randomUUID()}` };
   const parsed = universalRequestMetaSchema.safeParse(candidate);
-  if (parsed.success) return parsed.data;
+  if (parsed.success) {
+    return {
+      ...parsed.data,
+      requestId: parsed.data.requestId ?? `request_${randomUUID()}`,
+    };
+  }
   throw new UniversalBrokerError(
     "INVALID_ARGUMENT",
     "MCP request metadata at params._meta.devspace is invalid.",
@@ -1261,14 +1610,21 @@ function assertSchemaGeneration(
   );
 }
 
-function assertHumanApprovalVerifier(requestMeta: UniversalRequestMeta): void {
-  if (requestMeta.humanApprovalAttestation === undefined) return;
+function assertAuthorityContractGeneration(
+  requestMeta: UniversalRequestMeta,
+  runtimeIdentity: RuntimeIdentity | undefined,
+): void {
+  const expected = requestMeta.expectedAuthorityContractGeneration;
+  if (expected === undefined) return;
+  const observed = runtimeIdentity?.authorityContractGeneration ?? `sha256:${"0".repeat(64)}`;
+  if (expected === observed) return;
   throw new UniversalBrokerError(
-    "HUMAN_ATTESTATION_REQUIRED",
-    "Human approval attestation was supplied, but no verifier is configured.",
+    "SCHEMA_STALE",
+    "The request authority contract generation does not match this broker runtime.",
     {
       evidence: {
-        reasonCode: "HUMAN_APPROVAL_VERIFIER_UNAVAILABLE",
+        expectedAuthorityContractGeneration: expected,
+        observedAuthorityContractGeneration: observed,
         providerDispatchCount: 0,
         durableClaimCount: 0,
       },
@@ -1279,27 +1635,26 @@ function assertHumanApprovalVerifier(requestMeta: UniversalRequestMeta): void {
 function mergeOperationRequestMeta<T extends Record<string, unknown>>(
   input: T,
   requestMeta: UniversalRequestMeta,
-): T {
+): T & Pick<UniversalRequestMeta, "authorityId" | "taskInstanceId" | "transactionId"> {
   const merged: Record<string, unknown> = { ...input };
   for (const field of ["authorityId", "taskInstanceId", "transactionId"] as const) {
     const argumentValue = merged[field];
     const metadataValue = requestMeta[field];
-    if (
-      typeof argumentValue === "string"
-      && metadataValue !== undefined
-      && argumentValue !== metadataValue
-    ) {
+    if (argumentValue !== undefined) {
       throw new UniversalBrokerError(
         "INVALID_ARGUMENT",
-        `Tool argument ${field} conflicts with params._meta.devspace.${field}.`,
+        `Common request metadata ${field} is accepted only at params._meta.devspace.${field}.`,
         { evidence: { field, providerDispatchCount: 0, durableClaimCount: 0 } },
       );
     }
-    if (argumentValue === undefined && metadataValue !== undefined) {
+    if (metadataValue !== undefined) {
       merged[field] = metadataValue;
     }
   }
-  return merged as T;
+  return merged as T & Pick<
+    UniversalRequestMeta,
+    "authorityId" | "taskInstanceId" | "transactionId"
+  >;
 }
 
 function assertGenerationApplicability(
@@ -1382,7 +1737,10 @@ function applyObservedGenerations(
 ): void {
   const envelope = result.structuredContent;
   if (!envelope || typeof envelope !== "object") return;
-  if (runtimeIdentity) envelope.observedSchemaGeneration = runtimeIdentity.schemaGeneration;
+  if (runtimeIdentity) {
+    envelope.observedSchemaGeneration = runtimeIdentity.schemaGeneration;
+    envelope.observedAuthorityContractGeneration = runtimeIdentity.authorityContractGeneration;
+  }
   if (observation.targetGeneration) {
     envelope.observedTargetGeneration = observation.targetGeneration;
   }
@@ -1394,16 +1752,21 @@ function applyObservedGenerations(
 function measuredToolResult(
   result: CallToolResult,
   tool: UniversalToolName,
-): { result: "pass" | "fail" | "unknown"; transport: string } {
+): { result: "pass" | "fail" | "unknown"; transport: string; errorCode: string } {
   const envelope = result.structuredContent;
   if (!envelope || typeof envelope !== "object") {
-    return { result: result.isError === true ? "fail" : "pass", transport: tool };
+    return {
+      result: result.isError === true ? "fail" : "pass",
+      transport: tool,
+      errorCode: result.isError === true ? "MCP_ERROR" : "none",
+    };
   }
   if (envelope.ok === true) {
     const data = recordValue(envelope.data);
     return {
       result: data?.state === "UNKNOWN" ? "unknown" : "pass",
       transport: measuredTransport(data, tool),
+      errorCode: "none",
     };
   }
   const error = recordValue(envelope.error);
@@ -1418,7 +1781,13 @@ function measuredToolResult(
   return {
     result: unknown ? "unknown" : "fail",
     transport: measuredTransport(evidence, tool),
+    errorCode: typeof error?.code === "string" ? error.code : "UNEXPECTED_ERROR",
   };
+}
+
+function auditDigest(value: string): string {
+  const normalized = value.trim().toLowerCase();
+  return /^[a-f0-9]{64}$/u.test(normalized) ? `sha256:${normalized}` : normalized;
 }
 
 function measuredTransport(
@@ -1466,25 +1835,52 @@ async function withOperationAuthority<T extends Record<string, unknown>>(
   action: AuthorityActionDescriptor,
   risk: AuthorityRiskClass,
   execute: (dispatch?: OperationAuthorityDispatchController) => Promise<T>,
-  options: { adapterBoundary?: boolean } = {},
+  options: {
+    adapterBoundary?: boolean;
+    auditObservation?: GenerationObservation;
+    authInfo?: AuthorityAuthenticationInfo;
+  } = {},
 ): Promise<T> {
+  requireActivatedConnectorForRisk(options.authInfo, risk);
+  const principal = principalKeyFingerprint();
+  const audit = options.auditObservation;
+  if (audit) {
+    audit.audit = {
+      principalFingerprint: principal,
+      ...(authorityId ? { authorityId } : {}),
+      action,
+      risk,
+      dispatchState: "NOT_DISPATCHED",
+    };
+  }
   if (risk === "R0") return execute(undefined);
   const dispatch = authority.prepareDispatch(
     authorityId,
-    principalKeyFingerprint(),
+    principal,
     action,
     risk,
   );
   if (!options.adapterBoundary) {
     try {
       dispatch.claim();
+      if (audit?.audit) {
+        audit.audit.claimState = "CLAIMED";
+        audit.audit.dispatchState = "CLAIMED";
+      }
       dispatch.markDispatched();
+      if (audit?.audit) audit.audit.dispatchState = "DISPATCHED";
     } catch (error) {
       if (dispatch.phase === "CLAIMED") {
-        dispatch.cancelNotDispatched({
+        const receipt = dispatch.cancelNotDispatched({
           providerCallCount: 0,
           proof: "COARSE_BOUNDARY_PROVIDER_CALL_ZERO",
         });
+        if (audit?.audit) {
+          audit.audit.claimState = "CANCELLED_NOT_DISPATCHED";
+          audit.audit.dispatchState = "NOT_DISPATCHED";
+          audit.audit.actionClaimId = receipt.actionClaimId;
+          audit.audit.receiptDigest = receipt.receiptDigest;
+        }
       }
       throw error;
     }
@@ -1495,10 +1891,16 @@ async function withOperationAuthority<T extends Record<string, unknown>>(
   } catch (error) {
     if (dispatch.phase === "CLAIMED") {
       try {
-        dispatch.cancelNotDispatched({
+        const receipt = dispatch.cancelNotDispatched({
           providerCallCount: 0,
           proof: "ADAPTER_BOUNDARY_PROVIDER_CALL_ZERO",
         });
+        if (audit?.audit) {
+          audit.audit.claimState = "CANCELLED_NOT_DISPATCHED";
+          audit.audit.dispatchState = "NOT_DISPATCHED";
+          audit.audit.actionClaimId = receipt.actionClaimId;
+          audit.audit.receiptDigest = receipt.receiptDigest;
+        }
       } catch (cancellationError) {
         throw cancellationError;
       }
@@ -1507,27 +1909,66 @@ async function withOperationAuthority<T extends Record<string, unknown>>(
     if (dispatch.phase !== "DISPATCHED") throw error;
     const uncertain = error instanceof UniversalBrokerError
       && ["MCP_RESULT_UNKNOWN", "EXECUTION_STATE_UNKNOWN", "TRANSPORT_INTERRUPTED"].includes(error.code);
-    dispatch.complete(uncertain ? "UNCERTAIN" : "FAIL", {
+    const receipt = dispatch.complete(uncertain ? "UNCERTAIN" : "FAIL", {
       tool: action.tool,
       operation: action.operation,
       errorCode: error instanceof UniversalBrokerError ? error.code : "UNEXPECTED_ERROR",
     });
+    if (audit?.audit) {
+      audit.audit.claimState = uncertain ? "UNCERTAIN" : "FAIL";
+      audit.audit.dispatchState = uncertain ? "UNKNOWN" : "ACKNOWLEDGED";
+      audit.audit.actionClaimId = receipt.actionClaimId;
+      audit.audit.receiptDigest = receipt.receiptDigest;
+    }
     throw error;
   }
   if (dispatch.phase === "CLAIMED") {
-    dispatch.cancelNotDispatched({
+    const receipt = dispatch.cancelNotDispatched({
       providerCallCount: 0,
       proof: "ADAPTER_BOUNDARY_PROVIDER_CALL_ZERO",
     });
+    if (audit?.audit) {
+      audit.audit.claimState = "CANCELLED_NOT_DISPATCHED";
+      audit.audit.dispatchState = "NOT_DISPATCHED";
+      audit.audit.actionClaimId = receipt.actionClaimId;
+      audit.audit.receiptDigest = receipt.receiptDigest;
+    }
     return value;
   }
   if (dispatch.phase === "READY") return value;
   const terminalState = successfulDispatchTerminalState(value);
-  dispatch.complete(terminalState, {
+  const receipt = dispatch.complete(terminalState, {
     tool: action.tool,
     operation: action.operation,
   });
+  if (audit?.audit) {
+    audit.audit.claimState = terminalState;
+    audit.audit.dispatchState = terminalState === "UNCERTAIN" ? "UNKNOWN" : "ACKNOWLEDGED";
+    audit.audit.actionClaimId = receipt.actionClaimId;
+    audit.audit.receiptDigest = receipt.receiptDigest;
+  }
   return value;
+}
+
+function requireActivatedConnectorForRisk(
+  authInfo: AuthorityAuthenticationInfo | undefined,
+  risk: AuthorityRiskClass,
+): void {
+  if (risk === "R0") return;
+  const connector = recordValue(authInfo?.extra?.devspaceConnector);
+  if (connector?.activationRequired !== true) return;
+  throw new UniversalBrokerError(
+    "CONNECTOR_ACTIVATION_REQUIRED",
+    "This connector must complete owner-approved canonical activation before mutation authority can be used.",
+    {
+      evidence: {
+        ...(typeof connector.bindingId === "string" ? { connectorBindingId: connector.bindingId } : {}),
+        ...(typeof connector.state === "string" ? { connectorState: connector.state } : {}),
+        providerDispatchCount: 0,
+        durableClaimCount: 0,
+      },
+    },
+  );
 }
 
 function successfulDispatchTerminalState(
@@ -1615,6 +2056,7 @@ async function normalizeRequestedAuthorityActions(
   targets: TargetRegistry,
   contexts: ContextRegistry,
   execution: UniversalExecutionPlane | undefined,
+  filesystem: UniversalFilesystemService | undefined,
   mcpProxy: UniversalMcpProxy | undefined,
   gui: UniversalGuiService | undefined,
   callContext: CapabilityCallContext,
@@ -1627,6 +2069,7 @@ async function normalizeRequestedAuthorityActions(
       targets,
       contexts,
       execution,
+      filesystem,
       mcpProxy,
       gui,
       callContext,
@@ -1692,6 +2135,7 @@ async function normalizeAuthorityAction(
   targets: TargetRegistry,
   contexts: ContextRegistry,
   execution: UniversalExecutionPlane | undefined,
+  filesystem: UniversalFilesystemService | undefined,
   mcpProxy: UniversalMcpProxy | undefined,
   gui: UniversalGuiService | undefined,
   callContext: CapabilityCallContext,
@@ -1732,7 +2176,30 @@ async function normalizeAuthorityAction(
         input.contextId,
         callContext,
       );
-      return bindTargetAuthority(filesystemAction(input, binding.target.id), binding);
+      if (input.operation !== "sync" || input.sync?.phase !== "apply") {
+        return bindTargetAuthority(filesystemAction(input, binding.target.id), binding);
+      }
+      if (!filesystem) {
+        throw new UniversalBrokerError(
+          "CAPABILITY_UNAVAILABLE",
+          "Filesystem sync apply authority cannot be prepared because the filesystem service is unavailable.",
+        );
+      }
+      const syncBinding = await filesystem.prepareSyncAuthorityBinding(input, callContext);
+      if (
+        syncBinding.targetId !== binding.target.id
+        || syncBinding.targetGeneration !== binding.generation
+      ) {
+        throw new UniversalBrokerError(
+          "SYNC_PLAN_STALE",
+          "The immutable filesystem sync plan no longer matches the selected target generation.",
+          { evidence: { planId: syncBinding.planId, targetId: syncBinding.targetId } },
+        );
+      }
+      return bindTargetAuthority(filesystemAction(input, binding.target.id, {
+        syncPlanDigest: syncBinding.planDigest,
+        syncDeleteMode: syncBinding.deleteMode,
+      }), binding);
     }
     case "exec": {
       const input = argumentsValue as unknown as ExecuteCommandInput;
@@ -1964,7 +2431,9 @@ function processSummaryText(data: Record<string, unknown>): string {
 
 function isFilesystemMutation(
   operation: UniversalFilesystemInput["operation"],
+  syncPhase?: "plan" | "apply",
 ): boolean {
+  if (operation === "sync") return syncPhase !== "plan";
   return !["stat", "list", "read", "search", "hash"].includes(operation);
 }
 
@@ -2037,21 +2506,4 @@ function templateVariable(value: string | string[] | undefined, name: string): s
     "PRECONDITION_FAILED",
     `Missing resource template variable: ${name}`,
   );
-}
-
-function numericTemplateVariable(
-  value: string | string[] | undefined,
-  name: string,
-  minimum: number,
-  maximum: number,
-): number {
-  const raw = templateVariable(value, name);
-  const parsed = Number(raw);
-  if (!Number.isInteger(parsed) || parsed < minimum || parsed > maximum) {
-    throw new UniversalBrokerError(
-      "PRECONDITION_FAILED",
-      `Invalid resource template variable ${name}: ${raw}`,
-    );
-  }
-  return parsed;
 }

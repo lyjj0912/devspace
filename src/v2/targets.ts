@@ -1,9 +1,11 @@
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
-import { access, readFile } from "node:fs/promises";
+import { access, link, mkdtemp, open, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { homedir, platform as nodePlatform, arch, hostname, tmpdir, userInfo } from "node:os";
 import { promisify } from "node:util";
 import * as z from "zod/v4";
+import { requireCapabilityCallContext, type CapabilityCallContext } from "./capability-call-context.js";
+import type { SignedSnapshotCursorStore } from "./cursor-capability.js";
 import { UniversalBrokerError } from "./errors.js";
 import { macosUserOnlyProfile, windowsIntegrityIsElevated, windowsNonElevatedPrelude } from "./no-elevation.js";
 
@@ -24,6 +26,17 @@ export type ConfiguredTargetCapability =
   | "gui"
   | "durableProcess";
 export type ConfiguredTargetCapabilities = Readonly<Record<ConfiguredTargetCapability, boolean>>;
+
+export interface FilesystemPrimitiveCapabilities {
+  atomicReplace: boolean;
+  atomicNoReplace: boolean;
+  renameExchange: boolean;
+  directoryFsync: boolean;
+  hardlinkPublish: boolean;
+  trash: boolean;
+  reflink: boolean;
+  sparseCopy: boolean;
+}
 
 export interface TargetDefinition {
   id: string;
@@ -62,6 +75,7 @@ export interface TargetCapabilities {
   gui: boolean;
   mcp: boolean;
   durableProcess: boolean;
+  filesystem: FilesystemPrimitiveCapabilities;
 }
 
 export interface TargetObservation {
@@ -93,6 +107,7 @@ export interface TargetRegistryOptions {
   sshExecutable?: string;
   sftpExecutable?: string;
   execute?: typeof execFileAsync;
+  cursorStore?: SignedSnapshotCursorStore;
 }
 
 const targetSchema = z.strictObject({
@@ -197,7 +212,10 @@ export class TargetRegistry {
     return this.snapshot;
   }
 
-  async list(input: { cursor?: string; limit?: number } = {}): Promise<{
+  async list(
+    input: { cursor?: string; limit?: number } = {},
+    callContext?: CapabilityCallContext,
+  ): Promise<{
     generation: string;
     targets: Array<Record<string, unknown>>;
     logicalTargetCount: number;
@@ -205,16 +223,22 @@ export class TargetRegistry {
     nextCursor?: string;
   }> {
     const snapshot = await this.inspect();
-    const offset = parseCursor(input.cursor);
     const limit = Math.min(Math.max(input.limit ?? 50, 1), 200);
-    const page = snapshot.targets.slice(offset, offset + limit);
-    const nextOffset = offset + page.length;
+    const page = this.options.cursorStore
+      ? targetCursorPage(
+          this.options.cursorStore,
+          requireCapabilityCallContext(callContext),
+          snapshot,
+          input.cursor,
+          limit,
+        )
+      : targetUnpagedResult(snapshot, input.cursor, limit);
     return {
       generation: snapshot.generation,
-      targets: page.map(targetSummary),
+      targets: page.targets.map(targetSummary),
       logicalTargetCount: snapshot.targets.length,
       uniqueEndpointCount: new Set(snapshot.targets.map((target) => target.endpointId)).size,
-      ...(nextOffset < snapshot.targets.length ? { nextCursor: String(nextOffset) } : {}),
+      ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
     };
   }
 
@@ -335,10 +359,11 @@ export class TargetRegistry {
   private async probeLocal(target: TargetDefinition): Promise<TargetObservation> {
     const observedAtMs = this.now();
     const platform = target.platform === "unknown" ? currentPlatform() : target.platform;
-    const [git, rsync, boundary] = await Promise.all([
+    const [git, rsync, boundary, filesystem] = await Promise.all([
       commandAvailable("git", this.execute),
       commandAvailable("rsync", this.execute),
       probeLocalUserAccountBoundary(platform, this.execute),
+      probeLocalFilesystemPrimitives(),
     ]);
     return {
       targetId: target.id,
@@ -362,6 +387,7 @@ export class TargetRegistry {
         gui: boundary.available && target.gui.mode !== "none",
         mcp: boundary.available,
         durableProcess: boundary.available && target.durableProcess.mode !== "none",
+        filesystem: boundary.available ? filesystem : unavailableFilesystemPrimitives(),
       },
       ...(!boundary.available ? { reason: boundary.reason } : {}),
       evidence: {
@@ -403,6 +429,7 @@ export class TargetRegistry {
       "printf 'epoch=%s\\n' \"$(date +%s 2>/dev/null || printf 0)\"",
       "command -v git >/dev/null 2>&1 && printf 'git=1\\n' || printf 'git=0\\n'",
       "command -v rsync >/dev/null 2>&1 && printf 'rsync=1\\n' || printf 'rsync=0\\n'",
+      "fs_probe_root=$(mktemp -d \"${TMPDIR:-/tmp}/.devspace-target-fs.XXXXXX\" 2>/dev/null || printf ''); fs_atomic_replace=0; fs_atomic_no_replace=0; fs_directory_fsync=0; fs_hardlink_publish=0; fs_trash=0; if [ -n \"$fs_probe_root\" ]; then printf replace-source >\"$fs_probe_root/replace-source\"; printf replace-destination >\"$fs_probe_root/replace-destination\"; if mv -f \"$fs_probe_root/replace-source\" \"$fs_probe_root/replace-destination\" 2>/dev/null && [ \"$(cat \"$fs_probe_root/replace-destination\" 2>/dev/null)\" = replace-source ]; then fs_atomic_replace=1; fi; printf link-source >\"$fs_probe_root/link-source\"; if ln \"$fs_probe_root/link-source\" \"$fs_probe_root/link-destination\" 2>/dev/null; then fs_atomic_no_replace=1; fs_hardlink_publish=1; fi; if command -v python3 >/dev/null 2>&1 && python3 -c 'import os,sys; descriptor=os.open(sys.argv[1],os.O_RDONLY); os.fsync(descriptor); os.close(descriptor)' \"$fs_probe_root\" >/dev/null 2>&1; then fs_directory_fsync=1; fi; printf trash-source >\"$fs_probe_root/trash-source\"; if mv \"$fs_probe_root/trash-source\" \"$fs_probe_root/trash-destination\" 2>/dev/null && [ -f \"$fs_probe_root/trash-destination\" ]; then fs_trash=1; fi; rm -rf -- \"$fs_probe_root\"; fi; printf 'fs_atomic_replace=%s\\nfs_atomic_no_replace=%s\\nfs_rename_exchange=0\\nfs_directory_fsync=%s\\nfs_hardlink_publish=%s\\nfs_trash=%s\\nfs_reflink=0\\nfs_sparse_copy=0\\n' \"$fs_atomic_replace\" \"$fs_atomic_no_replace\" \"$fs_directory_fsync\" \"$fs_hardlink_publish\" \"$fs_trash\"",
       "setpriv_path=''; if [ -x /usr/bin/setpriv ] && [ ! -L /usr/bin/setpriv ]; then setpriv_path=/usr/bin/setpriv; elif [ -x /bin/setpriv ] && [ ! -L /bin/setpriv ]; then setpriv_path=/bin/setpriv; fi",
       "if [ -n \"$setpriv_path\" ] && \"$setpriv_path\" --no-new-privs -- /bin/sh -c 'grep -Eq \"^NoNewPrivs:[[:space:]]*1\" /proc/self/status && grep -Eq \"^CapPrm:[[:space:]]*0+$\" /proc/self/status && grep -Eq \"^CapEff:[[:space:]]*0+$\" /proc/self/status && grep -Eq \"^CapAmb:[[:space:]]*0+$\" /proc/self/status' >/dev/null 2>&1; then printf 'setpriv_boundary=1\\n'; else printf 'setpriv_boundary=0\\n'; fi",
       `if [ -x /usr/bin/sandbox-exec ] && /usr/bin/sandbox-exec -p ${macosProfile} /bin/echo boundary-ok >/dev/null 2>&1 && ! /usr/bin/sandbox-exec -p ${macosProfile} /bin/ps -p $$ >/dev/null 2>&1; then printf 'sandbox_boundary=1\\n'; else printf 'sandbox_boundary=0\\n'; fi`,
@@ -479,6 +506,7 @@ export class TargetRegistry {
           gui: ready && target.gui.mode !== "none",
           mcp: ready,
           durableProcess: ready && target.durableProcess.mode !== "none",
+          filesystem: filesystemPrimitivesFromFields(fields, ready),
         },
         ...(!ready ? {
           reason: !boundary.available
@@ -517,7 +545,7 @@ export class TargetRegistry {
         sshArguments(
           target.sshHost!,
           this.probeTimeoutMs,
-          "powershell -NoProfile -NonInteractive -Command \"Write-Output '__DEVSPACE_TARGET_V1__'; Write-Output ('hostname=' + $env:COMPUTERNAME); Write-Output ('user=' + $env:USERNAME); Write-Output ('shell=' + $env:ComSpec); Write-Output ('architecture=' + $env:PROCESSOR_ARCHITECTURE); Write-Output ('home=' + $HOME); Write-Output ('temporary=' + [IO.Path]::GetTempPath()); Write-Output ('epoch=' + [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()); if (Get-Command git -ErrorAction SilentlyContinue) { Write-Output 'git=1' } else { Write-Output 'git=0' }; $groups=(& whoami.exe /groups /fo csv /nh 2>$null | Out-String); if($groups -match 'S-1-16-(12288|16384)'){Write-Output 'elevated=1'}else{Write-Output 'elevated=0'}\"",
+          windowsTargetProbeCommand(),
         ),
         {
           timeout: this.probeTimeoutMs + 1_000,
@@ -578,6 +606,7 @@ export class TargetRegistry {
           gui: ready && target.gui.mode !== "none",
           mcp: ready,
           durableProcess: ready && target.durableProcess.mode !== "none",
+          filesystem: filesystemPrimitivesFromFields(fields, ready),
         },
         ...(!ready ? {
           reason: elevated
@@ -776,7 +805,10 @@ export function targetSummary(target: TargetDefinition): Record<string, unknown>
     platform: target.platform,
     guiMode: target.gui.mode,
     durableProcessMode: target.durableProcess.mode,
-    capabilities: { ...target.configuredCapabilities },
+    capabilities: {
+      ...target.configuredCapabilities,
+      filesystem: unavailableFilesystemPrimitives(),
+    },
     envProfileConfigured: Boolean(target.envProfile),
   };
 }
@@ -835,6 +867,9 @@ function applyConfiguredCapabilities(
       gui: observation.capabilities.gui && configured.gui,
       mcp: observation.capabilities.mcp && configured.mcp,
       durableProcess: observation.capabilities.durableProcess && configured.durableProcess,
+      filesystem: configured.fs
+        ? { ...observation.capabilities.filesystem }
+        : unavailableFilesystemPrimitives(),
     },
     evidence: {
       ...(observation.evidence ?? {}),
@@ -858,16 +893,54 @@ function normalizeSelector(value: string): string {
   return value.normalize("NFKC").trim().replace(/\s+/g, " ").toLocaleLowerCase("en-US");
 }
 
-function parseCursor(cursor: string | undefined): number {
-  if (cursor === undefined) return 0;
-  const parsed = Number(cursor);
-  if (!Number.isInteger(parsed) || parsed < 0) {
+function targetCursorPage(
+  store: SignedSnapshotCursorStore,
+  owner: CapabilityCallContext,
+  snapshot: TargetRegistrySnapshot,
+  cursor: string | undefined,
+  limit: number,
+): { targets: TargetDefinition[]; nextCursor?: string } {
+  const binding = {
+    principalKeyFingerprint: owner.principalKeyFingerprint,
+    resourceKind: "target.list",
+    resourceIdentityDigest: sha256("target-registry"),
+    queryDigest: sha256("all-targets"),
+    snapshotGeneration: snapshot.generation,
+  };
+  const cursorPage = cursor
+    ? store.continueSnapshot({ cursor, binding, limit })
+    : store.createSnapshot({
+        binding,
+        orderedItemIdentities: snapshot.targets.map((target) => target.id),
+        limit,
+      });
+  const byId = new Map(snapshot.targets.map((target) => [target.id, target]));
+  const targets = cursorPage.itemIdentities.map((identity) => {
+    const target = byId.get(identity);
+    if (!target) {
+      throw new UniversalBrokerError(
+        "CURSOR_STALE",
+        "Target pagination snapshot no longer matches the target registry.",
+        { evidence: { resourceKind: "target.list", providerDispatchCount: 0 } },
+      );
+    }
+    return target;
+  });
+  return { targets, ...(cursorPage.nextCursor ? { nextCursor: cursorPage.nextCursor } : {}) };
+}
+
+function targetUnpagedResult(
+  snapshot: TargetRegistrySnapshot,
+  cursor: string | undefined,
+  limit: number,
+): { targets: TargetDefinition[]; nextCursor?: string } {
+  if (cursor !== undefined || snapshot.targets.length > limit) {
     throw new UniversalBrokerError(
-      "PRECONDITION_FAILED",
-      `Invalid target cursor: ${cursor}`,
+      "CAPABILITY_UNAVAILABLE",
+      "Target pagination requires a configured signed cursor service.",
     );
   }
-  return parsed;
+  return { targets: [...snapshot.targets] };
 }
 
 function currentPlatform(): TargetPlatform {
@@ -976,6 +1049,118 @@ function normalizeIdentity(value: string | undefined): string {
   return value?.normalize("NFKC").trim().toLocaleLowerCase("en-US") ?? "";
 }
 
+function unavailableFilesystemPrimitives(): FilesystemPrimitiveCapabilities {
+  return {
+    atomicReplace: false,
+    atomicNoReplace: false,
+    renameExchange: false,
+    directoryFsync: false,
+    hardlinkPublish: false,
+    trash: false,
+    reflink: false,
+    sparseCopy: false,
+  };
+}
+
+function filesystemPrimitivesFromFields(
+  fields: Record<string, string>,
+  ready: boolean,
+): FilesystemPrimitiveCapabilities {
+  if (!ready) return unavailableFilesystemPrimitives();
+  return {
+    atomicReplace: fields.fs_atomic_replace === "1",
+    atomicNoReplace: fields.fs_atomic_no_replace === "1",
+    renameExchange: fields.fs_rename_exchange === "1",
+    directoryFsync: fields.fs_directory_fsync === "1",
+    hardlinkPublish: fields.fs_hardlink_publish === "1",
+    trash: fields.fs_trash === "1",
+    reflink: fields.fs_reflink === "1",
+    sparseCopy: fields.fs_sparse_copy === "1",
+  };
+}
+
+async function probeLocalFilesystemPrimitives(): Promise<FilesystemPrimitiveCapabilities> {
+  const result = unavailableFilesystemPrimitives();
+  let directory: string;
+  try {
+    directory = await mkdtemp(`${tmpdir().replace(/[\\/]$/u, "")}/devspace-target-fs-`);
+  } catch {
+    return result;
+  }
+  try {
+    try {
+      const source = `${directory}/replace-source`;
+      const destination = `${directory}/replace-destination`;
+      await writeFile(source, "replace-source", { mode: 0o600 });
+      await writeFile(destination, "replace-destination", { mode: 0o600 });
+      await rename(source, destination);
+      result.atomicReplace = await readFile(destination, "utf8") === "replace-source";
+    } catch {
+      result.atomicReplace = false;
+    }
+    try {
+      const source = `${directory}/link-source`;
+      const destination = `${directory}/link-destination`;
+      await writeFile(source, "link-source", { mode: 0o600 });
+      await link(source, destination);
+      result.atomicNoReplace = true;
+      result.hardlinkPublish = true;
+    } catch {
+      result.atomicNoReplace = false;
+      result.hardlinkPublish = false;
+    }
+    try {
+      const handle = await open(directory, "r");
+      try {
+        await handle.sync();
+        result.directoryFsync = true;
+      } finally {
+        await handle.close();
+      }
+    } catch {
+      result.directoryFsync = false;
+    }
+    try {
+      const source = `${directory}/trash-source`;
+      const destination = `${directory}/trash-destination`;
+      await writeFile(source, "trash-source", { mode: 0o600 });
+      await rename(source, destination);
+      result.trash = await readFile(destination, "utf8") === "trash-source";
+    } catch {
+      result.trash = false;
+    }
+    return result;
+  } finally {
+    await rm(directory, { recursive: true, force: true }).catch(() => undefined);
+  }
+}
+
+function windowsTargetProbeCommand(): string {
+  const source = [
+    "$ErrorActionPreference='Continue'",
+    "Write-Output '__DEVSPACE_TARGET_V1__'",
+    "Write-Output ('hostname=' + $env:COMPUTERNAME)",
+    "Write-Output ('user=' + $env:USERNAME)",
+    "Write-Output ('shell=' + $env:ComSpec)",
+    "Write-Output ('architecture=' + $env:PROCESSOR_ARCHITECTURE)",
+    "Write-Output ('home=' + $HOME)",
+    "Write-Output ('temporary=' + [IO.Path]::GetTempPath())",
+    "Write-Output ('epoch=' + [DateTimeOffset]::UtcNow.ToUnixTimeSeconds())",
+    "if(Get-Command git -ErrorAction SilentlyContinue){Write-Output 'git=1'}else{Write-Output 'git=0'}",
+    "$groups=(& whoami.exe /groups /fo csv /nh 2>$null | Out-String)",
+    "if($groups -match 'S-1-16-(12288|16384)'){Write-Output 'elevated=1'}else{Write-Output 'elevated=0'}",
+    "$fsAtomicReplace=0; $fsAtomicNoReplace=0; $fsHardlinkPublish=0; $fsTrash=0",
+    "$fsProbeRoot=Join-Path ([IO.Path]::GetTempPath()) ('.devspace-target-fs-' + [Guid]::NewGuid().ToString('N'))",
+    "try{[IO.Directory]::CreateDirectory($fsProbeRoot)|Out-Null; $source=Join-Path $fsProbeRoot 'replace-source'; $destination=Join-Path $fsProbeRoot 'replace-destination'; [IO.File]::WriteAllText($source,'replace-source'); [IO.File]::WriteAllText($destination,'replace-destination'); [IO.File]::Replace($source,$destination,$null); if([IO.File]::ReadAllText($destination)-eq'replace-source'){$fsAtomicReplace=1}}catch{}",
+    "try{$source=Join-Path $fsProbeRoot 'move-source'; $destination=Join-Path $fsProbeRoot 'move-destination'; [IO.File]::WriteAllText($source,'move-source'); [IO.File]::Move($source,$destination); if([IO.File]::Exists($destination)){$fsAtomicNoReplace=1}}catch{}",
+    "try{$source=Join-Path $fsProbeRoot 'link-source'; $destination=Join-Path $fsProbeRoot 'link-destination'; [IO.File]::WriteAllText($source,'link-source'); New-Item -ItemType HardLink -Path $destination -Target $source -ErrorAction Stop|Out-Null; if([IO.File]::Exists($destination)){$fsHardlinkPublish=1}}catch{}",
+    "try{$source=Join-Path $fsProbeRoot 'trash-source'; $destination=Join-Path $fsProbeRoot 'trash-destination'; [IO.File]::WriteAllText($source,'trash-source'); Move-Item -LiteralPath $source -Destination $destination -ErrorAction Stop; if([IO.File]::Exists($destination)){$fsTrash=1}}catch{}",
+    "Write-Output ('fs_atomic_replace=' + $fsAtomicReplace); Write-Output ('fs_atomic_no_replace=' + $fsAtomicNoReplace); Write-Output 'fs_rename_exchange=0'; Write-Output 'fs_directory_fsync=0'; Write-Output ('fs_hardlink_publish=' + $fsHardlinkPublish); Write-Output ('fs_trash=' + $fsTrash); Write-Output 'fs_reflink=0'; Write-Output 'fs_sparse_copy=0'",
+    "if(Test-Path -LiteralPath $fsProbeRoot){Remove-Item -LiteralPath $fsProbeRoot -Recurse -Force -ErrorAction SilentlyContinue}",
+  ].join("; ");
+  return `powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand ${Buffer.from(source, "utf16le").toString("base64")}`;
+}
+
 function unavailableCapabilities(): TargetCapabilities {
   return {
     fs: false,
@@ -987,6 +1172,7 @@ function unavailableCapabilities(): TargetCapabilities {
     gui: false,
     mcp: false,
     durableProcess: false,
+    filesystem: unavailableFilesystemPrimitives(),
   };
 }
 
@@ -1120,7 +1306,10 @@ function observationWithProbeMetadata(
 ): TargetObservation {
   return deepFreeze({
     ...observation,
-    capabilities: { ...observation.capabilities },
+    capabilities: {
+      ...observation.capabilities,
+      filesystem: { ...observation.capabilities.filesystem },
+    },
     evidence: {
       ...(observation.evidence ?? {}),
       targetGeneration: generation,

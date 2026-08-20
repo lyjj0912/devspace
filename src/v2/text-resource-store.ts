@@ -7,9 +7,16 @@ import {
 import { UniversalBrokerError } from "./errors.js";
 import { SynchronousQuotaReservations } from "./quota-reservations.js";
 import { RESOURCE_DEFAULT_CONTEXT_TTL_MS } from "./resource-defaults.js";
+import {
+  createEphemeralResourceContinuation,
+  isResourceContinuationToken,
+  SignedResourceContinuation,
+} from "./resource-continuation.js";
+import { formatResourceUri, parseResourceUri, ResourceUriError } from "./resource-uri.js";
 
 interface TextResourceRecord {
   id: string;
+  generation: string;
   text: string;
   mimeType: string;
   createdAt: number;
@@ -35,6 +42,7 @@ export interface UniversalTextResourceStoreOptions {
   tombstoneTtlMs?: number;
   ownerProvider?: CapabilityCallContextProvider;
   now?: () => number;
+  continuation?: SignedResourceContinuation;
 }
 
 export class UniversalTextResourceStore {
@@ -48,6 +56,7 @@ export class UniversalTextResourceStore {
   private readonly tombstoneTtlMs: number;
   private readonly ownerProvider?: CapabilityCallContextProvider;
   private readonly now: () => number;
+  private readonly continuation: SignedResourceContinuation;
   private readonly reservations: SynchronousQuotaReservations;
   private totalCharacters = 0;
 
@@ -75,6 +84,8 @@ export class UniversalTextResourceStore {
     );
     this.ownerProvider = options.ownerProvider;
     this.now = options.now ?? Date.now;
+    this.continuation = options.continuation
+      ?? createEphemeralResourceContinuation({ now: this.now });
     this.reservations = new SynchronousQuotaReservations(this.authority, {
       entries: this.maximumEntries,
       characters: this.maximumTotalCharacters,
@@ -101,6 +112,7 @@ export class UniversalTextResourceStore {
     const id = randomUUID();
     const record: TextResourceRecord = {
       id,
+      generation: randomUUID(),
       text,
       mimeType,
       createdAt: now,
@@ -114,22 +126,23 @@ export class UniversalTextResourceStore {
     });
     return {
       resourceId: id,
-      resourceUri: this.uri(id, 0, this.defaultPageCharacters),
+      resourceUri: this.uri(id),
       characters: text.length,
       expiresAt: new Date(record.expiresAt).toISOString(),
     };
   }
 
   readByUri(uri: string, callContext?: CapabilityCallContext): Record<string, unknown> {
-    const { id, offset, limit } = this.parseUri(uri);
-    return this.read(id, offset, limit, uri, callContext);
+    const owner = this.owner(callContext);
+    const { id, offset, limit, legacy } = this.parseUri(uri, owner);
+    return this.read(id, offset, limit, legacy ? this.uri(id) : uri, owner);
   }
 
   read(
     id: string,
     offset = 0,
     maximumCharacters = this.defaultPageCharacters,
-    uri = this.uri(id, offset, maximumCharacters),
+    uri = this.uri(id),
     callContext?: CapabilityCallContext,
   ): Record<string, unknown> {
     const owner = this.owner(callContext);
@@ -173,8 +186,7 @@ export class UniversalTextResourceStore {
       totalCharacters: record.text.length,
       truncated: nextOffset < record.text.length,
       ...(nextOffset < record.text.length ? {
-        nextOffset,
-        nextResourceUri: this.uri(id, nextOffset, limit),
+        nextResourceUri: this.continuationUri(record, nextOffset, limit),
       } : {}),
       expiresAt: new Date(record.expiresAt).toISOString(),
     };
@@ -195,34 +207,72 @@ export class UniversalTextResourceStore {
     };
   }
 
-  private uri(id: string, offset: number, limit: number): string {
-    return `devspace://${this.authority}/${encodeURIComponent(id)}/${offset}/${limit}`;
+  private uri(id: string): string {
+    return formatResourceUri({ kind: "context-diff", diffId: id });
   }
 
-  private parseUri(uri: string): { id: string; offset: number; limit: number } {
-    let parsed: URL;
-    try {
-      parsed = new URL(uri);
-    } catch {
-      throw new UniversalBrokerError("PRECONDITION_FAILED", `Invalid ${this.authority} URI: ${uri}`);
-    }
-    if (parsed.protocol !== "devspace:" || parsed.hostname !== this.authority) {
-      throw new UniversalBrokerError("PRECONDITION_FAILED", `Not a ${this.authority} URI: ${uri}`);
-    }
-    const [id, rawOffset = "0", rawLimit = String(this.defaultPageCharacters)] = parsed.pathname
-      .replace(/^\/+/, "")
-      .split("/");
-    if (!id) throw new UniversalBrokerError("PRECONDITION_FAILED", `Missing resource ID: ${uri}`);
-    const offset = Number(rawOffset);
-    const limit = Number(rawLimit);
-    if (!Number.isSafeInteger(offset) || offset < 0) {
-      throw new UniversalBrokerError("PRECONDITION_FAILED", `Invalid resource offset: ${uri}`);
-    }
-    return {
-      id: decodeURIComponent(id),
+  private continuationUri(record: TextResourceRecord, offset: number, limit: number): string {
+    const token = this.continuation.issue({
+      binding: {
+        principalKeyFingerprint: record.principalKeyFingerprint,
+        resourceKind: this.authority,
+        resourceIdentity: record.id,
+        resourceGeneration: record.generation,
+      },
       offset,
-      limit: boundedInteger(limit, this.defaultPageCharacters, 1, 100_000),
-    };
+      limit,
+      expiresAtMs: record.expiresAt,
+    });
+    return this.uri(token);
+  }
+
+  private parseUri(
+    uri: string,
+    owner: CapabilityCallContext,
+  ): { id: string; offset: number; limit: number; legacy: boolean } {
+    try {
+      const parsed = parseResourceUri(uri, { allowLegacyRead: true });
+      if (parsed.kind !== "context-diff") {
+        throw new UniversalBrokerError("PRECONDITION_FAILED", `Not a ${this.authority} URI: ${uri}`);
+      }
+      if (!parsed.legacy && isResourceContinuationToken(parsed.diffId)) {
+        const verified = this.continuation.verify({
+          token: parsed.diffId,
+          principalKeyFingerprint: owner.principalKeyFingerprint,
+          resourceKind: this.authority,
+          resolveResource: (id) => {
+            const record = this.records.get(id);
+            return record
+              ? { generation: record.generation, expiresAtMs: record.expiresAt }
+              : undefined;
+          },
+        });
+        return {
+          id: verified.resourceIdentity,
+          offset: verified.offset,
+          limit: verified.limit,
+          legacy: false,
+        };
+      }
+      return {
+        id: parsed.diffId,
+        offset: parsed.legacy ? parsed.offset ?? 0 : 0,
+        limit: parsed.legacy
+          ? boundedInteger(parsed.limit, this.defaultPageCharacters, 1, 100_000)
+          : this.defaultPageCharacters,
+        legacy: parsed.legacy,
+      };
+    } catch (error) {
+      if (error instanceof UniversalBrokerError) throw error;
+      if (error instanceof ResourceUriError) {
+        throw new UniversalBrokerError(
+          "PRECONDITION_FAILED",
+          `Invalid ${this.authority} URI: ${uri}`,
+          { evidence: { reason: error.reason } },
+        );
+      }
+      throw error;
+    }
   }
 
   private pruneExpired(): void {

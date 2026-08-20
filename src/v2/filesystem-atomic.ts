@@ -1,8 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
-import { constants as fsConstants, createReadStream } from "node:fs";
+import { constants as fsConstants, createReadStream, type PathLike, type Stats } from "node:fs";
 import {
   chmod,
   copyFile,
+  cp,
   link,
   lstat,
   open,
@@ -10,6 +11,7 @@ import {
   rename,
   rm,
   stat,
+  symlink,
   unlink,
   writeFile,
 } from "node:fs/promises";
@@ -30,36 +32,44 @@ export interface FilesystemPreimage {
   linkTarget?: string;
 }
 
-export interface AtomicPublicationHooks {
-  /** Fault-injection seam used by deterministic race tests. */
-  beforeDestinationRevalidation?: (input: {
-    destination: string;
-    temporary: string;
-  }) => void | Promise<void>;
-  /** Fault-injection seam used to prove an EXDEV copy is verified before deletion. */
-  afterCrossDevicePublication?: (input: {
-    source: string;
-    destination: string;
-  }) => void | Promise<void>;
-  beforeSourceQuarantine?: (input: {
-    source: string;
-    destination: string;
-  }) => void | Promise<void>;
-  afterMoveSourceRevalidation?: (input: {
-    quarantine: string;
-    destination: string;
-  }) => void | Promise<void>;
-  forceCrossDevice?: boolean;
-  forceHardLinkUnsupported?: boolean;
-  forceSourceRestoreHardLinkUnsupported?: boolean;
+export interface AtomicFilesystemOperations {
+  chmod: typeof chmod;
+  copyFile: typeof copyFile;
+  cp: typeof cp;
+  link: typeof link;
+  lstat: (path: PathLike) => Promise<Stats>;
+  open: typeof open;
+  readlink: typeof readlink;
+  rename: typeof rename;
+  rm: typeof rm;
+  stat: (path: PathLike) => Promise<Stats>;
+  symlink: typeof symlink;
+  unlink: typeof unlink;
+  writeFile: typeof writeFile;
 }
+
+export const nodeAtomicFilesystemOperations: AtomicFilesystemOperations = {
+  chmod,
+  copyFile,
+  cp,
+  link,
+  lstat,
+  open,
+  readlink,
+  rename,
+  rm,
+  stat,
+  symlink,
+  unlink,
+  writeFile,
+};
 
 export interface AtomicPublishOptions {
   overwrite: boolean;
   expectedSha256?: string;
   allowReplaceSymlink?: boolean;
   mode?: number;
-  hooks?: AtomicPublicationHooks;
+  filesystem?: AtomicFilesystemOperations;
 }
 
 export interface AtomicPublicationResult {
@@ -74,10 +84,13 @@ export interface AtomicPublicationResult {
  * Capture enough identity to reject a destination changed while bytes were staged.
  * File contents are hashed so same-inode rewrites do not evade the fence.
  */
-export async function captureFilesystemPreimage(path: string): Promise<FilesystemPreimage> {
+export async function captureFilesystemPreimage(
+  path: string,
+  filesystem: AtomicFilesystemOperations = nodeAtomicFilesystemOperations,
+): Promise<FilesystemPreimage> {
   let value;
   try {
-    value = await lstat(path);
+    value = await filesystem.lstat(path);
   } catch (error) {
     if (isNodeError(error, "ENOENT")) return { exists: false };
     throw error;
@@ -99,7 +112,7 @@ export async function captureFilesystemPreimage(path: string): Promise<Filesyste
     mtimeMs: value.mtimeMs,
     ctimeMs: value.ctimeMs,
     ...(type === "file" ? { sha256: await sha256File(path) } : {}),
-    ...(type === "symlink" ? { linkTarget: await readlink(path) } : {}),
+    ...(type === "symlink" ? { linkTarget: await filesystem.readlink(path) } : {}),
   };
 }
 
@@ -125,7 +138,8 @@ export async function atomicWriteBuffer(
   options: AtomicPublishOptions,
 ): Promise<AtomicPublicationResult> {
   return atomicPublishFile(destination, options, async (temporary) => {
-    await writeFile(temporary, content, { flag: "wx", mode: options.mode ?? 0o600 });
+    await (options.filesystem ?? nodeAtomicFilesystemOperations)
+      .writeFile(temporary, content, { flag: "wx", mode: options.mode ?? 0o600 });
   });
 }
 
@@ -134,15 +148,16 @@ export async function atomicCopyFile(
   destination: string,
   options: AtomicPublishOptions,
 ): Promise<AtomicPublicationResult> {
-  const sourcePreimage = await captureFilesystemPreimage(source);
+  const filesystem = options.filesystem ?? nodeAtomicFilesystemOperations;
+  const sourcePreimage = await captureFilesystemPreimage(source, filesystem);
   if (!sourcePreimage.exists) throw pathNotFound(source);
   if (sourcePreimage.type !== "file" || !sourcePreimage.sha256) {
     throw pathTypeMismatch(source, "file");
   }
   const result = await atomicPublishFile(destination, options, async (temporary) => {
-    await copyFile(source, temporary, fsConstants.COPYFILE_EXCL);
+    await filesystem.copyFile(source, temporary, fsConstants.COPYFILE_EXCL);
     const copiedSha256 = await sha256File(temporary);
-    const sourceAfterCopy = await captureFilesystemPreimage(source);
+    const sourceAfterCopy = await captureFilesystemPreimage(source, filesystem);
     if (
       copiedSha256 !== sourcePreimage.sha256
       || !filesystemPreimagesEqual(sourcePreimage, sourceAfterCopy)
@@ -183,12 +198,13 @@ export async function safeMoveFile(
   destination: string,
   options: AtomicPublishOptions,
 ): Promise<AtomicPublicationResult & { crossDevice: boolean }> {
-  const sourcePreimage = await captureFilesystemPreimage(source);
+  const filesystem = options.filesystem ?? nodeAtomicFilesystemOperations;
+  const sourcePreimage = await captureFilesystemPreimage(source, filesystem);
   if (!sourcePreimage.exists) throw pathNotFound(source);
   if (sourcePreimage.type !== "file" || !sourcePreimage.sha256) {
     throw pathTypeMismatch(source, "file");
   }
-  const destinationPreimage = await captureFilesystemPreimage(destination);
+  const destinationPreimage = await captureFilesystemPreimage(destination, filesystem);
   validateDestinationPreimage(destination, destinationPreimage, options);
   const quarantine = join(
     dirname(source),
@@ -200,43 +216,35 @@ export async function safeMoveFile(
       destination,
       quarantine,
       sourcePreimage,
-      options.hooks,
+      filesystem,
     );
     try {
       let removeQuarantineAfterVerification = false;
-      if (options.hooks?.forceCrossDevice) throw nodeError("EXDEV", "forced EXDEV");
-      await options.hooks?.beforeDestinationRevalidation?.({
-        destination,
-        temporary: quarantine,
-      });
-      await assertMoveSourceUnchanged(quarantine, sourcePreimage);
-      await assertDestinationUnchanged(destination, destinationPreimage);
-      await options.hooks?.afterMoveSourceRevalidation?.({ quarantine, destination });
+      await assertMoveSourceUnchanged(quarantine, sourcePreimage, filesystem);
+      await assertDestinationUnchanged(destination, destinationPreimage, filesystem);
       if (!destinationPreimage.exists) {
         let sourceMoved = false;
         try {
-          if (options.hooks?.forceHardLinkUnsupported) {
-            throw nodeError("ENOTSUP", "forced unsupported hard link");
-          }
-          await link(quarantine, destination);
+          await filesystem.link(quarantine, destination);
         } catch (error) {
           if (isNodeError(error, "EXDEV")) throw error;
           if (!isHardLinkUnsupported(error)) throw error;
           if (!options.overwrite) throw noReplaceCapabilityUnavailable(destination, error);
-          await rename(quarantine, destination);
+          await filesystem.rename(quarantine, destination);
           sourceMoved = true;
         }
         removeQuarantineAfterVerification = !sourceMoved;
       } else {
-        await rename(quarantine, destination);
+        await filesystem.rename(quarantine, destination);
       }
       await syncDirectory(dirname(destination));
       const published = await verifyPublishedFile(
         destination,
         sourcePreimage.sha256,
         sourcePreimage.size!,
+        filesystem,
       );
-      const publishedIdentity = await captureFilesystemPreimage(destination);
+      const publishedIdentity = await captureFilesystemPreimage(destination, filesystem);
       if (!filesystemMoveSourceIdentitiesEqual(sourcePreimage, publishedIdentity)) {
         throw new UniversalBrokerError(
           "PRECONDITION_FAILED",
@@ -257,7 +265,7 @@ export async function safeMoveFile(
         );
       }
       if (removeQuarantineAfterVerification) {
-        await unlink(quarantine);
+        await filesystem.unlink(quarantine);
         await syncDirectory(dirname(source));
       }
       return {
@@ -270,14 +278,14 @@ export async function safeMoveFile(
       if (!isNodeError(error, "EXDEV")) throw error;
     }
 
-    await assertMoveSourceUnchanged(quarantine, sourcePreimage);
+    await assertMoveSourceUnchanged(quarantine, sourcePreimage, filesystem);
     const published = await atomicCopyFile(quarantine, destination, options);
-    const publishedDestinationIdentity = await captureFilesystemPreimage(destination);
-    await options.hooks?.afterCrossDevicePublication?.({ source, destination });
-    const [sourceBeforeDelete, destinationBeforeDelete] = await Promise.all([
-      captureFilesystemPreimage(quarantine),
-      captureFilesystemPreimage(destination),
-    ]);
+    const publishedDestinationIdentity = await captureFilesystemPreimage(destination, filesystem);
+    // Keep the destination readback last. If the two reads run concurrently, a
+    // destination replacement can complete after its read but during the
+    // quarantine read, causing us to delete the final verified source copy.
+    const sourceBeforeDelete = await captureFilesystemPreimage(quarantine, filesystem);
+    const destinationBeforeDelete = await captureFilesystemPreimage(destination, filesystem);
     if (
       !filesystemMoveSourceIdentitiesEqual(sourcePreimage, sourceBeforeDelete)
       || !filesystemPublishedDestinationIdentitiesEqual(
@@ -300,7 +308,7 @@ export async function safeMoveFile(
         },
       );
     }
-    await unlink(quarantine);
+    await filesystem.unlink(quarantine);
     await syncDirectory(dirname(source));
     return { ...published, crossDevice: true };
   } catch (error) {
@@ -308,7 +316,7 @@ export async function safeMoveFile(
       quarantine,
       source,
       sourcePreimage,
-      options.hooks,
+      filesystem,
     );
     if (recovery.publicSourceRestored && !recovery.quarantineRetained) {
       throw error;
@@ -359,10 +367,11 @@ async function atomicPublishFile(
   options: AtomicPublishOptions,
   stage: (temporary: string) => Promise<void>,
 ): Promise<AtomicPublicationResult> {
+  const filesystem = options.filesystem ?? nodeAtomicFilesystemOperations;
   const parent = dirname(destination);
-  const parentMetadata = await stat(parent);
+  const parentMetadata = await filesystem.stat(parent);
   if (!parentMetadata.isDirectory()) throw pathTypeMismatch(parent, "directory");
-  const preimage = await captureFilesystemPreimage(destination);
+  const preimage = await captureFilesystemPreimage(destination, filesystem);
   validateDestinationPreimage(destination, preimage, options);
   const mode = options.mode ?? (preimage.type === "file" ? preimage.mode : undefined) ?? 0o600;
   const temporary = join(
@@ -372,39 +381,35 @@ async function atomicPublishFile(
   let published = false;
   try {
     await stage(temporary);
-    await chmod(temporary, mode);
-    const staged = await stat(temporary);
+    await filesystem.chmod(temporary, mode);
+    const staged = await filesystem.stat(temporary);
     if (!staged.isFile()) throw pathTypeMismatch(temporary, "file");
     const stagedSha256 = await sha256File(temporary);
-    const handle = await open(temporary, "r");
+    const handle = await filesystem.open(temporary, "r");
     try {
       await handle.sync();
     } finally {
       await handle.close();
     }
-    await options.hooks?.beforeDestinationRevalidation?.({ destination, temporary });
-    await assertDestinationUnchanged(destination, preimage);
+    await assertDestinationUnchanged(destination, preimage, filesystem);
 
     if (!preimage.exists) {
       // A hard-link publication gives POSIX/Windows file systems a real
       // no-clobber primitive. Filesystems such as exFAT may not support hard
       // links; only explicit overwrite permission permits atomic rename there.
       try {
-        if (options.hooks?.forceHardLinkUnsupported) {
-          throw nodeError("ENOTSUP", "forced unsupported hard link");
-        }
-        await link(temporary, destination);
+        await filesystem.link(temporary, destination);
       } catch (error) {
         if (!isHardLinkUnsupported(error)) throw error;
         if (!options.overwrite) throw noReplaceCapabilityUnavailable(destination, error);
-        await rename(temporary, destination);
+        await filesystem.rename(temporary, destination);
       }
       published = true;
-      await rm(temporary, { force: true });
+      await filesystem.rm(temporary, { force: true });
     } else {
       // rename replaces the final directory entry atomically; the old entry is
       // never removed first and therefore cannot expose a missing-path window.
-      await rename(temporary, destination);
+      await filesystem.rename(temporary, destination);
     }
     published = true;
     await syncDirectory(parent);
@@ -412,6 +417,7 @@ async function atomicPublishFile(
       destination,
       stagedSha256,
       staged.size,
+      filesystem,
     );
     return {
       ...readback,
@@ -419,7 +425,7 @@ async function atomicPublishFile(
       preimage,
     };
   } finally {
-    if (!published) await rm(temporary, { force: true }).catch(() => undefined);
+    if (!published) await filesystem.rm(temporary, { force: true }).catch(() => undefined);
   }
 }
 
@@ -457,26 +463,23 @@ async function recoverQuarantinedSource(
   quarantine: string,
   source: string,
   expected: FilesystemPreimage,
-  hooks: AtomicPublicationHooks | undefined,
+  filesystem: AtomicFilesystemOperations,
 ): Promise<QuarantinedSourceRecovery> {
   let recoveryError: string | undefined;
-  const initialSource = await inspectRecoveryPath(source, expected);
-  const initialQuarantine = await inspectRecoveryPath(quarantine, expected);
+  const initialSource = await inspectRecoveryPath(source, expected, filesystem);
+  const initialQuarantine = await inspectRecoveryPath(quarantine, expected, filesystem);
 
   if (!initialSource.exists && initialQuarantine.identityMatches) {
     try {
-      if (hooks?.forceSourceRestoreHardLinkUnsupported) {
-        throw nodeError("ENOTSUP", "forced unsupported source restore hard link");
-      }
-      await link(quarantine, source);
+      await filesystem.link(quarantine, source);
     } catch (error) {
       recoveryError = error instanceof Error ? error.message : String(error);
     }
   }
 
   const [finalSource, finalQuarantine] = await Promise.all([
-    inspectRecoveryPath(source, expected),
-    inspectRecoveryPath(quarantine, expected),
+    inspectRecoveryPath(source, expected, filesystem),
+    inspectRecoveryPath(quarantine, expected, filesystem),
   ]);
   return {
     publicSourceRestored: finalSource.identityMatches,
@@ -492,11 +495,10 @@ async function quarantineVerifiedMoveSource(
   destination: string,
   quarantine: string,
   sourcePreimage: FilesystemPreimage,
-  hooks: AtomicPublicationHooks | undefined,
+  filesystem: AtomicFilesystemOperations,
 ): Promise<void> {
-  await hooks?.beforeSourceQuarantine?.({ source, destination });
-  await rename(source, quarantine);
-  const quarantinedSource = await captureFilesystemPreimage(quarantine);
+  await filesystem.rename(source, quarantine);
+  const quarantinedSource = await captureFilesystemPreimage(quarantine, filesystem);
   if (!filesystemMoveSourceIdentitiesEqual(sourcePreimage, quarantinedSource)) {
     throw new UniversalBrokerError(
       "PRECONDITION_FAILED",
@@ -515,8 +517,9 @@ async function quarantineVerifiedMoveSource(
 async function assertMoveSourceUnchanged(
   quarantine: string,
   expected: FilesystemPreimage,
+  filesystem: AtomicFilesystemOperations = nodeAtomicFilesystemOperations,
 ): Promise<void> {
-  const observed = await captureFilesystemPreimage(quarantine);
+  const observed = await captureFilesystemPreimage(quarantine, filesystem);
   if (filesystemMoveSourceIdentitiesEqual(expected, observed)) return;
   throw new UniversalBrokerError(
     "PRECONDITION_FAILED",
@@ -528,15 +531,16 @@ async function assertMoveSourceUnchanged(
 async function inspectRecoveryPath(
   path: string,
   expected: FilesystemPreimage,
+  filesystem: AtomicFilesystemOperations,
 ): Promise<{ exists: boolean; identityMatches: boolean }> {
   try {
-    const observed = await captureFilesystemPreimage(path);
+    const observed = await captureFilesystemPreimage(path, filesystem);
     return {
       exists: observed.exists,
       identityMatches: filesystemMoveSourceIdentitiesEqual(expected, observed),
     };
   } catch {
-    const exists = await lstat(path).then(() => true, () => false);
+    const exists = await filesystem.lstat(path).then(() => true, () => false);
     return { exists, identityMatches: false };
   }
 }
@@ -616,8 +620,9 @@ function validateDestinationPreimage(
 async function assertDestinationUnchanged(
   destination: string,
   preimage: FilesystemPreimage,
+  filesystem: AtomicFilesystemOperations,
 ): Promise<void> {
-  const current = await captureFilesystemPreimage(destination);
+  const current = await captureFilesystemPreimage(destination, filesystem);
   if (filesystemPreimagesEqual(preimage, current)) return;
   throw new UniversalBrokerError(
     "PRECONDITION_FAILED",
@@ -630,8 +635,9 @@ async function verifyPublishedFile(
   destination: string,
   expectedSha256: string,
   expectedSize: number,
+  filesystem: AtomicFilesystemOperations = nodeAtomicFilesystemOperations,
 ): Promise<Pick<AtomicPublicationResult, "path" | "size" | "sha256">> {
-  const readback = await captureFilesystemPreimage(destination);
+  const readback = await captureFilesystemPreimage(destination, filesystem);
   if (
     readback.type !== "file"
     || readback.sha256 !== expectedSha256
@@ -687,10 +693,6 @@ function pathTypeMismatch(path: string, expected: string): UniversalBrokerError 
     `Expected ${expected}: ${path}`,
     { evidence: { path, expected } },
   );
-}
-
-function nodeError(code: string, message: string): NodeJS.ErrnoException {
-  return Object.assign(new Error(message), { code });
 }
 
 function isNodeError(error: unknown, code: string): error is NodeJS.ErrnoException {

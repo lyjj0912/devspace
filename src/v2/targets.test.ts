@@ -3,6 +3,8 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { createCapabilityCallContextFromTrustedPrincipal } from "./capability-call-context.js";
+import { SignedSnapshotCursorStore } from "./cursor-capability.js";
 import { assertTargetCapability, TargetRegistry } from "./targets.js";
 
 test("target registry supplies local by default and resolves exact aliases", async (t) => {
@@ -13,11 +15,86 @@ test("target registry supplies local by default and resolves exact aliases", asy
   const listed = await registry.list();
   assert.equal(listed.targets.length, 1);
   assert.equal(listed.targets[0]?.targetId, "local");
+  assert.deepEqual(
+    (listed.targets[0]?.capabilities as { filesystem?: Record<string, boolean> }).filesystem,
+    {
+      atomicReplace: false,
+      atomicNoReplace: false,
+      renameExchange: false,
+      directoryFsync: false,
+      hardlinkPublish: false,
+      trash: false,
+      reflink: false,
+      sparseCopy: false,
+    },
+  );
   assert.equal((await registry.resolve("내 맥")).id, "local");
   const probe = await registry.probe("local");
   assert.equal(probe.status, "ONLINE");
   assert.equal(probe.capabilities.fs, true);
   assert.equal(probe.capabilities.exec, true);
+  assert.deepEqual(Object.keys(probe.capabilities.filesystem), [
+    "atomicReplace",
+    "atomicNoReplace",
+    "renameExchange",
+    "directoryFsync",
+    "hardlinkPublish",
+    "trash",
+    "reflink",
+    "sparseCopy",
+  ]);
+  assert.equal(Object.values(probe.capabilities.filesystem).every((value) => typeof value === "boolean"), true);
+  assert.equal(probe.capabilities.filesystem.renameExchange, false);
+  assert.equal(probe.capabilities.filesystem.reflink, false);
+  assert.equal(probe.capabilities.filesystem.sparseCopy, false);
+});
+
+test("target list uses owner-bound signed snapshots and rejects stale generations", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-v3-target-cursor-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const configPath = join(root, "targets.json");
+  await writeTargetConfig(configPath, {
+    alpha: sshTarget("Alpha", ["alpha"]),
+    beta: sshTarget("Beta", ["beta"]),
+    gamma: sshTarget("Gamma", ["gamma"]),
+  });
+  const cursorStore = new SignedSnapshotCursorStore({
+    currentKey: { keyId: "target-test", secret: Buffer.alloc(32, 0x71) },
+    ttlMs: 60_000,
+    maximumSnapshotsPerPrincipal: 8,
+  });
+  const registry = new TargetRegistry({ configPath, cursorStore });
+  const ownerA = createCapabilityCallContextFromTrustedPrincipal({
+    principalKeyFingerprint: "a".repeat(64),
+  });
+  const ownerB = createCapabilityCallContextFromTrustedPrincipal({
+    principalKeyFingerprint: "b".repeat(64),
+  });
+  const first = await registry.list({ limit: 2 }, ownerA);
+  assert.equal(first.targets.length, 2);
+  assert.match(first.nextCursor!, /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/u);
+  assert.equal(Number.isNaN(Number(first.nextCursor)), true);
+  const second = await registry.list({ cursor: first.nextCursor, limit: 2 }, ownerA);
+  assert.equal(second.targets.length, 2);
+  assert.equal(second.nextCursor, undefined);
+  await assert.rejects(
+    registry.list({ cursor: first.nextCursor, limit: 2 }, ownerB),
+    (error: unknown) => error instanceof Error
+      && "reason" in error
+      && error.reason === "CURSOR_INVALID",
+  );
+
+  await writeTargetConfig(configPath, {
+    alpha: sshTarget("Alpha changed", ["alpha"]),
+    beta: sshTarget("Beta", ["beta"]),
+    gamma: sshTarget("Gamma", ["gamma"]),
+  });
+  await assert.rejects(
+    registry.list({ cursor: first.nextCursor, limit: 2 }, ownerA),
+    (error: unknown) => error instanceof Error
+      && "reason" in error
+      && error.reason === "CURSOR_STALE",
+  );
 });
 
 test("target registry hot reloads configuration without changing tool schema", async (t) => {
@@ -158,6 +235,14 @@ test("Windows SSH probes report the target temporary directory", async (t) => {
           "temporary=C:\\Users\\test\\AppData\\Local\\Temp\\",
           "git=1",
           "elevated=0",
+          "fs_atomic_replace=1",
+          "fs_atomic_no_replace=1",
+          "fs_rename_exchange=0",
+          "fs_directory_fsync=0",
+          "fs_hardlink_publish=1",
+          "fs_trash=1",
+          "fs_reflink=0",
+          "fs_sparse_copy=0",
           "",
         ].join("\n"),
         stderr: "",
@@ -171,6 +256,16 @@ test("Windows SSH probes report the target temporary directory", async (t) => {
   assert.equal(observation.capabilities.pty, true);
   assert.equal(observation.capabilities.sftp, true);
   assert.equal(observation.capabilities.fs, true);
+  assert.deepEqual(observation.capabilities.filesystem, {
+    atomicReplace: true,
+    atomicNoReplace: true,
+    renameExchange: false,
+    directoryFsync: false,
+    hardlinkPublish: true,
+    trash: true,
+    reflink: false,
+    sparseCopy: false,
+  });
   assert.equal(calls.length, 3);
   const base = calls.find((call) => call.executable === "ssh" && call.args.includes("-T"));
   const pty = calls.find((call) => call.executable === "ssh" && call.args.includes("-tt"));
@@ -178,6 +273,11 @@ test("Windows SSH probes report the target temporary directory", async (t) => {
   assert.ok(base);
   assert.ok(pty);
   assert.ok(sftp);
+  const baseEncoded = /-EncodedCommand\s+([A-Za-z0-9+/=]+)$/u.exec(base.args.at(-1) ?? "")?.[1];
+  assert.ok(baseEncoded);
+  const baseSource = Buffer.from(baseEncoded, "base64").toString("utf16le");
+  assert.match(baseSource, /fs_atomic_replace/u);
+  assert.match(baseSource, /\[IO\.File\]::Replace/u);
   assert.match(pty.args.at(-1) ?? "", /powershell\.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand/u);
   const encoded = /-EncodedCommand\s+([A-Za-z0-9+/=]+)$/u.exec(pty.args.at(-1) ?? "")?.[1];
   assert.ok(encoded);
@@ -250,6 +350,14 @@ test("POSIX SSH probes verify PTY and SFTP once, cache the result, and refresh e
           "rsync=1",
           "setpriv_boundary=0",
           "sandbox_boundary=1",
+          "fs_atomic_replace=1",
+          "fs_atomic_no_replace=1",
+          "fs_rename_exchange=0",
+          "fs_directory_fsync=1",
+          "fs_hardlink_publish=1",
+          "fs_trash=1",
+          "fs_reflink=0",
+          "fs_sparse_copy=0",
           "",
         ].join("\n"),
         stderr: "",
@@ -262,8 +370,21 @@ test("POSIX SSH probes verify PTY and SFTP once, cache the result, and refresh e
   assert.equal(first.capabilities.pty, true);
   assert.equal(first.capabilities.sftp, true);
   assert.equal(first.capabilities.fs, true);
+  assert.deepEqual(first.capabilities.filesystem, {
+    atomicReplace: true,
+    atomicNoReplace: true,
+    renameExchange: false,
+    directoryFsync: true,
+    hardlinkPublish: true,
+    trash: true,
+    reflink: false,
+    sparseCopy: false,
+  });
   assert.equal((first.evidence as { cache?: string }).cache, "miss");
   assert.equal(calls.length, 3);
+  const baseProbe = calls.find((call) => call.executable === "ssh" && call.args.includes("-T"));
+  assert.match(baseProbe?.args.at(-1) ?? "", /fs_atomic_replace/u);
+  assert.match(baseProbe?.args.at(-1) ?? "", /fs_directory_fsync/u);
 
   const cached = await registry.probe("company");
   assert.equal((cached.evidence as { cache?: string }).cache, "hit");

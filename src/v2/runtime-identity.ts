@@ -7,6 +7,11 @@ import {
   RUNTIME_AUTHORITY_CONTRACT_GENERATION,
   RUNTIME_SCHEMA_GENERATION,
 } from "./runtime-contract-identity.js";
+import {
+  BASE_PRODUCT_PROFILE,
+  capabilityDigest,
+  RESOURCE_URI_VERSION,
+} from "./build-capabilities.js";
 
 export interface RuntimeIdentityInput {
   config: unknown;
@@ -20,6 +25,9 @@ export interface RuntimeIdentityInput {
 export function createRuntimeIdentity(input: RuntimeIdentityInput): RuntimeIdentity {
   return Object.freeze({
     productVersion: UNIVERSAL_BROKER_VERSION,
+    productProfile: BASE_PRODUCT_PROFILE,
+    buildCapabilityDigest: capabilityDigest(),
+    resourceUriVersion: RESOURCE_URI_VERSION,
     schemaGeneration: RUNTIME_SCHEMA_GENERATION,
     authorityContractGeneration: RUNTIME_AUTHORITY_CONTRACT_GENERATION,
     configDigest: digest(redactConfigForDigest(input.config)),
@@ -34,6 +42,9 @@ export function publicRuntimeHealth(identity: RuntimeIdentity): Record<string, u
   return {
     status: "ok",
     productVersion: identity.productVersion,
+    productProfile: identity.productProfile,
+    buildCapabilityDigest: identity.buildCapabilityDigest,
+    resourceUriVersion: identity.resourceUriVersion,
     schemaGeneration: identity.schemaGeneration,
     authorityContractGeneration: identity.authorityContractGeneration,
     runtimeRevision: identity.runtimeRevision,
@@ -46,7 +57,7 @@ export function canonicalJson(value: unknown): string {
   if (value && typeof value === "object") {
     return `{${Object.entries(value as Record<string, unknown>)
       .filter(([, child]) => child !== undefined)
-      .sort(([left], [right]) => left.localeCompare(right))
+      .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
       .map(([key, child]) => `${JSON.stringify(key)}:${canonicalJson(child)}`)
       .join(",")}}`;
   }
