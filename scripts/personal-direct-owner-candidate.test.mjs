@@ -5,6 +5,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  realpath,
   rm,
   stat,
   writeFile,
@@ -107,6 +108,8 @@ test("Personal candidate orchestration emits a clean environment and complete ev
   assert.match(candidateEnvironment, /DEVSPACE_OAUTH_OWNER_TOKEN='owner-secret-preserved'/u);
   assert.doesNotMatch(candidateEnvironment, /stale-production-state/u);
   assert.doesNotMatch(candidateEnvironment, /DEVSPACE_PERSONAL_STAGING_FIXTURE/u);
+  assert.doesNotMatch(candidateEnvironment, /DEVSPACE_NEXT_HEALTH_PATH/u);
+  assert.doesNotMatch(candidateEnvironment, /DEVSPACE_NEXT_READY_PATH/u);
   assert.doesNotMatch(candidateEnvironment, /DEVSPACE_NEXT_AUTHORITY_STORE/u);
   assert.doesNotMatch(candidateEnvironment, /DEVSPACE_NEXT_LIFECYCLE_FINALIZATION_STORE/u);
 
@@ -195,7 +198,7 @@ class FakeProcessManager {
 }
 
 async function candidateFixture(t, suffix) {
-  const root = await mkdtemp(join(tmpdir(), `devspace-personal-candidate-${suffix}-`));
+  const root = await realpath(await mkdtemp(join(tmpdir(), `devspace-personal-candidate-${suffix}-`)));
   const releasePackage = join(root, "release-package");
   const dependencyRoot = join(root, "dependency");
   const dependencyEvidence = join(root, "dependency-evidence.json");
@@ -288,7 +291,9 @@ function runtimeIdentity() {
 }
 
 function parseEnvironment(text) {
-  return Object.fromEntries(text.trim().split("\n").filter(Boolean).map((line) => {
+  return Object.fromEntries(text.trim().split("\n")
+    .filter((line) => line && !line.trimStart().startsWith("#"))
+    .map((line) => {
     const index = line.indexOf("=");
     return [line.slice(0, index), decodeShellLiteral(line.slice(index + 1))];
   }));

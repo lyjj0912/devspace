@@ -268,8 +268,6 @@ function candidateEnvironmentValues(input) {
     DEVSPACE_NEXT_MANAGEMENT_PORT: String(input.managementPort),
     DEVSPACE_NEXT_PUBLIC_BASE_URL: input.publicBaseUrl,
     DEVSPACE_NEXT_MCP_PATH: "/mcp",
-    DEVSPACE_NEXT_HEALTH_PATH: "/healthz",
-    DEVSPACE_NEXT_READY_PATH: "/readyz",
     DEVSPACE_NEXT_STATE_DIR: input.stateDir,
     DEVSPACE_NEXT_OAUTH_STATE_DIR: input.oauthStateDir,
     DEVSPACE_NEXT_TARGETS_FILE: input.targetConfig,
