@@ -156,6 +156,8 @@ test("personal promotion snapshots mutable state and installs rollback before st
     'cp -a "$CONTROL_DIR" "$AUDIT/finalization-control.before"',
     'cp -p "$AUDIT/oauth.sqlite.before" "$OAUTH_STATE_DIR/devspace.sqlite"',
     'pm2 start "$OLD_SCRIPT"',
+    'Previous production listener did not stop.',
+    'observed!=sys.argv[2]',
     'wait_json "$PUBLIC_BASE_URL/healthz"',
     'pm2 delete "$CANDIDATE_PROCESS"',
   ]) assert.ok(source.includes(required), `missing personal promotion boundary: ${required}`);

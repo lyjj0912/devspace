@@ -95,6 +95,10 @@ const DEFAULT_CHECK_TIMEOUT_MS = 200;
 const MAXIMUM_CHECKS = 64;
 const CHECK_ID_PATTERN = /^[a-z][a-z0-9_]{1,63}$/u;
 const SHA256_DIGEST_PATTERN = /^sha256:[a-f0-9]{64}$/u;
+const LEGACY_PERSONAL_CONNECTOR_STATES = new Set([
+  "VERIFICATION_IDENTITY_INCOMPLETE",
+  "DRAINING_DEADLINE_ELAPSED",
+]);
 
 /**
  * A parallel runtime is started before its connector is activated. Treat only that
@@ -104,20 +108,28 @@ const SHA256_DIGEST_PATTERN = /^sha256:[a-f0-9]{64}$/u;
 export function canonicalConnectorReadinessObservation(
   deploymentMode: "parallel" | "production",
   connector: CanonicalConnectorReadinessInput,
+  allowLegacyPersonalConnector = false,
 ): ReadinessCheckObservation {
   const awaitingParallelActivation = deploymentMode === "parallel"
     && connector.state === "FAIL"
     && connector.activeCount === 0
     && connector.invalidStates.length === 1
     && connector.invalidStates[0] === "ACTIVE_COUNT";
+  const legacyPersonalActive = deploymentMode === "production"
+    && allowLegacyPersonalConnector
+    && connector.activeCount === 1
+    && connector.invalidStates.length > 0
+    && connector.invalidStates.every((state) => LEGACY_PERSONAL_CONNECTOR_STATES.has(state));
   return {
-    state: awaitingParallelActivation ? "PASS" : connector.state,
+    state: awaitingParallelActivation || legacyPersonalActive ? "PASS" : connector.state,
     evidence: {
       activeCount: connector.activeCount,
       bindingsByState: connector.bindingsByState,
       invalidStates: connector.invalidStates,
       activationState: awaitingParallelActivation
         ? "PENDING"
+        : legacyPersonalActive
+          ? "LEGACY_ACTIVE"
         : connector.state === "PASS" && connector.activeCount === 1
           ? "ACTIVE"
           : "INVALID",

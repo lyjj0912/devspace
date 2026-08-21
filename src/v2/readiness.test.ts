@@ -98,6 +98,21 @@ test("parallel readiness accepts only the consistent pre-activation connector st
   const production = canonicalConnectorReadinessObservation("production", emptyConnector);
   assert.equal(production.state, "FAIL");
 
+  const legacyPersonal = canonicalConnectorReadinessObservation("production", {
+    state: "FAIL",
+    activeCount: 1,
+    bindingsByState: { ACTIVE: 1, DRAINING: 2 },
+    invalidStates: ["VERIFICATION_IDENTITY_INCOMPLETE", "DRAINING_DEADLINE_ELAPSED"],
+  }, true);
+  assert.equal(legacyPersonal.state, "PASS");
+  assert.equal(legacyPersonal.evidence?.activationState, "LEGACY_ACTIVE");
+  assert.equal(canonicalConnectorReadinessObservation("production", {
+    state: "FAIL",
+    activeCount: 1,
+    bindingsByState: { ACTIVE: 1 },
+    invalidStates: ["PREPARED_RECEIPT_MISMATCH"],
+  }, true).state, "FAIL");
+
   const inconsistentParallel = canonicalConnectorReadinessObservation("parallel", {
     ...emptyConnector,
     invalidStates: ["ACTIVE_COUNT", "PREPARED_RECEIPT_MISMATCH"],

@@ -237,9 +237,6 @@ rollback() {
   if [[ "$PRODUCTION_MUTATION_STARTED" == 1 ]]; then pm2 delete "$PRODUCTION_PROCESS" >"$AUDIT/rollback-delete-current.log" 2>&1; fi
   cp -p "$AUDIT/production.env.before" "$PRODUCTION_ENV"
   if [[ "$STATE_BACKED_UP" == 1 ]]; then
-    rm -rf "$STATE_DIR" "$CONTROL_DIR"
-    cp -a "$AUDIT/state.before" "$STATE_DIR"
-    cp -a "$AUDIT/finalization-control.before" "$CONTROL_DIR"
     rm -f "$OAUTH_STATE_DIR/devspace.sqlite" "$OAUTH_STATE_DIR/devspace.sqlite-wal" "$OAUTH_STATE_DIR/devspace.sqlite-shm"
     cp -p "$AUDIT/oauth.sqlite.before" "$OAUTH_STATE_DIR/devspace.sqlite"
   fi
@@ -266,6 +263,12 @@ sqlite3 "$AUDIT/oauth.sqlite.before" 'pragma integrity_check;' >"$AUDIT/oauth-in
 [[ "$(cat "$AUDIT/oauth-integrity.before.txt")" == ok ]]
 STATE_BACKED_UP=1
 pm2 delete "$PRODUCTION_PROCESS" >"$AUDIT/delete-old.log" 2>&1
+listener_gone=0
+for _ in $(seq 1 120); do
+  if ! curl -sS --max-time 1 http://127.0.0.1:7678/healthz >/dev/null 2>&1; then listener_gone=1; break; fi
+  sleep 0.25
+done
+[[ "$listener_gone" == 1 ]] || { echo "Previous production listener did not stop." >&2; false; }
 cp -p "$ENV_NEXT" "$PRODUCTION_ENV.next"
 mv -f "$PRODUCTION_ENV.next" "$PRODUCTION_ENV"
 DEVSPACE_PRODUCTION_ENV_FILE="$PRODUCTION_ENV" pm2 start "$START_SCRIPT" \
@@ -273,18 +276,39 @@ DEVSPACE_PRODUCTION_ENV_FILE="$PRODUCTION_ENV" pm2 start "$START_SCRIPT" \
   >"$AUDIT/start-new.log" 2>&1
 
 wait_json() {
-  local url="$1" output="$2"
+  local url="$1" output="$2" kind="$3"
+  local status=""
+  local matched=0
+  trap - ERR
+  set +e
   for _ in $(seq 1 120); do
-    if curl -fsS --max-time 5 "$url" >"$output" 2>/dev/null; then return 0; fi
+    if status="$(curl -sS --max-time 5 -o "$output" -w '%{http_code}' "$url" 2>"$output.curl-error")" \
+      && [[ "$status" == 200 ]] \
+      && python3 - "$output" "$RUNTIME_REVISION" "$kind" <<'PY'
+import json,sys
+value=json.load(open(sys.argv[1]))
+observed=value.get("runtimeRevision") if sys.argv[3]=="health" else (value.get("identity") or {}).get("runtimeRevision")
+if observed!=sys.argv[2]: raise SystemExit(1)
+if sys.argv[3]=="ready" and value.get("status")!="ready": raise SystemExit(1)
+PY
+    then
+      matched=1
+      break
+    fi
     sleep 0.5
   done
-  curl -fsS --max-time 5 "$url" >"$output"
+  set -e
+  trap 'rollback $?' ERR
+  if [[ "$matched" == 1 ]]; then return 0; fi
+  if [[ -s "$output.curl-error" ]]; then cat "$output.curl-error" >&2; fi
+  echo "Expected HTTP 200 from $url, observed ${status:-transport_error}." >&2
+  return 1
 }
-wait_json http://127.0.0.1:7678/healthz "$AUDIT/health.local.json"
-wait_json http://127.0.0.1:8678/readyz "$AUDIT/ready.local.json"
+wait_json http://127.0.0.1:7678/healthz "$AUDIT/health.local.json" health
+wait_json http://127.0.0.1:8678/readyz "$AUDIT/ready.local.json" ready
 release_artifacts verify-gateway --package "$RELEASE_PACKAGE" --identity "$AUDIT/health.local.json" >/dev/null
 release_artifacts verify-runtime --package "$RELEASE_PACKAGE" --identity "$AUDIT/ready.local.json" >/dev/null
-wait_json "$PUBLIC_BASE_URL/healthz" "$AUDIT/health.public.json"
+wait_json "$PUBLIC_BASE_URL/healthz" "$AUDIT/health.public.json" health
 release_artifacts verify-gateway --package "$RELEASE_PACKAGE" --identity "$AUDIT/health.public.json" >/dev/null
 pm2 jlist >"$AUDIT/pm2.after.json"
 python3 - "$AUDIT/pm2.after.json" "$PRODUCTION_PROCESS" "$RELEASE_PACKAGE" "$START_SCRIPT" <<'PY'

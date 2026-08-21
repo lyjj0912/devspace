@@ -528,6 +528,7 @@ export function createUniversalBrokerNextServer(
       check: () => canonicalConnectorReadinessObservation(
         config.deploymentMode,
         oauthProvider.connectorReadiness(),
+        process.env.DEVSPACE_PERSONAL_STAGING_FIXTURE === "1",
       ),
     },
     {
