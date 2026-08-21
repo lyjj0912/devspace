@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
@@ -82,6 +82,22 @@ test("staging package runs the real metadata collector but remains ineligible fo
     });
     assert.notEqual(productionPreflight.status, 0);
     assert.match(productionPreflight.stderr, /gate producer trust anchor|--state-dir is required/iu);
+
+    const incompleteDependencyRoot = spawnSync("/bin/bash", [
+      join(sourceRoot, "scripts", "deploy-universal-broker-v2-parallel.sh"),
+      "--release-package", packageRoot,
+      "--dependency-root", sourceRoot,
+      "--verify-only",
+      "--staging-fixture",
+    ], { encoding: "utf8" });
+    assert.notEqual(incompleteDependencyRoot.status, 0);
+    assert.match(incompleteDependencyRoot.stderr, /--dependency-evidence must name an existing file/iu);
+
+    const startSource = readFileSync(join(sourceRoot, "scripts", "start-universal-broker-v2.sh"), "utf8");
+    assert.match(startSource, /DEVSPACE_PERSONAL_STAGING_FIXTURE/gu);
+    assert.match(startSource, /verify_release_artifact verify-runtime-command/gu);
+    assert.match(startSource, /verify_release_artifact verify-runtime-dependencies/gu);
+    assert.match(startSource, /DEVSPACE_RUNTIME_DEPENDENCY_ROOT/gu);
   } finally {
     rmSync(temporaryRoot, { recursive: true, force: true });
   }

@@ -5,6 +5,8 @@ umask 077
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 RELEASE_PACKAGE=""
 RUNTIME_ROOT="${DEVSPACE_RELEASE_RUNTIME_ROOT:-}"
+DEPENDENCY_ROOT=""
+DEPENDENCY_EVIDENCE=""
 BASE_ENVIRONMENT_FILE="${HOME:?HOME is required}/.devspace/universal-broker-v2-production.env"
 ENVIRONMENT_FILE=""
 IDENTITY_DIRECTORY="$HOME/.devspace/identity"
@@ -19,13 +21,15 @@ CANONICAL_CONNECTOR_NAME="myDevSpace"
 CONNECTOR_INSTALLATION_EPOCH="1"
 
 usage() {
-  echo "Usage: $0 --release-package DIR [--runtime-root DIR] [--base-environment-file FILE] [--environment-file FILE] [--identity-directory DIR] [--state-directory DIR] [--public-base-url URL] [--process-name NAME] [--port PORT] [--connector-name NAME] [--connector-installation-epoch N] [--audit DIR] [--verify-only] [--staging-fixture]" >&2
+  echo "Usage: $0 --release-package DIR [--runtime-root DIR] [--dependency-root DIR --dependency-evidence FILE] [--base-environment-file FILE] [--environment-file FILE] [--identity-directory DIR] [--state-directory DIR] [--public-base-url URL] [--process-name NAME] [--port PORT] [--connector-name NAME] [--connector-installation-epoch N] [--audit DIR] [--verify-only] [--staging-fixture]" >&2
 }
 
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
     --release-package) RELEASE_PACKAGE="${2:-}"; shift 2 ;;
     --runtime-root) RUNTIME_ROOT="${2:-}"; shift 2 ;;
+    --dependency-root) DEPENDENCY_ROOT="${2:-}"; shift 2 ;;
+    --dependency-evidence) DEPENDENCY_EVIDENCE="${2:-}"; shift 2 ;;
     --base-environment-file) BASE_ENVIRONMENT_FILE="${2:-}"; shift 2 ;;
     --environment-file) ENVIRONMENT_FILE="${2:-}"; shift 2 ;;
     --identity-directory) IDENTITY_DIRECTORY="${2:-}"; shift 2 ;;
@@ -52,6 +56,12 @@ RELEASE_PACKAGE="$(cd "$RELEASE_PACKAGE" && pwd -P)"
 RUNTIME_ROOT="${RUNTIME_ROOT:-$RELEASE_PACKAGE}"
 [[ -d "$RUNTIME_ROOT" ]] || { echo "--runtime-root must name an existing directory." >&2; exit 2; }
 RUNTIME_ROOT="$(cd "$RUNTIME_ROOT" && pwd -P)"
+if [[ -n "$DEPENDENCY_ROOT" || -n "$DEPENDENCY_EVIDENCE" ]]; then
+  [[ -n "$DEPENDENCY_ROOT" && -d "$DEPENDENCY_ROOT" ]] || { echo "--dependency-root must name an existing directory." >&2; exit 2; }
+  [[ -n "$DEPENDENCY_EVIDENCE" && -f "$DEPENDENCY_EVIDENCE" ]] || { echo "--dependency-evidence must name an existing file." >&2; exit 2; }
+  DEPENDENCY_ROOT="$(cd "$DEPENDENCY_ROOT" && pwd -P)"
+  DEPENDENCY_EVIDENCE="$(cd "$(dirname "$DEPENDENCY_EVIDENCE")" && pwd -P)/$(basename "$DEPENDENCY_EVIDENCE")"
+fi
 BASE_ENVIRONMENT_FILE="$(python3 -c 'import os,sys; print(os.path.abspath(os.path.expanduser(sys.argv[1])))' "$BASE_ENVIRONMENT_FILE")"
 IDENTITY_DIRECTORY="$(python3 -c 'import os,sys; print(os.path.abspath(os.path.expanduser(sys.argv[1])))' "$IDENTITY_DIRECTORY")"
 AUDIT="${AUDIT:-$HOME/.devspace/deployments/universal-broker-v2/parallel-$(date -u +%Y%m%dT%H%M%SZ)}"
@@ -83,6 +93,14 @@ run_release_artifacts() {
 run_release_artifacts verify --package "$RELEASE_PACKAGE" >"$AUDIT/package-verification.json"
 run_release_artifacts verify-runtime-tree \
   --package "$RELEASE_PACKAGE" --runtime-root "$RUNTIME_ROOT" >"$AUDIT/runtime-tree-verification.json"
+DEPENDENCY_EVIDENCE_SHA256=""
+if [[ -n "$DEPENDENCY_ROOT" ]]; then
+  DEPENDENCY_EVIDENCE_SHA256="sha256:$(/usr/bin/shasum -a 256 "$DEPENDENCY_EVIDENCE" | /usr/bin/awk '{print $1}')"
+  run_release_artifacts verify-runtime-dependencies \
+    --package "$RELEASE_PACKAGE" --dependency-root "$DEPENDENCY_ROOT" \
+    --evidence "$DEPENDENCY_EVIDENCE" --evidence-sha256 "$DEPENDENCY_EVIDENCE_SHA256" \
+    >"$AUDIT/runtime-dependencies-verification.json"
+fi
 MANIFEST="$RELEASE_PACKAGE/BUILD-MANIFEST.json"
 IDENTITY_TSV="$("$NODE" -e '
 const v=require(process.argv[1]);
@@ -133,6 +151,8 @@ managed={
   "DEVSPACE_NEXT_CONTEXT_STORE","DEVSPACE_NEXT_CONTEXT_WORKTREE_ROOT","DEVSPACE_NEXT_PROCESS_OUTPUT_DIR",
   "DEVSPACE_NEXT_SELF_MANAGEMENT_DIR","DEVSPACE_NEXT_ARTIFACT_STAGING_DIR","DEVSPACE_NEXT_PM2_PROCESS_NAME",
   "DEVSPACE_NEXT_PM2_EXPECTED_SCRIPT","DEVSPACE_NEXT_AUTHORITY_STORE","DEVSPACE_NEXT_AUTHORITY_OWNER_INSTANCE_ID",
+  "DEVSPACE_RUNTIME_PACKAGE_ROOT","DEVSPACE_RUNTIME_DEPENDENCY_ROOT","DEVSPACE_RUNTIME_DEPENDENCY_EVIDENCE",
+  "DEVSPACE_EXPECTED_RUNTIME_DEPENDENCY_EVIDENCE_SHA256","DEVSPACE_PERSONAL_STAGING_FIXTURE",
   "DEVSPACE_RELEASE_MANIFEST",
   "DEVSPACE_EXPECTED_SOURCE_REVISION","DEVSPACE_EXPECTED_RUNTIME_REVISION","DEVSPACE_EXPECTED_BUILD_DIGEST",
   "DEVSPACE_EXPECTED_SCHEMA_GENERATION","DEVSPACE_EXPECTED_AUTHORITY_CONTRACT_GENERATION","DEVSPACE_EXPECTED_CONFIG_SCHEMA_IDENTITY",
@@ -173,6 +193,15 @@ START_SCRIPT="$RUNTIME_ROOT/scripts/start-universal-broker-v2-production.sh"
   printf 'DEVSPACE_NEXT_PM2_EXPECTED_SCRIPT=%s\n' "$(quote "$START_SCRIPT")"
   printf 'DEVSPACE_NEXT_AUTHORITY_STORE=%s\n' "$(quote "$STATE_DIRECTORY/authority.sqlite")"
   printf 'DEVSPACE_NEXT_AUTHORITY_OWNER_INSTANCE_ID=%s\n' "$(quote "$OWNER_INSTANCE_ID")"
+  if [[ -n "$DEPENDENCY_ROOT" ]]; then
+    printf 'DEVSPACE_RUNTIME_PACKAGE_ROOT=%s\n' "$(quote "$RUNTIME_ROOT")"
+    printf 'DEVSPACE_RUNTIME_DEPENDENCY_ROOT=%s\n' "$(quote "$DEPENDENCY_ROOT")"
+    printf 'DEVSPACE_RUNTIME_DEPENDENCY_EVIDENCE=%s\n' "$(quote "$DEPENDENCY_EVIDENCE")"
+    printf 'DEVSPACE_EXPECTED_RUNTIME_DEPENDENCY_EVIDENCE_SHA256=%s\n' "$(quote "$DEPENDENCY_EVIDENCE_SHA256")"
+  fi
+  if [[ "$ALLOW_UNATTESTED_STAGING" == 1 ]]; then
+    printf 'DEVSPACE_PERSONAL_STAGING_FIXTURE=%s\n' "$(quote 1)"
+  fi
   printf 'DEVSPACE_RELEASE_MANIFEST=%s\n' "$(quote "$MANIFEST")"
   printf 'DEVSPACE_EXPECTED_SOURCE_REVISION=%s\n' "$(quote "$SOURCE_REVISION")"
   printf 'DEVSPACE_EXPECTED_RUNTIME_REVISION=%s\n' "$(quote "$RUNTIME_REVISION")"
