@@ -8,6 +8,7 @@ import {
   ReadinessRegistry,
   baseMutableSqliteStoreReadiness,
   canonicalConnectorReadinessObservation,
+  personalConnectorReadinessObservation,
   type ReadinessCheck,
 } from "./readiness.js";
 import { loadOrCreateManagementAuthorizationKey } from "./management-authorization.js";
@@ -98,20 +99,12 @@ test("parallel readiness accepts only the consistent pre-activation connector st
   const production = canonicalConnectorReadinessObservation("production", emptyConnector);
   assert.equal(production.state, "FAIL");
 
-  const legacyPersonal = canonicalConnectorReadinessObservation("production", {
-    state: "FAIL",
-    activeCount: 1,
-    bindingsByState: { ACTIVE: 1, DRAINING: 2 },
-    invalidStates: ["VERIFICATION_IDENTITY_INCOMPLETE", "DRAINING_DEADLINE_ELAPSED"],
-  }, true);
-  assert.equal(legacyPersonal.state, "PASS");
-  assert.equal(legacyPersonal.evidence?.activationState, "LEGACY_ACTIVE");
   assert.equal(canonicalConnectorReadinessObservation("production", {
     state: "FAIL",
     activeCount: 1,
     bindingsByState: { ACTIVE: 1 },
     invalidStates: ["PREPARED_RECEIPT_MISMATCH"],
-  }, true).state, "FAIL");
+  }).state, "FAIL");
 
   const inconsistentParallel = canonicalConnectorReadinessObservation("parallel", {
     ...emptyConnector,
@@ -127,6 +120,71 @@ test("parallel readiness accepts only the consistent pre-activation connector st
   });
   assert.equal(activeParallel.state, "PASS");
   assert.equal(activeParallel.evidence?.activationState, "ACTIVE");
+});
+
+test("Personal readiness has no production legacy-fixture bypass", () => {
+  const empty = {
+    state: "FAIL" as const,
+    activeCount: 0,
+    bindingsByState: {
+      REGISTERED: 0,
+      CANDIDATE: 0,
+      VERIFIED: 0,
+      ACTIVATION_PREPARED: 0,
+      ACTIVE: 0,
+      DRAINING: 0,
+      RETIRED: 0,
+      REJECTED: 0,
+      FAILED: 0,
+    },
+    invalidStates: ["ACTIVE_COUNT"],
+    expectedInstallationEpoch: 3,
+    activeFamilyCount: 0,
+    activeRefreshTokenCount: 0,
+    activePersistedTokenCount: 0,
+    overdueDrainingCount: 0,
+    unboundActiveFamilyCount: 0,
+    nonActiveTokenFamilyCount: 0,
+    preparedReceiptCount: 0,
+  };
+  assert.equal(personalConnectorReadinessObservation("parallel", empty).state, "PASS");
+  assert.equal(
+    personalConnectorReadinessObservation("parallel", empty).evidence?.activationState,
+    "PENDING",
+  );
+  assert.equal(personalConnectorReadinessObservation("production", empty).state, "FAIL");
+
+  const active = {
+    ...empty,
+    state: "PASS" as const,
+    activeCount: 1,
+    bindingsByState: { ...empty.bindingsByState, ACTIVE: 1 },
+    invalidStates: [],
+    activeInstallationEpoch: 3,
+    activeSchemaGeneration: `sha256:${"1".repeat(64)}`,
+    activeBindingIdDigest: `sha256:${"2".repeat(64)}`,
+    activeClientIdDigest: `sha256:${"3".repeat(64)}`,
+    activeFamilyCount: 1,
+    activeRefreshTokenCount: 1,
+    activePersistedTokenCount: 2,
+  };
+  assert.equal(personalConnectorReadinessObservation("production", active).state, "PASS");
+  assert.equal(
+    personalConnectorReadinessObservation("production", active).evidence?.activationState,
+    "ACTIVE",
+  );
+  const legacyInvalid = {
+    ...active,
+    state: "FAIL" as const,
+    bindingsByState: { ...active.bindingsByState, DRAINING: 2 },
+    invalidStates: ["DRAINING_DEADLINE_ELAPSED"],
+    overdueDrainingCount: 2,
+  };
+  assert.equal(personalConnectorReadinessObservation("production", legacyInvalid).state, "FAIL");
+  assert.equal(
+    personalConnectorReadinessObservation("production", legacyInvalid).evidence?.activationState,
+    "INVALID",
+  );
 });
 
 test("personal readiness is gated only by the mutable stores used by the request path", async (t) => {

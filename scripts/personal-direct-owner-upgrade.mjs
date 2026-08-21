@@ -34,6 +34,8 @@ if (command === "plan") {
   process.stdout.write(`${JSON.stringify({ status: "PASS", runtimeRevision: plan.runtimeRevision })}\n`);
 } else if (command === "apply") {
   await applyRuntimeUpgrade(request, plan);
+} else if (command === "rollback") {
+  await rollbackRuntimeUpgrade(request, plan);
 } else if (command === "status") {
   const pointer = await readlink(plan.currentRuntimePointer);
   process.stdout.write(`${JSON.stringify({
@@ -42,7 +44,7 @@ if (command === "plan") {
     resolvedRuntime: resolve(dirname(plan.currentRuntimePointer), pointer),
   }, null, 2)}\n`);
 } else {
-  throw new Error("Usage: personal-direct-owner-upgrade.mjs <plan|apply|status|verify-readback> --request FILE");
+  throw new Error("Usage: personal-direct-owner-upgrade.mjs <plan|apply|rollback|status|verify-readback> --request FILE");
 }
 
 async function applyRuntimeUpgrade(request, plan) {
@@ -105,6 +107,68 @@ async function applyRuntimeUpgrade(request, plan) {
     ], { allowFailure: true });
     throw error;
   }
+}
+
+async function rollbackRuntimeUpgrade(request, plan) {
+  const apply = request.apply ?? {};
+  const productionEnvironment = absolute(apply.productionEnvironment, "apply.productionEnvironment");
+  const auditDirectory = absolute(apply.auditDirectory, "apply.auditDirectory");
+  const productionProcess = processName(apply.productionProcess, "apply.productionProcess");
+  const candidateProcess = processName(apply.candidateProcess, "apply.candidateProcess");
+  const productionHealthUrl = httpsOrLoopbackUrl(
+    apply.productionHealthUrl,
+    "apply.productionHealthUrl",
+  );
+  const environmentPreimage = join(auditDirectory, "production.env.before");
+  const recordedPlanPath = join(auditDirectory, "PLAN.json");
+  await assertOwnerFile(environmentPreimage);
+  await assertOwnerFile(recordedPlanPath);
+  const recordedPlan = JSON.parse(await readFile(recordedPlanPath, "utf8"));
+  if (JSON.stringify(recordedPlan) !== JSON.stringify(plan)) {
+    throw new Error("Rollback plan differs from the exact applied upgrade plan.");
+  }
+  const pointer = resolve(
+    dirname(plan.currentRuntimePointer),
+    await readlink(plan.currentRuntimePointer),
+  );
+  if (![plan.candidateRuntimePath, plan.existingRuntimePath].includes(pointer)) {
+    throw new Error("Current runtime pointer is neither the candidate nor rollback runtime.");
+  }
+
+  run("pm2", ["delete", candidateProcess], { allowFailure: true });
+  run("pm2", ["delete", productionProcess], { allowFailure: true });
+  await atomicFileReplacement(environmentPreimage, productionEnvironment);
+  await atomicSymlink(plan.existingRuntimePath, plan.currentRuntimePointer);
+  await restoreStores(plan.backupSet, auditDirectory);
+  run("pm2", ["start", ...personalProductionStartArguments(
+    plan.existingRuntimePath,
+    productionProcess,
+  )]);
+  await waitForHealthyPersonalRuntime(
+    productionHealthUrl,
+    request.upgrade.existing.runtimeRevision,
+  );
+  const result = {
+    status: pointer === plan.existingRuntimePath ? "ALREADY_ROLLED_BACK" : "ROLLED_BACK",
+    productProfile: plan.productProfile,
+    runtimeRevision: request.upgrade.existing.runtimeRevision,
+    currentRuntimePointer: plan.currentRuntimePointer,
+    resolvedRuntime: plan.existingRuntimePath,
+    restoredEnvironment: productionEnvironment,
+    restoredStores: plan.backupSet.map((store) => store.id),
+    rolledBackAt: new Date().toISOString(),
+  };
+  const evidencePath = join(auditDirectory, "ROLLBACK.json");
+  try {
+    await writeFile(evidencePath, JSON.stringify(result, null, 2) + "\n", {
+      encoding: "utf8",
+      flag: "wx",
+      mode: 0o600,
+    });
+  } catch (error) {
+    if (!isNodeError(error, "EEXIST")) throw error;
+  }
+  process.stdout.write(`${JSON.stringify(result)}\n`);
 }
 
 async function backupStores(stores, auditDirectory) {
@@ -211,6 +275,10 @@ function run(command, args, options = {}) {
   if (!options.allowFailure && result.status !== 0) {
     throw new Error(`${command} failed with status ${result.status}: ${(result.stderr ?? "").trim()}`);
   }
+}
+
+function isNodeError(error, code) {
+  return Boolean(error && typeof error === "object" && "code" in error && error.code === code);
 }
 
 function parseArguments(values) {

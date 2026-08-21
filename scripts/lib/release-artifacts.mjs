@@ -483,6 +483,17 @@ function computedProductionModuleReferences(path, text) {
       }
     }
     computedImports.length = 0;
+  } else if (path === "scripts/personal-direct-owner-runtime.mjs") {
+    const exactModule = "dist/v2/runtime-contract-identity.js";
+    const exactImport = [
+      "import",
+      `(pathToFileURL(join(root, "${exactModule}")).href)`,
+    ].join("");
+    if (computedImports.length !== 1 || !text.includes(exactImport)) {
+      throw new Error("Personal runtime identity loader is not statically closure-auditable.");
+    }
+    output.push({ kind: "computed-dist-module", specifier: exactModule, packagePath: true });
+    computedImports.length = 0;
   }
   if (computedImports.length > 0) {
     throw new Error(`Runtime operations closure has an unresolved computed import in ${path}.`);

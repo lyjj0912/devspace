@@ -62,7 +62,16 @@ import {
   targetSummary,
 } from "./targets.js";
 import type { UniversalBrokerMetrics } from "./metrics.js";
-import type { OperationAuditSink } from "./operation-audit.js";
+import {
+  digestOperationAuditPayload,
+  type OperationAuditSink,
+} from "./operation-audit.js";
+import { personalOperationRisk } from "./operation-risk.js";
+import {
+  type ToolRequestReplayDisposition,
+  type ToolRequestReplayIdentity,
+  UniversalToolRequestReplayGuard,
+} from "./request-replay-guard.js";
 
 export interface UniversalBrokerServices {
   targets?: TargetRegistry;
@@ -79,6 +88,8 @@ export interface UniversalBrokerServices {
   runtimeIdentity?: RuntimeIdentity;
   metrics?: UniversalBrokerMetrics;
   operationAudit?: OperationAuditSink;
+  requestReplayGuard?: UniversalToolRequestReplayGuard;
+  acceptanceRunId?: string;
 }
 
 interface UniversalBrokerRequestBoundary {
@@ -86,6 +97,8 @@ interface UniversalBrokerRequestBoundary {
   metrics?: UniversalBrokerMetrics;
   operationAudit?: OperationAuditSink;
   authorityPrincipal?: AuthorityPrincipalResolver;
+  requestReplayGuard?: UniversalToolRequestReplayGuard;
+  acceptanceRunId?: string;
 }
 
 export function createUniversalBrokerMcpServer(
@@ -113,6 +126,8 @@ export function createUniversalBrokerMcpServer(
     metrics: services.metrics,
     operationAudit: services.operationAudit,
     authorityPrincipal,
+    requestReplayGuard: services.requestReplayGuard,
+    acceptanceRunId: services.acceptanceRunId,
   };
 
   if (services.mcpProxy && services.metrics) {
@@ -226,6 +241,7 @@ function registerGuiTool(
       requestBoundary,
       "gui",
       input.operation,
+      input,
       extra,
       async (requestMeta, observation) => {
       const authenticated = requireAuthenticatedPrincipal(extra, authorityPrincipal);
@@ -267,6 +283,7 @@ function registerArtifactTool(
       requestBoundary,
       "artifact",
       input.operation,
+      input,
       extra,
       async (requestMeta, observation) => {
       const authenticated = requireAuthenticatedPrincipal(extra, authorityPrincipal);
@@ -348,6 +365,7 @@ function registerMcpTool(
       requestBoundary,
       "mcp",
       input.operation,
+      input,
       extra,
       async (requestMeta, observation) => {
       const authenticated = requireAuthenticatedPrincipal(extra, authorityPrincipal);
@@ -419,6 +437,7 @@ function registerFilesystemTool(
       requestBoundary,
       "fs",
       input.operation,
+      input,
       extra,
       async (requestMeta, observation) => {
       const authenticated = requireAuthenticatedPrincipal(extra, authorityPrincipal);
@@ -489,6 +508,7 @@ function registerExecTool(
       requestBoundary,
       "exec",
       "run",
+      input,
       extra,
       async (requestMeta, observation) => {
       const authenticated = requireAuthenticatedPrincipal(extra, authorityPrincipal);
@@ -550,6 +570,7 @@ function registerProcessTool(
       requestBoundary,
       "process",
       input.operation,
+      input,
       extra,
       async (requestMeta, observation) => {
       const authenticated = requireAuthenticatedPrincipal(extra, authorityPrincipal);
@@ -831,6 +852,7 @@ function registerTargetTool(
       requestBoundary,
       "target",
       input.operation,
+      input,
       extra,
       async (requestMeta, observation) => {
       const authenticated = requireAuthenticatedPrincipal(extra, authorityPrincipal);
@@ -895,6 +917,7 @@ function registerContextTool(
       requestBoundary,
       "context",
       input.operation,
+      input,
       extra,
       async (requestMeta, observation) => {
       const authenticated = requireAuthenticatedPrincipal(extra, authorityPrincipal);
@@ -1038,10 +1061,17 @@ interface GenerationObservation {
   routeGeneration?: string;
 }
 
+interface UniversalToolExecutionOutcome {
+  result: CallToolResult;
+  requestMeta: UniversalRequestMeta;
+  observation: GenerationObservation;
+}
+
 async function executeMeasuredUniversalTool(
   boundary: UniversalBrokerRequestBoundary,
   tool: UniversalToolName,
   operation: string,
+  input: unknown,
   extra: AuthorityRequestExtra,
   callback: (
     requestMeta: UniversalRequestMeta,
@@ -1049,14 +1079,45 @@ async function executeMeasuredUniversalTool(
   ) => Promise<CallToolResult>,
 ): Promise<CallToolResult> {
   const startedAt = performance.now();
-  const observation: GenerationObservation = {};
-  let requestMeta: UniversalRequestMeta = {};
-  const result = await executeUniversalTool(async () => {
-    requestMeta = requestMetaFromExtra(extra);
-    assertSchemaGeneration(requestMeta, boundary.runtimeIdentity);
-    return callback(requestMeta, observation);
-  });
-  applyObservedGenerations(result, boundary.runtimeIdentity, observation);
+  const execute = async (): Promise<UniversalToolExecutionOutcome> => {
+    const observation: GenerationObservation = {};
+    let requestMeta: UniversalRequestMeta = {};
+    const result = await executeUniversalTool(async () => {
+      requestMeta = requestMetaFromExtra(extra);
+      assertSchemaGeneration(requestMeta, boundary.runtimeIdentity);
+      return callback(requestMeta, observation);
+    });
+    applyObservedGenerations(result, boundary.runtimeIdentity, observation);
+    return { result, requestMeta, observation };
+  };
+  let outcome: UniversalToolExecutionOutcome;
+  let replayDisposition: ToolRequestReplayDisposition = "EXECUTED";
+  const replayIdentity = toolRequestReplayIdentity(boundary, tool, input, extra);
+  try {
+    if (boundary.requestReplayGuard && replayIdentity) {
+      const replayed = await boundary.requestReplayGuard.execute(
+        replayIdentity,
+        execute,
+        (candidate) => measuredToolResult(candidate.result, tool).result === "unknown",
+      );
+      outcome = replayed.value;
+      replayDisposition = replayed.disposition;
+    } else {
+      outcome = await execute();
+    }
+  } catch (error) {
+    const observation: GenerationObservation = {};
+    let requestMeta: UniversalRequestMeta = {};
+    const result = await executeUniversalTool(async () => {
+      requestMeta = requestMetaFromExtra(extra);
+      assertSchemaGeneration(requestMeta, boundary.runtimeIdentity);
+      throw error;
+    });
+    applyObservedGenerations(result, boundary.runtimeIdentity, observation);
+    outcome = { result, requestMeta, observation };
+  }
+  const { result, requestMeta, observation } = outcome;
+  if (replayDisposition !== "EXECUTED") return result;
   const measured = measuredToolResult(result, tool);
   const metrics = boundary.metrics;
   if (metrics) {
@@ -1079,6 +1140,7 @@ async function executeMeasuredUniversalTool(
     boundary,
     tool,
     operation,
+    input,
     extra,
     requestMeta,
     observation,
@@ -1088,10 +1150,32 @@ async function executeMeasuredUniversalTool(
   return result;
 }
 
+function toolRequestReplayIdentity(
+  boundary: UniversalBrokerRequestBoundary,
+  tool: UniversalToolName,
+  input: unknown,
+  extra: AuthorityRequestExtra,
+): ToolRequestReplayIdentity | undefined {
+  if (!boundary.requestReplayGuard || extra.requestId === undefined || !extra.authInfo) {
+    return undefined;
+  }
+  const principalFingerprint = boundary.authorityPrincipal?.(extra);
+  if (!principalFingerprint) return undefined;
+  return {
+    principalFingerprint,
+    scopes: Array.isArray(extra.authInfo.scopes) ? extra.authInfo.scopes : [],
+    requestId: extra.requestId,
+    tool,
+    arguments: input,
+    ...(extra._meta?.devspace === undefined ? {} : { meta: extra._meta.devspace }),
+  };
+}
+
 async function recordOperationAudit(
   boundary: UniversalBrokerRequestBoundary,
   tool: UniversalToolName,
   operation: string,
+  input: unknown,
   extra: AuthorityRequestExtra,
   requestMeta: UniversalRequestMeta,
   observation: GenerationObservation,
@@ -1108,22 +1192,41 @@ async function recordOperationAudit(
       : `op_${String(extra.requestId ?? "unknown")}`;
     const principalFingerprint = boundary.authorityPrincipal?.(extra);
     if (!principalFingerprint) return;
+    const runtimeIdentity = boundary.runtimeIdentity;
+    const connector = authenticatedConnectorAuditIdentity(extra);
     const outcomePromise = sink.record({
       operationId,
       correlationId: requestMeta.requestId ?? String(extra.requestId ?? operationId),
       principalFingerprint,
+      ...(runtimeIdentity ? {
+        productProfile: runtimeIdentity.productProfile,
+        sourceRevision: runtimeIdentity.sourceRevision,
+        runtimeRevision: runtimeIdentity.runtimeRevision,
+        buildDigest: runtimeIdentity.buildDigest,
+        schemaGeneration: runtimeIdentity.schemaGeneration,
+        runtimeStartedAt: runtimeIdentity.startedAt,
+      } : {}),
+      ...(connector?.installationEpoch === undefined
+        ? {}
+        : { connectorInstallationEpoch: connector.installationEpoch }),
+      ...(connector?.rotationSequence === undefined
+        ? {}
+        : { connectorRotationSequence: connector.rotationSequence }),
+      ...(boundary.acceptanceRunId ? { acceptanceRunId: boundary.acceptanceRunId } : {}),
       ...(observation.targetGeneration
         ? { targetGeneration: auditDigest(observation.targetGeneration) }
         : {}),
       ...(observation.routeGeneration ? { routeGeneration: auditDigest(observation.routeGeneration) } : {}),
       tool,
       operation,
-      risk: "OBSERVE_ONLY",
+      risk: personalOperationRisk(tool, operation, input),
+      action: { tool, operation, input },
       dispatchState: typeof error?.dispatchState === "string"
         ? error.dispatchState
         : measuredResult === "pass" ? "ACKNOWLEDGED" : "NOT_DISPATCHED",
       result: measuredResult,
       ...(typeof error?.code === "string" ? { errorCode: error.code } : {}),
+      receiptDigest: digestOperationAuditPayload(result.structuredContent ?? result),
     });
     void outcomePromise.then((outcome) => {
       recordAuditMetric(boundary, outcome.status === "RECORDED" ? "recorded" : "sink_failed");
@@ -1131,6 +1234,23 @@ async function recordOperationAudit(
   } catch {
     recordAuditMetric(boundary, "sink_failed");
   }
+}
+
+function authenticatedConnectorAuditIdentity(
+  extra: AuthorityRequestExtra,
+): { installationEpoch?: number; rotationSequence?: number } | undefined {
+  const connector = recordValue(extra.authInfo?.extra?.devspaceConnector);
+  if (!connector) return undefined;
+  const epoch = connector.installationEpoch;
+  const rotation = connector.rotationSequence;
+  return {
+    ...(typeof epoch === "number" && Number.isSafeInteger(epoch) && epoch > 0
+      ? { installationEpoch: epoch }
+      : {}),
+    ...(typeof rotation === "number" && Number.isSafeInteger(rotation) && rotation >= 0
+      ? { rotationSequence: rotation }
+      : {}),
+  };
 }
 
 function recordAuditMetric(
@@ -1496,6 +1616,7 @@ function registerUnavailableTool(
       requestBoundary,
       name,
       name === "exec" ? "run" : String((input as { operation?: unknown }).operation ?? "unknown"),
+      input,
       extra,
       async () => failedToolResult(new UniversalBrokerError(
         "CAPABILITY_UNAVAILABLE",

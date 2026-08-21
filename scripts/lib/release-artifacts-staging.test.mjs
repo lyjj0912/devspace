@@ -94,7 +94,11 @@ test("staging package runs the real metadata collector but remains ineligible fo
     assert.match(incompleteDependencyRoot.stderr, /--dependency-evidence must name an existing file/iu);
 
     const startSource = readFileSync(join(sourceRoot, "scripts", "start-universal-broker-v2.sh"), "utf8");
-    assert.match(startSource, /DEVSPACE_PERSONAL_STAGING_FIXTURE/gu);
+    assert.doesNotMatch(startSource, /DEVSPACE_PERSONAL_STAGING_FIXTURE/gu);
+    assert.doesNotMatch(
+      readFileSync(join(sourceRoot, "scripts", "deploy-universal-broker-v2-parallel.sh"), "utf8"),
+      /DEVSPACE_PERSONAL_STAGING_FIXTURE/u,
+    );
     assert.match(startSource, /verify_release_artifact verify-runtime-command/gu);
     assert.match(startSource, /verify_release_artifact verify-runtime-dependencies/gu);
     assert.match(startSource, /DEVSPACE_RUNTIME_DEPENDENCY_ROOT/gu);

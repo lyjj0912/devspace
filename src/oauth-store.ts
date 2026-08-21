@@ -67,6 +67,100 @@ export interface ConnectorReadinessSummary {
   invalidStates: ConnectorReadinessInvalidState[];
 }
 
+export interface PersonalConnectorExpectation {
+  canonicalName: string;
+  installationEpoch: number;
+  schemaGeneration: string;
+  resource: string;
+}
+
+export type PersonalConnectorReadinessInvalidState =
+  | "CANONICAL_NAME_UNCONFIGURED"
+  | "ACTIVE_COUNT"
+  | "ACTIVE_EPOCH_MISMATCH"
+  | "ACTIVE_SCHEMA_STALE"
+  | "ACTIVE_SCHEMA_INVALID"
+  | "ACTIVE_DRAIN_FIELDS_SET"
+  | "ACTIVE_FAMILY_MISSING"
+  | "ACTIVE_REFRESH_TOKEN_MISSING"
+  | "ACTIVE_TOKEN_RESOURCE_MISMATCH"
+  | "TOKEN_CLIENT_MISMATCH"
+  | "DRAINING_DEADLINE_INVALID"
+  | "DRAINING_DEADLINE_ELAPSED"
+  | "REFERENCE_COUNT_MISMATCH"
+  | "TERMINAL_REFERENCES_REMAIN"
+  | "PREPARED_RECEIPT_RESIDUE"
+  | "UNBOUND_ACTIVE_FAMILY"
+  | "NON_ACTIVE_TOKEN_FAMILY"
+  | "UNKNOWN_BINDING_STATE";
+
+export interface PersonalConnectorReadinessSummary {
+  state: "PASS" | "FAIL";
+  activeCount: number;
+  bindingsByState: Record<ConnectorBindingState, number>;
+  invalidStates: PersonalConnectorReadinessInvalidState[];
+  expectedInstallationEpoch?: number;
+  activeInstallationEpoch?: number;
+  activeSchemaGeneration?: string;
+  activeBindingIdDigest?: string;
+  activeClientIdDigest?: string;
+  activeFamilyCount: number;
+  activeRefreshTokenCount: number;
+  activePersistedTokenCount: number;
+  overdueDrainingCount: number;
+  unboundActiveFamilyCount: number;
+  nonActiveTokenFamilyCount: number;
+  preparedReceiptCount: number;
+}
+
+export type PersonalConnectorReconciliationAction =
+  | {
+      kind: "UPDATE_ACTIVE_SCHEMA";
+      bindingId: string;
+      expectedInstallationEpoch: number;
+      expectedSchemaGeneration: string;
+      nextSchemaGeneration: string;
+    }
+  | {
+      kind: "REVOKE_UNBOUND_FAMILY";
+      familyId: string;
+    }
+  | {
+      kind: "RETIRE_DRAINING_BINDING";
+      bindingId: string;
+      expectedDrainEpoch: number;
+      reason: "REFERENCE_ZERO" | "DEADLINE_ELAPSED";
+    }
+  | {
+      kind: "PURGE_TERMINAL_BINDING";
+      bindingId: string;
+      expectedState: "RETIRED" | "REJECTED" | "FAILED";
+    };
+
+export interface PersonalConnectorReconciliationPlan {
+  schemaVersion: 1;
+  planId: string;
+  planDigest: string;
+  preimageDigest: string;
+  createdAt: string;
+  expectation: PersonalConnectorExpectation;
+  actions: readonly PersonalConnectorReconciliationAction[];
+  blockers: readonly PersonalConnectorReadinessInvalidState[];
+  readinessBefore: PersonalConnectorReadinessSummary;
+}
+
+export interface PersonalConnectorReconciliationResult {
+  status: "APPLIED" | "NO_CHANGES";
+  planId: string;
+  planDigest: string;
+  preimageDigest: string;
+  postimageDigest: string;
+  appliedAt: string;
+  appliedActions: readonly PersonalConnectorReconciliationAction[];
+  retirementReceipts: readonly ConnectorRetirementReceipt[];
+  readinessAfter: PersonalConnectorReadinessSummary;
+}
+
 const DIGEST_PATTERN = /^sha256:[a-f0-9]{64}$/u;
 const RAW_SHA256_PATTERN = /^[a-f0-9]{64}$/u;
 const UUID_PATTERN = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/u;
@@ -229,6 +323,7 @@ export interface ConnectorAuthenticationContext {
   canonicalName: string;
   state: ConnectorBindingState;
   installationEpoch: number;
+  rotationSequence: number;
   schemaGeneration: string;
   buildDigest?: string;
   drainDeadlineAt?: string;
@@ -757,6 +852,431 @@ export class SqliteOAuthStore {
     };
   }
 
+  personalConnectorReadiness(
+    expectation: PersonalConnectorExpectation | undefined,
+    nowMs = Date.now(),
+  ): PersonalConnectorReadinessSummary {
+    const bindingsByState = emptyConnectorBindingCounts();
+    const empty = (invalidStates: PersonalConnectorReadinessInvalidState[]): PersonalConnectorReadinessSummary => ({
+      state: "FAIL",
+      activeCount: 0,
+      bindingsByState,
+      invalidStates,
+      ...(expectation ? { expectedInstallationEpoch: expectation.installationEpoch } : {}),
+      activeFamilyCount: 0,
+      activeRefreshTokenCount: 0,
+      activePersistedTokenCount: 0,
+      overdueDrainingCount: 0,
+      unboundActiveFamilyCount: 0,
+      nonActiveTokenFamilyCount: 0,
+      preparedReceiptCount: 0,
+    });
+    if (!expectation?.canonicalName) return empty(["CANONICAL_NAME_UNCONFIGURED"]);
+    validatePersonalConnectorExpectation(expectation);
+
+    const rows = this.database.sqlite.prepare(`
+      select binding_id, canonical_name, client_id, installation_epoch, state,
+             schema_generation, drain_deadline_at, refresh_allowed_during_drain, ref_count,
+             (select count(*) from oauth_token_families as family
+               where family.connector_binding_id = binding.binding_id and family.status <> 'REVOKED')
+               as active_family_count,
+             (select count(*) from oauth_refresh_tokens as refresh_token
+               where refresh_token.connector_binding_id = binding.binding_id)
+               as persisted_refresh_token_count,
+             ((select count(*) from oauth_access_tokens as access_token
+                 where access_token.connector_binding_id = binding.binding_id)
+               + (select count(*) from oauth_refresh_tokens as refresh_token
+                   where refresh_token.connector_binding_id = binding.binding_id))
+               as persisted_token_count,
+             ((select count(*) from oauth_access_tokens as access_token
+                 where access_token.connector_binding_id = binding.binding_id
+                   and (access_token.resource is null or access_token.resource <> ?))
+               + (select count(*) from oauth_refresh_tokens as refresh_token
+                   where refresh_token.connector_binding_id = binding.binding_id
+                     and (refresh_token.resource is null or refresh_token.resource <> ?)))
+               as resource_mismatch_count,
+             ((select count(*) from oauth_access_tokens as access_token
+                 where access_token.connector_binding_id = binding.binding_id
+                   and access_token.client_id <> binding.client_id)
+               + (select count(*) from oauth_refresh_tokens as refresh_token
+                   where refresh_token.connector_binding_id = binding.binding_id
+                     and refresh_token.client_id <> binding.client_id)
+               + (select count(*) from oauth_token_families as family
+                   where family.connector_binding_id = binding.binding_id
+                     and family.status <> 'REVOKED'
+                     and family.client_id <> binding.client_id))
+               as client_mismatch_count
+        from oauth_connector_bindings as binding
+       where canonical_name = ?
+       order by installation_epoch, binding_id
+    `).all(
+      expectation.resource,
+      expectation.resource,
+      expectation.canonicalName,
+    ) as PersonalConnectorReadinessRow[];
+    const invalidStates = new Set<PersonalConnectorReadinessInvalidState>();
+    let activeRow: PersonalConnectorReadinessRow | undefined;
+    let overdueDrainingCount = 0;
+    for (const row of rows) {
+      if (!isConnectorBindingState(row.state)) {
+        invalidStates.add("UNKNOWN_BINDING_STATE");
+        continue;
+      }
+      bindingsByState[row.state] += 1;
+      if (row.ref_count !== row.active_family_count) invalidStates.add("REFERENCE_COUNT_MISMATCH");
+      if (row.client_mismatch_count !== 0) invalidStates.add("TOKEN_CLIENT_MISMATCH");
+      if (row.state === "ACTIVE") {
+        activeRow = row;
+        if (row.drain_deadline_at !== null || row.refresh_allowed_during_drain !== 0) {
+          invalidStates.add("ACTIVE_DRAIN_FIELDS_SET");
+        }
+      }
+      if (row.state === "DRAINING") {
+        const deadlineMs = row.drain_deadline_at === null ? Number.NaN : Date.parse(row.drain_deadline_at);
+        if (!Number.isFinite(deadlineMs)) invalidStates.add("DRAINING_DEADLINE_INVALID");
+        else if (nowMs >= deadlineMs) {
+          invalidStates.add("DRAINING_DEADLINE_ELAPSED");
+          overdueDrainingCount += 1;
+        }
+      }
+      if (["RETIRED", "REJECTED", "FAILED"].includes(row.state)
+        && (row.ref_count !== 0 || row.active_family_count !== 0 || row.persisted_token_count !== 0)) {
+        invalidStates.add("TERMINAL_REFERENCES_REMAIN");
+      }
+    }
+
+    const activeCount = bindingsByState.ACTIVE;
+    if (activeCount !== 1) invalidStates.add("ACTIVE_COUNT");
+    if (activeCount === 1 && activeRow) {
+      if (activeRow.installation_epoch !== expectation.installationEpoch) {
+        invalidStates.add("ACTIVE_EPOCH_MISMATCH");
+      }
+      if (activeRow.schema_generation !== expectation.schemaGeneration) {
+        invalidStates.add("ACTIVE_SCHEMA_STALE");
+      }
+      if (!DIGEST_PATTERN.test(activeRow.schema_generation)) {
+        invalidStates.add("ACTIVE_SCHEMA_INVALID");
+      }
+      if (activeRow.active_family_count < 1) invalidStates.add("ACTIVE_FAMILY_MISSING");
+      if (activeRow.persisted_refresh_token_count < activeRow.active_family_count) {
+        invalidStates.add("ACTIVE_REFRESH_TOKEN_MISSING");
+      }
+      if (activeRow.resource_mismatch_count !== 0) {
+        invalidStates.add("ACTIVE_TOKEN_RESOURCE_MISMATCH");
+      }
+    }
+
+    const unboundActiveFamilyCount = Number(this.database.sqlite.prepare(`
+      select count(*) from oauth_token_families
+       where connector_binding_id is null and status <> 'REVOKED'
+    `).pluck().get());
+    if (unboundActiveFamilyCount > 0) invalidStates.add("UNBOUND_ACTIVE_FAMILY");
+    const nonActiveTokenFamilyCount = Number(this.database.sqlite.prepare(`
+      select count(*)
+        from oauth_token_families as family
+        join oauth_connector_bindings as binding on binding.binding_id = family.connector_binding_id
+       where binding.canonical_name = ?
+         and family.status <> 'REVOKED'
+         and binding.state not in ('ACTIVE', 'DRAINING')
+    `).pluck().get(expectation.canonicalName));
+    if (nonActiveTokenFamilyCount > 0) invalidStates.add("NON_ACTIVE_TOKEN_FAMILY");
+    const preparedReceiptCount = Number(this.database.sqlite.prepare(`
+      select count(*) from oauth_connector_activation_receipts
+       where canonical_name = ? and status = 'PREPARED'
+    `).pluck().get(expectation.canonicalName));
+    if (preparedReceiptCount > 0) invalidStates.add("PREPARED_RECEIPT_RESIDUE");
+
+    const orderedInvalidStates = PERSONAL_CONNECTOR_READINESS_INVALID_STATE_ORDER
+      .filter((state) => invalidStates.has(state));
+    return {
+      state: orderedInvalidStates.length === 0 ? "PASS" : "FAIL",
+      activeCount,
+      bindingsByState,
+      invalidStates: orderedInvalidStates,
+      expectedInstallationEpoch: expectation.installationEpoch,
+      ...(activeRow ? {
+        activeInstallationEpoch: activeRow.installation_epoch,
+        activeSchemaGeneration: activeRow.schema_generation,
+        activeBindingIdDigest: sha256Digest(activeRow.binding_id),
+        activeClientIdDigest: sha256Digest(activeRow.client_id),
+      } : {}),
+      activeFamilyCount: activeRow?.active_family_count ?? 0,
+      activeRefreshTokenCount: activeRow?.persisted_refresh_token_count ?? 0,
+      activePersistedTokenCount: activeRow?.persisted_token_count ?? 0,
+      overdueDrainingCount,
+      unboundActiveFamilyCount,
+      nonActiveTokenFamilyCount,
+      preparedReceiptCount,
+    };
+  }
+
+  planPersonalConnectorReconciliation(
+    expectation: PersonalConnectorExpectation,
+    nowMs = Date.now(),
+  ): PersonalConnectorReconciliationPlan {
+    validatePersonalConnectorExpectation(expectation);
+    const createdAt = new Date(nowMs).toISOString();
+    const snapshot = this.personalConnectorReconciliationSnapshot(expectation.canonicalName);
+    const preimageDigest = sha256Digest(stableJson(snapshot));
+    const readinessBefore = this.personalConnectorReadiness(expectation, nowMs);
+    const actions: PersonalConnectorReconciliationAction[] = [];
+
+    const activeBinding = snapshot.bindings.find((binding) => binding.state === "ACTIVE");
+    if (activeBinding
+      && activeBinding.installationEpoch === expectation.installationEpoch
+      && activeBinding.schemaGeneration !== expectation.schemaGeneration) {
+      actions.push({
+        kind: "UPDATE_ACTIVE_SCHEMA",
+        bindingId: activeBinding.bindingId,
+        expectedInstallationEpoch: activeBinding.installationEpoch,
+        expectedSchemaGeneration: activeBinding.schemaGeneration,
+        nextSchemaGeneration: expectation.schemaGeneration,
+      });
+    }
+
+    for (const family of snapshot.families) {
+      if (family.connectorBindingId === null && family.status !== "REVOKED") {
+        actions.push({ kind: "REVOKE_UNBOUND_FAMILY", familyId: family.familyId });
+      }
+    }
+    for (const binding of snapshot.bindings) {
+      if (binding.state === "DRAINING") {
+        const deadlineMs = binding.drainDeadlineAt === null
+          ? Number.NaN
+          : Date.parse(binding.drainDeadlineAt);
+        if (Number.isFinite(deadlineMs)
+          && binding.refCount === binding.activeFamilyCount
+          && (binding.refCount === 0 || nowMs >= deadlineMs)) {
+          actions.push({
+            kind: "RETIRE_DRAINING_BINDING",
+            bindingId: binding.bindingId,
+            expectedDrainEpoch: binding.drainEpoch,
+            reason: nowMs >= deadlineMs ? "DEADLINE_ELAPSED" : "REFERENCE_ZERO",
+          });
+        }
+      } else if (["RETIRED", "REJECTED", "FAILED"].includes(binding.state)
+        && binding.refCount === binding.activeFamilyCount
+        && (binding.refCount > 0 || binding.persistedTokenCount > 0)) {
+        actions.push({
+          kind: "PURGE_TERMINAL_BINDING",
+          bindingId: binding.bindingId,
+          expectedState: binding.state as "RETIRED" | "REJECTED" | "FAILED",
+        });
+      }
+    }
+    actions.sort((left, right) => reconciliationActionIdentity(left)
+      .localeCompare(reconciliationActionIdentity(right)));
+
+    const terminalBindingIds = new Set(snapshot.bindings
+      .filter((binding) => ["RETIRED", "REJECTED", "FAILED"].includes(binding.state))
+      .map((binding) => binding.bindingId));
+    const nonActiveFamiliesAreTerminal = snapshot.families
+      .filter((family) => family.status !== "REVOKED" && family.connectorBindingId !== null)
+      .filter((family) => {
+        const binding = snapshot.bindings.find((candidate) => candidate.bindingId === family.connectorBindingId);
+        return binding && !["ACTIVE", "DRAINING"].includes(binding.state);
+      })
+      .every((family) => terminalBindingIds.has(family.connectorBindingId!));
+    const reconcilable = new Set<PersonalConnectorReadinessInvalidState>([
+      ...(actions.some((action) => action.kind === "UPDATE_ACTIVE_SCHEMA")
+        ? ["ACTIVE_SCHEMA_STALE" as const]
+        : []),
+      "DRAINING_DEADLINE_ELAPSED",
+      "TERMINAL_REFERENCES_REMAIN",
+      "UNBOUND_ACTIVE_FAMILY",
+      ...(nonActiveFamiliesAreTerminal ? ["NON_ACTIVE_TOKEN_FAMILY" as const] : []),
+    ]);
+    const blockers = readinessBefore.invalidStates.filter((state) => !reconcilable.has(state));
+    const unsigned = {
+      schemaVersion: 1 as const,
+      planId: `personal-connector-reconcile-${sha256Hex(stableJson({
+        expectation,
+        preimageDigest,
+      })).slice(0, 32)}`,
+      preimageDigest,
+      createdAt,
+      expectation: { ...expectation },
+      actions,
+      blockers,
+      readinessBefore,
+    };
+    return Object.freeze({
+      ...unsigned,
+      planDigest: sha256Digest(stableJson(unsigned)),
+    });
+  }
+
+  applyPersonalConnectorReconciliation(
+    plan: PersonalConnectorReconciliationPlan,
+    nowMs = Date.now(),
+  ): PersonalConnectorReconciliationResult {
+    validatePersonalConnectorReconciliationPlan(plan);
+    if (plan.blockers.length > 0) {
+      throw new ConnectorStateConflictError(
+        `Personal connector reconciliation is blocked: ${plan.blockers.join(", ")}`,
+      );
+    }
+    const currentSnapshot = this.personalConnectorReconciliationSnapshot(
+      plan.expectation.canonicalName,
+    );
+    const currentPreimageDigest = sha256Digest(stableJson(currentSnapshot));
+    if (currentPreimageDigest !== plan.preimageDigest) {
+      throw new ConnectorStateConflictError(
+        "Personal connector reconciliation preimage changed after planning.",
+      );
+    }
+    const appliedAt = new Date(nowMs).toISOString();
+    const retirementReceipts: ConnectorRetirementReceipt[] = [];
+    let retiredCount = 0;
+    const apply = this.database.sqlite.transaction(() => {
+      for (const action of plan.actions) {
+        if (action.kind === "UPDATE_ACTIVE_SCHEMA") {
+          const updated = this.database.sqlite.prepare(`
+            update oauth_connector_bindings
+               set schema_generation = ?, updated_at = ?
+             where binding_id = ? and state = 'ACTIVE'
+               and installation_epoch = ? and schema_generation = ?
+               and drain_deadline_at is null and refresh_allowed_during_drain = 0
+          `).run(
+            action.nextSchemaGeneration,
+            appliedAt,
+            action.bindingId,
+            action.expectedInstallationEpoch,
+            action.expectedSchemaGeneration,
+          );
+          if (updated.changes !== 1) {
+            throw new ConnectorStateConflictError(
+              "Planned ACTIVE connector schema generation changed concurrently.",
+            );
+          }
+          continue;
+        }
+        if (action.kind === "REVOKE_UNBOUND_FAMILY") {
+          const family = this.database.sqlite.prepare(`
+            select connector_binding_id, status from oauth_token_families where family_id = ?
+          `).get(action.familyId) as {
+            connector_binding_id: string | null;
+            status: string;
+          } | undefined;
+          if (!family || family.connector_binding_id !== null || family.status === "REVOKED") {
+            throw new ConnectorStateConflictError(
+              "Planned unbound token family is absent, bound, or already revoked.",
+            );
+          }
+          this.database.sqlite.prepare(`
+            update oauth_token_families
+               set status = 'REVOKED', revoked_at = ?
+             where family_id = ? and connector_binding_id is null and status <> 'REVOKED'
+          `).run(appliedAt, action.familyId);
+          this.database.sqlite.prepare("delete from oauth_access_tokens where family_id = ?")
+            .run(action.familyId);
+          this.database.sqlite.prepare("delete from oauth_refresh_tokens where family_id = ?")
+            .run(action.familyId);
+          continue;
+        }
+        const binding = this.getConnectorBinding(action.bindingId);
+        if (!binding) {
+          throw new ConnectorStateConflictError("Planned connector binding no longer exists.");
+        }
+        if (action.kind === "PURGE_TERMINAL_BINDING") {
+          if (binding.state !== action.expectedState) {
+            throw new ConnectorStateConflictError("Planned terminal binding state changed.");
+          }
+          this.revokeBindingTokenFamilies(binding.bindingId, appliedAt);
+          this.database.sqlite.prepare(`
+            update oauth_connector_bindings
+               set ref_count = 0, updated_at = ?
+             where binding_id = ? and state = ?
+          `).run(appliedAt, binding.bindingId, action.expectedState);
+          continue;
+        }
+        if (binding.state !== "DRAINING"
+          || binding.drainEpoch !== action.expectedDrainEpoch) {
+          throw new ConnectorStateConflictError("Planned DRAINING binding generation changed.");
+        }
+        const activeFamilyCount = Number(this.database.sqlite.prepare(`
+          select count(*) from oauth_token_families
+           where connector_binding_id = ? and status <> 'REVOKED'
+        `).pluck().get(binding.bindingId));
+        if (activeFamilyCount !== binding.refCount) {
+          throw new ConnectorStateConflictError(
+            "Planned DRAINING binding reference count changed.",
+          );
+        }
+        const deadlineMs = binding.drainDeadlineAt
+          ? Date.parse(binding.drainDeadlineAt)
+          : Number.NaN;
+        const deadlineElapsed = Number.isFinite(deadlineMs) && nowMs >= deadlineMs;
+        if (action.reason === "DEADLINE_ELAPSED" && !deadlineElapsed) {
+          throw new ConnectorStateConflictError("Planned DRAINING deadline has not elapsed.");
+        }
+        if (action.reason === "REFERENCE_ZERO" && binding.refCount !== 0) {
+          throw new ConnectorStateConflictError("Planned DRAINING binding still has references.");
+        }
+        const revokedFamilyCount = action.reason === "DEADLINE_ELAPSED"
+          ? this.revokeBindingTokenFamilies(binding.bindingId, appliedAt)
+          : 0;
+        const updated = this.database.sqlite.prepare(`
+          update oauth_connector_bindings
+             set state = 'RETIRED', state_reason = ?, ref_count = 0,
+                 drain_epoch = drain_epoch + 1, drain_deadline_at = null,
+                 refresh_allowed_during_drain = 0, updated_at = ?
+           where binding_id = ? and state = 'DRAINING' and drain_epoch = ?
+        `).run(
+          action.reason,
+          appliedAt,
+          binding.bindingId,
+          action.expectedDrainEpoch,
+        );
+        if (updated.changes !== 1) {
+          throw new ConnectorStateConflictError("DRAINING connector changed concurrently.");
+        }
+        const receiptId = `connector-retirement-${randomUUID()}`;
+        this.database.sqlite.prepare(`
+          insert into oauth_connector_retirement_receipts
+            (receipt_id, binding_id, canonical_name, drain_epoch, reason,
+             revoked_family_count, retired_at)
+          values (?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          receiptId,
+          binding.bindingId,
+          binding.canonicalName,
+          action.expectedDrainEpoch + 1,
+          action.reason,
+          revokedFamilyCount,
+          appliedAt,
+        );
+        retirementReceipts.push(this.getRetirementReceipt(binding.bindingId)!);
+        retiredCount += 1;
+      }
+      const readinessAfter = this.personalConnectorReadiness(plan.expectation, nowMs);
+      if (readinessAfter.state !== "PASS") {
+        throw new ConnectorStateConflictError(
+          `Personal connector reconciliation did not establish readiness: ${readinessAfter.invalidStates.join(", ")}`,
+        );
+      }
+      const postimageDigest = sha256Digest(stableJson(
+        this.personalConnectorReconciliationSnapshot(plan.expectation.canonicalName),
+      ));
+      return { readinessAfter, postimageDigest };
+    });
+    const committed = apply.immediate();
+    for (let index = 0; index < retiredCount; index += 1) {
+      this.recordConnectorTransition("DRAINING", "RETIRED");
+    }
+    return {
+      status: plan.actions.length === 0 ? "NO_CHANGES" : "APPLIED",
+      planId: plan.planId,
+      planDigest: plan.planDigest,
+      preimageDigest: plan.preimageDigest,
+      postimageDigest: committed.postimageDigest,
+      appliedAt,
+      appliedActions: plan.actions,
+      retirementReceipts,
+      readinessAfter: committed.readinessAfter,
+    };
+  }
+
   connectorCanIssueAuthorizationCode(canonicalName: string, clientId: string): boolean {
     const binding = this.getConnectorBindingForClient(canonicalName, clientId);
     if (!binding) return true;
@@ -1145,6 +1665,86 @@ export class SqliteOAuthStore {
     return row ? this.getActivationReceipt(row.receipt_id) : undefined;
   }
 
+  private personalConnectorReconciliationSnapshot(
+    canonicalName: string,
+  ): PersonalConnectorReconciliationSnapshot {
+    const bindings = this.database.sqlite.prepare(`
+      select binding_id as bindingId, client_id as clientId,
+             installation_epoch as installationEpoch, schema_generation as schemaGeneration,
+             drain_epoch as drainEpoch, drain_deadline_at as drainDeadlineAt,
+             refresh_allowed_during_drain as refreshAllowedDuringDrain,
+             state, state_reason as stateReason, ref_count as refCount,
+             (select count(*) from oauth_token_families as family
+               where family.connector_binding_id = binding.binding_id and family.status <> 'REVOKED')
+               as activeFamilyCount,
+             ((select count(*) from oauth_access_tokens as access_token
+                 where access_token.connector_binding_id = binding.binding_id)
+               + (select count(*) from oauth_refresh_tokens as refresh_token
+                   where refresh_token.connector_binding_id = binding.binding_id))
+               as persistedTokenCount
+        from oauth_connector_bindings as binding
+       where canonical_name = ?
+       order by installation_epoch, binding_id
+    `).all(canonicalName) as PersonalConnectorSnapshotBinding[];
+    const families = this.database.sqlite.prepare(`
+      select family.family_id as familyId, family.client_id as clientId,
+             family.connector_binding_id as connectorBindingId,
+             family.installation_epoch as installationEpoch,
+             family.drain_epoch as drainEpoch, family.status,
+             family.rotation_sequence as rotationSequence,
+             family.created_at as createdAt, family.rotated_at as rotatedAt,
+             family.revoked_at as revokedAt
+        from oauth_token_families as family
+        left join oauth_connector_bindings as binding
+          on binding.binding_id = family.connector_binding_id
+       where family.connector_binding_id is null or binding.canonical_name = ?
+       order by family.family_id
+    `).all(canonicalName) as PersonalConnectorSnapshotFamily[];
+    const accessTokens = this.database.sqlite.prepare(`
+      select token_hash as tokenHash, client_id as clientId, resource,
+             family_id as familyId, connector_binding_id as connectorBindingId,
+             connector_drain_epoch as connectorDrainEpoch,
+             installation_epoch as installationEpoch,
+             rotation_sequence as rotationSequence, expires_at as expiresAt
+        from oauth_access_tokens
+       where connector_binding_id is null
+          or connector_binding_id in (
+            select binding_id from oauth_connector_bindings where canonical_name = ?
+          )
+       order by token_hash
+    `).all(canonicalName) as PersonalConnectorSnapshotToken[];
+    const refreshTokens = this.database.sqlite.prepare(`
+      select token_hash as tokenHash, client_id as clientId, resource,
+             family_id as familyId, connector_binding_id as connectorBindingId,
+             connector_drain_epoch as connectorDrainEpoch,
+             installation_epoch as installationEpoch,
+             rotation_sequence as rotationSequence, expires_at as expiresAt
+        from oauth_refresh_tokens
+       where connector_binding_id is null
+          or connector_binding_id in (
+            select binding_id from oauth_connector_bindings where canonical_name = ?
+          )
+       order by token_hash
+    `).all(canonicalName) as PersonalConnectorSnapshotToken[];
+    const preparedReceipts = this.database.sqlite.prepare(`
+      select receipt_id as receiptId, candidate_binding_id as candidateBindingId,
+             tuple_digest as tupleDigest, preimage_digest as preimageDigest,
+             drain_deadline_at as drainDeadlineAt, prepared_at as preparedAt
+        from oauth_connector_activation_receipts
+       where canonical_name = ? and status = 'PREPARED'
+       order by receipt_id
+    `).all(canonicalName) as PersonalConnectorSnapshotPreparedReceipt[];
+    return {
+      schemaVersion: 1,
+      canonicalName,
+      bindings,
+      families,
+      accessTokens,
+      refreshTokens,
+      preparedReceipts,
+    };
+  }
+
   private revokeBindingTokenFamilies(bindingId: string, revokedAt: string): number {
     const revoked = this.database.sqlite.prepare(`
       update oauth_token_families
@@ -1292,6 +1892,82 @@ interface ConnectorReadinessRow {
   prepared_receipt_identity_match_count: number;
   prepared_tuple_digest: string | null;
   canonical_prepared_receipt_count: number;
+}
+
+interface PersonalConnectorReadinessRow {
+  binding_id: string;
+  canonical_name: string;
+  client_id: string;
+  installation_epoch: number;
+  state: string;
+  schema_generation: string;
+  drain_deadline_at: string | null;
+  refresh_allowed_during_drain: number;
+  ref_count: number;
+  active_family_count: number;
+  persisted_refresh_token_count: number;
+  persisted_token_count: number;
+  resource_mismatch_count: number;
+  client_mismatch_count: number;
+}
+
+interface PersonalConnectorSnapshotBinding {
+  bindingId: string;
+  clientId: string;
+  installationEpoch: number;
+  schemaGeneration: string;
+  drainEpoch: number;
+  drainDeadlineAt: string | null;
+  refreshAllowedDuringDrain: number;
+  state: ConnectorBindingState;
+  stateReason: string | null;
+  refCount: number;
+  activeFamilyCount: number;
+  persistedTokenCount: number;
+}
+
+interface PersonalConnectorSnapshotFamily {
+  familyId: string;
+  clientId: string;
+  connectorBindingId: string | null;
+  installationEpoch: number | null;
+  drainEpoch: number | null;
+  status: string;
+  rotationSequence: number;
+  createdAt: string;
+  rotatedAt: string | null;
+  revokedAt: string | null;
+}
+
+interface PersonalConnectorSnapshotToken {
+  tokenHash: string;
+  clientId: string;
+  resource: string | null;
+  familyId: string | null;
+  connectorBindingId: string | null;
+  connectorDrainEpoch: number | null;
+  installationEpoch: number | null;
+  rotationSequence: number;
+  expiresAt: number;
+}
+
+interface PersonalConnectorSnapshotPreparedReceipt {
+  receiptId: string;
+  candidateBindingId: string;
+  tupleDigest: string;
+  preimageDigest: string;
+  drainDeadlineAt: string;
+  preparedAt: string;
+}
+
+interface PersonalConnectorReconciliationSnapshot {
+  schemaVersion: 1;
+  canonicalName: string;
+  bindings: PersonalConnectorSnapshotBinding[];
+  families: PersonalConnectorSnapshotFamily[];
+  accessTokens: PersonalConnectorSnapshotToken[];
+  refreshTokens: PersonalConnectorSnapshotToken[];
+  preparedReceipts: PersonalConnectorSnapshotPreparedReceipt[];
 }
 
 interface ConnectorActivationReceiptRow {
@@ -1470,6 +2146,71 @@ const CONNECTOR_READINESS_INVALID_STATE_ORDER: readonly ConnectorReadinessInvali
   "UNKNOWN_BINDING_STATE",
   "CANONICAL_NAME_UNCONFIGURED",
 ];
+
+const PERSONAL_CONNECTOR_READINESS_INVALID_STATE_ORDER:
+readonly PersonalConnectorReadinessInvalidState[] = [
+  "CANONICAL_NAME_UNCONFIGURED",
+  "ACTIVE_COUNT",
+  "ACTIVE_EPOCH_MISMATCH",
+  "ACTIVE_SCHEMA_STALE",
+  "ACTIVE_SCHEMA_INVALID",
+  "ACTIVE_DRAIN_FIELDS_SET",
+  "ACTIVE_FAMILY_MISSING",
+  "ACTIVE_REFRESH_TOKEN_MISSING",
+  "ACTIVE_TOKEN_RESOURCE_MISMATCH",
+  "TOKEN_CLIENT_MISMATCH",
+  "DRAINING_DEADLINE_INVALID",
+  "DRAINING_DEADLINE_ELAPSED",
+  "REFERENCE_COUNT_MISMATCH",
+  "TERMINAL_REFERENCES_REMAIN",
+  "PREPARED_RECEIPT_RESIDUE",
+  "UNBOUND_ACTIVE_FAMILY",
+  "NON_ACTIVE_TOKEN_FAMILY",
+  "UNKNOWN_BINDING_STATE",
+];
+
+function validatePersonalConnectorExpectation(expectation: PersonalConnectorExpectation): void {
+  if (!expectation.canonicalName.trim()
+    || !Number.isSafeInteger(expectation.installationEpoch)
+    || expectation.installationEpoch <= 0
+    || !DIGEST_PATTERN.test(expectation.schemaGeneration)) {
+    throw new Error("Personal connector expectation is invalid.");
+  }
+  const resource = new URL(expectation.resource);
+  if (!resource.href || resource.username || resource.password || resource.hash) {
+    throw new Error("Personal connector resource is invalid.");
+  }
+}
+
+function reconciliationActionIdentity(action: PersonalConnectorReconciliationAction): string {
+  if (action.kind === "UPDATE_ACTIVE_SCHEMA") return `${action.kind}:${action.bindingId}`;
+  if (action.kind === "REVOKE_UNBOUND_FAMILY") return `${action.kind}:${action.familyId}`;
+  return `${action.kind}:${action.bindingId}`;
+}
+
+function validatePersonalConnectorReconciliationPlan(
+  plan: PersonalConnectorReconciliationPlan,
+): void {
+  if (!plan || plan.schemaVersion !== 1 || !plan.planId.startsWith("personal-connector-reconcile-")) {
+    throw new ConnectorStateConflictError("Personal connector reconciliation plan is invalid.");
+  }
+  validatePersonalConnectorExpectation(plan.expectation);
+  if (!DIGEST_PATTERN.test(plan.preimageDigest) || !DIGEST_PATTERN.test(plan.planDigest)) {
+    throw new ConnectorStateConflictError("Personal connector reconciliation digest is invalid.");
+  }
+  if (!Number.isFinite(Date.parse(plan.createdAt))) {
+    throw new ConnectorStateConflictError("Personal connector reconciliation timestamp is invalid.");
+  }
+  const { planDigest, ...unsigned } = plan;
+  if (sha256Digest(stableJson(unsigned)) !== planDigest) {
+    throw new ConnectorStateConflictError("Personal connector reconciliation plan digest mismatch.");
+  }
+  const identities = plan.actions.map(reconciliationActionIdentity);
+  if (new Set(identities).size !== identities.length
+    || identities.some((identity, index) => index > 0 && identity < identities[index - 1]!)) {
+    throw new ConnectorStateConflictError("Personal connector reconciliation actions are not unique and ordered.");
+  }
+}
 
 function emptyConnectorBindingCounts(): Record<ConnectorBindingState, number> {
   return {

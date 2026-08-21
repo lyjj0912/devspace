@@ -17,6 +17,7 @@ import {
   type ConnectorAuthenticationContext,
   type ConnectorBindingRecord,
   type ConnectorReadinessSummary,
+  type PersonalConnectorReadinessSummary,
   type PersistedRefreshTokenRecord,
 } from "./oauth-store.js";
 import type { UniversalBrokerMetrics } from "./v2/metrics.js";
@@ -293,6 +294,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
           canonicalName: connectorBinding.canonicalName,
           state: connectorBinding.state,
           installationEpoch: connectorBinding.installationEpoch,
+          rotationSequence: record.rotationSequence ?? 0,
           schemaGeneration: connectorBinding.schemaGeneration,
           buildDigest: connectorBinding.buildDigest,
           drainDeadlineAt: connectorBinding.drainDeadlineAt,
@@ -318,6 +320,20 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
 
   connectorReadiness(canonicalName = this.canonicalConnector?.name, nowMs = Date.now()): ConnectorReadinessSummary {
     return this.oauthStore.connectorReadiness(canonicalName, nowMs);
+  }
+
+  personalConnectorReadiness(nowMs = Date.now()): PersonalConnectorReadinessSummary {
+    return this.oauthStore.personalConnectorReadiness(
+      this.canonicalConnector
+        ? {
+            canonicalName: this.canonicalConnector.name,
+            installationEpoch: this.canonicalConnector.installationEpoch,
+            schemaGeneration: this.canonicalConnector.schemaGeneration,
+            resource: this.resourceServerUrl.href,
+          }
+        : undefined,
+      nowMs,
+    );
   }
 
   activeConnectorBinding(canonicalName = this.canonicalConnector?.name): ConnectorBindingRecord | undefined {

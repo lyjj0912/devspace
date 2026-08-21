@@ -14,6 +14,15 @@ export interface OperationAuditEvent {
   operationId: string;
   correlationId: string;
   principalFingerprintPrefix: string;
+  productProfile?: string;
+  sourceRevision?: string;
+  runtimeRevision?: string;
+  buildDigest?: string;
+  schemaGeneration?: string;
+  runtimeStartedAt?: string;
+  connectorInstallationEpoch?: number;
+  connectorRotationSequence?: number;
+  acceptanceRunId?: string;
   taskInstanceDigest?: string;
   authorityIdDigest?: string;
   actionDigest?: string;
@@ -36,6 +45,15 @@ export interface OperationAuditInput {
   operationId: string;
   correlationId: string;
   principalFingerprint: string;
+  productProfile?: string;
+  sourceRevision?: string;
+  runtimeRevision?: string;
+  buildDigest?: string;
+  schemaGeneration?: string;
+  runtimeStartedAt?: string;
+  connectorInstallationEpoch?: number;
+  connectorRotationSequence?: number;
+  acceptanceRunId?: string;
   taskInstanceId?: string;
   authorityId?: string;
   action?: unknown;
@@ -78,7 +96,7 @@ export interface OperationAuditSinkStats {
   failed: boolean;
 }
 
-interface StoredOperationAuditEvent extends OperationAuditEvent {
+export interface StoredOperationAuditEvent extends OperationAuditEvent {
   schemaVersion: 1;
   sequence: number;
   previousEventDigest?: string;
@@ -263,26 +281,35 @@ export class OperationAuditSink {
     } catch (error) {
       if (!isNodeError(error, "ENOENT")) throw error;
     }
-    if (text && !text.endsWith("\n")) {
-      throw new Error("Operation audit sink has an incomplete trailing record.");
-    }
-    let sequence = 0;
-    let previousEventDigest: string | undefined;
-    for (const line of text.split("\n")) {
-      if (!line) continue;
-      const record = JSON.parse(line) as StoredOperationAuditEvent;
-      verifyStoredRecord(record, sequence + 1, previousEventDigest);
-      sequence = record.sequence;
-      previousEventDigest = record.eventDigest;
-    }
-    this.sequence = sequence;
-    this.previousEventDigest = previousEventDigest;
+    const records = verifyOperationAuditText(text);
+    this.sequence = records.at(-1)?.sequence ?? 0;
+    this.previousEventDigest = records.at(-1)?.eventDigest;
     this.initialized = true;
   }
 }
 
 export function digestAuditIdentity(value: string): string {
   return `sha256:${createHash("sha256").update(value).digest("hex")}`;
+}
+
+export function digestOperationAuditPayload(value: unknown): string {
+  return digestCanonical(value);
+}
+
+export function verifyOperationAuditText(text: string): readonly StoredOperationAuditEvent[] {
+  if (text && !text.endsWith("\n")) {
+    throw new Error("Operation audit sink has an incomplete trailing record.");
+  }
+  const records: StoredOperationAuditEvent[] = [];
+  let previousEventDigest: string | undefined;
+  for (const line of text.split("\n")) {
+    if (!line) continue;
+    const record = JSON.parse(line) as StoredOperationAuditEvent;
+    verifyStoredRecord(record, records.length + 1, previousEventDigest);
+    records.push(record);
+    previousEventDigest = record.eventDigest;
+  }
+  return Object.freeze(records);
 }
 
 function operationAuditEvent(
@@ -300,6 +327,37 @@ function operationAuditEvent(
     operationId: safeIdentifier(input.operationId, "operationId"),
     correlationId: safeIdentifier(input.correlationId, "correlationId"),
     principalFingerprintPrefix: principal.slice(0, 12),
+    ...(input.productProfile
+      ? { productProfile: safeIdentifier(input.productProfile, "productProfile") }
+      : {}),
+    ...(input.sourceRevision
+      ? { sourceRevision: safeIdentifier(input.sourceRevision, "sourceRevision") }
+      : {}),
+    ...(input.runtimeRevision
+      ? { runtimeRevision: safeIdentifier(input.runtimeRevision, "runtimeRevision") }
+      : {}),
+    ...(input.buildDigest ? { buildDigest: requiredDigest(input.buildDigest, "buildDigest") } : {}),
+    ...(input.schemaGeneration
+      ? { schemaGeneration: requiredDigest(input.schemaGeneration, "schemaGeneration") }
+      : {}),
+    ...(input.runtimeStartedAt
+      ? { runtimeStartedAt: validTimestamp(input.runtimeStartedAt, "runtimeStartedAt") }
+      : {}),
+    ...(input.connectorInstallationEpoch === undefined
+      ? {}
+      : { connectorInstallationEpoch: positiveInteger(
+          input.connectorInstallationEpoch,
+          "connectorInstallationEpoch",
+        ) }),
+    ...(input.connectorRotationSequence === undefined
+      ? {}
+      : { connectorRotationSequence: nonNegativeInteger(
+          input.connectorRotationSequence,
+          "connectorRotationSequence",
+        ) }),
+    ...(input.acceptanceRunId
+      ? { acceptanceRunId: safeIdentifier(input.acceptanceRunId, "acceptanceRunId") }
+      : {}),
     ...(input.taskInstanceId ? { taskInstanceDigest: digestAuditIdentity(input.taskInstanceId) } : {}),
     ...(input.authorityId ? { authorityIdDigest: digestAuditIdentity(input.authorityId) } : {}),
     ...(input.action !== undefined ? { actionDigest: digestCanonical(input.action) } : {}),
@@ -389,6 +447,28 @@ function safeIdentifier(value: string, field: string): string {
     throw new Error(`${field} is missing or contains unsafe characters.`);
   }
   return normalized;
+}
+
+function validTimestamp(value: string, field: string): string {
+  const normalized = value.trim();
+  if (!normalized || !Number.isFinite(Date.parse(normalized))) {
+    throw new Error(`${field} must be an ISO-8601 timestamp.`);
+  }
+  return new Date(normalized).toISOString();
+}
+
+function positiveInteger(value: number, field: string): number {
+  if (!Number.isInteger(value) || value <= 0 || value > Number.MAX_SAFE_INTEGER) {
+    throw new Error(`${field} must be a positive safe integer.`);
+  }
+  return value;
+}
+
+function nonNegativeInteger(value: number, field: string): number {
+  if (!Number.isInteger(value) || value < 0 || value > Number.MAX_SAFE_INTEGER) {
+    throw new Error(`${field} must be a non-negative safe integer.`);
+  }
+  return value;
 }
 
 function boundedInteger(

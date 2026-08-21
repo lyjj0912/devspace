@@ -54,6 +54,7 @@ import { assertServiceAccountBoundary } from "./no-elevation.js";
 import { UniversalMcpRouteRegistry } from "./mcp-routes.js";
 import { UniversalBrokerMetrics } from "./metrics.js";
 import { OperationAuditSink } from "./operation-audit.js";
+import { UniversalToolRequestReplayGuard } from "./request-replay-guard.js";
 import {
   BrokerRateLimiter,
   trustedLoopbackProxyHopCount,
@@ -63,7 +64,7 @@ import {
 import {
   ReadinessRegistry,
   baseMutableSqliteStoreReadiness,
-  canonicalConnectorReadinessObservation,
+  personalConnectorReadinessObservation,
   readablePathReadiness,
   runtimeCapabilityIdentityReadiness,
   type ReadinessCheckObservation,
@@ -99,10 +100,6 @@ import {
 
 type NextTransport = StreamableHTTPServerTransport;
 const MAXIMUM_HTTP_JSON_BYTES = 2 * 1024 * 1024;
-const SAFE_SESSIONLESS_DISCOVERY_METHODS = new Set([
-  "notifications/initialized",
-  "tools/list",
-]);
 const DEEP_DOCTOR_RATE_CANARY_CLEANUP_BINDING = "deep-doctor-rate-canary-v1";
 const DEEP_DOCTOR_PUBLIC_PROBE_HEADER = "x-devspace-internal-doctor-probe";
 const BASE64URL_256_BIT_VALUE = /^[A-Za-z0-9_-]{43}$/u;
@@ -126,9 +123,24 @@ function jsonRpcRequestIds(body: unknown): Array<string | number> {
   });
 }
 
-function isSafeSessionlessDiscoveryRequest(methods: readonly string[]): boolean {
-  return methods.length > 0
-    && methods.every((method) => SAFE_SESSIONLESS_DISCOVERY_METHODS.has(method));
+function digestJsonRpcRequestIds(ids: readonly (string | number)[]): string {
+  return digestCanonicalJson(ids);
+}
+
+function digestCanonicalJson(value: unknown): string {
+  return `sha256:${createHash("sha256").update(canonicalJson(value)).digest("hex")}`;
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.entries(value as Record<string, unknown>)
+      .filter(([, child]) => child !== undefined)
+      .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
+      .map(([key, child]) => `${JSON.stringify(key)}:${canonicalJson(child)}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
 }
 
 export interface RunningUniversalBrokerNextServer {
@@ -152,6 +164,8 @@ export interface CreateUniversalBrokerNextServerOptions {
   incomingArtifactAdapters?: readonly IncomingArtifactAdapter[];
   guiRunner?: GuiNodeRunner;
   selfManagement?: UniversalSelfManagementService;
+  requestReplayGuard?: UniversalToolRequestReplayGuard;
+  acceptanceRunId?: string;
 }
 
 export function createUniversalBrokerNextServer(
@@ -171,6 +185,7 @@ export function createUniversalBrokerNextServer(
     maximumSessions: config.maximumMcpSessions,
   });
   const metrics = new UniversalBrokerMetrics();
+  const requestReplayGuard = options.requestReplayGuard ?? new UniversalToolRequestReplayGuard();
   const trustedProxyPolicy = trustedLoopbackProxyHopCount(config.logging.trustProxy);
   const rateLimitIdentity = Object.freeze({
     mode: config.rateLimit.mode,
@@ -203,6 +218,9 @@ export function createUniversalBrokerNextServer(
     runtimeRevision: config.runtimeRevision,
     ...(config.buildDigest ? { buildDigest: config.buildDigest } : {}),
   });
+  const acceptanceRunId = optionalAcceptanceRunId(
+    options.acceptanceRunId ?? process.env.DEVSPACE_NEXT_ACCEPTANCE_RUN_ID,
+  );
   const auditStartupProof = operationAudit.record({
     operationId: "broker-startup",
     correlationId: `startup-${createHash("sha256")
@@ -214,6 +232,13 @@ export function createUniversalBrokerNextServer(
       .update("\0")
       .update(runtimeIdentity.configDigest)
       .digest("hex"),
+    productProfile: runtimeIdentity.productProfile,
+    sourceRevision: runtimeIdentity.sourceRevision,
+    runtimeRevision: runtimeIdentity.runtimeRevision,
+    buildDigest: runtimeIdentity.buildDigest,
+    schemaGeneration: runtimeIdentity.schemaGeneration,
+    runtimeStartedAt: runtimeIdentity.startedAt,
+    ...(acceptanceRunId ? { acceptanceRunId } : {}),
     tool: "management",
     operation: "startup-audit-probe",
     risk: "R0",
@@ -475,10 +500,9 @@ export function createUniversalBrokerNextServer(
     {
       id: "canonical_connector",
       sideEffectFree: true,
-      check: () => canonicalConnectorReadinessObservation(
+      check: () => personalConnectorReadinessObservation(
         config.deploymentMode,
-        oauthProvider.connectorReadiness(),
-        process.env.DEVSPACE_PERSONAL_STAGING_FIXTURE === "1",
+        oauthProvider.personalConnectorReadiness(),
       ),
     },
     {
@@ -756,14 +780,13 @@ export function createUniversalBrokerNextServer(
       res.status(401).json({ error: "management_authorization_required" });
       return;
     }
-    const connector = oauthProvider.connectorReadiness();
+    const connector = oauthProvider.personalConnectorReadiness();
     const activeBinding = oauthProvider.activeConnectorBinding();
     if (config.deploymentMode !== "production"
       || connector.state !== "PASS"
       || connector.activeCount !== 1
       || !activeBinding
-      || activeBinding.schemaGeneration !== runtimeIdentity.schemaGeneration
-      || activeBinding.buildDigest !== runtimeIdentity.buildDigest) {
+      || activeBinding.schemaGeneration !== runtimeIdentity.schemaGeneration) {
       res.status(503).json({
         schemaVersion: 1,
         state: "UNAVAILABLE",
@@ -799,7 +822,13 @@ export function createUniversalBrokerNextServer(
     } catch {
       // Readiness evidence is authoritative even when metrics instrumentation is unavailable.
     }
-    res.status(report.httpStatus).json({ ...report, identity: runtimeIdentity });
+    res.status(report.httpStatus).json({
+      ...report,
+      identity: {
+        ...runtimeIdentity,
+        ...(acceptanceRunId ? { acceptanceRunId } : {}),
+      },
+    });
   });
 
   managementApp.get("/doctorz", (_req, res) => {
@@ -852,6 +881,7 @@ export function createUniversalBrokerNextServer(
       selfManagement.stats(),
     ]);
     const targetProbeStats = targets.stats();
+    const replayStats = requestReplayGuard.stats();
     res.type("text/plain; version=0.0.4").send(metrics.render({
       devspace_open_http_sessions: gauge("Open MCP HTTP sessions", transports.size),
       devspace_pending_mcp_initializations: gauge("Pending MCP initialize requests", pendingInitializations),
@@ -877,6 +907,13 @@ export function createUniversalBrokerNextServer(
       devspace_restart_transactions: gauge("Retained broker restart transactions", numeric(selfManagementStats.restartTransactions)),
       devspace_active_restart_transactions: gauge("Active broker restart transactions", numeric(selfManagementStats.activeRestartTransactions)),
       devspace_rate_limit_buckets: gauge("Broker-owned rate limit buckets", rateLimiter.stats().buckets),
+      devspace_request_replay_entries: gauge("Retained MCP request replay entries", replayStats.entries),
+      devspace_request_replay_in_flight: gauge("In-flight MCP request replay entries", replayStats.inFlight),
+      devspace_request_replay_executed_total: gauge("Executed MCP replay-guard requests", replayStats.executed),
+      devspace_request_replay_coalesced_total: gauge("Coalesced duplicate MCP requests", replayStats.coalesced),
+      devspace_request_replay_replayed_total: gauge("Replayed terminal MCP responses", replayStats.replayed),
+      devspace_request_replay_conflicts_total: gauge("Rejected MCP request-id/body conflicts", replayStats.conflicts),
+      devspace_request_replay_evicted_total: gauge("Evicted MCP request replay entries", replayStats.evicted),
       devspace_operation_audit_pending: gauge("Operation audit events awaiting durable flush", operationAudit.stats().pending),
     }));
   });
@@ -1015,13 +1052,19 @@ export function createUniversalBrokerNextServer(
           runtimeIdentity,
           metrics,
           operationAudit,
+          requestReplayGuard,
+          acceptanceRunId,
         });
         await server.connect(transport);
-      } else if (isSafeSessionlessDiscoveryRequest(messageMethods)) {
-        logEvent(config.logging, "info", "v2_mcp_sessionless_discovery", {
+      } else if (req.method === "POST") {
+        logEvent(config.logging, "info", "v2_mcp_sessionless_request", {
           requestId,
           methods: messageMethods,
           batch: Array.isArray(req.body),
+          principalFingerprintPrefix: principalFingerprint.slice(0, 12),
+          requestIdDigest: digestJsonRpcRequestIds(responseRequestIds),
+          requestDigest: digestCanonicalJson(req.body),
+          transportMode: "stateless",
         });
         transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: undefined,
@@ -1040,6 +1083,8 @@ export function createUniversalBrokerNextServer(
           runtimeIdentity,
           metrics,
           operationAudit,
+          requestReplayGuard,
+          acceptanceRunId,
         });
         await ephemeralServer.connect(transport);
       } else {
@@ -1105,6 +1150,15 @@ export function createUniversalBrokerNextServer(
       return closePromise;
     },
   };
+}
+
+function optionalAcceptanceRunId(value: string | undefined): string | undefined {
+  const normalized = value?.trim();
+  if (!normalized) return undefined;
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,255}$/u.test(normalized)) {
+    throw new Error("DEVSPACE_NEXT_ACCEPTANCE_RUN_ID contains unsafe characters.");
+  }
+  return normalized;
 }
 
 function bindRestartResponseLifecycle(
@@ -1325,7 +1379,7 @@ function createDeepDoctorChecks(input: {
     {
       id: "connector_consistency",
       check: () => {
-        const connector = input.oauthProvider.connectorReadiness();
+        const connector = input.oauthProvider.personalConnectorReadiness();
         return {
           state: connector.state,
           ...(connector.state === "PASS" ? {} : { summary: "Canonical connector consistency failed." }),

@@ -6,6 +6,7 @@ import { dirname, join, relative, resolve, sep } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
+  RETIRED_RELEASE_ENVIRONMENT_KEYS,
   RUNTIME_STATE_PATH_KEYS,
   materializeReleaseEnvironment,
 } from "./lib/release-environment.mjs";
@@ -93,7 +94,6 @@ test("candidate and production runtime environments materialize all writable pat
     values: {
       ...candidatePaths,
       DEVSPACE_NEXT_PORT: "7679",
-      DEVSPACE_PERSONAL_STAGING_FIXTURE: "1",
       DEVSPACE_NEXT_LIFECYCLE_FINALIZATION_CONTROL: candidateControl,
     },
   });
@@ -103,7 +103,6 @@ test("candidate and production runtime environments materialize all writable pat
     values: {
       ...productionPaths,
       DEVSPACE_NEXT_PORT: "7678",
-      DEVSPACE_PERSONAL_STAGING_FIXTURE: "1",
       DEVSPACE_NEXT_LIFECYCLE_FINALIZATION_CONTROL: productionControl,
     },
   });
@@ -122,7 +121,13 @@ test("candidate and production runtime environments materialize all writable pat
     "DEVSPACE_PERSONAL_STAGING_FIXTURE",
   ]);
   assert.equal(removed.DEVSPACE_NEXT_SELF_RESTART_DELAY_MS, "");
-  assert.equal(removed.DEVSPACE_PERSONAL_STAGING_FIXTURE, "1");
+  assert.equal(removed.DEVSPACE_PERSONAL_STAGING_FIXTURE, "");
+  assert.deepEqual(RETIRED_RELEASE_ENVIRONMENT_KEYS, ["DEVSPACE_PERSONAL_STAGING_FIXTURE"]);
+  assert.throws(() => materializeReleaseEnvironment({
+    sourcePath: source,
+    destinationPath: join(root, "forbidden.env"),
+    values: { DEVSPACE_PERSONAL_STAGING_FIXTURE: "1" },
+  }), /key is not managed/u);
   assert.deepEqual(
     sourceEnvironment(candidate, ["DEVSPACE_NEXT_LIFECYCLE_FINALIZATION_CONTROL"]),
     { DEVSPACE_NEXT_LIFECYCLE_FINALIZATION_CONTROL: candidateControl },
@@ -638,7 +643,9 @@ function runtimeStatePaths(root, includePrevious) {
 
 function sourceEnvironment(path, keys) {
   const script = [
-    'set -a; source "$1"; shift',
+    'path="$1"; shift',
+    'for key in "$@"; do unset "$key"; done',
+    'set -a; source "$path"; set +a',
     'for key in "$@"; do printf "%s\\0%s\\0" "$key" "${!key-}"; done',
   ].join("\n");
   const result = spawnSync("/bin/bash", ["-c", script, "_", path, ...keys], { encoding: "buffer" });

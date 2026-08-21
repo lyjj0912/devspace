@@ -153,7 +153,7 @@ managed={
   "DEVSPACE_NEXT_SELF_RESTART_DELAY_MS",
   "DEVSPACE_NEXT_PM2_EXPECTED_SCRIPT","DEVSPACE_NEXT_AUTHORITY_STORE","DEVSPACE_NEXT_AUTHORITY_OWNER_INSTANCE_ID",
   "DEVSPACE_RUNTIME_PACKAGE_ROOT","DEVSPACE_RUNTIME_DEPENDENCY_ROOT","DEVSPACE_RUNTIME_DEPENDENCY_EVIDENCE",
-  "DEVSPACE_EXPECTED_RUNTIME_DEPENDENCY_EVIDENCE_SHA256","DEVSPACE_PERSONAL_STAGING_FIXTURE",
+  "DEVSPACE_EXPECTED_RUNTIME_DEPENDENCY_EVIDENCE_SHA256",
   "DEVSPACE_RELEASE_MANIFEST",
   "DEVSPACE_EXPECTED_SOURCE_REVISION","DEVSPACE_EXPECTED_RUNTIME_REVISION","DEVSPACE_EXPECTED_BUILD_DIGEST",
   "DEVSPACE_EXPECTED_SCHEMA_GENERATION","DEVSPACE_EXPECTED_AUTHORITY_CONTRACT_GENERATION","DEVSPACE_EXPECTED_CONFIG_SCHEMA_IDENTITY",
@@ -161,10 +161,11 @@ managed={
   "DEVSPACE_NEXT_CANONICAL_CONNECTOR_NAME","DEVSPACE_SOURCE_REVISION","DEVSPACE_RUNTIME_REVISION","DEVSPACE_BUILD_DIGEST",
 }
 pattern=re.compile(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=")
+retired={"DEVSPACE_" + "PERSONAL_STAGING_FIXTURE"}
 with open(target,"w",encoding="utf-8") as out:
   for line in open(source,encoding="utf-8"):
     match=pattern.match(line)
-    if not match or match.group(1) not in managed: out.write(line)
+    if not match or (match.group(1) not in managed and match.group(1) not in retired): out.write(line)
 PY
 quote() { printf '%q' "$1"; }
 START_SCRIPT="$RUNTIME_ROOT/scripts/start-universal-broker-v2-production.sh"
@@ -199,9 +200,6 @@ START_SCRIPT="$RUNTIME_ROOT/scripts/start-universal-broker-v2-production.sh"
     printf 'DEVSPACE_RUNTIME_DEPENDENCY_ROOT=%s\n' "$(quote "$DEPENDENCY_ROOT")"
     printf 'DEVSPACE_RUNTIME_DEPENDENCY_EVIDENCE=%s\n' "$(quote "$DEPENDENCY_EVIDENCE")"
     printf 'DEVSPACE_EXPECTED_RUNTIME_DEPENDENCY_EVIDENCE_SHA256=%s\n' "$(quote "$DEPENDENCY_EVIDENCE_SHA256")"
-  fi
-  if [[ "$ALLOW_UNATTESTED_STAGING" == 1 ]]; then
-    printf 'DEVSPACE_PERSONAL_STAGING_FIXTURE=%s\n' "$(quote 1)"
   fi
   printf 'DEVSPACE_RELEASE_MANIFEST=%s\n' "$(quote "$MANIFEST")"
   printf 'DEVSPACE_EXPECTED_SOURCE_REVISION=%s\n' "$(quote "$SOURCE_REVISION")"
@@ -259,10 +257,9 @@ if os.path.realpath(env.get("pm_exec_path", ""))!=os.path.realpath(script): rais
 PY
 pm2 save >"$AUDIT/pm2-save.log" 2>&1
 trap - ERR INT TERM
-DEVSPACE_PERSONAL_STAGING_FIXTURE="$ALLOW_UNATTESTED_STAGING" \
-  "$NODE" - "$MANIFEST" "$AUDIT/deployment.json" "$PROCESS_NAME" "$PORT" "$RUNTIME_ROOT" <<'NODE'
+"$NODE" - "$MANIFEST" "$AUDIT/deployment.json" "$PROCESS_NAME" "$PORT" "$RUNTIME_ROOT" "$ALLOW_UNATTESTED_STAGING" <<'NODE'
 const fs=require("node:fs"); const crypto=require("node:crypto");
-const [manifestPath,output,processName,port,runtimeRoot]=process.argv.slice(2); const manifest=JSON.parse(fs.readFileSync(manifestPath));
-const result={status:"STAGING_ONLINE",eligibility:process.env.DEVSPACE_PERSONAL_STAGING_FIXTURE === "1" ? "UNATTESTED_STAGING_ONLY" : "ATTESTED_RELEASE_CANDIDATE",processName,port:Number(port),runtimeRoot,sourceRevision:manifest.sourceRevision,runtimeRevision:manifest.runtimeRevision,buildDigest:manifest.buildDigest,manifestSha256:`sha256:${crypto.createHash("sha256").update(fs.readFileSync(manifestPath)).digest("hex")}`};
+const [manifestPath,output,processName,port,runtimeRoot,unattested]=process.argv.slice(2); const manifest=JSON.parse(fs.readFileSync(manifestPath));
+const result={status:"STAGING_ONLINE",eligibility:unattested === "1" ? "UNATTESTED_STAGING_ONLY" : "ATTESTED_RELEASE_CANDIDATE",processName,port:Number(port),runtimeRoot,sourceRevision:manifest.sourceRevision,runtimeRevision:manifest.runtimeRevision,buildDigest:manifest.buildDigest,manifestSha256:`sha256:${crypto.createHash("sha256").update(fs.readFileSync(manifestPath)).digest("hex")}`};
 fs.writeFileSync(output,JSON.stringify(result,null,2)+"\n",{mode:0o600}); console.log(JSON.stringify(result,null,2));
 NODE

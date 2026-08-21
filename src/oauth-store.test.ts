@@ -1445,6 +1445,7 @@ async function testProviderTokenIssuanceNeverActivatesConnector(stateDir: string
       canonicalName: "myDevSpace",
       state: "CANDIDATE",
       installationEpoch: 2,
+      rotationSequence: 0,
       schemaGeneration: digest("d"),
       buildDigest: undefined,
       drainDeadlineAt: undefined,

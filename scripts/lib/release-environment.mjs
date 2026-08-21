@@ -28,6 +28,12 @@ export const RUNTIME_STATE_PATH_KEYS = Object.freeze([
   "DEVSPACE_NEXT_MANAGEMENT_AUTHORIZATION_KEY_REF",
 ]);
 
+export const RETIRED_RELEASE_ENVIRONMENT_KEYS = Object.freeze([
+  // Removed after Personal readiness stopped accepting legacy connector state.
+  // The materializer still strips it from older owner files but never permits a new value.
+  "DEVSPACE_PERSONAL_STAGING_FIXTURE",
+]);
+
 export const MANAGED_RELEASE_ENVIRONMENT_KEYS = Object.freeze([
   "DEVSPACE_V2_DEPLOYMENT_MODE",
   "DEVSPACE_V2_LEGACY_SCOPE_COMPATIBILITY",
@@ -49,6 +55,8 @@ export const MANAGED_RELEASE_ENVIRONMENT_KEYS = Object.freeze([
   "DEVSPACE_NEXT_ALLOWED_HOSTS",
   "DEVSPACE_TRUST_PROXY",
   "DEVSPACE_NEXT_AUTHORITY_OWNER_INSTANCE_ID",
+  "DEVSPACE_OAUTH_OWNER_INSTANCE_ID",
+  "DEVSPACE_NEXT_ACCEPTANCE_RUN_ID",
   "DEVSPACE_RELEASE_MANIFEST",
   "DEVSPACE_EXPECTED_RELEASE_MANIFEST_SHA256",
   "DEVSPACE_EXPECTED_SOURCE_REVISION",
@@ -61,7 +69,6 @@ export const MANAGED_RELEASE_ENVIRONMENT_KEYS = Object.freeze([
   "DEVSPACE_RUNTIME_DEPENDENCY_ROOT",
   "DEVSPACE_RUNTIME_DEPENDENCY_EVIDENCE",
   "DEVSPACE_EXPECTED_RUNTIME_DEPENDENCY_EVIDENCE_SHA256",
-  "DEVSPACE_PERSONAL_STAGING_FIXTURE",
   "DEVSPACE_OAUTH_CANONICAL_CONNECTOR_NAME",
   "DEVSPACE_OAUTH_CONNECTOR_INSTALLATION_EPOCH",
   "DEVSPACE_NEXT_CANONICAL_CONNECTOR_NAME",
@@ -73,6 +80,10 @@ export const MANAGED_RELEASE_ENVIRONMENT_KEYS = Object.freeze([
 ]);
 
 const MANAGED = new Set(MANAGED_RELEASE_ENVIRONMENT_KEYS);
+const STRIPPED = new Set([
+  ...MANAGED_RELEASE_ENVIRONMENT_KEYS,
+  ...RETIRED_RELEASE_ENVIRONMENT_KEYS,
+]);
 const ASSIGNMENT = /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=/u;
 
 export function materializeReleaseEnvironment(options) {
@@ -94,7 +105,7 @@ export function materializeReleaseEnvironment(options) {
     .split("\n")
     .filter((line) => {
       const match = ASSIGNMENT.exec(line);
-      return !match || !MANAGED.has(match[1]);
+      return !match || !STRIPPED.has(match[1]);
     });
   while (kept.length > 0 && kept.at(-1) === "") kept.pop();
   const body = [

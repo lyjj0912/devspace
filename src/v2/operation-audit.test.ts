@@ -6,6 +6,7 @@ import test from "node:test";
 import {
   OperationAuditSink,
   digestAuditIdentity,
+  verifyOperationAuditText,
   type OperationAuditInput,
 } from "./operation-audit.js";
 
@@ -22,6 +23,15 @@ test("operation audit appends owner-only hash-chained events with receipt linkag
     resourceKey: "/secret/path/must-not-appear",
     action: { command: "rm -rf /secret/path", token: "token-must-not-appear" },
     receiptDigest: RECEIPT,
+    productProfile: "PERSONAL_DIRECT_OWNER",
+    sourceRevision: "source-abc123",
+    runtimeRevision: "runtime-abc123",
+    buildDigest: `sha256:${"c".repeat(64)}`,
+    schemaGeneration: `sha256:${"d".repeat(64)}`,
+    runtimeStartedAt: "2026-08-20T00:00:00.000Z",
+    connectorInstallationEpoch: 7,
+    connectorRotationSequence: 11,
+    acceptanceRunId: "pdo-e2e-20260822-0001",
   });
   const second = auditInput("operation-2");
 
@@ -47,9 +57,19 @@ test("operation audit appends owner-only hash-chained events with receipt linkag
   const records = text.trim().split("\n").map((line) => JSON.parse(line)) as Array<Record<string, unknown>>;
   assert.equal(records.length, 2);
   assert.equal(records[0]?.principalFingerprintPrefix, PRINCIPAL.slice(0, 12));
+  assert.equal(records[0]?.productProfile, "PERSONAL_DIRECT_OWNER");
+  assert.equal(records[0]?.sourceRevision, "source-abc123");
+  assert.equal(records[0]?.runtimeRevision, "runtime-abc123");
+  assert.equal(records[0]?.buildDigest, `sha256:${"c".repeat(64)}`);
+  assert.equal(records[0]?.schemaGeneration, `sha256:${"d".repeat(64)}`);
+  assert.equal(records[0]?.runtimeStartedAt, "2026-08-20T00:00:00.000Z");
+  assert.equal(records[0]?.connectorInstallationEpoch, 7);
+  assert.equal(records[0]?.connectorRotationSequence, 11);
+  assert.equal(records[0]?.acceptanceRunId, "pdo-e2e-20260822-0001");
   assert.equal(records[0]?.authorityIdDigest, digestAuditIdentity("raw-authority-must-not-appear"));
   assert.equal(records[0]?.receiptDigest, RECEIPT);
   assert.equal(records[1]?.previousEventDigest, records[0]?.eventDigest);
+  assert.equal(verifyOperationAuditText(text).length, 2);
 });
 
 test("graceful close loses no accepted audit event", async (t) => {

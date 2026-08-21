@@ -10,7 +10,7 @@ const unknown = [...argumentsSet].filter((argument) => !supported.has(argument))
 if (unknown.length > 0) fail(`Unknown release-gate option: ${unknown.join(" ")}`);
 
 if (!liveOnly) {
-  const args = ["scripts/verify-universal-broker-v2-release.mjs"];
+  const args = ["scripts/verify-personal-direct-owner-release.mjs"];
   if (requireClean) args.push("--require-clean");
   run(process.execPath, args);
 }

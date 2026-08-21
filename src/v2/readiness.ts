@@ -29,6 +29,25 @@ export interface CanonicalConnectorReadinessInput {
   invalidStates: readonly string[];
 }
 
+export interface PersonalConnectorReadinessInput {
+  state: "PASS" | "FAIL";
+  activeCount: number;
+  bindingsByState: Record<string, number>;
+  invalidStates: readonly string[];
+  expectedInstallationEpoch?: number;
+  activeInstallationEpoch?: number;
+  activeSchemaGeneration?: string;
+  activeBindingIdDigest?: string;
+  activeClientIdDigest?: string;
+  activeFamilyCount: number;
+  activeRefreshTokenCount: number;
+  activePersistedTokenCount: number;
+  overdueDrainingCount: number;
+  unboundActiveFamilyCount: number;
+  nonActiveTokenFamilyCount: number;
+  preparedReceiptCount: number;
+}
+
 export interface ReadinessCheckContext {
   readonly mode: "READ_ONLY";
   readonly signal: AbortSignal;
@@ -89,11 +108,6 @@ const DEFAULT_CHECK_TIMEOUT_MS = 200;
 const MAXIMUM_CHECKS = 64;
 const CHECK_ID_PATTERN = /^[a-z][a-z0-9_]{1,63}$/u;
 const SHA256_DIGEST_PATTERN = /^sha256:[a-f0-9]{64}$/u;
-const LEGACY_PERSONAL_CONNECTOR_STATES = new Set([
-  "VERIFICATION_IDENTITY_INCOMPLETE",
-  "DRAINING_DEADLINE_ELAPSED",
-]);
-
 /**
  * A parallel runtime is started before its connector is activated. Treat only that
  * exact empty-but-consistent state as ready; production still requires one ACTIVE
@@ -102,28 +116,58 @@ const LEGACY_PERSONAL_CONNECTOR_STATES = new Set([
 export function canonicalConnectorReadinessObservation(
   deploymentMode: "parallel" | "production",
   connector: CanonicalConnectorReadinessInput,
-  allowLegacyPersonalConnector = false,
 ): ReadinessCheckObservation {
   const awaitingParallelActivation = deploymentMode === "parallel"
     && connector.state === "FAIL"
     && connector.activeCount === 0
     && connector.invalidStates.length === 1
     && connector.invalidStates[0] === "ACTIVE_COUNT";
-  const legacyPersonalActive = deploymentMode === "production"
-    && allowLegacyPersonalConnector
-    && connector.activeCount === 1
-    && connector.invalidStates.length > 0
-    && connector.invalidStates.every((state) => LEGACY_PERSONAL_CONNECTOR_STATES.has(state));
   return {
-    state: awaitingParallelActivation || legacyPersonalActive ? "PASS" : connector.state,
+    state: awaitingParallelActivation ? "PASS" : connector.state,
     evidence: {
       activeCount: connector.activeCount,
       bindingsByState: connector.bindingsByState,
       invalidStates: connector.invalidStates,
       activationState: awaitingParallelActivation
         ? "PENDING"
-        : legacyPersonalActive
-          ? "LEGACY_ACTIVE"
+        : connector.state === "PASS" && connector.activeCount === 1
+          ? "ACTIVE"
+          : "INVALID",
+    },
+  };
+}
+
+/**
+ * Personal production accepts no enterprise verification ceremony bypass. A fresh parallel
+ * candidate may be ready before its isolated connector is activated, but production requires
+ * the exact Personal connector/token-family invariants reported by the OAuth store.
+ */
+export function personalConnectorReadinessObservation(
+  deploymentMode: "parallel" | "production",
+  connector: PersonalConnectorReadinessInput,
+): ReadinessCheckObservation {
+  const bindingCount = Object.values(connector.bindingsByState)
+    .reduce((total, count) => total + Number(count), 0);
+  const awaitingParallelActivation = deploymentMode === "parallel"
+    && connector.state === "FAIL"
+    && connector.activeCount === 0
+    && bindingCount === 0
+    && connector.invalidStates.length === 1
+    && connector.invalidStates[0] === "ACTIVE_COUNT"
+    && connector.unboundActiveFamilyCount === 0
+    && connector.nonActiveTokenFamilyCount === 0
+    && connector.preparedReceiptCount === 0;
+  return {
+    state: awaitingParallelActivation ? "PASS" : connector.state,
+    ...(awaitingParallelActivation
+      ? { summary: "Parallel Personal connector activation is pending." }
+      : connector.state === "PASS"
+        ? {}
+        : { summary: "Personal connector consistency failed." }),
+    evidence: {
+      ...connector,
+      activationState: awaitingParallelActivation
+        ? "PENDING"
         : connector.state === "PASS" && connector.activeCount === 1
           ? "ACTIVE"
           : "INVALID",
