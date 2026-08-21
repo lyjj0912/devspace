@@ -1400,10 +1400,10 @@ test("remote POSIX fs uses framed helper execution and SFTP atomic publication",
     disposition: "permanent",
   });
   assert.ok(fixture.executionCalls >= 7);
-  assert.equal(fixture.forgottenProcesses, fixture.executionCalls);
+  assert.equal(fixture.forgottenProcesses, 0);
 });
 
-test("remote filesystem helper processes preserve the authenticated owner context", async (t) => {
+test("remote filesystem one-shot helpers preserve the authenticated owner context", async (t) => {
   const fixture = await createRemoteFixture(t);
   const path = join(fixture.root, "owner-context.txt");
   await writeFile(path, "owner-context\n");
@@ -1415,7 +1415,7 @@ test("remote filesystem helper processes preserve the authenticated owner contex
     target: "remote",
     path,
   }, callContext);
-  assert.ok(fixture.processCallContexts.length >= 2);
+  assert.ok(fixture.processCallContexts.length >= 1);
   assert.ok(fixture.processCallContexts.every((observed) => observed === callContext));
 });
 
@@ -1905,7 +1905,7 @@ test("remote Windows fs uses PowerShell framing and SFTP atomic publication", as
     recursive: true,
   });
   assert.ok(fixture.executionCalls >= 10);
-  assert.equal(fixture.forgottenProcesses, fixture.executionCalls);
+  assert.equal(fixture.forgottenProcesses, 0);
 
   const command = windowsFilesystemCommand(
     { op: "stat", path },
@@ -2069,10 +2069,8 @@ async function createRemoteFixture(
   const remoteRequests: Array<Record<string, unknown>> = [];
   const unknownAfterOps = [...(options.unknownAfterOps ?? [])];
   const execution = {
-    async execute(
+    async run(
       input: { command: string },
-      _binding?: unknown,
-      _dispatch?: unknown,
       callContext?: CapabilityCallContext,
     ): Promise<UniversalProcessSnapshot> {
       executionCalls += 1;
@@ -2099,16 +2097,7 @@ async function createRemoteFixture(
         );
       }
     },
-    async operate(
-      input: { operation: string },
-      _dispatch?: unknown,
-      callContext?: CapabilityCallContext,
-    ): Promise<Record<string, unknown>> {
-      assert.equal(input.operation, "forget");
-      forgottenProcesses += 1;
-      processCallContexts.push(callContext);
-      return { forgotten: true };
-    },
+    stats() { return { active: 0, maximumConcurrent: 32, completed: executionCalls }; },
   } as unknown as UniversalExecutionPlane;
   let sftpPuts = 0;
   let sftpGets = 0;
@@ -2207,10 +2196,8 @@ async function createWindowsRemoteFixture(
   const remoteRequests: Array<Record<string, unknown>> = [];
   const unknownAfterOps = [...(options.unknownAfterOps ?? [])];
   const execution = {
-    async execute(
+    async run(
       input: { command: string },
-      _binding?: unknown,
-      _dispatch?: unknown,
       callContext?: CapabilityCallContext,
     ): Promise<UniversalProcessSnapshot> {
       executionCalls += 1;
@@ -2252,16 +2239,7 @@ async function createWindowsRemoteFixture(
         started,
       );
     },
-    async operate(
-      input: { operation: string },
-      _dispatch?: unknown,
-      callContext?: CapabilityCallContext,
-    ): Promise<Record<string, unknown>> {
-      assert.equal(input.operation, "forget");
-      forgottenProcesses += 1;
-      processCallContexts.push(callContext);
-      return { forgotten: true };
-    },
+    stats() { return { active: 0, maximumConcurrent: 32, completed: executionCalls }; },
   } as unknown as UniversalExecutionPlane;
   let sftpPuts = 0;
   let sftpGets = 0;

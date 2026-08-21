@@ -10,7 +10,7 @@ import {
 
 const runtimeIdentity: RuntimeIdentity = Object.freeze({
   productVersion: "2.1.1",
-  productProfile: "BASE_SINGLE_OWNER",
+  productProfile: "PERSONAL_DIRECT_OWNER",
   buildCapabilityDigest: `sha256:${"1".repeat(64)}`,
   resourceUriVersion: "v1",
   schemaGeneration: `sha256:${"2".repeat(64)}`,

@@ -1,7 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, posix } from "node:path";
-import type { UniversalExecutionPlane, UniversalProcessSnapshot } from "./execution.js";
+import type { InternalOneShotRunner, UniversalExecutionPlane } from "./execution.js";
+import { asInternalOneShotRunner } from "./execution.js";
 import type { UniversalFilesystemService } from "./filesystem.js";
 import {
   GUI_NODE_APPLESCRIPT_SOURCE,
@@ -45,7 +46,6 @@ export interface UniversalGuiInput {
   timeoutMs?: number;
   maxElements?: number;
   focusPolicy?: "preserve" | "allow";
-  authorityId?: string;
 }
 
 export interface GuiApplicationObservation {
@@ -160,7 +160,7 @@ export class UniversalGuiService {
   constructor(
     private readonly targets: TargetRegistry,
     filesystem: UniversalFilesystemService,
-    execution: UniversalExecutionPlane,
+    execution: UniversalExecutionPlane | InternalOneShotRunner,
     options: UniversalGuiServiceOptions = {},
   ) {
     this.runner = options.runner
@@ -708,6 +708,7 @@ export class UniversalGuiService {
 
 export class MacOsGuiNodeRunner implements GuiNodeRunner {
   private readonly installed = new Set<string>();
+  private readonly internalRunner: InternalOneShotRunner;
   private readonly sourceSha256 = createHash("sha256")
     .update(GUI_NODE_APPLESCRIPT_SOURCE)
     .digest("hex");
@@ -715,8 +716,10 @@ export class MacOsGuiNodeRunner implements GuiNodeRunner {
   constructor(
     private readonly targets: TargetRegistry,
     private readonly filesystem: UniversalFilesystemService,
-    private readonly execution: UniversalExecutionPlane,
-  ) {}
+    execution: UniversalExecutionPlane | InternalOneShotRunner,
+  ) {
+    this.internalRunner = asInternalOneShotRunner(execution);
+  }
 
   async call(
     target: TargetDefinition,
@@ -731,23 +734,14 @@ export class MacOsGuiNodeRunner implements GuiNodeRunner {
     }
     const scriptPath = await this.ensureInstalled(target, callContext);
     const args = guiNodeArguments(request);
-    let process = await this.execution.execute({
+    const process = await this.internalRunner.run({
       internalPolicy: { kind: "gui", scriptPath, scriptSha256: this.sourceSha256 },
       target: target.id,
       cwd: target.defaultCwd,
       command: ["/usr/bin/osascript", shellQuote(scriptPath), ...args.map(shellQuote)].join(" "),
-      mode: "foreground",
-      yieldMs: 30_000,
+      timeoutMs: NODE_TIMEOUT_MS,
       maxOutputChars: 1_000_000,
-    }, undefined, undefined, callContext);
-    if (process.state === "RUNNING" || process.state === "STARTING") {
-      process = await this.execution.operate({
-        operation: "wait",
-        processId: process.processId,
-        waitMs: NODE_TIMEOUT_MS,
-        maxOutputChars: 1_000_000,
-      }, undefined, callContext) as UniversalProcessSnapshot;
-    }
+    }, callContext);
     if (process.state !== "EXITED" || process.exitCode !== 0) {
       throw new UniversalBrokerError(
         process.state === "UNKNOWN" ? "EXECUTION_STATE_UNKNOWN" : "TRANSPORT_INTERRUPTED",

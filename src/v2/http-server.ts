@@ -31,17 +31,12 @@ import {
 } from "../mcp-sessions.js";
 import { SingleUserOAuthProvider } from "../oauth-provider.js";
 import { UniversalArtifactService } from "./artifact-service.js";
-import { OperationAuthorityRegistry } from "./authority.js";
 import { resolveAuthorityPrincipal } from "./authority-principal.js";
-import {
-  authorityActionFromToolCall,
-  minimumAuthorityRisk,
-} from "./authority-policy.js";
 import { buildCapabilityContract } from "./build-capabilities.js";
 import { ContextRegistry } from "./contexts.js";
 import { SignedSnapshotCursorStore } from "./cursor-capability.js";
 import { loadCursorSigningKeyRing } from "./cursor-signing-key.js";
-import { UniversalExecutionPlane } from "./execution.js";
+import { BoundedInternalOneShotRunner, UniversalExecutionPlane } from "./execution.js";
 import { UniversalEnvProfileRegistry } from "./env-profiles.js";
 import { UniversalFilesystemService } from "./filesystem.js";
 import {
@@ -83,11 +78,6 @@ import { UniversalSelfManagementService } from "./self-management.js";
 import { captureSnapshotGroup } from "./snapshot-group.js";
 import { TargetRegistry } from "./targets.js";
 import { UniversalTextResourceStore } from "./text-resource-store.js";
-import { SqliteConnectorActivationRecoveryJournal } from "./connector-activation-journal.js";
-import {
-  createFinalizationStoreBootstrapAuthorization,
-  initializeFinalizationStore,
-} from "../../scripts/lib/finalization-store-contract.mjs";
 import { connectorProductionRouteIdentityReadback } from "./connector-route-identity.js";
 import { configureResultEnvelopeIdentity } from "./errors.js";
 import {
@@ -154,7 +144,6 @@ export interface RunningUniversalBrokerNextServer {
   mcpProxy: UniversalMcpProxy;
   artifacts: UniversalArtifactService;
   gui: UniversalGuiService;
-  authority: OperationAuthorityRegistry;
   selfManagement: UniversalSelfManagementService;
   close(): Promise<void>;
 }
@@ -244,24 +233,6 @@ export function createUniversalBrokerNextServer(
     keyRef: config.managementAuthorizationKeyRef,
     stateDir: config.stateDir,
   });
-  const finalizationControlRoot = dirname(config.lifecycleFinalizationControlPath);
-  mkdirSync(finalizationControlRoot, { recursive: true, mode: 0o700 });
-  chmodSync(finalizationControlRoot, 0o700);
-  const finalizationBootstrapAuthorization = createFinalizationStoreBootstrapAuthorization({
-    storePath: config.lifecycleFinalizationStorePath,
-    controlPath: config.lifecycleFinalizationControlPath,
-    key: managementAuthorization,
-  });
-  initializeFinalizationStore({
-    storePath: config.lifecycleFinalizationStorePath,
-    controlPath: config.lifecycleFinalizationControlPath,
-    key: managementAuthorization,
-    bootstrapAuthorization: finalizationBootstrapAuthorization,
-  });
-  const connectorActivationJournal = new SqliteConnectorActivationRecoveryJournal({
-    storePath: config.connectorActivationJournalPath,
-  });
-  const connectorActivationJournalIdentity = connectorActivationJournal.identity();
   const cursors = new SignedSnapshotCursorStore({
     currentKey: cursorKeys.currentKey,
     ...(cursorKeys.previousKey ? { previousKey: cursorKeys.previousKey } : {}),
@@ -274,14 +245,6 @@ export function createUniversalBrokerNextServer(
     ...(cursorKeys.previousKey ? { previousKey: cursorKeys.previousKey } : {}),
   });
   configureResultEnvelopeIdentity(runtimeIdentity);
-  const authority = new OperationAuthorityRegistry({
-    minimumRisk: minimumAuthorityRisk,
-    storePath: config.authorityStorePath,
-    resourceLeaseTtlMs: config.authorityResourceLeaseTtlSeconds * 1_000,
-    resourceLeaseHeartbeatMs: config.authorityResourceLeaseHeartbeatSeconds * 1_000,
-    resourceLeaseRecoveryGraceMs: config.authorityResourceLeaseRecoveryGraceSeconds * 1_000,
-    metrics,
-  });
   const envProfiles = new UniversalEnvProfileRegistry({
     configPath: config.envProfileConfigPath,
   });
@@ -325,10 +288,14 @@ export function createUniversalBrokerNextServer(
     resourceContinuation,
     metrics,
   });
+  const internalRunner = new BoundedInternalOneShotRunner(
+    execution,
+    config.internalRunnerMaximumConcurrent,
+  );
   const filesystem = new UniversalFilesystemService(
     targets,
     contexts,
-    execution,
+    internalRunner,
     {
       sshControlDir: config.sshControlDir,
       syncStatePath: filesystemSyncStorePath,
@@ -372,7 +339,7 @@ export function createUniversalBrokerNextServer(
   const gui = new UniversalGuiService(
     targets,
     filesystem,
-    execution,
+    internalRunner,
     {
       runner: options.guiRunner,
       maximumSessions: config.guiMaximumSessions,
@@ -428,13 +395,8 @@ export function createUniversalBrokerNextServer(
       sideEffectFree: true,
       check: async () => {
         const sqliteReadiness = baseMutableSqliteStoreReadiness({
-          authorityStorePath: config.authorityStorePath,
           artifactCatalogPath: config.artifactCatalogPath,
           filesystemSyncStorePath,
-          connectorActivationJournalPath: config.connectorActivationJournalPath,
-          lifecycleFinalizationStorePath: config.lifecycleFinalizationStorePath,
-          lifecycleFinalizationControlPath: config.lifecycleFinalizationControlPath,
-          finalizationManagementKey: managementAuthorization,
         });
         let mainDatabaseReadiness: ReadinessCheckObservation;
         try {
@@ -462,31 +424,19 @@ export function createUniversalBrokerNextServer(
             id: "management-authorization-key",
             required: true,
           }),
-          {
-            state: connectorActivationJournalIdentity.storePath
-                === config.connectorActivationJournalPath
-              && connectorActivationJournalIdentity.schemaVersion === 1
-              ? "PASS"
-              : "FAIL",
-            evidence: {
-              id: "connector-activation-journal-identity",
-              ...connectorActivationJournalIdentity,
-            },
-          },
         ]);
       },
     },
     {
-      id: "authority_artifact_readability",
+      id: "artifact_readability",
       sideEffectFree: true,
       check: () => {
-        const authorityStats = authority.readOnlyStats();
         const artifactStats = artifacts.stats();
         return {
-          state: numeric(authorityStats.authorities) >= 0 && numeric(artifactStats.artifacts) >= 0
+          state: numeric(artifactStats.artifacts) >= 0
             ? "PASS"
             : "FAIL",
-          evidence: { authority: authorityStats, artifacts: artifactStats },
+          evidence: { artifacts: artifactStats },
         };
       },
     },
@@ -640,9 +590,7 @@ export function createUniversalBrokerNextServer(
       config,
       runtimeIdentity,
       oauthProvider,
-      authority,
       artifacts,
-      selfManagement,
       rateLimitPolicy,
       rateLimitPolicyDigest,
       deepDoctorPublicProbeSecret,
@@ -815,7 +763,6 @@ export function createUniversalBrokerNextServer(
       || connector.activeCount !== 1
       || !activeBinding
       || activeBinding.schemaGeneration !== runtimeIdentity.schemaGeneration
-      || activeBinding.authorityContractGeneration !== runtimeIdentity.authorityContractGeneration
       || activeBinding.buildDigest !== runtimeIdentity.buildDigest) {
       res.status(503).json({
         schemaVersion: 1,
@@ -905,7 +852,6 @@ export function createUniversalBrokerNextServer(
       selfManagement.stats(),
     ]);
     const targetProbeStats = targets.stats();
-    const authorityStats = authority.stats();
     res.type("text/plain; version=0.0.4").send(metrics.render({
       devspace_open_http_sessions: gauge("Open MCP HTTP sessions", transports.size),
       devspace_pending_mcp_initializations: gauge("Pending MCP initialize requests", pendingInitializations),
@@ -918,8 +864,6 @@ export function createUniversalBrokerNextServer(
       devspace_artifacts: gauge("Published artifacts", numeric(artifacts.stats().artifacts)),
       devspace_artifact_bytes: gauge("Published artifact bytes", numeric(artifacts.stats().totalBytes)),
       devspace_gui_sessions: gauge("Open GUI sessions", numeric(gui.stats().sessions)),
-      devspace_operation_authorities: gauge("Active operation authority records", numeric(authorityStats.authorities)),
-      devspace_authority_previews: gauge("Operation authority previews since process start", numeric(authorityStats.previews)),
       devspace_target_probe_cache_entries: gauge("Cached target probe observations", numeric(targetProbeStats.probeCacheEntries)),
       devspace_target_probe_in_flight: gauge("Target probes currently in flight", numeric(targetProbeStats.probeInFlight)),
       devspace_target_probe_cache_hits: gauge("Target probe cache hits since process start", numeric(targetProbeStats.probeCacheHits)),
@@ -1066,7 +1010,6 @@ export function createUniversalBrokerNextServer(
           mcpProxy,
           artifacts,
           gui,
-          authority,
           authorityPrincipal,
           selfManagement,
           runtimeIdentity,
@@ -1092,7 +1035,6 @@ export function createUniversalBrokerNextServer(
           mcpProxy,
           artifacts,
           gui,
-          authority,
           authorityPrincipal,
           selfManagement,
           runtimeIdentity,
@@ -1146,7 +1088,6 @@ export function createUniversalBrokerNextServer(
     mcpProxy,
     artifacts,
     gui,
-    authority,
     selfManagement,
     close: () => {
       closePromise ??= (async () => {
@@ -1158,8 +1099,6 @@ export function createUniversalBrokerNextServer(
         await artifacts.close();
         await mcpProxy.close();
         await execution.close();
-        authority.close();
-        connectorActivationJournal.close();
         oauthProvider.close();
         await operationAudit.close();
       })();
@@ -1377,19 +1316,12 @@ function createDeepDoctorChecks(input: {
   config: UniversalBrokerNextConfig;
   runtimeIdentity: RuntimeIdentity;
   oauthProvider: SingleUserOAuthProvider;
-  authority: OperationAuthorityRegistry;
   artifacts: UniversalArtifactService;
-  selfManagement: UniversalSelfManagementService;
   rateLimitPolicy: BrokerRateLimitPolicy;
   rateLimitPolicyDigest: string;
   deepDoctorPublicProbeSecret: Uint8Array;
 }): DeepDoctorCheck[] {
   return [
-    {
-      id: "authority_claim_receipt",
-      timeoutMs: 2_000,
-      check: (context) => isolatedAuthorityClaimReceipt(input.config, context.namespace),
-    },
     {
       id: "connector_consistency",
       check: () => {
@@ -1499,84 +1431,10 @@ function createDeepDoctorChecks(input: {
       },
     },
     {
-      id: "stale_lease_nonterminal_report",
-      timeoutMs: 2_000,
-      check: async () => {
-        const authorityStats = input.authority.stats();
-        const selfManagementStats = await input.selfManagement.stats();
-        const pendingReservations = numeric(authorityStats.pendingReservations);
-        const activeRestartTransactions = numeric(selfManagementStats.activeRestartTransactions);
-        return {
-          state: pendingReservations === 0 && activeRestartTransactions === 0 ? "PASS" : "UNKNOWN",
-          ...(pendingReservations === 0 && activeRestartTransactions === 0
-            ? {}
-            : { summary: "Nonterminal authority or restart state requires operator readback." }),
-          evidence: { authority: authorityStats, selfManagement: selfManagementStats },
-        };
-      },
-    },
-    {
       id: "runtime_identity_readback",
       check: () => exactRuntimeIdentityReadback(input.config, input.runtimeIdentity),
     },
   ];
-}
-
-async function isolatedAuthorityClaimReceipt(
-  config: UniversalBrokerNextConfig,
-  namespace: string,
-): Promise<DeepDoctorCheckObservation> {
-  const namespaceRoot = doctorNamespacePath(config, namespace);
-  const registry = new OperationAuthorityRegistry({
-    minimumRisk: minimumAuthorityRisk,
-    storePath: join(namespaceRoot, "authority.sqlite"),
-    instanceId: `${namespace}_authority`,
-    resourceLeaseTtlMs: 1_000,
-  });
-  try {
-    const descriptor = authorityActionFromToolCall("fs", {
-      operation: "write",
-      target: "local",
-      path: join(namespaceRoot, "authority-canary.txt"),
-      content: "deep doctor isolated authority canary\n",
-    });
-    const principalFingerprint = createHash("sha256")
-      .update("doctor-isolated-authority")
-      .update("\0")
-      .update(namespace)
-      .digest("hex");
-    const created = registry.create({
-      taskId: "deep-doctor-isolated-authority",
-      authorityText: "Authorize only the isolated deep doctor authority canary.",
-      expiresInSeconds: 60,
-      actions: [{ descriptor, risk: "R1", uses: 1 }],
-    }, principalFingerprint) as { authorityId?: unknown };
-    const authorityId = String(created.authorityId ?? "");
-    const dispatch = registry.prepareDispatch(authorityId, principalFingerprint, descriptor, "R1");
-    const grant = dispatch.claim();
-    dispatch.cancelNotDispatched({
-      providerCallCount: 0,
-      proof: "DEEP_DOCTOR_ISOLATED_PROVIDER_CALL_ZERO",
-    });
-    const status = registry.status(authorityId, principalFingerprint) as {
-      receipts?: Array<{ result?: string; leaseState?: string }>;
-    };
-    return {
-      state: status.receipts?.some((receipt) => receipt.result === "CANCELLED_NOT_DISPATCHED")
-        ? "PASS"
-        : "FAIL",
-      evidence: {
-        authorityIdDigest: sha256Digest(authorityId),
-        actionClaimIdDigest: sha256Digest(grant.actionClaimId),
-        receiptResults: status.receipts?.map((receipt) => ({
-          result: receipt.result,
-          leaseState: receipt.leaseState,
-        })),
-      },
-    };
-  } finally {
-    registry.close();
-  }
 }
 
 async function processManagerProductionUniqueness(

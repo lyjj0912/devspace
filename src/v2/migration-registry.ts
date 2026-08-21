@@ -223,32 +223,14 @@ export function baseMutableSqliteStoreRequirements(
 ): readonly BaseMutableSqliteStoreRequirement[] {
   const requirements: BaseMutableSqliteStoreRequirement[] = [
     {
-      storeId: "authority",
-      expectedUserVersion: 7,
-      required: true,
-      reason: "Durable operation authority claims, receipts, leases, and fencing.",
-    },
-    {
       storeId: "artifact-catalog",
       expectedUserVersion: 1,
       required: true,
       reason: "Durable artifact catalog, reservations, and CAS reference metadata.",
     },
-    {
-      storeId: CONNECTOR_ACTIVATION_JOURNAL_STORE_ID,
-      expectedUserVersion: CONNECTOR_ACTIVATION_JOURNAL_SCHEMA_VERSION,
-      required: true,
-      reason: "Append-only connector activation intent, dispatch, postcheck, and rollback tombstones.",
-    },
-    {
-      storeId: FINALIZATION_STORE_ID,
-      expectedUserVersion: FINALIZATION_STORE_SCHEMA_VERSION,
-      required: true,
-      reason: "Durable finalization lifecycle, prepared transaction, transition, and evidence ledger.",
-    },
   ];
   if (
-    capabilities.productProfile === "BASE_SINGLE_OWNER"
+    capabilities.productProfile === "PERSONAL_DIRECT_OWNER"
     && capabilities.supportedOperations?.fs?.includes("sync")
   ) {
     requirements.push({

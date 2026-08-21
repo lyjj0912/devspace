@@ -71,7 +71,6 @@ export interface UniversalArtifactInput {
   overwrite?: boolean;
   maxBytes?: number;
   ttlSeconds?: number;
-  authorityId?: string;
 }
 
 /** Compatible with the capability call-context being wired by the broker. */

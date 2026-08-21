@@ -62,7 +62,6 @@ export interface UniversalMcpInput {
   cursor?: string;
   limit?: number;
   responsePolicy?: Record<string, unknown>;
-  authorityId?: string;
 }
 
 type DownstreamTransport = StdioClientTransport | StreamableHTTPClientTransport;

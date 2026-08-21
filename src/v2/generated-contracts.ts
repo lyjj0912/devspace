@@ -116,7 +116,7 @@ export function generatedErrorSchema(): Record<string, unknown> {
       message: { type: "string", minLength: 1 },
       retryable: { type: "boolean" },
       dispatchState: {
-        enum: ["NOT_DISPATCHED", "CLAIMED", "DISPATCHED", "ACKNOWLEDGED", "UNKNOWN"],
+        enum: ["NOT_DISPATCHED", "DISPATCHED", "ACKNOWLEDGED", "UNKNOWN"],
       },
       resourceKey: { type: "string" },
       evidence: { type: "object" },
@@ -135,7 +135,7 @@ export function generatedUnifiedConfigSchema(): Record<string, unknown> {
   return {
     $schema: "https://json-schema.org/draft/2020-12/schema",
     $id: "https://devspace.local/config/config.schema.json",
-    title: "DevSpace Universal Broker BASE_SINGLE_OWNER Configuration",
+    title: "DevSpace Universal Broker PERSONAL_DIRECT_OWNER Configuration",
     ...schema,
   };
 }
@@ -151,7 +151,6 @@ export function generatedBuildCapabilitySchema(): Record<string, unknown> {
       "productVersion",
       "productProfile",
       "schemaGeneration",
-      "authorityContractGeneration",
       "supportedProfiles",
       "supportedOperations",
       "resourceUriVersion",
@@ -162,7 +161,6 @@ export function generatedBuildCapabilitySchema(): Record<string, unknown> {
       productVersion: { const: UNIVERSAL_BROKER_VERSION },
       productProfile: { const: BASE_PRODUCT_PROFILE },
       schemaGeneration: { type: "string", pattern: "^sha256:[a-f0-9]{64}$" },
-      authorityContractGeneration: { type: "string", pattern: "^sha256:[a-f0-9]{64}$" },
       supportedProfiles: { const: [...SUPPORTED_PRODUCT_PROFILES] },
       supportedOperations: {
         type: "object",

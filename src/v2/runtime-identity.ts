@@ -3,10 +3,7 @@ import {
   UNIVERSAL_BROKER_VERSION,
   type RuntimeIdentity,
 } from "./contracts.js";
-import {
-  RUNTIME_AUTHORITY_CONTRACT_GENERATION,
-  RUNTIME_SCHEMA_GENERATION,
-} from "./runtime-contract-identity.js";
+import { RUNTIME_SCHEMA_GENERATION } from "./runtime-contract-identity.js";
 import {
   BASE_PRODUCT_PROFILE,
   capabilityDigest,
@@ -29,13 +26,12 @@ export function createRuntimeIdentity(input: RuntimeIdentityInput): RuntimeIdent
     buildCapabilityDigest: capabilityDigest(),
     resourceUriVersion: RESOURCE_URI_VERSION,
     schemaGeneration: RUNTIME_SCHEMA_GENERATION,
-    authorityContractGeneration: RUNTIME_AUTHORITY_CONTRACT_GENERATION,
     configDigest: digest(redactConfigForDigest(input.config)),
     sourceRevision: boundedIdentity(input.sourceRevision, "unknown-source"),
     runtimeRevision: boundedIdentity(input.runtimeRevision, "development-runtime"),
     buildDigest: normalizeDigest(input.buildDigest),
     startedAt: normalizeDate(input.startedAt),
-  });
+  }) as RuntimeIdentity;
 }
 
 export function publicRuntimeHealth(identity: RuntimeIdentity): Record<string, unknown> {
@@ -46,7 +42,6 @@ export function publicRuntimeHealth(identity: RuntimeIdentity): Record<string, u
     buildCapabilityDigest: identity.buildCapabilityDigest,
     resourceUriVersion: identity.resourceUriVersion,
     schemaGeneration: identity.schemaGeneration,
-    authorityContractGeneration: identity.authorityContractGeneration,
     runtimeRevision: identity.runtimeRevision,
     startedAt: identity.startedAt,
   };

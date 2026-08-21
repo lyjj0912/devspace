@@ -296,7 +296,6 @@ function assertRuntimeIdentity(
     "buildCapabilityDigest",
     "resourceUriVersion",
     "schemaGeneration",
-    "authorityContractGeneration",
     "configDigest",
     "sourceRevision",
     "runtimeRevision",
@@ -321,7 +320,6 @@ function assertRequestMatchesStatus(
   if (
     status.transactionId !== request.transactionId
     || status.ownerFingerprint !== request.ownerFingerprint
-    || status.authorityId !== request.authorityId
     || !sameRuntimeIdentity(status.expectedRuntimeIdentity, request.expectedRuntimeIdentity)
   ) {
     throw new Error(
@@ -340,7 +338,6 @@ function sameRuntimeIdentity(
     "buildCapabilityDigest",
     "resourceUriVersion",
     "schemaGeneration",
-    "authorityContractGeneration",
     "configDigest",
     "sourceRevision",
     "runtimeRevision",

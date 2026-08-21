@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, open, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
-import { basename, dirname, join } from "node:path";
+import { dirname, join } from "node:path";
 import type { AuthorityRiskClass } from "./contracts.js";
 import type { DurableProcessIdentity } from "./durable-process-adapter.js";
 import { UniversalBrokerError } from "./errors.js";
@@ -72,14 +72,11 @@ export class FileProcessStateStore implements ProcessStateStore {
         const parsed = JSON.parse(await readFile(path, "utf8")) as PersistentProcessRecord;
         assertRecord(parsed, path);
         records.push(parsed);
-      } catch (error) {
+      } catch {
         const quarantine = `${path}.corrupt-${Date.now()}-${randomUUID()}`;
         await rename(path, quarantine).catch(() => undefined);
-        throw new UniversalBrokerError(
-          "STATE_CORRUPTED",
-          `Process state is corrupt and was quarantined: ${basename(path)}`,
-          { evidence: { stateFile: path, quarantine, cause: errorMessage(error) } },
-        );
+        // One corrupt terminal record must not prevent recovery of unrelated processes.
+        // The quarantined preimage remains available to doctor/maintenance inspection.
       }
     }
     return records;
@@ -114,7 +111,7 @@ export class FileProcessStateStore implements ProcessStateStore {
     } catch (error) {
       await rm(temporary, { force: true }).catch(() => undefined);
       throw new UniversalBrokerError(
-        "AUTHORITY_STORE_UNAVAILABLE",
+        "STATE_CORRUPTED",
         `Unable to persist process state for ${input.processId}.`,
         { evidence: { processId: input.processId, cause: errorMessage(error) } },
       );

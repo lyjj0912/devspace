@@ -8,13 +8,12 @@ import {
 } from "./contracts.js";
 import { cursorFailure } from "./cursor-capability.js";
 
-type EnvelopeIdentity = Pick<RuntimeIdentity, "schemaGeneration" | "authorityContractGeneration">;
+type EnvelopeIdentity = Pick<RuntimeIdentity, "schemaGeneration">;
 let envelopeIdentity: EnvelopeIdentity | undefined;
 
 export function configureResultEnvelopeIdentity(identity: EnvelopeIdentity): void {
   envelopeIdentity = Object.freeze({
     schemaGeneration: identity.schemaGeneration,
-    authorityContractGeneration: identity.authorityContractGeneration,
   });
 }
 
@@ -62,7 +61,6 @@ export function successfulToolResult(
     ...(typeof data.resourceUri === "string" ? { resourceUri: data.resourceUri } : {}),
     ...(typeof data.nextCursor === "string" ? { nextCursor: data.nextCursor } : {}),
     observedSchemaGeneration: observedSchemaGeneration(),
-    observedAuthorityContractGeneration: observedAuthorityContractGeneration(),
     ...(typeof data.targetGeneration === "string"
       ? { observedTargetGeneration: data.targetGeneration }
       : {}),
@@ -99,7 +97,6 @@ export function failedToolResult(error: unknown): CallToolResult {
       } : {}),
     },
     observedSchemaGeneration: observedSchemaGeneration(),
-    observedAuthorityContractGeneration: observedAuthorityContractGeneration(),
     ...(typeof normalized.evidence?.targetGeneration === "string"
       ? { observedTargetGeneration: normalized.evidence.targetGeneration }
       : {}),
@@ -118,15 +115,10 @@ function observedSchemaGeneration(): string {
   return envelopeIdentity?.schemaGeneration ?? `sha256:${"0".repeat(64)}`;
 }
 
-function observedAuthorityContractGeneration(): string {
-  return envelopeIdentity?.authorityContractGeneration ?? `sha256:${"0".repeat(64)}`;
-}
-
 function errorDispatchState(error: UniversalBrokerError): DispatchState {
   const declared = error.evidence?.dispatchState;
   if (
     declared === "NOT_DISPATCHED"
-    || declared === "CLAIMED"
     || declared === "DISPATCHED"
     || declared === "ACKNOWLEDGED"
     || declared === "UNKNOWN"

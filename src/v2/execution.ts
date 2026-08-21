@@ -90,6 +90,7 @@ import {
 } from "./resource-uri.js";
 import {
   FileProcessStateStore,
+  type PersistentProcessRecord,
   type ProcessStateStore,
   type WritableProcessRecord,
 } from "./process-state.js";
@@ -125,7 +126,6 @@ export interface ExecuteCommandInput {
   maxOutputChars?: number;
   envProfile?: string;
   durable?: boolean;
-  authorityId?: string;
   /** Internal helpers may select a constrained policy; MCP callers cannot set this field. */
   internalPolicy?: InternalExecutionPolicy;
 }
@@ -162,7 +162,6 @@ export interface ProcessOperationInput {
   signal?: string;
   columns?: number;
   rows?: number;
-  authorityId?: string;
   transactionId?: string;
   reason?: string;
   waitMs?: number;
@@ -198,6 +197,36 @@ export interface UniversalProcessSnapshot extends Record<string, unknown> {
   signal?: string;
   errorCode?: string;
   errorMessage?: string;
+}
+
+export interface InternalOneShotInput {
+  target: string;
+  cwd?: string;
+  command: string;
+  maxOutputChars?: number;
+  timeoutMs?: number;
+  internalPolicy: InternalExecutionPolicy;
+}
+
+export interface InternalOneShotResult {
+  targetId: string;
+  transport: "local" | "ssh";
+  cwd: string;
+  state: "EXITED" | "FAILED" | "SIGNALED" | "UNKNOWN";
+  exitCode?: number;
+  signal?: string;
+  errorCode?: string;
+  errorMessage?: string;
+  output: string;
+  outputTruncated: boolean;
+}
+
+export interface InternalOneShotRunner {
+  run(
+    input: InternalOneShotInput,
+    callContext?: CapabilityCallContext,
+  ): Promise<InternalOneShotResult>;
+  stats(): { active: number; maximumConcurrent: number; completed: number };
 }
 
 export interface ExecutionPlaneOptions {
@@ -290,7 +319,7 @@ export class UniversalExecutionPlane {
   private readonly now: () => number;
   private readonly spawnProcess: typeof spawn;
   private readonly ownerProvider: CapabilityCallContextProvider;
-  private readonly maximumProcessRecords: number;
+  private readonly maximumRetainedTerminalRecords: number;
   private readonly maximumRunningProcesses: number;
   private readonly maximumRunningProcessesPerTarget: number;
   private readonly maximumInlineOutputBytes: number;
@@ -310,7 +339,7 @@ export class UniversalExecutionPlane {
   constructor(private readonly options: ExecutionPlaneOptions) {
     this.now = options.now ?? Date.now;
     this.spawnProcess = options.spawnProcess ?? spawn;
-    this.maximumProcessRecords = boundedOption(
+    this.maximumRetainedTerminalRecords = boundedOption(
       options.maxProcessRecords,
       RESOURCE_DEFAULT_PROCESSES,
       1,
@@ -353,7 +382,6 @@ export class UniversalExecutionPlane {
       "completedProcessTtlMs",
     );
     this.reservations = new SynchronousQuotaReservations("process", {
-      records: this.maximumProcessRecords,
       concurrent: this.maximumRunningProcesses,
     });
     const compatibilityOwner = createCapabilityCallContextFromTrustedPrincipal({
@@ -373,7 +401,7 @@ export class UniversalExecutionPlane {
       ?? createEphemeralResourceContinuation({ now: this.now });
   }
 
-  async prepareAuthorityBinding(
+  async prepareExecutionBinding(
     input: ExecuteCommandInput,
     target: TargetDefinition,
     targetGeneration: string,
@@ -383,8 +411,8 @@ export class UniversalExecutionPlane {
     const resolved = await this.resolveExecution(input, callContext);
     if (resolved.target.id !== target.id || resolved.targetGeneration !== targetGeneration) {
       throw new UniversalBrokerError(
-        "AUTHORITY_STALE",
-        "Execution target changed while canonicalizing its authority resource.",
+        "PRECONDITION_FAILED",
+        "Execution target changed while preparing the command.",
       );
     }
     return prepareExecExecutionBinding(
@@ -394,6 +422,16 @@ export class UniversalExecutionPlane {
       resolved.envProfileGeneration,
       resolved.cwd,
     );
+  }
+
+  /** @deprecated Personal callers use prepareExecutionBinding; retained for source compatibility. */
+  prepareAuthorityBinding(
+    input: ExecuteCommandInput,
+    target: TargetDefinition,
+    targetGeneration: string,
+    callContext?: CapabilityCallContext,
+  ): Promise<PreparedExecExecutionBinding> {
+    return this.prepareExecutionBinding(input, target, targetGeneration, callContext);
   }
 
   async execute(
@@ -522,6 +560,157 @@ export class UniversalExecutionPlane {
     } finally {
       reservation.release();
     }
+  }
+
+  /**
+   * Runs a broker-owned helper without recovery, persistence, output spooling,
+   * or a managed process handle. Internal helper health therefore cannot be
+   * coupled to retained user-process records.
+   */
+  async runInternalOneShot(
+    input: InternalOneShotInput,
+    callContext?: CapabilityCallContext,
+  ): Promise<InternalOneShotResult> {
+    this.assertOpen();
+    validateCommand(input.command);
+    assertNoElevationCommand(input.command);
+    assertInternalExecutionCommand(input.internalPolicy, input.command);
+    const resolved = await this.resolveExecution({
+      target: input.target,
+      cwd: input.cwd,
+      command: input.command,
+      internalPolicy: input.internalPolicy,
+    }, callContext);
+    await assertCachedExecutionCapability(this.options.targets, resolved.target, false);
+    await mkdir(this.options.sshControlDir, { recursive: true, mode: 0o700 });
+    const spec = await this.commandSpec(resolved, {
+      target: input.target,
+      cwd: input.cwd,
+      command: input.command,
+      internalPolicy: input.internalPolicy,
+    }, `internal_${randomUUID()}`);
+    const maximumCharacters = outputLimit(input.maxOutputChars);
+    const timeoutMs = boundedWait(input.timeoutMs ?? 60_000);
+    const detached = process.platform !== "win32";
+    const child = this.spawnProcess(spec.executable, spec.args, {
+      cwd: spec.cwd,
+      env: spec.env,
+      detached,
+      windowsHide: true,
+      stdio: ["pipe", "pipe", "pipe"],
+    }) as ChildProcessWithoutNullStreams;
+    child.stdin.end();
+    let output = "";
+    let outputTruncated = false;
+    const appendVisible = (visible: string): void => {
+      if (visible.length === 0) return;
+      const remaining = maximumCharacters - output.length;
+      if (remaining <= 0) {
+        outputTruncated = true;
+        return;
+      }
+      output += visible.slice(0, remaining);
+      if (visible.length > remaining) outputTruncated = true;
+    };
+    const append = (value: Buffer | string, channel: ProcessOutputChannel): void => {
+      const text = Buffer.isBuffer(value) ? value.toString("utf8") : value;
+      appendVisible(spec.remoteMarkers
+        ? spec.remoteMarkers.consume(text, false, channel)
+        : text);
+    };
+    child.stdout.on("data", (value: Buffer | string) => append(value, "stdout"));
+    child.stderr.on("data", (value: Buffer | string) => append(value, "stderr"));
+    let timedOut = false;
+    let timer: NodeJS.Timeout | undefined;
+    const completion = new Promise<{ code: number | null; signal?: string; error?: unknown }>((resolvePromise) => {
+      let settled = false;
+      const settle = (result: { code: number | null; signal?: string; error?: unknown }): void => {
+        if (settled) return;
+        settled = true;
+        resolvePromise(result);
+      };
+      child.once("error", (error) => settle({ code: null, error }));
+      child.once("close", (code, signal) => settle({ code, ...(signal ? { signal } : {}) }));
+      timer = setTimeout(() => {
+        timedOut = true;
+        void Promise.resolve(terminateProcessTree(child, "SIGKILL", detached)).finally(() => {
+          setTimeout(() => settle({ code: null, signal: "SIGKILL" }), 1_000).unref();
+        });
+      }, timeoutMs);
+      timer.unref();
+    });
+    const completed = await completion;
+    if (timer) clearTimeout(timer);
+    if (spec.remoteMarkers) {
+      for (const channel of ["stdout", "stderr"] as const) {
+        appendVisible(spec.remoteMarkers.consume("", true, channel));
+      }
+    }
+    if (completed.error) {
+      return {
+        targetId: resolved.target.id,
+        transport: resolved.target.transport,
+        cwd: resolved.cwd,
+        state: "FAILED",
+        errorCode: "TRANSPORT_UNAVAILABLE",
+        errorMessage: boundedError(completed.error),
+        output,
+        outputTruncated,
+      };
+    }
+    if (timedOut) {
+      return {
+        targetId: resolved.target.id,
+        transport: resolved.target.transport,
+        cwd: resolved.cwd,
+        state: "SIGNALED",
+        signal: completed.signal ?? "SIGKILL",
+        errorCode: "TRANSPORT_INTERRUPTED",
+        errorMessage: `Internal helper timed out after ${timeoutMs} ms.`,
+        output,
+        outputTruncated,
+      };
+    }
+    if (spec.remoteMarkers) {
+      const markers = spec.remoteMarkers;
+      if (markers.elevationBlocked) {
+        return internalRemoteFailure(resolved, output, outputTruncated, "ELEVATION_BLOCKED", "Remote execution target has an elevated token.");
+      }
+      if (markers.cwdRejected) {
+        return internalRemoteFailure(resolved, output, outputTruncated, "PATH_NOT_FOUND", `Remote working directory is unavailable: ${resolved.cwd}`);
+      }
+      if (markers.completed) {
+        return {
+          targetId: resolved.target.id,
+          transport: resolved.target.transport,
+          cwd: resolved.cwd,
+          state: "EXITED",
+          exitCode: markers.exitCode ?? 0,
+          output,
+          outputTruncated,
+        };
+      }
+      return internalRemoteFailure(
+        resolved,
+        output,
+        outputTruncated,
+        markers.dispatched ? "TRANSPORT_INTERRUPTED" : "TRANSPORT_UNAVAILABLE",
+        markers.dispatched
+          ? "SSH transport ended after dispatch but before completion; the helper was not retried."
+          : "SSH transport ended before helper dispatch.",
+        markers.dispatched ? "UNKNOWN" : "FAILED",
+      );
+    }
+    return {
+      targetId: resolved.target.id,
+      transport: resolved.target.transport,
+      cwd: resolved.cwd,
+      state: completed.signal ? "SIGNALED" : "EXITED",
+      ...(completed.code !== null ? { exitCode: completed.code } : {}),
+      ...(completed.signal ? { signal: completed.signal } : {}),
+      output,
+      outputTruncated,
+    };
   }
 
   async operate(
@@ -802,6 +991,7 @@ export class UniversalExecutionPlane {
     return {
       processes: entries.length,
       runningProcesses: entries.filter(isRunning).length,
+      retainedTerminalRecords: entries.filter((entry) => !isRunning(entry)).length,
       outputBytes: entries.reduce((total, entry) => total + entry.output.totalFileBytes, 0),
       byTarget: Object.fromEntries([...byTarget].sort(([left], [right]) => left.localeCompare(right))),
     };
@@ -1221,10 +1411,9 @@ export class UniversalExecutionPlane {
     try {
       return this.reservations.reserve(
         {
-          records: this.entries.size + this.nonDurableAfterRestart.size,
           concurrent: running.length,
         },
-        { records: 1, concurrent: 1 },
+        { concurrent: 1 },
       );
     } catch (error) {
       this.recordQuotaRejection();
@@ -1269,6 +1458,7 @@ export class UniversalExecutionPlane {
       void this.forgetEntry(entry).catch(() => undefined);
     }, delay);
     entry.cleanupTimer.unref();
+    void this.pruneTerminalOverflow().catch(() => undefined);
   }
 
   private async forgetEntry(entry: ProcessEntry): Promise<void> {
@@ -1287,22 +1477,31 @@ export class UniversalExecutionPlane {
   }
 
   private ensureRecovered(): Promise<void> {
-    this.recoveryPromise ??= this.recoverPersistedProcesses();
+    this.recoveryPromise ??= this.recoverPersistedProcesses().catch((error) => {
+      this.recoveryPromise = undefined;
+      throw error;
+    });
     return this.recoveryPromise;
   }
 
   private async recoverPersistedProcesses(): Promise<void> {
-    const records = await this.stateStore.loadAll();
-    if (records.length > this.maximumProcessRecords) {
-      this.recordQuotaRejection();
-      throw new UniversalBrokerError(
-        "RESOURCE_QUOTA_EXCEEDED",
-        "Persisted process records exceed the configured process quota.",
-        { evidence: { records: records.length, maximum: this.maximumProcessRecords } },
-      );
-    }
+    const loaded = await this.stateStore.loadAll();
+    const now = this.now();
+    const terminal = loaded
+      .filter(isTerminalProcessRecord)
+      .sort((left, right) => terminalRecordTime(right) - terminalRecordTime(left));
+    const pruned = new Set(terminal
+      .filter((record, index) => (
+        terminalRecordTime(record) + this.completedProcessTtlMs <= now
+        || index >= this.maximumRetainedTerminalRecords
+      ))
+      .map((record) => record.processId));
+    await Promise.all(loaded
+      .filter((record) => pruned.has(record.processId))
+      .map((record) => this.deletePersistedRecord(record)));
+    const records = loaded.filter((record) => !pruned.has(record.processId));
     for (const record of records) {
-      if (!record.durable) {
+      if (!record.durable && !isTerminalProcessRecord(record)) {
         this.nonDurableAfterRestart.set(record.processId, record.principalKeyFingerprint);
         continue;
       }
@@ -1311,7 +1510,7 @@ export class UniversalExecutionPlane {
         maximumInlineBytes: this.maximumInlineOutputBytes,
         maximumFileBytes: this.maximumProcessOutputBytes,
       });
-      await output.open({ existing: true });
+      await output.open({ existing: true, readOnly: isTerminalProcessRecord(record) });
       const outputObservation = await observeProcessOutput(output.path);
       const outputChanged = (
         record.outputIdentity !== undefined
@@ -1345,7 +1544,7 @@ export class UniversalExecutionPlane {
         signal: record.signal,
         errorCode: record.errorCode,
         errorMessage: record.errorMessage,
-        durable: true,
+        durable: record.durable,
         durableIdentity: record.durableIdentity,
         dispatched: true,
         output,
@@ -1432,6 +1631,25 @@ export class UniversalExecutionPlane {
     }
   }
 
+  private async deletePersistedRecord(record: { processId: string; outputPath: string }): Promise<void> {
+    await Promise.allSettled([
+      rm(record.outputPath, { force: true }),
+      rm(`${record.outputPath}.stdout`, { force: true }),
+      rm(`${record.outputPath}.stderr`, { force: true }),
+      rm(`${record.outputPath}.pty`, { force: true }),
+      this.stateStore.delete(record.processId),
+    ]);
+  }
+
+  private async pruneTerminalOverflow(): Promise<void> {
+    const terminal = [...this.entries.values()]
+      .filter((entry) => !isRunning(entry))
+      .sort((left, right) => terminalEntryTime(left) - terminalEntryTime(right));
+    const overflow = terminal.length - this.maximumRetainedTerminalRecords;
+    if (overflow <= 0) return;
+    for (const entry of terminal.slice(0, overflow)) await this.forgetEntry(entry);
+  }
+
   private persistEntry(entry: ProcessEntry): Promise<void> {
     // Removing an entry is the durable forget fence. Exit callbacks and other
     // already-scheduled lifecycle work must not resurrect its state afterward.
@@ -1494,7 +1712,7 @@ export class UniversalExecutionPlane {
   ): void {
     if (expected === owner.principalKeyFingerprint) return;
     throw new UniversalBrokerError(
-      "AUTHORITY_PRINCIPAL_MISMATCH",
+      "PERMISSION_DENIED",
       `Process ${processId} belongs to a different authenticated principal.`,
       { evidence: { processId, providerDispatchCount: 0 } },
     );
@@ -1520,6 +1738,68 @@ export class UniversalExecutionPlane {
       // Process quota rejection must not be masked by instrumentation failure.
     }
   }
+}
+
+export class BoundedInternalOneShotRunner implements InternalOneShotRunner {
+  private readonly reservations: SynchronousQuotaReservations;
+  private active = 0;
+  private completed = 0;
+
+  constructor(
+    private readonly execution: UniversalExecutionPlane,
+    private readonly maximumConcurrent = 32,
+  ) {
+    this.reservations = new SynchronousQuotaReservations("internal-runner", {
+      concurrent: boundedOption(maximumConcurrent, 32, 1, 1_000, "internalRunnerMaximumConcurrent"),
+    });
+  }
+
+  async run(
+    input: InternalOneShotInput,
+    callContext?: CapabilityCallContext,
+  ): Promise<InternalOneShotResult> {
+    const reservation = this.reservations.reserve({ concurrent: this.active }, { concurrent: 1 });
+    reservation.commit(() => { this.active += 1; });
+    try {
+      return await this.execution.runInternalOneShot(input, callContext);
+    } finally {
+      this.active -= 1;
+      this.completed += 1;
+    }
+  }
+
+  stats(): { active: number; maximumConcurrent: number; completed: number } {
+    return { active: this.active, maximumConcurrent: this.maximumConcurrent, completed: this.completed };
+  }
+}
+
+export function asInternalOneShotRunner(
+  value: InternalOneShotRunner | UniversalExecutionPlane,
+  maximumConcurrent = 32,
+): InternalOneShotRunner {
+  return "run" in value
+    ? value
+    : new BoundedInternalOneShotRunner(value, maximumConcurrent);
+}
+
+function internalRemoteFailure(
+  resolved: ResolvedExecution,
+  output: string,
+  outputTruncated: boolean,
+  errorCode: string,
+  errorMessage: string,
+  state: InternalOneShotResult["state"] = "FAILED",
+): InternalOneShotResult {
+  return {
+    targetId: resolved.target.id,
+    transport: resolved.target.transport,
+    cwd: resolved.cwd,
+    state,
+    errorCode,
+    errorMessage,
+    output,
+    outputTruncated,
+  };
 }
 
 export function prepareExecExecutionBinding(
@@ -1788,7 +2068,7 @@ function posixRemoteCommand(
     "rc=$?",
     `printf '%s%s\\n' ${shellQuote(markers.completedPrefix)} \"$rc\" >&2`,
     "exit 0",
-  ].join("; ");
+  ].join("\n");
   return `/bin/sh -lc ${shellQuote(script)}`;
 }
 
@@ -2069,6 +2349,18 @@ function processUnpagedResult(
 
 function isRunning(entry: ProcessEntry): boolean {
   return entry.state === "STARTING" || entry.state === "RUNNING";
+}
+
+function isTerminalProcessRecord(record: PersistentProcessRecord): boolean {
+  return !["STARTING", "RUNNING"].includes(record.state);
+}
+
+function terminalRecordTime(record: PersistentProcessRecord): number {
+  return record.endedAtMs ?? record.startedAtMs;
+}
+
+function terminalEntryTime(entry: ProcessEntry): number {
+  return entry.endedAtMs ?? entry.startedAtMs;
 }
 
 async function waitForExit(entry: ProcessEntry, waitMs: number): Promise<void> {

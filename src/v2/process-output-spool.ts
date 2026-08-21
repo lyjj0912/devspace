@@ -61,7 +61,7 @@ export class ProcessOutputSpool {
     return `${this.options.path}.${channel}`;
   }
 
-  async open(options: { existing?: boolean } = {}): Promise<void> {
+  async open(options: { existing?: boolean; readOnly?: boolean } = {}): Promise<void> {
     if (options.existing) {
       this.offsets = {
         global: await fileSize(this.path),
@@ -70,6 +70,7 @@ export class ProcessOutputSpool {
         pty: await fileSize(this.channelPath("pty")),
       };
     }
+    if (options.readOnly) return;
     const flags = options.existing ? "a" : "wx";
     await Promise.all(([
       ["global", this.path],

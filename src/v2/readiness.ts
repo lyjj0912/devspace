@@ -75,18 +75,12 @@ export interface RuntimeCapabilityIdentityInput {
   buildCapabilityDigest?: string;
   resourceUriVersion?: string;
   schemaGeneration: string;
-  authorityContractGeneration: string;
   buildDigest: string;
 }
 
 export interface BaseMutableSqliteStoreReadinessInput {
-  authorityStorePath: string;
   artifactCatalogPath: string;
   filesystemSyncStorePath: string;
-  connectorActivationJournalPath: string;
-  lifecycleFinalizationStorePath: string;
-  lifecycleFinalizationControlPath: string;
-  finalizationManagementKey: ManagementAuthorizationKey;
   capabilities?: BuildCapabilityContract;
 }
 
@@ -257,9 +251,6 @@ export function runtimeCapabilityIdentityReadiness(
   if (identity.buildCapabilityDigest !== expectedCapabilityDigest) mismatches.push("buildCapabilityDigest");
   if (identity.resourceUriVersion !== contract.resourceUriVersion) mismatches.push("resourceUriVersion");
   if (identity.schemaGeneration !== contract.schemaGeneration) mismatches.push("schemaGeneration");
-  if (identity.authorityContractGeneration !== contract.authorityContractGeneration) {
-    mismatches.push("authorityContractGeneration");
-  }
   if (!SHA256_DIGEST_PATTERN.test(identity.buildDigest)) mismatches.push("buildDigest");
   return {
     state: mismatches.length === 0 ? "PASS" : "FAIL",
@@ -269,7 +260,6 @@ export function runtimeCapabilityIdentityReadiness(
       buildCapabilityDigest: identity.buildCapabilityDigest,
       resourceUriVersion: identity.resourceUriVersion,
       schemaGeneration: identity.schemaGeneration,
-      authorityContractGeneration: identity.authorityContractGeneration,
       buildDigest: identity.buildDigest,
       expectedCapabilityDigest,
     },
@@ -366,11 +356,8 @@ export function baseMutableSqliteStoreReadiness(
   input: BaseMutableSqliteStoreReadinessInput,
 ): ReadinessCheckObservation {
   const pathByStoreId = new Map([
-    ["authority", input.authorityStorePath],
     ["artifact-catalog", input.artifactCatalogPath],
     ["filesystem-sync", input.filesystemSyncStorePath],
-    ["connector-activation-journal", input.connectorActivationJournalPath],
-    [FINALIZATION_STORE_ID, input.lifecycleFinalizationStorePath],
   ]);
   const observations = baseMutableSqliteStoreRequirements(input.capabilities ?? buildCapabilityContract())
     .map((requirement) => {
@@ -385,14 +372,6 @@ export function baseMutableSqliteStoreReadiness(
             expectedUserVersion: requirement.expectedUserVersion,
           },
         };
-      }
-      if (requirement.storeId === FINALIZATION_STORE_ID) {
-        return finalizationStoreReadiness(
-          path,
-          input.lifecycleFinalizationControlPath,
-          input.finalizationManagementKey,
-          requirement.required,
-        );
       }
       return sqliteStoreReadiness({
         storeId: requirement.storeId,

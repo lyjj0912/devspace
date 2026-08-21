@@ -20,7 +20,7 @@ export type AuthorityRiskClass = (typeof UNIVERSAL_AUTHORITY_RISKS)[number];
 
 export const UNIVERSAL_TOOL_OPERATIONS = {
   target: ["list", "resolve", "probe"],
-  context: ["open", "search", "diff", "close", "authority_preview", "authorize", "authority_status", "invalidate_authority", "release_authority"],
+  context: ["open", "search", "diff", "close"],
   fs: [
     "stat",
     "list",
@@ -93,12 +93,6 @@ export const UNIVERSAL_ERROR_CODES = [
   "CURSOR_INVALID",
   "CURSOR_EXPIRED",
   "CURSOR_STALE",
-  "AUTHORITY_REQUIRED",
-  "AUTHORITY_EXPIRED",
-  "AUTHORITY_PRINCIPAL_MISMATCH",
-  "AUTHORITY_ACTION_MISMATCH",
-  "AUTHORITY_STALE",
-  "AUTHORITY_STORE_UNAVAILABLE",
   "STATE_CORRUPTED",
   "INVALID_ARGUMENT",
   "RESOURCE_EXPIRED",
@@ -106,9 +100,6 @@ export const UNIVERSAL_ERROR_CODES = [
   "PROCESS_NOT_DURABLE",
   "GUI_GENERATION_MISMATCH",
   "SCHEMA_STALE",
-  "AUTHORITY_STATE_UNCERTAIN",
-  "AUTHORITY_MISMATCH",
-  "AUTHORITY_CONSUMED",
   "ELEVATION_BLOCKED",
   "ELEVATION_DENIED",
   "SYNC_PLAN_STALE",
@@ -119,13 +110,27 @@ export const UNIVERSAL_ERROR_CODES = [
   "PROFILE_UNSUPPORTED",
   "MIGRATION_CONFLICT",
   "ROLLBACK_STATE_UNKNOWN",
-  "CONNECTOR_ACTIVATION_REQUIRED",
   "CONNECTOR_STATE_CONFLICT",
   "SUPERVISOR_UNAVAILABLE",
   "FINALIZATION_STAGE_CONFLICT",
 ] as const;
 
-export type UniversalErrorCode = (typeof UNIVERSAL_ERROR_CODES)[number];
+const LEGACY_AUTHORITY_ERROR_CODES = [
+  "AUTHORITY_REQUIRED",
+  "AUTHORITY_EXPIRED",
+  "AUTHORITY_PRINCIPAL_MISMATCH",
+  "AUTHORITY_ACTION_MISMATCH",
+  "AUTHORITY_STALE",
+  "AUTHORITY_STORE_UNAVAILABLE",
+  "AUTHORITY_STATE_UNCERTAIN",
+  "AUTHORITY_MISMATCH",
+  "AUTHORITY_CONSUMED",
+  "CONNECTOR_ACTIVATION_REQUIRED",
+] as const;
+
+export type UniversalErrorCode =
+  | (typeof UNIVERSAL_ERROR_CODES)[number]
+  | (typeof LEGACY_AUTHORITY_ERROR_CODES)[number];
 
 export const UNIVERSAL_BROKER_BUDGETS = Object.freeze({
   maximumTools: 8,
@@ -137,20 +142,18 @@ export const UNIVERSAL_BROKER_BUDGETS = Object.freeze({
 });
 
 export const UNIVERSAL_BROKER_INSTRUCTIONS = [
-  "DevSpace Universal Broker exposes a fixed set of generic tools.",
+  "DevSpace Personal Direct Owner exposes a fixed set of generic tools.",
   "Resolve named machines and environments with target instead of guessing identifiers.",
-  "Use context only for project instructions, Git state, and a default target/path; it is not an authority boundary.",
+  "Use context only for project instructions, Git state, and a default target/path; it is not a security boundary.",
   "Use fs for local or remote files, exec plus process for commands, mcp for arbitrary configured MCP servers, artifact for file exchange, and gui only for operating-system UI that has no better protocol.",
   "DevSpace never installs, injects, or reuses privilege-elevation credentials. Commands and file operations run only as the configured target user; any operating-system authorization must be approved directly by the user outside DevSpace.",
-  "Use context.authority_preview to classify and batch exact planned actions before the first mutation. R0 needs no authority; prepare R1 through R3 with context.authorize and pass authorityId; R3 is one-shot.",
-  "DevSpace blocks privilege-elevation commands at validation and execution boundaries. Higher-authority work is manual and outside DevSpace.",
-  "Do not retry an identical failed operation. Provider mutations and commands whose dispatch state is unknown must not be replayed automatically.",
+  "DevSpace blocks privilege-elevation commands at validation and execution boundaries. Privileged work is manual and outside DevSpace.",
+  "Do not automatically replay a mutation when its dispatch state is unknown; read back its result first.",
   "Large results are returned through resource handles rather than repeated in tool text.",
 ].join(" ");
 
 export type DispatchState =
   | "NOT_DISPATCHED"
-  | "CLAIMED"
   | "DISPATCHED"
   | "ACKNOWLEDGED"
   | "UNKNOWN";
@@ -163,11 +166,12 @@ export interface WarningRecord {
 
 export interface RuntimeIdentity {
   productVersion: string;
-  productProfile?: "BASE_SINGLE_OWNER";
+  productProfile: "PERSONAL_DIRECT_OWNER";
   buildCapabilityDigest?: string;
   resourceUriVersion?: "v1";
   schemaGeneration: string;
-  authorityContractGeneration: string;
+  /** @deprecated Legacy compile-time compatibility; personal runtime objects omit this key. */
+  authorityContractGeneration?: string;
   configDigest: string;
   sourceRevision: string;
   runtimeRevision: string;
@@ -179,10 +183,7 @@ export interface RuntimeIdentity {
 export interface UniversalRequestMeta {
   requestId?: string;
   transactionId?: string;
-  taskInstanceId?: string;
-  authorityId?: string;
   expectedSchemaGeneration?: string;
-  expectedAuthorityContractGeneration?: string;
   expectedTargetGeneration?: string;
   expectedRouteGeneration?: string;
 }
@@ -195,7 +196,6 @@ export interface SuccessEnvelope<T> {
   resourceUri?: string;
   nextCursor?: string;
   observedSchemaGeneration: string;
-  observedAuthorityContractGeneration: string;
   observedTargetGeneration?: string;
   observedRouteGeneration?: string;
 }
@@ -207,10 +207,7 @@ const genericRecordSchema = z.record(z.string(), z.unknown());
 export const UNIVERSAL_REQUEST_META_INPUT_SCHEMA = {
   requestId: z.string().min(1).max(256).optional(),
   transactionId: z.string().min(1).max(128).optional(),
-  taskInstanceId: z.string().min(1).max(128).optional(),
-  authorityId: z.string().min(1).max(256).optional(),
   expectedSchemaGeneration: z.string().min(1).max(256).optional(),
-  expectedAuthorityContractGeneration: z.string().min(1).max(256).optional(),
   expectedTargetGeneration: z.string().min(1).max(256).optional(),
   expectedRouteGeneration: z.string().min(1).max(256).optional(),
 } as const satisfies z.ZodRawShape;
@@ -227,7 +224,6 @@ export const UNIVERSAL_RESULT_OUTPUT_SCHEMA = {
   resourceUri: z.string().optional(),
   nextCursor: z.string().optional(),
   observedSchemaGeneration: z.string(),
-  observedAuthorityContractGeneration: z.string(),
   observedTargetGeneration: z.string().optional(),
   observedRouteGeneration: z.string().optional(),
   error: z
@@ -235,7 +231,7 @@ export const UNIVERSAL_RESULT_OUTPUT_SCHEMA = {
       code: z.enum(UNIVERSAL_ERROR_CODES),
       message: z.string(),
       retryable: z.boolean(),
-      dispatchState: z.enum(["NOT_DISPATCHED", "CLAIMED", "DISPATCHED", "ACKNOWLEDGED", "UNKNOWN"]),
+      dispatchState: z.enum(["NOT_DISPATCHED", "DISPATCHED", "ACKNOWLEDGED", "UNKNOWN"]),
       resourceKey: z.string().optional(),
       evidence: genericRecordSchema.optional(),
       recovery: z.array(genericRecordSchema).optional(),
@@ -285,7 +281,7 @@ const targetContract = {
 
 const contextContract = {
   title: "Context",
-  description: "Context and authority.",
+  description: "Project context and convenience index.",
   inputSchema: {
     operation: z.enum(UNIVERSAL_TOOL_OPERATIONS.context),
     contextId: z.string().min(1).optional(),
@@ -296,18 +292,6 @@ const contextContract = {
     task: z.string().min(1).optional(),
     query: z.string().min(1).optional(),
     maxCharacters: z.number().int().min(100).max(100_000).optional(),
-    taskLabel: z.string().min(1).max(256).optional(),
-    taskId: z.string().min(1).max(256).optional(),
-    authorityText: z.string().min(1).max(8_000).optional(),
-    actions: z.array(z.strictObject({
-      id: z.string().min(1).max(128).optional(),
-      tool: z.enum(UNIVERSAL_TOOL_NAMES),
-      arguments: genericRecordSchema,
-      risk: z.enum(UNIVERSAL_AUTHORITY_RISKS).optional(),
-      uses: z.number().int().min(1).max(50).optional(),
-    })).min(1).max(64).optional(),
-    correctionText: z.string().min(1).max(8_000).optional(),
-    expiresInSeconds: z.number().int().min(60).max(28_800).optional(),
     cursor: cursorSchema,
     limit: limitSchema,
   },

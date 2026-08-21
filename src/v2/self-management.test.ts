@@ -26,15 +26,13 @@ import {
 import { UniversalBrokerMetrics } from "./metrics.js";
 
 const OWNER = "a".repeat(64);
-const AUTHORITY = "authority_test_1";
 const TRANSPORT = "http-request-test-1";
 const TEST_RUNTIME_IDENTITY: RuntimeIdentity = {
   productVersion: "3.0.0",
-  productProfile: "BASE_SINGLE_OWNER",
+  productProfile: "PERSONAL_DIRECT_OWNER",
   buildCapabilityDigest: `sha256:${"5".repeat(64)}`,
   resourceUriVersion: "v1",
   schemaGeneration: `sha256:${"1".repeat(64)}`,
-  authorityContractGeneration: `sha256:${"2".repeat(64)}`,
   configDigest: `sha256:${"3".repeat(64)}`,
   sourceRevision: "source-test",
   runtimeRevision: "runtime-test",
@@ -42,7 +40,7 @@ const TEST_RUNTIME_IDENTITY: RuntimeIdentity = {
   startedAt: "2026-08-20T00:00:00.000Z",
 };
 
-test("self-management requires the complete BASE runtime identity tuple", async (t) => {
+test("self-management requires the complete personal runtime identity tuple", async (t) => {
   const root = await temporaryRoot(t, "devspace-self-management-runtime-identity-");
   const {
     productProfile: _productProfile,
@@ -51,7 +49,7 @@ test("self-management requires the complete BASE runtime identity tuple", async 
     ...legacyIdentity
   } = TEST_RUNTIME_IDENTITY;
   assert.throws(
-    () => serviceFixture(root, { runtimeIdentity: legacyIdentity }),
+    () => serviceFixture(root, { runtimeIdentity: legacyIdentity as RuntimeIdentity }),
     /runtimeIdentity is missing or invalid/u,
   );
 });
@@ -110,7 +108,6 @@ test("restart handoff occurs only after the exact response is durably ACK_FLUSHE
   const prepared = await service.requestRestart({
     reason: "test restart",
     ownerFingerprint: OWNER,
-    authorityId: AUTHORITY,
   });
   assert.equal(prepared.state, "PREPARED");
   assert.equal(launches.length, 0);
@@ -163,7 +160,6 @@ test("response abort is terminal, idempotent, and never launches the supervisor"
   const service = serviceFixture(root, { launchWorker: (request) => launches.push(request) });
   const prepared = await service.requestRestart({
     ownerFingerprint: OWNER,
-    authorityId: AUTHORITY,
   });
   await service.bindResponse(prepared.transactionId, "rpc-request-abort", TRANSPORT);
 
@@ -196,7 +192,6 @@ test("response abort is terminal, idempotent, and never launches the supervisor"
 
   const replacement = await service.requestRestart({
     ownerFingerprint: OWNER,
-    authorityId: "authority_test_2",
   });
   assert.equal(replacement.state, "PREPARED");
 });
@@ -210,7 +205,6 @@ test("restart metrics derive from durable states, deduplicate callbacks, and nev
   });
   const prepared = await flushedService.requestRestart({
     ownerFingerprint: OWNER,
-    authorityId: AUTHORITY,
   });
   await flushedService.bindResponse(prepared.transactionId, "rpc-metrics-flush", TRANSPORT);
   await flushedService.responseFlushedForRequest(TRANSPORT, "rpc-metrics-flush");
@@ -220,7 +214,6 @@ test("restart metrics derive from durable states, deduplicate callbacks, and nev
   const abortedService = serviceFixture(abortedRoot, { metrics });
   const aborted = await abortedService.requestRestart({
     ownerFingerprint: OWNER,
-    authorityId: "authority_test_metrics_abort",
   });
   await abortedService.bindResponse(aborted.transactionId, "rpc-metrics-abort", TRANSPORT);
   await abortedService.responseAbortedForRequest(TRANSPORT, "rpc-metrics-abort", "closed");
@@ -236,7 +229,6 @@ test("restart metrics derive from durable states, deduplicate callbacks, and nev
   const resilientService = serviceFixture(resilientRoot, { metrics: throwingMetrics });
   assert.equal((await resilientService.requestRestart({
     ownerFingerprint: OWNER,
-    authorityId: "authority_test_metrics_resilient",
   })).state, "PREPARED");
 });
 
@@ -250,7 +242,7 @@ test("ACK persistence failure prevents supervisor launch", async (t) => {
       await atomicRestartStatusWrite(path, status);
     },
   });
-  const prepared = await service.requestRestart({ ownerFingerprint: OWNER, authorityId: AUTHORITY });
+  const prepared = await service.requestRestart({ ownerFingerprint: OWNER });
   await service.bindResponse(prepared.transactionId, "rpc-request-write-failure", TRANSPORT);
 
   await assert.rejects(
@@ -273,7 +265,7 @@ test("ACK_ABORTED is durable before FAIL and a failed terminal write is safely r
       await atomicRestartStatusWrite(path, status);
     },
   });
-  const prepared = await service.requestRestart({ ownerFingerprint: OWNER, authorityId: AUTHORITY });
+  const prepared = await service.requestRestart({ ownerFingerprint: OWNER });
   await service.bindResponse(
     prepared.transactionId,
     "rpc-request-abort-write-failure",
@@ -311,7 +303,7 @@ test("reused JSON-RPC IDs cannot acknowledge a restart bound to another HTTP res
   const service = serviceFixture(root, { launchWorker: (request) => launches.push(request) });
   const sharedRequestId = "rpc-reused-across-transports";
 
-  const first = await service.requestRestart({ ownerFingerprint: OWNER, authorityId: AUTHORITY });
+  const first = await service.requestRestart({ ownerFingerprint: OWNER });
   await service.bindResponse(first.transactionId, sharedRequestId, "http-response-old");
   await service.responseAbortedForRequest(
     "http-response-old",
@@ -321,7 +313,6 @@ test("reused JSON-RPC IDs cannot acknowledge a restart bound to another HTTP res
 
   const second = await service.requestRestart({
     ownerFingerprint: OWNER,
-    authorityId: "authority_test_transport_2",
   });
   await service.bindResponse(second.transactionId, sharedRequestId, "http-response-current");
   assert.equal(
@@ -349,12 +340,11 @@ test("duplicate durable transport bindings fail closed even when only one match 
   const requestId = "rpc-ambiguous-binding";
   const transportId = "http-response-reused";
 
-  const first = await service.requestRestart({ ownerFingerprint: OWNER, authorityId: AUTHORITY });
+  const first = await service.requestRestart({ ownerFingerprint: OWNER });
   await service.bindResponse(first.transactionId, requestId, transportId);
   await service.responseAbortedForRequest(transportId, requestId, "first response aborted");
   const second = await service.requestRestart({
     ownerFingerprint: OWNER,
-    authorityId: "authority_test_ambiguous_2",
   });
   await service.bindResponse(second.transactionId, requestId, transportId);
 
@@ -378,7 +368,7 @@ test("an uncertain supervisor launch is durable UNKNOWN and is never auto-retrie
       throw new Error("supervisor handoff result unavailable");
     },
   });
-  const prepared = await service.requestRestart({ ownerFingerprint: OWNER, authorityId: AUTHORITY });
+  const prepared = await service.requestRestart({ ownerFingerprint: OWNER });
   await service.bindResponse(prepared.transactionId, "rpc-launch-unknown", TRANSPORT);
 
   await assert.rejects(
@@ -400,7 +390,7 @@ test("binding is exact and stale nonterminal transactions become UNKNOWN without
     timeoutMs: 10_000,
     launchWorker: (request) => launches.push(request),
   });
-  const prepared = await service.requestRestart({ ownerFingerprint: OWNER, authorityId: AUTHORITY });
+  const prepared = await service.requestRestart({ ownerFingerprint: OWNER });
   await service.bindResponse(prepared.transactionId, "rpc-request-stale", TRANSPORT);
   await assert.rejects(
     service.bindResponse(prepared.transactionId, "different-request", TRANSPORT),
@@ -421,7 +411,7 @@ test("binding is exact and stale nonterminal transactions become UNKNOWN without
 test("a malformed durable transaction blocks a second restart instead of being skipped", async (t) => {
   const root = await temporaryRoot(t, "devspace-self-management-corrupt-state-");
   const service = serviceFixture(root);
-  const prepared = await service.requestRestart({ ownerFingerprint: OWNER, authorityId: AUTHORITY });
+  const prepared = await service.requestRestart({ ownerFingerprint: OWNER });
   const statusPath = join(
     root,
     "state",
@@ -434,7 +424,6 @@ test("a malformed durable transaction blocks a second restart instead of being s
   await assert.rejects(
     service.requestRestart({
       ownerFingerprint: OWNER,
-      authorityId: "authority_test_after_corruption",
     }),
     (error: unknown) => brokerCode(error) === "TRANSPORT_INTERRUPTED",
   );
@@ -452,7 +441,7 @@ test("stale broker polling does not overwrite a restart still owned by the super
     timeoutMs: 10_000,
     launchWorker() {},
   });
-  const prepared = await service.requestRestart({ ownerFingerprint: OWNER, authorityId: AUTHORITY });
+  const prepared = await service.requestRestart({ ownerFingerprint: OWNER });
   await service.bindResponse(prepared.transactionId, "rpc-supervisor-owner", TRANSPORT);
   const acknowledged = await service.responseFlushedForRequest(
     TRANSPORT,
@@ -791,7 +780,6 @@ async function workerFixture(
     updatedAt: requestedAt,
     expectedDisconnect: true,
     ownerFingerprint: OWNER,
-    authorityId: AUTHORITY,
     expectedRuntimeIdentity: TEST_RUNTIME_IDENTITY,
     responseTransportId: state === "PREPARED" ? undefined : TRANSPORT,
     responseRequestId: state === "PREPARED" ? undefined : "rpc-worker",
@@ -802,7 +790,6 @@ async function workerFixture(
     transactionId,
     requestedAt,
     ownerFingerprint: OWNER,
-    authorityId: AUTHORITY,
     timeoutMs: 2_000,
     pm2ProcessName: "devspace-test",
     pm2Executable: "/usr/bin/true",

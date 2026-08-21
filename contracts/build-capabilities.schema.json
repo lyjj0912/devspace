@@ -8,7 +8,6 @@
     "productVersion",
     "productProfile",
     "schemaGeneration",
-    "authorityContractGeneration",
     "supportedProfiles",
     "supportedOperations",
     "resourceUriVersion",
@@ -20,19 +19,15 @@
       "const": "2.1.1"
     },
     "productProfile": {
-      "const": "BASE_SINGLE_OWNER"
+      "const": "PERSONAL_DIRECT_OWNER"
     },
     "schemaGeneration": {
       "type": "string",
       "pattern": "^sha256:[a-f0-9]{64}$"
     },
-    "authorityContractGeneration": {
-      "type": "string",
-      "pattern": "^sha256:[a-f0-9]{64}$"
-    },
     "supportedProfiles": {
       "const": [
-        "BASE_SINGLE_OWNER"
+        "PERSONAL_DIRECT_OWNER"
       ]
     },
     "supportedOperations": {
@@ -61,12 +56,7 @@
             "open",
             "search",
             "diff",
-            "close",
-            "authority_preview",
-            "authorize",
-            "authority_status",
-            "invalidate_authority",
-            "release_authority"
+            "close"
           ]
         },
         "fs": {

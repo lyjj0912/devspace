@@ -41,9 +41,10 @@ import {
   type SignedSnapshotCursorStore,
 } from "./cursor-capability.js";
 import type {
+  InternalOneShotRunner,
   UniversalExecutionPlane,
-  UniversalProcessSnapshot,
 } from "./execution.js";
+import { asInternalOneShotRunner } from "./execution.js";
 import { UniversalBrokerError } from "./errors.js";
 import {
   atomicCopyFile,
@@ -134,7 +135,6 @@ export interface UniversalFilesystemInput {
   trashId?: string;
   /** Final-component behavior. Mutations default to reject; reads default to follow. */
   finalSymlink?: "follow" | "preserve" | "replace" | "reject";
-  authorityId?: string;
   cursor?: string;
   /** Byte range offset for fs.read; never a pagination cursor. */
   offset?: number;
@@ -203,14 +203,16 @@ interface FilesystemSearchSnapshot {
 
 export class UniversalFilesystemService {
   private readonly trash: RecoverableFilesystemTrash;
+  private readonly internalRunner: InternalOneShotRunner;
   private syncService: DurableFilesystemSync | undefined;
 
   constructor(
     private readonly targets: TargetRegistry,
     private readonly contexts: ContextRegistry,
-    private readonly execution: UniversalExecutionPlane,
+    execution: UniversalExecutionPlane | InternalOneShotRunner,
     private readonly options: UniversalFilesystemOptions,
   ) {
+    this.internalRunner = asInternalOneShotRunner(execution);
     this.trash = new RecoverableFilesystemTrash(
       options.trashRoot ?? join(dirname(options.sshControlDir), "filesystem-trash"),
       options.atomicFilesystem ?? nodeAtomicFilesystemOperations,
@@ -1542,32 +1544,18 @@ export class UniversalFilesystemService {
     remoteScript: string,
     callContext?: CapabilityCallContext,
   ): Promise<void> {
-    let result: UniversalProcessSnapshot | undefined;
     try {
-      result = await this.execution.execute({
+      await this.internalRunner.run({
         internalPolicy: "filesystem",
         target: target.id,
         cwd: target.defaultCwd ?? "~",
         command: `Remove-Item -LiteralPath ${powershellLiteral(remoteScript)} -Force -ErrorAction SilentlyContinue`,
-        mode: "foreground",
-        yieldMs: 30_000,
+        timeoutMs: 30_000,
         maxOutputChars: 8_000,
-      }, undefined, undefined, callContext);
-      if (result.state === "RUNNING" || result.state === "STARTING") {
-        result = await this.execution.operate({
-          operation: "wait",
-          processId: result.processId,
-          waitMs: 30_000,
-          maxOutputChars: 8_000,
-        }, undefined, callContext) as typeof result;
-      }
+      }, callContext);
     } catch {
       // The staged script is random, owner-level, and short-lived. The caller's
       // original filesystem error remains authoritative if cleanup also fails.
-    } finally {
-      if (result) {
-        await this.forgetRemoteFilesystemProcess(result, callContext).catch(() => undefined);
-      }
     }
   }
 
@@ -1577,24 +1565,15 @@ export class UniversalFilesystemService {
     responseMarker: string,
     callContext?: CapabilityCallContext,
   ): Promise<unknown> {
-    let result = await this.execution.execute({
+    const result = await this.internalRunner.run({
       internalPolicy: "filesystem",
       target: target.id,
       cwd: target.defaultCwd ?? "~",
       command,
-      mode: "foreground",
-      yieldMs: 30_000,
+      timeoutMs: 60_000,
       maxOutputChars: 1_000_000,
-    }, undefined, undefined, callContext);
-    try {
-      if (result.state === "RUNNING" || result.state === "STARTING") {
-        result = await this.execution.operate({
-          operation: "wait",
-          processId: result.processId,
-          waitMs: 60_000,
-          maxOutputChars: 1_000_000,
-        }, undefined, callContext) as typeof result;
-      }
+    }, callContext);
+    {
       if (result.state !== "EXITED" || result.exitCode !== 0) {
         throw new UniversalBrokerError(
           result.state === "UNKNOWN" ? "EXECUTION_STATE_UNKNOWN" : "TRANSPORT_INTERRUPTED",
@@ -1602,7 +1581,6 @@ export class UniversalFilesystemService {
           {
             evidence: {
               targetId: target.id,
-              processId: result.processId,
               state: result.state,
               exitCode: result.exitCode,
               outputPreview: result.output.slice(0, 500),
@@ -1638,28 +1616,7 @@ export class UniversalFilesystemService {
         response.message ?? `Remote filesystem operation failed on target ${target.id}.`,
         { evidence: { targetId: target.id, remoteCode: response.code } },
       );
-    } finally {
-      await this.forgetRemoteFilesystemProcess(result, callContext);
     }
-  }
-
-  private async forgetRemoteFilesystemProcess(
-    result: UniversalProcessSnapshot,
-    callContext?: CapabilityCallContext,
-  ): Promise<void> {
-    if (result.state === "RUNNING" || result.state === "STARTING") {
-      result = await this.execution.operate({
-        operation: "signal",
-        processId: result.processId,
-        signal: "SIGTERM",
-        waitMs: 2_000,
-        maxOutputChars: 1_000,
-      }, undefined, callContext) as UniversalProcessSnapshot;
-    }
-    await this.execution.operate({
-      operation: "forget",
-      processId: result.processId,
-    }, undefined, callContext);
   }
 
   private async publishRemoteFile(

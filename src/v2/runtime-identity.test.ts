@@ -17,10 +17,10 @@ test("runtime identity is canonical, secret-free, and public health is minimal",
   });
   assert.equal(left.configDigest, right.configDigest);
   assert.match(left.schemaGeneration, /^sha256:[a-f0-9]{64}$/u);
-  assert.equal(left.productProfile, "BASE_SINGLE_OWNER");
+  assert.equal(left.productProfile, "PERSONAL_DIRECT_OWNER");
   assert.equal(left.resourceUriVersion, "v1");
   assert.match(String(left.buildCapabilityDigest), /^sha256:[a-f0-9]{64}$/u);
-  assert.match(left.authorityContractGeneration, /^sha256:[a-f0-9]{64}$/u);
+  assert.equal("authorityContractGeneration" in left, false);
   assert.deepEqual(Object.keys(publicRuntimeHealth(left)), [
     "status",
     "productVersion",
@@ -28,7 +28,6 @@ test("runtime identity is canonical, secret-free, and public health is minimal",
     "buildCapabilityDigest",
     "resourceUriVersion",
     "schemaGeneration",
-    "authorityContractGeneration",
     "runtimeRevision",
     "startedAt",
   ]);

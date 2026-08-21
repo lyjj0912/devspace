@@ -5,10 +5,7 @@ import {
   UNIVERSAL_TOOL_OPERATIONS,
   type UniversalToolName,
 } from "./contracts.js";
-import {
-  RUNTIME_AUTHORITY_CONTRACT_GENERATION,
-  RUNTIME_SCHEMA_GENERATION,
-} from "./runtime-contract-identity.js";
+import { RUNTIME_SCHEMA_GENERATION } from "./runtime-contract-identity.js";
 export {
   BASE_PRODUCT_PROFILE,
   RESOURCE_URI_VERSION,
@@ -26,7 +23,6 @@ export interface BuildCapabilityManifest {
   productVersion: string;
   productProfile: ProductProfile;
   schemaGeneration: string;
-  authorityContractGeneration: string;
   supportedProfiles: readonly ProductProfile[];
   supportedOperations: Readonly<Record<UniversalToolName, readonly string[]>>;
   resourceUriVersion: typeof RESOURCE_URI_VERSION;
@@ -38,7 +34,6 @@ export interface BuildCapabilityContract {
   productVersion: string;
   productProfile: ProductProfile;
   schemaGeneration: string;
-  authorityContractGeneration: string;
   supportedProfiles: readonly ProductProfile[];
   supportedOperations: Readonly<Record<UniversalToolName, readonly string[]>>;
   resourceUriVersion: typeof RESOURCE_URI_VERSION;
@@ -49,7 +44,6 @@ export function buildCapabilityContract(): BuildCapabilityContract {
     productVersion: UNIVERSAL_BROKER_VERSION,
     productProfile: BASE_PRODUCT_PROFILE,
     schemaGeneration: RUNTIME_SCHEMA_GENERATION,
-    authorityContractGeneration: RUNTIME_AUTHORITY_CONTRACT_GENERATION,
     supportedProfiles: [...SUPPORTED_PRODUCT_PROFILES],
     supportedOperations: Object.fromEntries(UNIVERSAL_TOOL_NAMES.map((tool) => [
       tool,

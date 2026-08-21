@@ -55,19 +55,16 @@ if [[ "${DEVSPACE_V2_DEPLOYMENT_MODE-}" == production ]]; then
     echo "Production release manifest does not belong to the executing package: $runtime_manifest" >&2
     exit 1
   }
-  verify_release_artifact() {
-    if [[ "${DEVSPACE_PERSONAL_STAGING_FIXTURE-}" == 1 ]]; then
-      node "$repo/scripts/release-artifacts.mjs" "$@" --staging-fixture true
-    else
-      node "$repo/scripts/release-artifacts.mjs" "$@"
-    fi
-  }
-  verify_release_artifact verify-runtime-command \
-    --package "$repo" --runtime-root "$repo" --entrypoint "${DEVSPACE_NEXT_PM2_EXPECTED_SCRIPT:?Production PM2 entrypoint is required}" \
-    --manifest-sha256 "$runtime_manifest_sha256" >/dev/null
-  verify_release_artifact verify-runtime-dependencies \
-    --package "$repo" --dependency-root "$runtime_dependency_root" \
-    --evidence "$runtime_dependency_evidence" --evidence-sha256 "$runtime_dependency_evidence_sha256" >/dev/null
+  node "$repo/scripts/personal-direct-owner-runtime.mjs" verify \
+    --package "$repo" \
+    --entrypoint "${DEVSPACE_NEXT_PM2_EXPECTED_SCRIPT:?Production PM2 entrypoint is required}" \
+    --manifest "$runtime_manifest" \
+    --manifest-sha256 "$runtime_manifest_sha256" \
+    --source-revision "${DEVSPACE_SOURCE_REVISION:?Production source revision is required}" \
+    --runtime-revision "${DEVSPACE_RUNTIME_REVISION:?Production runtime revision is required}" \
+    --dependency-root "$runtime_dependency_root" \
+    --dependency-evidence "$runtime_dependency_evidence" \
+    --dependency-evidence-sha256 "$runtime_dependency_evidence_sha256" >/dev/null
   exec node --import "$repo/scripts/lib/runtime-dependency-loader.mjs" "$repo/dist/cli.js" serve-next
 fi
 if [[ -n "${DEVSPACE_RUNTIME_DEPENDENCY_ROOT-}" ]]; then

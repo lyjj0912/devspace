@@ -140,22 +140,7 @@
             "minLength": 1,
             "maxLength": 128
           },
-          "taskInstanceId": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 128
-          },
-          "authorityId": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 256
-          },
           "expectedSchemaGeneration": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 256
-          },
-          "expectedAuthorityContractGeneration": {
             "type": "string",
             "minLength": 1,
             "maxLength": 256
@@ -205,9 +190,6 @@
           "observedSchemaGeneration": {
             "type": "string"
           },
-          "observedAuthorityContractGeneration": {
-            "type": "string"
-          },
           "observedTargetGeneration": {
             "type": "string"
           },
@@ -251,12 +233,6 @@
                   "CURSOR_INVALID",
                   "CURSOR_EXPIRED",
                   "CURSOR_STALE",
-                  "AUTHORITY_REQUIRED",
-                  "AUTHORITY_EXPIRED",
-                  "AUTHORITY_PRINCIPAL_MISMATCH",
-                  "AUTHORITY_ACTION_MISMATCH",
-                  "AUTHORITY_STALE",
-                  "AUTHORITY_STORE_UNAVAILABLE",
                   "STATE_CORRUPTED",
                   "INVALID_ARGUMENT",
                   "RESOURCE_EXPIRED",
@@ -264,9 +240,6 @@
                   "PROCESS_NOT_DURABLE",
                   "GUI_GENERATION_MISMATCH",
                   "SCHEMA_STALE",
-                  "AUTHORITY_STATE_UNCERTAIN",
-                  "AUTHORITY_MISMATCH",
-                  "AUTHORITY_CONSUMED",
                   "ELEVATION_BLOCKED",
                   "ELEVATION_DENIED",
                   "SYNC_PLAN_STALE",
@@ -277,7 +250,6 @@
                   "PROFILE_UNSUPPORTED",
                   "MIGRATION_CONFLICT",
                   "ROLLBACK_STATE_UNKNOWN",
-                  "CONNECTOR_ACTIVATION_REQUIRED",
                   "CONNECTOR_STATE_CONFLICT",
                   "SUPERVISOR_UNAVAILABLE",
                   "FINALIZATION_STAGE_CONFLICT"
@@ -293,7 +265,6 @@
                 "type": "string",
                 "enum": [
                   "NOT_DISPATCHED",
-                  "CLAIMED",
                   "DISPATCHED",
                   "ACKNOWLEDGED",
                   "UNKNOWN"
@@ -349,8 +320,7 @@
         "required": [
           "ok",
           "operationId",
-          "observedSchemaGeneration",
-          "observedAuthorityContractGeneration"
+          "observedSchemaGeneration"
         ],
         "additionalProperties": false
       }
@@ -435,12 +405,7 @@
                 "open",
                 "search",
                 "diff",
-                "close",
-                "authority_preview",
-                "authorize",
-                "authority_status",
-                "invalidate_authority",
-                "release_authority"
+                "close"
               ]
             },
             "inputSchema": {
@@ -454,12 +419,7 @@
                       "open",
                       "search",
                       "diff",
-                      "close",
-                      "authority_preview",
-                      "authorize",
-                      "authority_status",
-                      "invalidate_authority",
-                      "release_authority"
+                      "close"
                     ]
                   },
                   "contextId": {
@@ -497,85 +457,6 @@
                     "type": "integer",
                     "minimum": 100,
                     "maximum": 100000
-                  },
-                  "taskLabel": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 256
-                  },
-                  "taskId": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 256
-                  },
-                  "authorityText": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 8000
-                  },
-                  "actions": {
-                    "minItems": 1,
-                    "maxItems": 64,
-                    "type": "array",
-                    "items": {
-                      "type": "object",
-                      "properties": {
-                        "id": {
-                          "type": "string",
-                          "minLength": 1,
-                          "maxLength": 128
-                        },
-                        "tool": {
-                          "type": "string",
-                          "enum": [
-                            "target",
-                            "context",
-                            "fs",
-                            "exec",
-                            "process",
-                            "mcp",
-                            "artifact",
-                            "gui"
-                          ]
-                        },
-                        "arguments": {
-                          "type": "object",
-                          "propertyNames": {
-                            "type": "string"
-                          },
-                          "additionalProperties": {}
-                        },
-                        "risk": {
-                          "type": "string",
-                          "enum": [
-                            "R0",
-                            "R1",
-                            "R2",
-                            "R3"
-                          ]
-                        },
-                        "uses": {
-                          "type": "integer",
-                          "minimum": 1,
-                          "maximum": 50
-                        }
-                      },
-                      "required": [
-                        "tool",
-                        "arguments"
-                      ],
-                      "additionalProperties": false
-                    }
-                  },
-                  "correctionText": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 8000
-                  },
-                  "expiresInSeconds": {
-                    "type": "integer",
-                    "minimum": 60,
-                    "maximum": 28800
                   },
                   "cursor": {
                     "type": "string",

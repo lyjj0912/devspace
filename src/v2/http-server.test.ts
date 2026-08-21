@@ -32,6 +32,7 @@ import {
 } from "./management-authorization.js";
 import { UniversalSelfManagementService } from "./self-management.js";
 import { createRuntimeIdentity } from "./runtime-identity.js";
+import { RUNTIME_AUTHORITY_CONTRACT_GENERATION } from "./runtime-contract-identity.js";
 import { connectorProductionRouteIdentityReadback } from "./connector-route-identity.js";
 
 function connectorActivationProofFixture(
@@ -368,7 +369,7 @@ test("production HTTP rejects legacy-scope tokens and accepts granular tokens", 
     const connectorTuple = {
       ...connectorInput,
       candidateBindingId: connector.bindingId,
-      authorityContractGeneration: fixtureRuntimeIdentity.authorityContractGeneration,
+      authorityContractGeneration: RUNTIME_AUTHORITY_CONTRACT_GENERATION,
       redirectUrisDigest: `sha256:${createHash("sha256").update(label).digest("hex")}`,
       buildDigest: fixtureRuntimeIdentity.buildDigest,
     };
@@ -813,7 +814,7 @@ test("parallel v2 HTTP service has an independent health endpoint and protected 
   const connectorTuple = {
     ...connectorInput,
     candidateBindingId: connector.bindingId,
-    authorityContractGeneration: fixtureRuntimeIdentity.authorityContractGeneration,
+    authorityContractGeneration: RUNTIME_AUTHORITY_CONTRACT_GENERATION,
     redirectUrisDigest: `sha256:${createHash("sha256").update("http-fixture-redirects").digest("hex")}`,
     buildDigest: fixtureRuntimeIdentity.buildDigest,
   };

@@ -42,7 +42,8 @@ export type RestartTransactionState = (typeof RESTART_TRANSACTION_STATES)[number
 export interface RestartBrokerInput {
   reason?: string;
   ownerFingerprint: string;
-  authorityId: string;
+  /** Ignored legacy caller field. */
+  authorityId?: string;
 }
 
 export interface RestartStatusInput {
@@ -59,7 +60,8 @@ export interface RestartWorkerRequest {
   transactionId: string;
   requestedAt: string;
   ownerFingerprint: string;
-  authorityId: string;
+  /** Ignored legacy persisted field. */
+  authorityId?: string;
   reason?: string;
   timeoutMs: number;
   pm2ProcessName: string;
@@ -83,7 +85,6 @@ export interface RestartTransactionStatus extends Record<string, unknown> {
   updatedAt: string;
   expectedDisconnect: boolean;
   ownerFingerprint: string;
-  authorityId: string;
   expectedRuntimeIdentity: RuntimeIdentity;
   reason?: string;
   responseTransportId?: string;
@@ -245,11 +246,6 @@ export class UniversalSelfManagementService {
       }
       const reason = optionalText(input.reason, MAXIMUM_REASON_CHARACTERS, "reason");
       const ownerFingerprint = requiredOwnerFingerprint(input.ownerFingerprint);
-      const authorityId = requiredText(
-        input.authorityId,
-        "authorityId",
-        MAXIMUM_IDENTIFIER_CHARACTERS,
-      );
       const transactionId = `restart_${randomUUID()}`;
       const directory = this.transactionDirectory(transactionId);
       await mkdir(directory, { recursive: false, mode: 0o700 });
@@ -263,7 +259,6 @@ export class UniversalSelfManagementService {
         transactionId,
         requestedAt,
         ownerFingerprint,
-        authorityId,
         ...(reason ? { reason } : {}),
         timeoutMs: this.timeoutMs,
         pm2ProcessName: this.pm2ProcessName,
@@ -286,7 +281,6 @@ export class UniversalSelfManagementService {
         updatedAt: requestedAt,
         expectedDisconnect: true,
         ownerFingerprint,
-        authorityId,
         expectedRuntimeIdentity: this.runtimeIdentity,
         ...(reason ? { reason } : {}),
         history: [{ state: "PREPARED", at: requestedAt }],
@@ -813,7 +807,6 @@ export function assertRestartStatus(
     || !Number.isFinite(Date.parse(value.requestedAt))
     || !Number.isFinite(Date.parse(value.updatedAt))
     || !OWNER_FINGERPRINT_PATTERN.test(value.ownerFingerprint)
-    || !safeStatusText(value.authorityId, MAXIMUM_IDENTIFIER_CHARACTERS)
     || !validRuntimeIdentity(value.expectedRuntimeIdentity)
     || !validRestartHistory(value)
   ) {
@@ -833,7 +826,6 @@ export function assertRestartWorkerRequest(
     || value.transactionId !== transactionId
     || !TRANSACTION_ID_PATTERN.test(value.transactionId)
     || !OWNER_FINGERPRINT_PATTERN.test(value.ownerFingerprint)
-    || !safeStatusText(value.authorityId, MAXIMUM_IDENTIFIER_CHARACTERS)
     || !validRuntimeIdentity(value.expectedRuntimeIdentity)
     || !value.statusPath
     || !value.requestPath
@@ -1035,13 +1027,12 @@ function validRuntimeIdentity(value: RuntimeIdentity | undefined): value is Runt
   if (
     !safeRuntimeIdentityText(value.productVersion)
     || !SHA256_DIGEST_PATTERN.test(value.schemaGeneration)
-    || !SHA256_DIGEST_PATTERN.test(value.authorityContractGeneration)
     || !SHA256_DIGEST_PATTERN.test(value.configDigest)
     || !safeRuntimeIdentityText(value.sourceRevision)
     || !safeRuntimeIdentityText(value.runtimeRevision)
     || !SHA256_DIGEST_PATTERN.test(value.buildDigest)
     || typeof value.startedAt !== "string"
-    || value.productProfile !== "BASE_SINGLE_OWNER"
+    || value.productProfile !== "PERSONAL_DIRECT_OWNER"
     || !SHA256_DIGEST_PATTERN.test(value.buildCapabilityDigest ?? "")
     || value.resourceUriVersion !== "v1"
   ) return false;

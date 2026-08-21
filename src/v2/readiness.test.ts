@@ -129,38 +129,15 @@ test("parallel readiness accepts only the consistent pre-activation connector st
   assert.equal(activeParallel.evidence?.activationState, "ACTIVE");
 });
 
-test("Base readiness uses the keyed finalization store and external control readback", async (t) => {
+test("personal readiness is gated only by the mutable stores used by the request path", async (t) => {
   const root = await realpath(await mkdtemp(join(tmpdir(), "devspace-base-store-readiness-")));
   t.after(() => rm(root, { recursive: true, force: true }));
-  const authorityStorePath = join(root, "authority.sqlite");
   const artifactCatalogPath = join(root, "artifacts.sqlite");
   const filesystemSyncStorePath = join(root, "filesystem-sync", "sync.sqlite");
-  const connectorActivationJournalPath = join(root, "connector-activation-journal.sqlite");
-  const finalizationStateRoot = join(root, "finalization-state");
-  const finalizationControlRoot = join(root, "finalization-control");
-  const managementStateRoot = join(root, "management-state");
-  await mkdir(finalizationStateRoot, { mode: 0o700 });
-  await mkdir(finalizationControlRoot, { mode: 0o700 });
-  await mkdir(managementStateRoot, { mode: 0o700 });
-  const lifecycleFinalizationStorePath = join(finalizationStateRoot, "lifecycle.sqlite");
-  const lifecycleFinalizationControlPath = join(
-    finalizationControlRoot,
-    "lifecycle-finalization-head.json",
-  );
-  const finalizationManagementKey = loadOrCreateManagementAuthorizationKey({
-    keyRef: "readiness-test",
-    stateDir: managementStateRoot,
-  });
   const input = {
-    authorityStorePath,
     artifactCatalogPath,
     filesystemSyncStorePath,
-    connectorActivationJournalPath,
-    lifecycleFinalizationStorePath,
-    lifecycleFinalizationControlPath,
-    finalizationManagementKey,
   };
-  createSqliteStore(authorityStorePath, 7);
   createSqliteStore(artifactCatalogPath, 1);
 
   const missingSync = baseMutableSqliteStoreReadiness(input);
@@ -174,33 +151,10 @@ test("Base readiness uses the keyed finalization store and external control read
   assert.match(syncObservation(incompleteSync)?.summary ?? "", /schema version is 0/u);
 
   createSqliteStore(filesystemSyncStorePath, 1);
-  const missingJournal = baseMutableSqliteStoreReadiness(input);
-  assert.equal(missingJournal.state, "FAIL");
-  assert.equal(storeObservation(missingJournal, "connector-activation-journal")?.state, "FAIL");
-
-  createSqliteStore(connectorActivationJournalPath, 1);
-  const ready = baseMutableSqliteStoreReadiness(input);
-  assert.equal(ready.state, "FAIL");
-  assert.equal(storeObservation(ready, "lifecycle-finalization-store")?.state, "FAIL");
-
-  const bootstrapAuthorization = createFinalizationStoreBootstrapAuthorization({
-    storePath: lifecycleFinalizationStorePath,
-    controlPath: lifecycleFinalizationControlPath,
-    key: finalizationManagementKey,
-  });
-  initializeFinalizationStore({
-    storePath: lifecycleFinalizationStorePath,
-    controlPath: lifecycleFinalizationControlPath,
-    key: finalizationManagementKey,
-    bootstrapAuthorization,
-  });
   const complete = baseMutableSqliteStoreReadiness(input);
   assert.equal(complete.state, "PASS");
-  assert.equal(storeObservation(complete, "lifecycle-finalization-store")?.state, "PASS");
-  assert.equal(
-    storeObservation(complete, "lifecycle-finalization-store")?.evidence?.schemaVersion,
-    2,
-  );
+  assert.equal(storeObservation(complete, "connector-activation-journal"), undefined);
+  assert.equal(storeObservation(complete, "lifecycle-finalization-store"), undefined);
   assert.equal(syncObservation(complete)?.state, "PASS");
 });
 

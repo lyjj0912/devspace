@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://devspace.local/config/config.schema.json",
-  "title": "DevSpace Universal Broker BASE_SINGLE_OWNER Configuration",
+  "title": "DevSpace Universal Broker PERSONAL_DIRECT_OWNER Configuration",
   "type": "object",
   "properties": {
     "version": {
@@ -10,7 +10,7 @@
     },
     "productProfile": {
       "type": "string",
-      "const": "BASE_SINGLE_OWNER"
+      "const": "PERSONAL_DIRECT_OWNER"
     },
     "profile": {
       "type": "string",
@@ -150,109 +150,6 @@
         "allowAnonymousSessionFallback": {
           "type": "boolean",
           "const": false
-        }
-      },
-      "additionalProperties": false
-    },
-    "authority": {
-      "type": "object",
-      "properties": {
-        "mode": {
-          "type": "string",
-          "enum": [
-            "enforced",
-            "audit",
-            "disabled"
-          ]
-        },
-        "deployment": {
-          "type": "string",
-          "const": "in-process"
-        },
-        "approvalAssurance": {
-          "type": "string",
-          "const": "cooperative"
-        },
-        "stateDirectory": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 4096
-        },
-        "storePath": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 4096
-        },
-        "r0FastPath": {
-          "type": "boolean"
-        },
-        "authorityTtlSeconds": {
-          "type": "object",
-          "properties": {
-            "R1": {
-              "type": "integer",
-              "minimum": 1,
-              "maximum": 86400
-            },
-            "R2": {
-              "type": "integer",
-              "minimum": 1,
-              "maximum": 86400
-            },
-            "R3": {
-              "type": "integer",
-              "minimum": 1,
-              "maximum": 86400
-            }
-          },
-          "additionalProperties": false
-        },
-        "resourceLease": {
-          "type": "object",
-          "properties": {
-            "ttlSeconds": {
-              "type": "integer",
-              "minimum": 1,
-              "maximum": 86400
-            },
-            "heartbeatSeconds": {
-              "type": "integer",
-              "minimum": 1,
-              "maximum": 86400
-            },
-            "recoveryGraceSeconds": {
-              "type": "integer",
-              "minimum": 1,
-              "maximum": 86400
-            }
-          },
-          "additionalProperties": false
-        },
-        "maximumActionsPerPlan": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 1024
-        },
-        "maximumUses": {
-          "type": "object",
-          "properties": {
-            "R1": {
-              "type": "integer",
-              "minimum": 1,
-              "maximum": 10000
-            },
-            "R2": {
-              "type": "integer",
-              "minimum": 1,
-              "maximum": 10000
-            },
-            "R3": {
-              "type": "integer",
-              "minimum": 1,
-              "maximum": 10000
-            }
-          },
-          "additionalProperties": false
         }
       },
       "additionalProperties": false
@@ -399,10 +296,6 @@
           "minimum": 1,
           "maximum": 9007199254740991
         },
-        "activationMode": {
-          "type": "string",
-          "const": "owner-approved"
-        },
         "drainGraceSeconds": {
           "type": "integer",
           "minimum": 1,
@@ -410,8 +303,7 @@
         }
       },
       "required": [
-        "canonicalName",
-        "activationMode"
+        "canonicalName"
       ],
       "additionalProperties": false
     },
@@ -602,21 +494,6 @@
           "minLength": 1,
           "maxLength": 4096
         },
-        "connectorActivationJournal": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 4096
-        },
-        "lifecycleFinalizationStore": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 4096
-        },
-        "lifecycleFinalizationControl": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 4096
-        },
         "stateFileMode": {
           "type": "string",
           "const": "0600"
@@ -628,6 +505,46 @@
       },
       "additionalProperties": false
     },
+    "process": {
+      "type": "object",
+      "properties": {
+        "maximumRunningTotal": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000
+        },
+        "maximumRunningPerTarget": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000
+        },
+        "terminalRetentionTtlSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 604800
+        },
+        "maximumRetainedTerminalRecords": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100000
+        },
+        "maximumOutputBytesPerProcess": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10737418240
+        },
+        "terminalOverflowPolicy": {
+          "type": "string",
+          "const": "prune-oldest"
+        },
+        "internalRunnerMaximumConcurrent": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000
+        }
+      },
+      "additionalProperties": false
+    },
     "quotas": {
       "type": "object",
       "properties": {
@@ -635,16 +552,6 @@
           "type": "integer",
           "minimum": 1,
           "maximum": 10000
-        },
-        "processes": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 10000
-        },
-        "concurrentProcesses": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 1024
         },
         "mcpConnections": {
           "type": "integer",
@@ -670,11 +577,6 @@
           "type": "integer",
           "minimum": 1,
           "maximum": 100000000
-        },
-        "processOutputBytes": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 10737418240
         },
         "artifactMaxBytes": {
           "type": "integer",
@@ -989,9 +891,6 @@
           "type": "boolean"
         },
         "requireRuntimeBuildDigestMatch": {
-          "type": "boolean"
-        },
-        "requireAuthorityContractDigestMatch": {
           "type": "boolean"
         },
         "requireHostSessionChurnCanary": {

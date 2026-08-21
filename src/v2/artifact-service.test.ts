@@ -1155,13 +1155,10 @@ async function createRemoteArtifactFixture(
     targets,
     serverConfig,
   });
-  let forgottenProcesses = 0;
   let destinationDispatches = 0;
   const execution = {
-    async execute(
+    async run(
       input: { command: string; target?: string },
-      _binding?: unknown,
-      _dispatch?: unknown,
       _callContext?: CapabilityCallContext,
     ): Promise<UniversalProcessSnapshot> {
       if (input.target === "remote-b") destinationDispatches += 1;
@@ -1182,17 +1179,7 @@ async function createRemoteArtifactFixture(
         );
       }
     },
-    async operate(
-      input: { operation: string },
-      _dispatch?: unknown,
-      _callContext?: CapabilityCallContext,
-    ): Promise<Record<string, unknown>> {
-      if (input.operation === "forget") {
-        forgottenProcesses += 1;
-        return { forgotten: true };
-      }
-      return { state: "EXITED", forgottenProcesses };
-    },
+    stats() { return { active: 0, maximumConcurrent: 32, completed: destinationDispatches }; },
   } as unknown as UniversalExecutionPlane;
   let sftpGets = 0;
   let sftpPuts = 0;

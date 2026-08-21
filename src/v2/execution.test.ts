@@ -164,7 +164,7 @@ test("process handles and listings are stable-principal owned with cross-princip
       processId: started.processId,
       signal: "SIGTERM",
     }, undefined, ownerB),
-    (error: unknown) => brokerCode(error) === "AUTHORITY_PRINCIPAL_MISMATCH",
+    (error: unknown) => brokerCode(error) === "PERMISSION_DENIED",
   );
   assert.equal(killCalls, 0);
   await fixture.execution.operate({
@@ -240,7 +240,7 @@ test("process.list uses owner-bound signed snapshots and rejects a changed proce
   }
 });
 
-test("process record quota rejects synchronously before a second provider spawn", async (t) => {
+test("terminal record soft cap prunes oldest and never blocks a second provider spawn", async (t) => {
   let spawnCalls = 0;
   const metrics = new UniversalBrokerMetrics();
   const fixture = await createFixture(t, {
@@ -258,20 +258,17 @@ test("process record quota rejects synchronously before a second provider spawn"
     yieldMs: 2_000,
   });
   assert.equal(spawnCalls, 1);
-  await assert.rejects(
-    fixture.execution.execute({
-      cwd: fixture.root,
-      command: "printf second",
-      mode: "foreground",
-      yieldMs: 2_000,
-    }),
-    (error: unknown) => brokerCode(error) === "RESOURCE_QUOTA_EXCEEDED",
-  );
-  assert.equal(spawnCalls, 1);
-  assert.match(
-    metrics.render({}),
-    /devspace_quota_rejections_total\{resource_kind="process"\} 1/u,
-  );
+  const second = await fixture.execution.execute({
+    cwd: fixture.root,
+    command: "printf second",
+    mode: "foreground",
+    yieldMs: 2_000,
+  });
+  assert.equal(second.state, "EXITED");
+  assert.equal(spawnCalls, 2);
+  await new Promise<void>((resolvePromise) => setImmediate(resolvePromise));
+  assert.equal(Number(fixture.execution.stats().retainedTerminalRecords) <= 1, true);
+  assert.doesNotMatch(metrics.render({}), /devspace_quota_rejections_total\{resource_kind="process"\} 1/u);
 });
 
 test("R0 foreground exec does not await process metadata fsync, while mutation launch does", async (t) => {
@@ -626,14 +623,12 @@ test("legacy process records upgrade output generation metadata and malformed ge
     now: () => 1_800_000_200_000,
   });
   t.after(() => corrupt.close());
-  await assert.rejects(
-    corrupt.operate({ operation: "list" }, undefined, principal),
-    (error: unknown) => brokerCode(error) === "STATE_CORRUPTED",
-  );
+  const afterQuarantine = await corrupt.operate({ operation: "list" }, undefined, principal);
+  assert.deepEqual(afterQuarantine.processes, []);
   assert.equal((await readdir(stateDirectory)).some((name) => name.includes(".corrupt-")), true);
 });
 
-test("non-durable process after restart returns a typed non-reattachable failure", async (t) => {
+test("terminal non-durable process metadata remains readable after restart", async (t) => {
   const fixture = await createFixture(t);
   const completed = await fixture.execution.execute({
     cwd: fixture.root,
@@ -649,11 +644,13 @@ test("non-durable process after restart returns a typed non-reattachable failure
     sshControlDir: join(fixture.root, "v2-state", "ssh-control-recovered"),
   });
   t.after(() => recovered.close());
-  await assert.rejects(
-    recovered.operate({ operation: "poll", processId: completed.processId }),
-    (error: unknown) => brokerCode(error) === "PROCESS_NOT_FOUND"
-      && (error as UniversalBrokerError).evidence?.reasonCode === "NON_DURABLE_PROCESS_NOT_REATTACHABLE",
-  );
+  const snapshot = await recovered.operate({
+    operation: "poll",
+    processId: completed.processId,
+  }) as UniversalProcessSnapshot;
+  assert.equal(snapshot.state, "EXITED");
+  const output = await recovered.readOutput(completed.processId, 0, 1_024);
+  assert.equal(output.text, "transient");
 });
 
 test("process signal does not mutate requested state before barrier and provider kill succeed", async (t) => {
