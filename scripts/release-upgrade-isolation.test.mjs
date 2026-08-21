@@ -71,6 +71,8 @@ test("candidate and production runtime environments materialize all writable pat
   t.after(() => rm(root, { recursive: true, force: true }));
   const productionRoot = join(root, "production-state");
   const candidateRoot = join(root, "audit", "candidate-state");
+  const candidateControl = join(root, "audit", "candidate-control", "lifecycle-finalization-head.json");
+  const productionControl = join(root, "production-control", "lifecycle-finalization-head.json");
   const source = join(root, "production.env");
   const candidate = join(root, "candidate.env");
   const next = join(root, "production.env.next");
@@ -79,6 +81,7 @@ test("candidate and production runtime environments materialize all writable pat
     "KEEP_UNRELATED='preserved value'",
     "DEVSPACE_NEXT_SELF_RESTART_DELAY_MS='500'",
     "DEVSPACE_PERSONAL_STAGING_FIXTURE='stale'",
+    "DEVSPACE_NEXT_LIFECYCLE_FINALIZATION_CONTROL='stale-control'",
     ...Object.entries(productionPaths).map(([key, value]) => `${key}='${value}'`),
     "",
   ].join("\n"), { mode: 0o600 });
@@ -87,12 +90,22 @@ test("candidate and production runtime environments materialize all writable pat
   materializeReleaseEnvironment({
     sourcePath: source,
     destinationPath: candidate,
-    values: { ...candidatePaths, DEVSPACE_NEXT_PORT: "7679", DEVSPACE_PERSONAL_STAGING_FIXTURE: "1" },
+    values: {
+      ...candidatePaths,
+      DEVSPACE_NEXT_PORT: "7679",
+      DEVSPACE_PERSONAL_STAGING_FIXTURE: "1",
+      DEVSPACE_NEXT_LIFECYCLE_FINALIZATION_CONTROL: candidateControl,
+    },
   });
   materializeReleaseEnvironment({
     sourcePath: source,
     destinationPath: next,
-    values: { ...productionPaths, DEVSPACE_NEXT_PORT: "7678", DEVSPACE_PERSONAL_STAGING_FIXTURE: "1" },
+    values: {
+      ...productionPaths,
+      DEVSPACE_NEXT_PORT: "7678",
+      DEVSPACE_PERSONAL_STAGING_FIXTURE: "1",
+      DEVSPACE_NEXT_LIFECYCLE_FINALIZATION_CONTROL: productionControl,
+    },
   });
 
   const releaseStateKeys = [
@@ -110,6 +123,10 @@ test("candidate and production runtime environments materialize all writable pat
   ]);
   assert.equal(removed.DEVSPACE_NEXT_SELF_RESTART_DELAY_MS, "");
   assert.equal(removed.DEVSPACE_PERSONAL_STAGING_FIXTURE, "1");
+  assert.deepEqual(
+    sourceEnvironment(candidate, ["DEVSPACE_NEXT_LIFECYCLE_FINALIZATION_CONTROL"]),
+    { DEVSPACE_NEXT_LIFECYCLE_FINALIZATION_CONTROL: candidateControl },
+  );
   for (const key of releaseStateKeys) {
     const candidateValue = candidateEnvironment[key];
     assert.notEqual(candidateValue, productionPaths[key], `${key} must not reuse production state`);
