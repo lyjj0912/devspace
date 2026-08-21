@@ -893,6 +893,7 @@ function launchDetachedRestartWorker(
   if (!existsSync(workerPath)) throw new Error(`Restart worker is missing: ${workerPath}`);
   const launch = restartWorkerLaunchDescriptor(request, workerPath);
   if (platform === "darwin") {
+    const command = restartWorkerLaunchctlCommand(launch);
     const result = spawnSync(
       "/bin/launchctl",
       [
@@ -904,8 +905,8 @@ function launchDetachedRestartWorker(
         "-e",
         request.workerLogPath,
         "--",
-        process.execPath,
-        ...launch.arguments,
+        command.executable,
+        ...command.arguments,
       ],
       {
         encoding: "utf8",
@@ -939,6 +940,23 @@ export interface RestartWorkerLaunchDescriptor {
   arguments: string[];
   environment: NodeJS.ProcessEnv;
   dependencyLoaderPath?: string;
+}
+
+export interface RestartWorkerLaunchCommand {
+  executable: string;
+  arguments: string[];
+}
+
+export function restartWorkerLaunchctlCommand(
+  launch: RestartWorkerLaunchDescriptor,
+): RestartWorkerLaunchCommand {
+  const environment = Object.entries(launch.environment)
+    .filter((entry): entry is [string, string] => entry[1] !== undefined)
+    .map(([name, value]) => `${name}=${value}`);
+  return {
+    executable: "/usr/bin/env",
+    arguments: ["-i", ...environment, process.execPath, ...launch.arguments],
+  };
 }
 
 export function restartWorkerLaunchDescriptor(

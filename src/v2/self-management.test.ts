@@ -18,6 +18,7 @@ import {
   UniversalSelfManagementService,
   atomicRestartStatusWrite,
   restartWorkerLaunchDescriptor,
+  restartWorkerLaunchctlCommand,
   type RestartTransactionStatus,
   type RestartWorkerRequest,
 } from "./self-management.js";
@@ -154,6 +155,23 @@ test("packaged restart worker uses the runtime dependency loader without inherit
   assert.equal(descriptor.environment.DEVSPACE_RUNTIME_DEPENDENCY_ROOT, realDependencyRoot);
   assert.equal(descriptor.environment.DEVSPACE_RUNTIME_SECRET, undefined);
   assert.equal(descriptor.environment.OAUTH_CLIENT_SECRET, undefined);
+  const launchctlCommand = restartWorkerLaunchctlCommand(descriptor);
+  assert.equal(launchctlCommand.executable, "/usr/bin/env");
+  assert.deepEqual(launchctlCommand.arguments.slice(0, 3), [
+    "-i",
+    `HOME=${root}`,
+    "PATH=/usr/bin:/bin",
+  ]);
+  assert.ok(launchctlCommand.arguments.includes(`DEVSPACE_RUNTIME_PACKAGE_ROOT=${realRoot}`));
+  assert.ok(launchctlCommand.arguments.includes(`DEVSPACE_RUNTIME_DEPENDENCY_ROOT=${realDependencyRoot}`));
+  assert.deepEqual(launchctlCommand.arguments.slice(-5), [
+    process.execPath,
+    "--import",
+    realLoaderPath,
+    realWorkerPath,
+    requestPath,
+  ]);
+  assert.equal(launchctlCommand.arguments.some((value) => value.includes("must-not-leak")), false);
 });
 
 test("restart handoff occurs only after the exact response is durably ACK_FLUSHED", async (t) => {
