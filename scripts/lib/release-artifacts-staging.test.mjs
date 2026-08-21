@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
@@ -45,6 +45,43 @@ test("staging package runs the real metadata collector but remains ineligible fo
       join(packageRoot, "scripts/start-universal-broker-v2-production.sh"),
       { allowUnattestedFixture: true },
     ).status, "PASS");
+
+    const ownerDirectory = join(temporaryRoot, "identity");
+    mkdirSync(ownerDirectory, { mode: 0o700 });
+    const personalPreflight = spawnSync("/bin/bash", [
+      join(sourceRoot, "scripts", "deploy-universal-broker-v2-parallel.sh"),
+      "--release-package", packageRoot,
+      "--runtime-root", packageRoot,
+      "--identity-directory", ownerDirectory,
+      "--audit", join(temporaryRoot, "personal-parallel-audit"),
+      "--verify-only",
+      "--staging-fixture",
+    ], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PATH: `${process.execPath.slice(0, process.execPath.lastIndexOf("/"))}:${process.env.PATH ?? ""}`,
+      },
+    });
+    assert.equal(personalPreflight.status, 0, personalPreflight.stderr);
+    assert.equal(JSON.parse(personalPreflight.stdout).status, "VERIFIED");
+
+    const productionPreflight = spawnSync("/bin/bash", [
+      join(sourceRoot, "scripts", "deploy-universal-broker-v2-parallel.sh"),
+      "--release-package", packageRoot,
+      "--runtime-root", packageRoot,
+      "--identity-directory", ownerDirectory,
+      "--audit", join(temporaryRoot, "production-parallel-audit"),
+      "--verify-only",
+    ], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        PATH: `${process.execPath.slice(0, process.execPath.lastIndexOf("/"))}:${process.env.PATH ?? ""}`,
+      },
+    });
+    assert.notEqual(productionPreflight.status, 0);
+    assert.match(productionPreflight.stderr, /gate producer trust anchor|--state-dir is required/iu);
   } finally {
     rmSync(temporaryRoot, { recursive: true, force: true });
   }

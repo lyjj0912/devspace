@@ -14,11 +14,12 @@ AUDIT=""
 STATE_DIRECTORY=""
 PUBLIC_BASE_URL=""
 VERIFY_ONLY=0
+ALLOW_UNATTESTED_STAGING=0
 CANONICAL_CONNECTOR_NAME="myDevSpace"
 CONNECTOR_INSTALLATION_EPOCH="1"
 
 usage() {
-  echo "Usage: $0 --release-package DIR [--runtime-root DIR] [--base-environment-file FILE] [--environment-file FILE] [--identity-directory DIR] [--state-directory DIR] [--public-base-url URL] [--process-name NAME] [--port PORT] [--connector-name NAME] [--connector-installation-epoch N] [--audit DIR] [--verify-only]" >&2
+  echo "Usage: $0 --release-package DIR [--runtime-root DIR] [--base-environment-file FILE] [--environment-file FILE] [--identity-directory DIR] [--state-directory DIR] [--public-base-url URL] [--process-name NAME] [--port PORT] [--connector-name NAME] [--connector-installation-epoch N] [--audit DIR] [--verify-only] [--staging-fixture]" >&2
 }
 
 while [[ "$#" -gt 0 ]]; do
@@ -36,6 +37,7 @@ while [[ "$#" -gt 0 ]]; do
     --connector-installation-epoch) CONNECTOR_INSTALLATION_EPOCH="${2:-}"; shift 2 ;;
     --audit) AUDIT="${2:-}"; shift 2 ;;
     --verify-only) VERIFY_ONLY=1; shift ;;
+    --staging-fixture) ALLOW_UNATTESTED_STAGING=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) usage; exit 2 ;;
   esac
@@ -71,8 +73,15 @@ NODE="$(command -v node)" || { echo "Node.js is required." >&2; exit 1; }
 NODE_MAJOR="$($NODE -p 'Number(process.versions.node.split(".")[0])')"
 (( NODE_MAJOR >= 22 )) || { echo "Parallel deployment requires Node.js 22 or newer." >&2; exit 1; }
 
-"$NODE" "$SCRIPT_DIR/release-artifacts.mjs" verify --package "$RELEASE_PACKAGE" >"$AUDIT/package-verification.json"
-"$NODE" "$SCRIPT_DIR/release-artifacts.mjs" verify-runtime-tree \
+run_release_artifacts() {
+  if [[ "$ALLOW_UNATTESTED_STAGING" == 1 ]]; then
+    "$NODE" "$SCRIPT_DIR/release-artifacts.mjs" "$@" --staging-fixture true
+  else
+    "$NODE" "$SCRIPT_DIR/release-artifacts.mjs" "$@"
+  fi
+}
+run_release_artifacts verify --package "$RELEASE_PACKAGE" >"$AUDIT/package-verification.json"
+run_release_artifacts verify-runtime-tree \
   --package "$RELEASE_PACKAGE" --runtime-root "$RUNTIME_ROOT" >"$AUDIT/runtime-tree-verification.json"
 MANIFEST="$RELEASE_PACKAGE/BUILD-MANIFEST.json"
 IDENTITY_TSV="$("$NODE" -e '
@@ -200,11 +209,11 @@ for _ in $(seq 1 120); do
   sleep 0.5
 done
 curl --fail --silent --show-error --max-time 5 "$HEALTH_URL" >"$AUDIT/gateway-identity.json"
-"$NODE" "$SCRIPT_DIR/release-artifacts.mjs" verify-gateway \
+run_release_artifacts verify-gateway \
   --package "$RELEASE_PACKAGE" --identity "$AUDIT/gateway-identity.json" >"$AUDIT/gateway-verification.json"
 if (( PORT <= 64535 )); then MANAGEMENT_PORT="$((PORT + 1000))"; else MANAGEMENT_PORT="$((PORT - 1000))"; fi
 curl --fail --silent --show-error --max-time 5 "http://127.0.0.1:$MANAGEMENT_PORT/readyz" >"$AUDIT/runtime-identity.json"
-"$NODE" "$SCRIPT_DIR/release-artifacts.mjs" verify-runtime \
+run_release_artifacts verify-runtime \
   --package "$RELEASE_PACKAGE" --identity "$AUDIT/runtime-identity.json" >"$AUDIT/runtime-verification.json"
 pm2 jlist >"$AUDIT/pm2-readback.json"
 python3 - "$AUDIT/pm2-readback.json" "$PROCESS_NAME" "$RUNTIME_ROOT" "$START_SCRIPT" <<'PY'
@@ -220,9 +229,10 @@ if os.path.realpath(env.get("pm_exec_path", ""))!=os.path.realpath(script): rais
 PY
 pm2 save >"$AUDIT/pm2-save.log" 2>&1
 trap - ERR INT TERM
-"$NODE" - "$MANIFEST" "$AUDIT/deployment.json" "$PROCESS_NAME" "$PORT" "$RUNTIME_ROOT" <<'NODE'
+DEVSPACE_PERSONAL_STAGING_FIXTURE="$ALLOW_UNATTESTED_STAGING" \
+  "$NODE" - "$MANIFEST" "$AUDIT/deployment.json" "$PROCESS_NAME" "$PORT" "$RUNTIME_ROOT" <<'NODE'
 const fs=require("node:fs"); const crypto=require("node:crypto");
 const [manifestPath,output,processName,port,runtimeRoot]=process.argv.slice(2); const manifest=JSON.parse(fs.readFileSync(manifestPath));
-const result={status:"STAGING_ONLINE",processName,port:Number(port),runtimeRoot,sourceRevision:manifest.sourceRevision,runtimeRevision:manifest.runtimeRevision,buildDigest:manifest.buildDigest,manifestSha256:`sha256:${crypto.createHash("sha256").update(fs.readFileSync(manifestPath)).digest("hex")}`};
+const result={status:"STAGING_ONLINE",eligibility:process.env.DEVSPACE_PERSONAL_STAGING_FIXTURE === "1" ? "UNATTESTED_STAGING_ONLY" : "ATTESTED_RELEASE_CANDIDATE",processName,port:Number(port),runtimeRoot,sourceRevision:manifest.sourceRevision,runtimeRevision:manifest.runtimeRevision,buildDigest:manifest.buildDigest,manifestSha256:`sha256:${crypto.createHash("sha256").update(fs.readFileSync(manifestPath)).digest("hex")}`};
 fs.writeFileSync(output,JSON.stringify(result,null,2)+"\n",{mode:0o600}); console.log(JSON.stringify(result,null,2));
 NODE
