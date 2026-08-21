@@ -17,6 +17,7 @@ test("personal immutable runtime manifest verifies exact package and reused depe
   const packageRoot = join(root, "package");
   const dependencyRoot = join(root, "dependencies");
   await mkdir(join(packageRoot, "dist", "v2"), { recursive: true });
+  await mkdir(join(packageRoot, "contracts"), { recursive: true });
   await mkdir(join(packageRoot, "scripts"), { recursive: true });
   await mkdir(join(dependencyRoot, "node_modules", "fixture"), { recursive: true });
   const packageJson = { name: "fixture", version: "1.0.0", type: "module" };
@@ -29,10 +30,21 @@ test("personal immutable runtime manifest verifies exact package and reused depe
     writeFile(join(dependencyRoot, "node_modules", "fixture", "index.js"), "export default true;\n"),
     writeFile(join(packageRoot, "scripts", "start-universal-broker-v2-production.sh"), "#!/bin/sh\n", { mode: 0o700 }),
     writeFile(join(packageRoot, "dist", "cli.js"), "export {};\n"),
-    writeFile(join(packageRoot, "dist", "v2", "build-capabilities.js"), `
-export function createBuildCapabilityManifest(buildDigest) {
-  return { productProfile: "PERSONAL_DIRECT_OWNER", schemaGeneration: "sha256:${"1".repeat(64)}", buildDigest };
-}\n`),
+    writeFile(join(packageRoot, "dist", "v2", "runtime-contract-identity.js"),
+      `export const RUNTIME_SCHEMA_GENERATION = "sha256:${"1".repeat(64)}";\n`),
+    writeFile(join(packageRoot, "contracts", "build-capabilities.schema.json"), JSON.stringify({
+      properties: {
+        productVersion: { const: "2.1.1" },
+        productProfile: { const: "PERSONAL_DIRECT_OWNER" },
+        supportedProfiles: { const: ["PERSONAL_DIRECT_OWNER"] },
+        resourceUriVersion: { const: "v1" },
+        supportedOperations: {
+          properties: Object.fromEntries([
+            "target", "context", "fs", "exec", "process", "mcp", "artifact", "gui",
+          ].map((name) => [name, { const: ["fixture"] }])),
+        },
+      },
+    })),
   ]);
   const created = await createPersonalRuntimeManifest({
     packageRoot,

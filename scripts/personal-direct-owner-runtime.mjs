@@ -22,8 +22,7 @@ export async function createPersonalRuntimeManifest(input) {
   const runtimeRevision = revision(input.runtimeRevision, "runtime revision");
   const files = await snapshotFiles(root, relative(root, manifestPath));
   const buildDigest = digest(files);
-  const capabilitiesModule = await import(pathToFileURL(join(root, "dist/v2/build-capabilities.js")).href);
-  const buildCapabilities = capabilitiesModule.createBuildCapabilityManifest(buildDigest);
+  const buildCapabilities = await buildCapabilitiesFromGeneratedContract(root, buildDigest);
   if (buildCapabilities.productProfile !== PROFILE || "authorityContractGeneration" in buildCapabilities) {
     throw new Error("Built capabilities are not the Personal Direct Owner contract.");
   }
@@ -54,6 +53,35 @@ export async function createPersonalRuntimeManifest(input) {
     await rm(temporary, { force: true });
   }
   return { manifest, manifestPath, manifestSha256: bufferDigest(bytes) };
+}
+
+async function buildCapabilitiesFromGeneratedContract(root, buildDigest) {
+  const schema = JSON.parse(await readFile(join(root, "contracts", "build-capabilities.schema.json"), "utf8"));
+  const properties = schema.properties ?? {};
+  const runtimeIdentity = await import(pathToFileURL(join(root, "dist/v2/runtime-contract-identity.js")).href);
+  const supportedOperations = Object.fromEntries(Object.entries(
+    properties.supportedOperations?.properties ?? {},
+  ).map(([name, value]) => [name, value.const]));
+  const contract = {
+    productVersion: properties.productVersion?.const,
+    productProfile: properties.productProfile?.const,
+    schemaGeneration: runtimeIdentity.RUNTIME_SCHEMA_GENERATION,
+    supportedProfiles: properties.supportedProfiles?.const,
+    supportedOperations,
+    resourceUriVersion: properties.resourceUriVersion?.const,
+  };
+  if (contract.productProfile !== PROFILE
+      || !Array.isArray(contract.supportedProfiles)
+      || contract.supportedProfiles.length !== 1
+      || contract.supportedProfiles[0] !== PROFILE
+      || Object.keys(supportedOperations).length !== 8) {
+    throw new Error("Generated build capability contract is not Personal Direct Owner.");
+  }
+  return {
+    ...contract,
+    buildDigest,
+    capabilityDigest: bufferDigest(Buffer.from(canonicalJson(contract))),
+  };
 }
 
 export async function verifyPersonalRuntime(input) {
@@ -191,6 +219,18 @@ function revision(value, label) {
 
 function digest(value) {
   return bufferDigest(Buffer.from(JSON.stringify(value)));
+}
+
+function canonicalJson(value) {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    return `{${Object.entries(value)
+      .filter(([, child]) => child !== undefined)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([key, child]) => `${JSON.stringify(key)}:${canonicalJson(child)}`)
+      .join(",")}}`;
+  }
+  return JSON.stringify(value) ?? "null";
 }
 
 function bufferDigest(value) {
