@@ -77,6 +77,8 @@ test("candidate and production runtime environments materialize all writable pat
   const productionPaths = runtimeStatePaths(productionRoot, true);
   await writeFile(source, [
     "KEEP_UNRELATED='preserved value'",
+    "DEVSPACE_NEXT_SELF_RESTART_DELAY_MS='500'",
+    "DEVSPACE_PERSONAL_STAGING_FIXTURE='stale'",
     ...Object.entries(productionPaths).map(([key, value]) => `${key}='${value}'`),
     "",
   ].join("\n"), { mode: 0o600 });
@@ -85,12 +87,12 @@ test("candidate and production runtime environments materialize all writable pat
   materializeReleaseEnvironment({
     sourcePath: source,
     destinationPath: candidate,
-    values: { ...candidatePaths, DEVSPACE_NEXT_PORT: "7679" },
+    values: { ...candidatePaths, DEVSPACE_NEXT_PORT: "7679", DEVSPACE_PERSONAL_STAGING_FIXTURE: "1" },
   });
   materializeReleaseEnvironment({
     sourcePath: source,
     destinationPath: next,
-    values: { ...productionPaths, DEVSPACE_NEXT_PORT: "7678" },
+    values: { ...productionPaths, DEVSPACE_NEXT_PORT: "7678", DEVSPACE_PERSONAL_STAGING_FIXTURE: "1" },
   });
 
   const releaseStateKeys = [
@@ -102,6 +104,12 @@ test("candidate and production runtime environments materialize all writable pat
   const productionEnvironment = sourceEnvironment(next, [...releaseStateKeys, "KEEP_UNRELATED"]);
   assert.equal(candidateEnvironment.KEEP_UNRELATED, "preserved value");
   assert.equal(productionEnvironment.KEEP_UNRELATED, "preserved value");
+  const removed = sourceEnvironment(candidate, [
+    "DEVSPACE_NEXT_SELF_RESTART_DELAY_MS",
+    "DEVSPACE_PERSONAL_STAGING_FIXTURE",
+  ]);
+  assert.equal(removed.DEVSPACE_NEXT_SELF_RESTART_DELAY_MS, "");
+  assert.equal(removed.DEVSPACE_PERSONAL_STAGING_FIXTURE, "1");
   for (const key of releaseStateKeys) {
     const candidateValue = candidateEnvironment[key];
     assert.notEqual(candidateValue, productionPaths[key], `${key} must not reuse production state`);
@@ -114,6 +122,27 @@ test("candidate and production runtime environments materialize all writable pat
     }
     assert.equal(productionEnvironment[key], productionPaths[key], `${key} production path must be exact`);
   }
+});
+
+test("personal promotion snapshots mutable state and installs rollback before stopping production", async () => {
+  const path = join(repositoryRoot, "scripts", "promote-universal-broker-v2-personal.sh");
+  const help = spawnSync("/bin/bash", [path, "--help"], { encoding: "utf8" });
+  assert.equal(help.status, 0, help.stderr);
+  const source = await readFile(path, "utf8");
+  const trapIndex = source.indexOf("trap 'rollback $?' ERR");
+  const stopIndex = source.indexOf('pm2 stop "$PRODUCTION_PROCESS"');
+  assert.ok(trapIndex >= 0 && stopIndex > trapIndex, "rollback trap must precede production stop");
+  for (const required of [
+    'cp -p "$PRODUCTION_ENV" "$AUDIT/production.env.before"',
+    'cp -a "$STATE_DIR" "$AUDIT/state.before"',
+    'sqlite3 "$OAUTH_STATE_DIR/devspace.sqlite" ".backup',
+    'cp -a "$CONTROL_DIR" "$AUDIT/finalization-control.before"',
+    'cp -p "$AUDIT/oauth.sqlite.before" "$OAUTH_STATE_DIR/devspace.sqlite"',
+    'pm2 start "$OLD_SCRIPT"',
+    'wait_json "$PUBLIC_BASE_URL/healthz"',
+    'pm2 delete "$CANDIDATE_PROCESS"',
+  ]) assert.ok(source.includes(required), `missing personal promotion boundary: ${required}`);
+  assert.doesNotMatch(source, /tailscale funnel --bg|tailscale funnel --https/u);
 });
 
 test("pre-cutover candidate cleanup fails closed at delete, save, PM2 readback, listener readback, and listener presence", async () => {

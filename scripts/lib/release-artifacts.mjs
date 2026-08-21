@@ -89,6 +89,7 @@ export const RUNTIME_OPERATIONS_CLOSURE_ROOTS = Object.freeze([
   "scripts/collect-generated-release-metadata.mjs",
   "scripts/cutover-universal-broker-v2-production.sh",
   "scripts/deploy-universal-broker-v2-parallel.sh",
+  "scripts/promote-universal-broker-v2-personal.sh",
   "scripts/deploy-universal-broker-v2-pm2.sh",
   "scripts/deploy-universal-broker-v2-production.sh",
   "scripts/ensure-owner-instance-id.mjs",
@@ -119,6 +120,7 @@ export const RUNTIME_OPERATIONS_CLOSURE_ROOTS = Object.freeze([
   "scripts/lib/generated-release-metadata.mjs",
   "scripts/lib/owner-instance-id.mjs",
   "scripts/lib/release-artifacts.mjs",
+  "scripts/lib/release-environment.mjs",
   "scripts/lib/runtime-dependency-loader.mjs",
 ].sort(compareAscii));
 const REVIEWED_PRODUCTION_SCRIPT_PATHS = new Set([
