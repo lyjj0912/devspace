@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { test } from "node:test";
+import { personalProductionStartArguments } from "./lib/personal-upgrade-process.mjs";
 
 const execute = promisify(execFile);
 
@@ -49,4 +50,15 @@ test("packaged personal upgrade CLI resolves its compiled planner", async (t) =>
   assert.equal(plan.productProfile, "PERSONAL_DIRECT_OWNER");
   assert.equal(plan.identityAction, "PRESERVE_EXISTING_BINDING");
   assert.deepEqual(plan.backupSet, []);
+});
+
+test("personal production PM2 identity uses the real immutable runtime rather than the current pointer", () => {
+  const runtime = "/Users/example/.devspace/releases/universal-broker-v2/revision-personal-direct-owner";
+  assert.deepEqual(personalProductionStartArguments(runtime, "devspace-v2-production"), [
+    `${runtime}/scripts/start-universal-broker-v2-production.sh`,
+    "--name",
+    "devspace-v2-production",
+    "--cwd",
+    runtime,
+  ]);
 });

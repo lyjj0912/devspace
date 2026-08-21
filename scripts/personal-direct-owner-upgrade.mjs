@@ -19,6 +19,7 @@ import {
   createPersonalUpgradePlan,
 } from "../dist/v2/personal-upgrade.js";
 import { waitForHealthyPersonalRuntime } from "./lib/personal-runtime-health.mjs";
+import { personalProductionStartArguments } from "./lib/personal-upgrade-process.mjs";
 
 const [command = "plan", ...argumentsList] = process.argv.slice(2);
 const options = parseArguments(argumentsList);
@@ -77,14 +78,10 @@ async function applyRuntimeUpgrade(request, plan) {
     environmentSwitched = true;
     run("pm2", ["delete", candidateProcess], { allowFailure: true });
     run("pm2", ["delete", productionProcess], { allowFailure: true });
-    run("pm2", [
-      "start",
-      join(plan.currentRuntimePointer, "scripts", "start-universal-broker-v2-production.sh"),
-      "--name",
+    run("pm2", ["start", ...personalProductionStartArguments(
+      plan.candidateRuntimePath,
       productionProcess,
-      "--cwd",
-      plan.currentRuntimePointer,
-    ]);
+    )]);
     await waitForHealthyPersonalRuntime(productionHealthUrl, plan.runtimeRevision);
     process.stdout.write(`${JSON.stringify({
       status: "SWITCHED_PENDING_ACTUAL_HOST_VERIFICATION",
