@@ -22,6 +22,13 @@ export interface ReadinessCheckObservation {
   evidence?: Record<string, unknown>;
 }
 
+export interface CanonicalConnectorReadinessInput {
+  state: "PASS" | "FAIL";
+  activeCount: number;
+  bindingsByState: Record<string, number>;
+  invalidStates: readonly string[];
+}
+
 export interface ReadinessCheckContext {
   readonly mode: "READ_ONLY";
   readonly signal: AbortSignal;
@@ -88,6 +95,35 @@ const DEFAULT_CHECK_TIMEOUT_MS = 200;
 const MAXIMUM_CHECKS = 64;
 const CHECK_ID_PATTERN = /^[a-z][a-z0-9_]{1,63}$/u;
 const SHA256_DIGEST_PATTERN = /^sha256:[a-f0-9]{64}$/u;
+
+/**
+ * A parallel runtime is started before its connector is activated. Treat only that
+ * exact empty-but-consistent state as ready; production still requires one ACTIVE
+ * connector and every other connector consistency failure remains fail-closed.
+ */
+export function canonicalConnectorReadinessObservation(
+  deploymentMode: "parallel" | "production",
+  connector: CanonicalConnectorReadinessInput,
+): ReadinessCheckObservation {
+  const awaitingParallelActivation = deploymentMode === "parallel"
+    && connector.state === "FAIL"
+    && connector.activeCount === 0
+    && connector.invalidStates.length === 1
+    && connector.invalidStates[0] === "ACTIVE_COUNT";
+  return {
+    state: awaitingParallelActivation ? "PASS" : connector.state,
+    evidence: {
+      activeCount: connector.activeCount,
+      bindingsByState: connector.bindingsByState,
+      invalidStates: connector.invalidStates,
+      activationState: awaitingParallelActivation
+        ? "PENDING"
+        : connector.state === "PASS" && connector.activeCount === 1
+          ? "ACTIVE"
+          : "INVALID",
+    },
+  };
+}
 
 /** A bounded registry whose check API deliberately exposes no mutation capabilities. */
 export class ReadinessRegistry {

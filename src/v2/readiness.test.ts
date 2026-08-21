@@ -7,6 +7,7 @@ import Database from "better-sqlite3";
 import {
   ReadinessRegistry,
   baseMutableSqliteStoreReadiness,
+  canonicalConnectorReadinessObservation,
   type ReadinessCheck,
 } from "./readiness.js";
 import { loadOrCreateManagementAuthorizationKey } from "./management-authorization.js";
@@ -81,6 +82,36 @@ test("registration rejects mutation canaries and duplicate check identities", ()
     check("store", { state: "PASS" }),
     check("store", { state: "PASS" }),
   ]), /duplicate readiness check/iu);
+});
+
+test("parallel readiness accepts only the consistent pre-activation connector state", () => {
+  const emptyConnector = {
+    state: "FAIL" as const,
+    activeCount: 0,
+    bindingsByState: { ACTIVE: 0 },
+    invalidStates: ["ACTIVE_COUNT"],
+  };
+  const parallel = canonicalConnectorReadinessObservation("parallel", emptyConnector);
+  assert.equal(parallel.state, "PASS");
+  assert.equal(parallel.evidence?.activationState, "PENDING");
+
+  const production = canonicalConnectorReadinessObservation("production", emptyConnector);
+  assert.equal(production.state, "FAIL");
+
+  const inconsistentParallel = canonicalConnectorReadinessObservation("parallel", {
+    ...emptyConnector,
+    invalidStates: ["ACTIVE_COUNT", "PREPARED_RECEIPT_MISMATCH"],
+  });
+  assert.equal(inconsistentParallel.state, "FAIL");
+
+  const activeParallel = canonicalConnectorReadinessObservation("parallel", {
+    state: "PASS",
+    activeCount: 1,
+    bindingsByState: { ACTIVE: 1 },
+    invalidStates: [],
+  });
+  assert.equal(activeParallel.state, "PASS");
+  assert.equal(activeParallel.evidence?.activationState, "ACTIVE");
 });
 
 test("Base readiness uses the keyed finalization store and external control readback", async (t) => {

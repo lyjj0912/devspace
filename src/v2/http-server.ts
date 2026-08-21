@@ -68,6 +68,7 @@ import {
 import {
   ReadinessRegistry,
   baseMutableSqliteStoreReadiness,
+  canonicalConnectorReadinessObservation,
   readablePathReadiness,
   runtimeCapabilityIdentityReadiness,
   type ReadinessCheckObservation,
@@ -524,17 +525,10 @@ export function createUniversalBrokerNextServer(
     {
       id: "canonical_connector",
       sideEffectFree: true,
-      check: () => {
-        const connector = oauthProvider.connectorReadiness();
-        return {
-          state: connector.state,
-          evidence: {
-            activeCount: connector.activeCount,
-            bindingsByState: connector.bindingsByState,
-            invalidStates: connector.invalidStates,
-          },
-        };
-      },
+      check: () => canonicalConnectorReadinessObservation(
+        config.deploymentMode,
+        oauthProvider.connectorReadiness(),
+      ),
     },
     {
       id: "supervisor_control",
