@@ -41,6 +41,17 @@ test("runtime-only personal upgrade preserves connector/client/origin and create
   assert.equal(JSON.stringify(plan).match(/authority|activation|finalization|drain/giu), null);
 });
 
+test("the one-time legacy base runtime may upgrade to personal without changing its connector binding", () => {
+  const upgradeInput = input();
+  const plan = createPersonalUpgradePlan({
+    ...upgradeInput,
+    existing: { ...upgradeInput.existing, productProfile: "BASE_SINGLE_OWNER" },
+  });
+  assert.equal(plan.productProfile, "PERSONAL_DIRECT_OWNER");
+  assert.equal(plan.identityAction, "PRESERVE_EXISTING_BINDING");
+  assert.equal(plan.backupSet.length, 0);
+});
+
 test("store backup set contains only changed stores and their actual dependencies", () => {
   const plan = createPersonalUpgradePlan(input({
     stores: [

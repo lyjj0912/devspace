@@ -11,6 +11,11 @@ export interface PersonalDeploymentIdentity {
   connectorInstallationEpoch: number;
 }
 
+export interface PersonalExistingDeploymentIdentity
+  extends Omit<PersonalDeploymentIdentity, "productProfile"> {
+  productProfile: typeof BASE_PRODUCT_PROFILE | "BASE_SINGLE_OWNER";
+}
+
 export interface PersonalRuntimeCandidate extends PersonalDeploymentIdentity {
   runtimePath: string;
   sourceRevision: string;
@@ -27,7 +32,7 @@ export interface PersonalStoreChange {
 }
 
 export interface PersonalUpgradeInput {
-  existing: PersonalDeploymentIdentity & { runtimePath: string };
+  existing: PersonalExistingDeploymentIdentity & { runtimePath: string };
   candidate: PersonalRuntimeCandidate;
   stores: readonly PersonalStoreChange[];
   currentRuntimePointer: string;
@@ -70,9 +75,9 @@ const UPGRADE_PHASES = Object.freeze([
 ] as const);
 
 export function createPersonalUpgradePlan(input: PersonalUpgradeInput): PersonalUpgradePlan {
-  assertIdentity(input.existing, "existing");
+  assertIdentity(input.existing, "existing", true);
   assertIdentity(input.candidate, "candidate");
-  assertPreservedIdentity(input.existing, input.candidate);
+  assertPreservedBinding(input.existing, input.candidate);
   const existingRuntimePath = absolutePath(input.existing.runtimePath, "existing.runtimePath");
   const candidateRuntimePath = absolutePath(input.candidate.runtimePath, "candidate.runtimePath");
   if (existingRuntimePath === candidateRuntimePath) {
@@ -175,9 +180,32 @@ function assertPreservedIdentity(
   }
 }
 
-function assertIdentity(value: PersonalDeploymentIdentity, label: string): void {
-  if (value.productProfile !== BASE_PRODUCT_PROFILE) {
-    throw new Error(`${label}.productProfile must be ${BASE_PRODUCT_PROFILE}.`);
+function assertPreservedBinding(
+  expected: PersonalExistingDeploymentIdentity,
+  observed: PersonalDeploymentIdentity,
+): void {
+  for (const field of [
+    "publicOrigin",
+    "oauthClientId",
+    "oauthResource",
+    "ownerInstanceId",
+    "connectorName",
+    "connectorInstallationEpoch",
+  ] as const) {
+    if (expected[field] !== observed[field]) {
+      throw new Error(`Runtime-only upgrade cannot change ${field}.`);
+    }
+  }
+}
+
+function assertIdentity(
+  value: PersonalDeploymentIdentity | PersonalExistingDeploymentIdentity,
+  label: string,
+  allowLegacyProfile = false,
+): void {
+  if (value.productProfile !== BASE_PRODUCT_PROFILE
+      && !(allowLegacyProfile && value.productProfile === "BASE_SINGLE_OWNER")) {
+    throw new Error(`${label}.productProfile must be ${BASE_PRODUCT_PROFILE}${allowLegacyProfile ? " or the legacy base profile" : ""}.`);
   }
   const origin = new URL(value.publicOrigin);
   if (origin.origin !== value.publicOrigin || origin.protocol !== "https:") {
