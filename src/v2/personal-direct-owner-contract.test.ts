@@ -53,6 +53,7 @@ test("personal build exposes the exact direct-owner public contract", () => {
     "expectedTargetGeneration",
     "expectedRouteGeneration",
   ]);
+  assert.equal("transactionId" in UNIVERSAL_TOOL_CONTRACTS.process.inputSchema, true);
 
   const runtimeIdentity = createRuntimeIdentity({ config: {} });
   assert.equal(runtimeIdentity.productProfile, "PERSONAL_DIRECT_OWNER");

@@ -400,6 +400,7 @@ const processContract = {
     signal: z.string().min(1).optional(),
     columns: z.number().int().min(1).max(1_000).optional(),
     rows: z.number().int().min(1).max(1_000).optional(),
+    transactionId: z.string().min(1).max(128).optional(),
     reason: z.string().min(1).max(2_000).optional(),
     waitMs: z.number().int().min(0).max(110_000).optional(),
     maxOutputChars: z.number().int().min(1).max(1_000_000).optional(),
