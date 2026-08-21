@@ -17,7 +17,8 @@ import { dirname, join, resolve } from "node:path";
 import {
   assertPersonalProductionReadback,
   createPersonalUpgradePlan,
-} from "../src/v2/personal-upgrade.js";
+} from "../dist/v2/personal-upgrade.js";
+import { waitForHealthyPersonalRuntime } from "./lib/personal-runtime-health.mjs";
 
 const [command = "plan", ...argumentsList] = process.argv.slice(2);
 const options = parseArguments(argumentsList);
@@ -55,7 +56,7 @@ async function applyRuntimeUpgrade(request, plan) {
   await assertOwnerFile(productionEnvironment);
   await assertOwnerFile(candidateEnvironment);
   await assertPreservedEnvironment(productionEnvironment, candidateEnvironment);
-  await assertHealthy(candidateHealthUrl, plan.runtimeRevision);
+  await waitForHealthyPersonalRuntime(candidateHealthUrl, plan.runtimeRevision);
   await mkdir(auditDirectory, { recursive: false, mode: 0o700 });
   const oldPointer = await readlink(plan.currentRuntimePointer);
   const oldRuntime = resolve(dirname(plan.currentRuntimePointer), oldPointer);
@@ -84,7 +85,7 @@ async function applyRuntimeUpgrade(request, plan) {
       "--cwd",
       plan.currentRuntimePointer,
     ]);
-    await assertHealthy(productionHealthUrl, plan.runtimeRevision);
+    await waitForHealthyPersonalRuntime(productionHealthUrl, plan.runtimeRevision);
     process.stdout.write(`${JSON.stringify({
       status: "SWITCHED_PENDING_ACTUAL_HOST_VERIFICATION",
       runtimeRevision: plan.runtimeRevision,
@@ -178,17 +179,6 @@ async function parseEnvironment(path) {
     if (match) values.set(match[1], match[2]);
   }
   return values;
-}
-
-async function assertHealthy(url, runtimeRevision) {
-  const response = await fetch(url, { signal: AbortSignal.timeout(10_000) });
-  if (!response.ok) throw new Error(`Runtime health returned HTTP ${response.status}: ${url}`);
-  const value = await response.json();
-  const productProfile = value.productProfile ?? value.identity?.productProfile;
-  if (productProfile !== "PERSONAL_DIRECT_OWNER") throw new Error("Runtime health profile mismatch.");
-  if (value.runtimeRevision !== runtimeRevision && value.identity?.runtimeRevision !== runtimeRevision) {
-    throw new Error("Runtime health revision mismatch.");
-  }
 }
 
 async function atomicSymlink(target, pointer) {
