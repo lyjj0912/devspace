@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import {
   mkdtemp,
   mkdir,
+  realpath,
   readdir,
   readFile,
   rm,
@@ -16,6 +17,7 @@ import { UniversalBrokerError } from "./errors.js";
 import {
   UniversalSelfManagementService,
   atomicRestartStatusWrite,
+  restartWorkerLaunchDescriptor,
   type RestartTransactionStatus,
   type RestartWorkerRequest,
 } from "./self-management.js";
@@ -94,6 +96,64 @@ module.exports = {
     scriptMatches: true,
     pid: 12345,
   });
+});
+
+test("packaged restart worker uses the runtime dependency loader without inheriting secrets", async (t) => {
+  const root = await temporaryRoot(t, "devspace-self-management-packaged-worker-");
+  const workerPath = join(root, "dist", "v2", "self-management-worker.js");
+  const loaderPath = join(root, "scripts", "lib", "runtime-dependency-loader.mjs");
+  const dependencyRoot = join(root, "dependencies");
+  const requestPath = join(root, "request.json");
+  await Promise.all([
+    mkdir(join(root, "dist", "v2"), { recursive: true }),
+    mkdir(join(root, "scripts", "lib"), { recursive: true }),
+    mkdir(dependencyRoot, { recursive: true }),
+  ]);
+  await Promise.all([
+    writeFile(workerPath, "export {};\n"),
+    writeFile(loaderPath, "export {};\n"),
+    writeFile(join(dependencyRoot, "package.json"), "{}\n"),
+    writeFile(requestPath, "{}\n"),
+  ]);
+  const request: RestartWorkerRequest = {
+    version: 2,
+    transactionId: "restart_11111111-1111-4111-8111-111111111111",
+    requestedAt: "2026-08-21T00:00:00.000Z",
+    ownerFingerprint: OWNER,
+    timeoutMs: 10_000,
+    pm2ProcessName: "devspace-test",
+    pm2Executable: "/usr/bin/true",
+    expectedCwd: root,
+    localHealthUrl: "http://127.0.0.1:17690/healthz",
+    expectedRuntimeIdentity: TEST_RUNTIME_IDENTITY,
+    statusPath: join(root, "status.json"),
+    requestPath,
+    workerLogPath: join(root, "worker.log"),
+  };
+  const descriptor = restartWorkerLaunchDescriptor(request, workerPath, {
+    HOME: root,
+    PATH: "/usr/bin:/bin",
+    DEVSPACE_RUNTIME_DEPENDENCY_ROOT: dependencyRoot,
+    DEVSPACE_RUNTIME_SECRET: "must-not-leak",
+    OAUTH_CLIENT_SECRET: "must-not-leak",
+  });
+  const [realRoot, realDependencyRoot, realWorkerPath, realLoaderPath] = await Promise.all([
+    realpath(root),
+    realpath(dependencyRoot),
+    realpath(workerPath),
+    realpath(loaderPath),
+  ]);
+  assert.deepEqual(descriptor.arguments, [
+    "--import",
+    realLoaderPath,
+    realWorkerPath,
+    requestPath,
+  ]);
+  assert.equal(descriptor.dependencyLoaderPath, realLoaderPath);
+  assert.equal(descriptor.environment.DEVSPACE_RUNTIME_PACKAGE_ROOT, realRoot);
+  assert.equal(descriptor.environment.DEVSPACE_RUNTIME_DEPENDENCY_ROOT, realDependencyRoot);
+  assert.equal(descriptor.environment.DEVSPACE_RUNTIME_SECRET, undefined);
+  assert.equal(descriptor.environment.OAUTH_CLIENT_SECRET, undefined);
 });
 
 test("restart handoff occurs only after the exact response is durably ACK_FLUSHED", async (t) => {

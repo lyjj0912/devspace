@@ -17,7 +17,7 @@ import {
   stat,
 } from "node:fs/promises";
 import { homedir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, spawnSync, type SpawnOptions } from "node:child_process";
 import { UniversalBrokerError } from "./errors.js";
@@ -891,6 +891,7 @@ function launchDetachedRestartWorker(
   workerPath: string,
 ): void {
   if (!existsSync(workerPath)) throw new Error(`Restart worker is missing: ${workerPath}`);
+  const launch = restartWorkerLaunchDescriptor(request, workerPath);
   if (platform === "darwin") {
     const result = spawnSync(
       "/bin/launchctl",
@@ -904,13 +905,12 @@ function launchDetachedRestartWorker(
         request.workerLogPath,
         "--",
         process.execPath,
-        workerPath,
-        request.requestPath,
+        ...launch.arguments,
       ],
       {
         encoding: "utf8",
         timeout: 10_000,
-        env: workerEnvironment(),
+        env: launch.environment,
       },
     );
     if (result.status !== 0) {
@@ -924,10 +924,10 @@ function launchDetachedRestartWorker(
     const options: SpawnOptions = {
       detached: true,
       stdio: ["ignore", logFd, logFd],
-      env: workerEnvironment(),
+      env: launch.environment,
       windowsHide: true,
     };
-    const child = spawn(process.execPath, [workerPath, request.requestPath], options);
+    const child = spawn(process.execPath, launch.arguments, options);
     child.once("error", () => undefined);
     child.unref();
   } finally {
@@ -935,16 +935,82 @@ function launchDetachedRestartWorker(
   }
 }
 
-function workerEnvironment(): NodeJS.ProcessEnv {
+export interface RestartWorkerLaunchDescriptor {
+  arguments: string[];
+  environment: NodeJS.ProcessEnv;
+  dependencyLoaderPath?: string;
+}
+
+export function restartWorkerLaunchDescriptor(
+  request: RestartWorkerRequest,
+  workerPath: string,
+  sourceEnvironment: NodeJS.ProcessEnv = process.env,
+): RestartWorkerLaunchDescriptor {
+  const resolvedWorkerPath = realpathSync(resolve(workerPath));
+  const dependencyLoaderPath = resolve(
+    dirname(resolvedWorkerPath),
+    "../../scripts/lib/runtime-dependency-loader.mjs",
+  );
+  if (!existsSync(dependencyLoaderPath)) {
+    return {
+      arguments: [resolvedWorkerPath, request.requestPath],
+      environment: workerEnvironment(sourceEnvironment),
+    };
+  }
+
+  const packageRoot = requiredRealDirectory(request.expectedCwd, "expectedCwd");
+  const dependencyRoot = requiredRealDirectory(
+    sourceEnvironment.DEVSPACE_RUNTIME_DEPENDENCY_ROOT,
+    "DEVSPACE_RUNTIME_DEPENDENCY_ROOT",
+  );
+  const resolvedLoaderPath = realpathSync(dependencyLoaderPath);
+  assertPathWithin(packageRoot, resolvedWorkerPath, "Restart worker");
+  assertPathWithin(packageRoot, resolvedLoaderPath, "Runtime dependency loader");
   return {
-    HOME: process.env.HOME ?? homedir(),
-    USER: process.env.USER,
-    LOGNAME: process.env.LOGNAME,
-    PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
-    TMPDIR: process.env.TMPDIR,
-    LANG: process.env.LANG,
-    LC_ALL: process.env.LC_ALL,
+    arguments: ["--import", resolvedLoaderPath, resolvedWorkerPath, request.requestPath],
+    environment: workerEnvironment(sourceEnvironment, { packageRoot, dependencyRoot }),
+    dependencyLoaderPath: resolvedLoaderPath,
   };
+}
+
+function workerEnvironment(
+  sourceEnvironment: NodeJS.ProcessEnv,
+  runtime?: { packageRoot: string; dependencyRoot: string },
+): NodeJS.ProcessEnv {
+  return {
+    HOME: sourceEnvironment.HOME ?? homedir(),
+    USER: sourceEnvironment.USER,
+    LOGNAME: sourceEnvironment.LOGNAME,
+    PATH: sourceEnvironment.PATH ?? "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+    TMPDIR: sourceEnvironment.TMPDIR,
+    LANG: sourceEnvironment.LANG,
+    LC_ALL: sourceEnvironment.LC_ALL,
+    ...(runtime
+      ? {
+          DEVSPACE_RUNTIME_PACKAGE_ROOT: runtime.packageRoot,
+          DEVSPACE_RUNTIME_DEPENDENCY_ROOT: runtime.dependencyRoot,
+        }
+      : {}),
+  };
+}
+
+function requiredRealDirectory(value: string | undefined, name: string): string {
+  if (
+    typeof value !== "string"
+    || !isAbsolute(value)
+    || /[\0\r\n]/u.test(value)
+  ) {
+    throw new Error(`${name} must be an absolute path.`);
+  }
+  const path = realpathSync(resolve(value));
+  if (!existsSync(path)) throw new Error(`${name} does not exist: ${path}`);
+  return path;
+}
+
+function assertPathWithin(root: string, path: string, label: string): void {
+  const child = relative(root, path);
+  if (child === "" || (!child.startsWith(`..${sep}`) && child !== ".." && !isAbsolute(child))) return;
+  throw new Error(`${label} must be contained by the expected runtime root.`);
 }
 
 async function atomicJsonWrite(path: string, value: unknown): Promise<void> {
