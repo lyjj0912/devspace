@@ -508,14 +508,18 @@ test("one exclusive worker claim prevents concurrent stop snapshot and provider 
   const winner = runProductionUpgradeWorker(fixture.requestPath, fixture.dependencies);
   let claimed = false;
   for (let attempt = 0; attempt < 100; attempt += 1) {
-    const status = await readFile(fixture.statusPath, "utf8").catch(() => undefined);
-    if (status && JSON.parse(status).state === "CONNECTOR_ACTIVATION_PREPARED") {
+    const claim = await readFile(claimPath, "utf8").then((value) => JSON.parse(value) as {
+      transactionId?: string;
+      requestBindingDigest?: string;
+    }).catch(() => undefined);
+    if (claim?.transactionId === request.transactionId
+      && claim.requestBindingDigest === productionUpgradeRequestBindingDigest(request)) {
       claimed = true;
       break;
     }
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
-  assert.equal(claimed, true, "the winning worker must publish its claim before the contender starts");
+  assert.equal(claimed, true, "the winning worker must publish its exact claim before the contender starts");
   await assert.rejects(
     runProductionUpgradeWorker(fixture.requestPath, fixture.dependencies),
     /active worker claim/u,

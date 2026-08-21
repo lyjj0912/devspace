@@ -98,6 +98,8 @@ test("staging package runs the real metadata collector but remains ineligible fo
     assert.match(startSource, /verify_release_artifact verify-runtime-command/gu);
     assert.match(startSource, /verify_release_artifact verify-runtime-dependencies/gu);
     assert.match(startSource, /DEVSPACE_RUNTIME_DEPENDENCY_ROOT/gu);
+    const parallelSource = readFileSync(join(sourceRoot, "scripts", "deploy-universal-broker-v2-parallel.sh"), "utf8");
+    assert.match(parallelSource, /"DEVSPACE_NEXT_SELF_RESTART_DELAY_MS"/gu);
   } finally {
     rmSync(temporaryRoot, { recursive: true, force: true });
   }
