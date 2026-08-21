@@ -554,7 +554,9 @@ function registerProcessTool(
       async (requestMeta, observation) => {
       const authenticated = requireAuthenticatedPrincipal(extra, authorityPrincipal);
       requireScope(authenticated.authInfo, "devspace.exec");
-      const typed = mergeOperationRequestMeta(input, requestMeta) as ProcessOperationInput;
+      const typed = mergeOperationRequestMeta(input, requestMeta, {
+        allowTopLevelTransactionId: input.operation === "restart_status",
+      }) as ProcessOperationInput;
       const targetApplicable = processOperationTargetsRecord(typed.operation);
       assertGenerationApplicability(requestMeta, "process", typed.operation, {
         target: targetApplicable,
@@ -1192,12 +1194,23 @@ function assertSchemaGeneration(
 function mergeOperationRequestMeta<T extends Record<string, unknown>>(
   input: T,
   requestMeta: UniversalRequestMeta,
+  options: { allowTopLevelTransactionId?: boolean } = {},
 ): T & Pick<UniversalRequestMeta, "transactionId"> {
   const merged: Record<string, unknown> = { ...input };
   for (const field of ["transactionId"] as const) {
     const argumentValue = merged[field];
     const metadataValue = requestMeta[field];
     if (argumentValue !== undefined) {
+      if (options.allowTopLevelTransactionId) {
+        if (metadataValue !== undefined && metadataValue !== argumentValue) {
+          throw new UniversalBrokerError(
+            "INVALID_ARGUMENT",
+            "process.restart_status transactionId conflicts with params._meta.devspace.transactionId.",
+            { evidence: { field, providerDispatchCount: 0, durableClaimCount: 0 } },
+          );
+        }
+        continue;
+      }
       throw new UniversalBrokerError(
         "INVALID_ARGUMENT",
         `Common request metadata ${field} is accepted only at params._meta.devspace.${field}.`,

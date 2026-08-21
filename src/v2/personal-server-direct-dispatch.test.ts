@@ -13,6 +13,7 @@ import type {
   UniversalExecutionPlane,
 } from "./execution.js";
 import type { UniversalFilesystemService } from "./filesystem.js";
+import type { UniversalSelfManagementService } from "./self-management.js";
 import { createUniversalBrokerMcpServer } from "./server.js";
 import { TargetRegistry } from "./targets.js";
 
@@ -75,6 +76,14 @@ test("personal OAuth-scoped fs, exec, and process mutations dispatch directly wi
       return { targetId: "local", targetGeneration: prepared.targetGeneration };
     },
   } as unknown as UniversalExecutionPlane;
+  const restartTransactionId = "restart_11111111-1111-4111-8111-111111111111";
+  const selfManagement = {
+    async status(transactionId: string) {
+      assert.equal(transactionId, restartTransactionId);
+      calls.push("process.restart_status");
+      return { transactionId, state: "PASS", expectedDisconnect: true, history: [] };
+    },
+  } as unknown as UniversalSelfManagementService;
   let legacyStoreTouches = 0;
   const ignoredLegacyService = new Proxy({}, {
     get() {
@@ -94,6 +103,7 @@ test("personal OAuth-scoped fs, exec, and process mutations dispatch directly wi
     contexts,
     filesystem,
     execution,
+    selfManagement,
     authority: ignoredLegacyService,
     authorityPrincipal: {
       environment: "production",
@@ -119,6 +129,15 @@ test("personal OAuth-scoped fs, exec, and process mutations dispatch directly wi
     assert.notEqual(result.isError, true, JSON.stringify(result.structuredContent));
     assert.equal((result.structuredContent as { ok?: unknown })?.ok, true);
   }
-  assert.deepEqual(calls, ["fs.write", "exec.run", "process.forget"]);
+  const restartStatus = await client.callTool({
+    name: "process",
+    arguments: { operation: "restart_status", transactionId: restartTransactionId },
+  });
+  assert.notEqual(restartStatus.isError, true, JSON.stringify(restartStatus.structuredContent));
+  assert.equal(
+    (restartStatus.structuredContent as { data?: { transactionId?: string } })?.data?.transactionId,
+    restartTransactionId,
+  );
+  assert.deepEqual(calls, ["fs.write", "exec.run", "process.forget", "process.restart_status"]);
   assert.equal(legacyStoreTouches, 0);
 });
