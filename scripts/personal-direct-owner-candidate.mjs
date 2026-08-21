@@ -95,7 +95,7 @@ export async function deployPersonalDirectOwnerCandidate(input, adapters = {}) {
     await mkdir(oauthStateDir, { recursive: true, mode: 0o700 });
     await chmod(oauthStateDir, 0o700);
     const publicBaseUrl = `http://127.0.0.1:${dataPort}`;
-    const publicMcpUrl = `${publicBaseUrl}/mcp`;
+    const publicMcpUrl = `${publicBaseUrl}/mcp-next`;
     const values = candidateEnvironmentValues({
       releasePackage,
       dependencyRoot,
@@ -150,7 +150,7 @@ export async function deployPersonalDirectOwnerCandidate(input, adapters = {}) {
     });
     started = true;
 
-    const health = await waitForJson(`${publicBaseUrl}/healthz`, {
+    const health = await waitForJson(`${publicBaseUrl}/healthz-next`, {
       timeoutMs: input.startupTimeoutMs ?? 60_000,
       expectedStatus: 200,
     });
@@ -172,6 +172,8 @@ export async function deployPersonalDirectOwnerCandidate(input, adapters = {}) {
     const live = await liveVerifier({
       dataBaseUrl: publicBaseUrl,
       managementBaseUrl,
+      healthPath: "/healthz-next",
+      mcpPath: "/mcp-next",
       releasePackage,
       tokenFile: audit.tokenFile,
       auditPath: join(stateDir, "audit", "operations.jsonl"),
@@ -262,12 +264,12 @@ export async function deployPersonalDirectOwnerCandidate(input, adapters = {}) {
 
 function candidateEnvironmentValues(input) {
   return {
-    DEVSPACE_V2_DEPLOYMENT_MODE: "production",
+    DEVSPACE_V2_DEPLOYMENT_MODE: "parallel",
     DEVSPACE_NEXT_HOST: "127.0.0.1",
     DEVSPACE_NEXT_PORT: String(input.dataPort),
     DEVSPACE_NEXT_MANAGEMENT_PORT: String(input.managementPort),
     DEVSPACE_NEXT_PUBLIC_BASE_URL: input.publicBaseUrl,
-    DEVSPACE_NEXT_MCP_PATH: "/mcp",
+    DEVSPACE_NEXT_MCP_PATH: "/mcp-next",
     DEVSPACE_NEXT_STATE_DIR: input.stateDir,
     DEVSPACE_NEXT_OAUTH_STATE_DIR: input.oauthStateDir,
     DEVSPACE_NEXT_TARGETS_FILE: input.targetConfig,

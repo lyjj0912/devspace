@@ -48,8 +48,8 @@ test("Personal candidate orchestration emits a clean environment and complete ev
     },
     processManager,
     waitForJson: async (url) => {
-      events.push(url.endsWith("/healthz") ? "health" : "readiness");
-      return url.endsWith("/healthz")
+      events.push(url.endsWith("/healthz-next") ? "health" : "readiness");
+      return url.endsWith("/healthz-next")
         ? runtimeIdentity()
         : {
             status: "ready",
@@ -68,6 +68,8 @@ test("Personal candidate orchestration emits a clean environment and complete ev
       assert.equal(input.acceptanceRunId, fixture.input.acceptanceRunId);
       assert.equal(input.connectorInstallationEpoch, 3);
       assert.equal(input.connectorRotationSequence, 0);
+      assert.equal(input.healthPath, "/healthz-next");
+      assert.equal(input.mcpPath, "/mcp-next");
       return {
         status: "PERSONAL_DIRECT_OWNER_HTTP_LIVE_PASS",
         ...runtimeIdentity(),
@@ -106,6 +108,8 @@ test("Personal candidate orchestration emits a clean environment and complete ev
   const expectedEnvironment = processManager.started[0].expectedEnvironment;
   assertPersonalCandidateEnvironment(candidateEnvironment, expectedEnvironment);
   assert.match(candidateEnvironment, /DEVSPACE_OAUTH_OWNER_TOKEN='owner-secret-preserved'/u);
+  assert.match(candidateEnvironment, /DEVSPACE_V2_DEPLOYMENT_MODE='parallel'/u);
+  assert.match(candidateEnvironment, /DEVSPACE_NEXT_MCP_PATH='\/mcp-next'/u);
   assert.doesNotMatch(candidateEnvironment, /stale-production-state/u);
   assert.doesNotMatch(candidateEnvironment, /DEVSPACE_PERSONAL_STAGING_FIXTURE/u);
   assert.doesNotMatch(candidateEnvironment, /DEVSPACE_NEXT_HEALTH_PATH/u);
@@ -143,7 +147,7 @@ test("Personal candidate orchestration deletes only its candidate process after 
         return { status: "PASS", rotationSequence: 0, readiness: { state: "PASS" } };
       },
       processManager,
-      waitForJson: async (url) => url.endsWith("/healthz")
+      waitForJson: async (url) => url.endsWith("/healthz-next")
         ? runtimeIdentity()
         : { status: "ready", httpStatus: 200, checks: [], identity: runtimeIdentity() },
       verifyRuntime: async () => ({ status: "PASS" }),
