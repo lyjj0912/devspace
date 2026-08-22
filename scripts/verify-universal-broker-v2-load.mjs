@@ -315,7 +315,7 @@ function personalContract(scopes, contracts) {
     target: ["operation", "selector", "targetId", "refresh", "cursor", "limit"],
     context: ["operation", "contextId", "target", "path", "mode", "baseRef", "task", "query", "maxCharacters", "cursor", "limit"],
     fs: ["operation", "target", "contextId", "path", "destination", "content", "patch", "query", "recursive", "overwrite", "expectedSha256", "disposition", "sync", "finalSymlink", "offset", "cursor", "limit"],
-    exec: ["target", "contextId", "cwd", "command", "tty", "mode", "yieldMs", "maxOutputChars", "envProfile", "durable"],
+    exec: ["target", "contextId", "cwd", "command", "tty", "mode", "yieldMs", "maxOutputChars", "envProfile", "durable", "elevation"],
     process: ["operation", "processId", "chars", "signal", "columns", "rows", "transactionId", "reason", "waitMs", "maxOutputChars", "cursor", "limit"],
     mcp: ["operation", "route", "query", "name", "arguments", "uri", "cursor", "limit", "responsePolicy"],
     artifact: ["operation", "source", "destination", "overwrite", "maxBytes", "ttlSeconds"],

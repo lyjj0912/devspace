@@ -15,6 +15,7 @@ test("Personal operation audit risk distinguishes reads, mutations, and irrevers
     ["fs", "write", {}, "R1"],
     ["fs", "remove", { disposition: "permanent" }, "R3"],
     ["exec", "run", {}, "R2"],
+    ["exec", "run", { elevation: { mode: "prompt" } }, "R3"],
     ["process", "restart_status", {}, "R0"],
     ["process", "signal", {}, "R2"],
     ["process", "restart_broker", {}, "R3"],

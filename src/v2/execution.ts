@@ -37,7 +37,8 @@ import {
   EXEC_RISK_CLASSIFIER_GENERATION,
   type ProcessAuthorityBinding,
 } from "./authority-policy.js";
-import type { AuthorityRiskClass } from "./contracts.js";
+import type { AuthorityRiskClass, AuthorizationState, ElevationMode, ElevationPolicy } from "./contracts.js";
+import { normalizeExecutionElevation, type ExecuteElevationRequest } from "./elevation.js";
 import type { OperationAuthorityDispatchController } from "./authority.js";
 import {
   createCapabilityCallContextFromTrustedPrincipal,
@@ -106,6 +107,7 @@ const MAX_LIST_LIMIT = 500;
 
 export type UniversalProcessState =
   | "STARTING"
+  | "WAITING_AUTHORIZATION"
   | "RUNNING"
   | "EXITED"
   | "SIGNALED"
@@ -126,6 +128,7 @@ export interface ExecuteCommandInput {
   maxOutputChars?: number;
   envProfile?: string;
   durable?: boolean;
+  elevation?: ExecuteElevationRequest;
   /** Internal helpers may select a constrained policy; MCP callers cannot set this field. */
   internalPolicy?: InternalExecutionPolicy;
 }
@@ -142,6 +145,8 @@ export interface PreparedExecExecutionBinding {
   effectiveCwd: string;
   mode: ExecutionMode;
   tty: boolean;
+  elevationMode: ElevationMode;
+  elevationPolicy: ElevationPolicy;
   classifierGeneration: string;
   launchRisk: AuthorityRiskClass;
 }
@@ -192,6 +197,8 @@ export interface UniversalProcessSnapshot extends Record<string, unknown> {
   };
   resourceUri: string;
   durable?: boolean;
+  elevationMode?: ElevationMode;
+  authorizationState?: AuthorizationState;
   pid?: number;
   exitCode?: number;
   signal?: string;
@@ -273,6 +280,8 @@ interface ProcessEntry {
   cwd: string;
   tty: boolean;
   launchRisk: AuthorityRiskClass;
+  elevationMode: ElevationMode;
+  authorizationState: AuthorizationState;
   state: UniversalProcessState;
   startedAtMs: number;
   endedAtMs?: number;
@@ -444,7 +453,8 @@ export class UniversalExecutionPlane {
     await this.ensureRecovered();
     const owner = this.owner(callContext);
     validateCommand(input.command);
-    assertNoElevationCommand(input.command);
+    const elevation = normalizeExecutionElevation(input.elevation);
+    if (elevation.mode === "none") assertNoElevationCommand(input.command);
     assertInternalExecutionCommand(input.internalPolicy, input.command);
     if (input.internalPolicy && input.envProfile) {
       throw new UniversalBrokerError(
@@ -461,6 +471,41 @@ export class UniversalExecutionPlane {
       );
     }
     const resolved = await this.resolveExecution(input, callContext);
+    if (elevation.mode === "prompt") {
+      if (input.internalPolicy) {
+        throw new UniversalBrokerError(
+          "ELEVATION_BLOCKED",
+          "Broker-owned internal helpers cannot request interactive elevation.",
+          { evidence: { providerDispatchCount: 0 } },
+        );
+      }
+      if (resolved.target.elevationPolicy !== "prompt") {
+        throw new UniversalBrokerError(
+          "ELEVATION_UNAVAILABLE",
+          `Target ${resolved.target.id} does not permit prompt elevation.`,
+          {
+            evidence: {
+              targetId: resolved.target.id,
+              elevationPolicy: resolved.target.elevationPolicy,
+              providerDispatchCount: 0,
+            },
+          },
+        );
+      }
+      throw new UniversalBrokerError(
+        "ELEVATION_UNAVAILABLE",
+        `Target ${resolved.target.id} permits prompt elevation, but no verified user-authorization provider is installed in this runtime.`,
+        {
+          evidence: {
+            targetId: resolved.target.id,
+            targetGeneration: resolved.targetGeneration,
+            elevationMode: elevation.mode,
+            reasonSha256: elevation.reasonSha256,
+            providerDispatchCount: 0,
+          },
+        },
+      );
+    }
     const observedBinding = prepareExecExecutionBinding(
       input,
       resolved.target,
@@ -503,6 +548,8 @@ export class UniversalExecutionPlane {
         cwd: resolved.cwd,
         tty: input.tty === true,
         launchRisk,
+        elevationMode: elevation.mode,
+        authorizationState: "NOT_REQUIRED",
         state: "STARTING",
         startedAtMs: this.now(),
         durable: input.durable === true,
@@ -1352,6 +1399,8 @@ export class UniversalExecutionPlane {
       outputOffsets: entry.output.currentOffsets,
       resourceUri: processOutputResourceUri(entry.processId),
       durable: entry.durable,
+      elevationMode: entry.elevationMode,
+      authorizationState: entry.authorizationState,
       ...(entry.handle?.pid !== undefined ? { pid: entry.handle.pid } : {}),
       ...(entry.exitCode !== undefined ? { exitCode: entry.exitCode } : {}),
       ...(entry.signal ? { signal: entry.signal } : {}),
@@ -1376,6 +1425,8 @@ export class UniversalExecutionPlane {
       tty: entry.tty,
       state: entry.state,
       durable: entry.durable,
+      elevationMode: entry.elevationMode,
+      authorizationState: entry.authorizationState,
       ...(entry.handle?.pid !== undefined ? { pid: entry.handle.pid } : {}),
       startedAt: new Date(entry.startedAtMs).toISOString(),
       ...(entry.endedAtMs ? { endedAt: new Date(entry.endedAtMs).toISOString() } : {}),
@@ -1537,6 +1588,8 @@ export class UniversalExecutionPlane {
         cwd: record.cwd,
         tty: record.tty,
         launchRisk: record.launchRisk,
+        elevationMode: record.elevationMode ?? "none",
+        authorizationState: record.authorizationState ?? "NOT_REQUIRED",
         state: persistentState(record.state),
         startedAtMs: record.startedAtMs,
         endedAtMs: record.endedAtMs,
@@ -1663,6 +1716,8 @@ export class UniversalExecutionPlane {
       cwd: entry.cwd,
       tty: entry.tty,
       launchRisk: entry.launchRisk,
+      elevationMode: entry.elevationMode,
+      authorizationState: entry.authorizationState,
       state: entry.state,
       startedAtMs: entry.startedAtMs,
       endedAtMs: entry.endedAtMs,
@@ -1812,6 +1867,7 @@ export function prepareExecExecutionBinding(
     ?? (target.transport === "local" ? homedir() : "~"),
 ): PreparedExecExecutionBinding {
   const effectiveEnvProfile = input.envProfile ?? target.envProfile;
+  const elevation = normalizeExecutionElevation(input.elevation);
   return {
     targetId: target.id,
     targetGeneration,
@@ -1823,6 +1879,8 @@ export function prepareExecExecutionBinding(
     effectiveCwd,
     mode: input.mode ?? "auto",
     tty: input.tty === true,
+    elevationMode: elevation.mode,
+    elevationPolicy: target.elevationPolicy,
     classifierGeneration: EXEC_RISK_CLASSIFIER_GENERATION,
     launchRisk: commandRisk(input.command, {
       targetId: target.id,
@@ -1832,6 +1890,7 @@ export function prepareExecExecutionBinding(
       mode: input.mode ?? "auto",
       tty: input.tty === true,
       envProfile: effectiveEnvProfile,
+      elevationMode: elevation.mode,
     }),
   };
 }
@@ -1852,6 +1911,8 @@ function assertPreparedExecExecutionBinding(
     "effectiveCwd",
     "mode",
     "tty",
+    "elevationMode",
+    "elevationPolicy",
     "classifierGeneration",
     "launchRisk",
   ] as const satisfies readonly (keyof PreparedExecExecutionBinding)[];
@@ -2348,11 +2409,11 @@ function processUnpagedResult(
 }
 
 function isRunning(entry: ProcessEntry): boolean {
-  return entry.state === "STARTING" || entry.state === "RUNNING";
+  return entry.state === "STARTING" || entry.state === "WAITING_AUTHORIZATION" || entry.state === "RUNNING";
 }
 
 function isTerminalProcessRecord(record: PersistentProcessRecord): boolean {
-  return !["STARTING", "RUNNING"].includes(record.state);
+  return !["STARTING", "WAITING_AUTHORIZATION", "RUNNING"].includes(record.state);
 }
 
 function terminalRecordTime(record: PersistentProcessRecord): number {
@@ -2411,10 +2472,23 @@ function validateExecutionSnapshot(
 
 function executionFailureCode(
   value: string | undefined,
-): "TRANSPORT_UNAVAILABLE" | "PATH_NOT_FOUND" | "PERMISSION_DENIED" {
+):
+  | "TRANSPORT_UNAVAILABLE"
+  | "PATH_NOT_FOUND"
+  | "PERMISSION_DENIED"
+  | "ELEVATION_DENIED"
+  | "ELEVATION_CANCELED"
+  | "ELEVATION_TIMED_OUT"
+  | "ELEVATION_UNAVAILABLE"
+  | "ELEVATION_RESULT_UNKNOWN" {
   switch (value) {
     case "PATH_NOT_FOUND":
     case "PERMISSION_DENIED":
+    case "ELEVATION_DENIED":
+    case "ELEVATION_CANCELED":
+    case "ELEVATION_TIMED_OUT":
+    case "ELEVATION_UNAVAILABLE":
+    case "ELEVATION_RESULT_UNKNOWN":
       return value;
     default:
       return "TRANSPORT_UNAVAILABLE";
@@ -2554,6 +2628,7 @@ function adaptDurableHandle(handle: DurableProcessHandle): ProcessHandle {
 function persistentState(value: string): UniversalProcessState {
   const states = new Set<UniversalProcessState>([
     "STARTING",
+    "WAITING_AUTHORIZATION",
     "RUNNING",
     "EXITED",
     "SIGNALED",

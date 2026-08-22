@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdir, open, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
-import type { AuthorityRiskClass } from "./contracts.js";
+import type { AuthorityRiskClass, AuthorizationState, ElevationMode } from "./contracts.js";
 import type { DurableProcessIdentity } from "./durable-process-adapter.js";
 import { UniversalBrokerError } from "./errors.js";
 
@@ -17,6 +17,8 @@ export interface PersistentProcessRecord {
   cwd: string;
   tty: boolean;
   launchRisk: AuthorityRiskClass;
+  elevationMode?: ElevationMode;
+  authorizationState?: AuthorizationState;
   state: string;
   startedAtMs: number;
   endedAtMs?: number;
@@ -137,6 +139,17 @@ function assertRecord(record: PersistentProcessRecord, path: string): void {
     || typeof record.principalKeyFingerprint !== "string"
     || typeof record.outputPath !== "string"
     || typeof record.checksum !== "string"
+    || (record.elevationMode !== undefined && !["none", "prompt"].includes(record.elevationMode))
+    || (record.authorizationState !== undefined && ![
+      "NOT_REQUIRED",
+      "PENDING",
+      "APPROVED",
+      "DENIED",
+      "CANCELED",
+      "TIMED_OUT",
+      "EXPIRED",
+      "RESULT_UNKNOWN",
+    ].includes(record.authorizationState))
     || (record.outputGeneration !== undefined && !isSha256Identity(record.outputGeneration))
     || (record.outputIdentity !== undefined && !isSha256Identity(record.outputIdentity))
     || (record.outputTruncated !== undefined && typeof record.outputTruncated !== "boolean")

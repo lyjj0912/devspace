@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { AuthorityActionDescriptor } from "./authority.js";
-import type { AuthorityRiskClass, UniversalToolName } from "./contracts.js";
+import type { AuthorityRiskClass, ElevationMode, UniversalToolName } from "./contracts.js";
 import type { UniversalFilesystemInput } from "./filesystem.js";
 import type { UniversalMcpInput } from "./mcp-proxy.js";
 import type { UniversalGuiInput } from "./gui.js";
@@ -67,6 +67,7 @@ export interface CommandRiskContext {
   mode?: string;
   tty?: boolean;
   envProfile?: string;
+  elevationMode?: ElevationMode;
 }
 
 export interface ExecAuthorityBinding {
@@ -161,6 +162,7 @@ export function minimumAuthorityRisk(action: AuthorityActionDescriptor): Authori
         mode: optionalText(action.parameters?.mode),
         tty: action.parameters?.tty === true,
         envProfile: optionalText(action.parameters?.envProfile),
+        elevationMode: elevationModeValue(action.parameters?.elevationMode),
       });
     case "process":
       return processRisk(action.operation, action.parameters);
@@ -177,8 +179,8 @@ export function assertNoElevationCommand(command: string): void {
   if (containsElevationCommand(command)) {
     throw new UniversalBrokerError(
       "ELEVATION_BLOCKED",
-      "DevSpace user-account-only enforcement blocked a privilege-elevation command. Run higher-authority work manually outside DevSpace.",
-      { evidence: { commandSha256: sha256(command), policy: "user-account-only" } },
+      "DevSpace blocked an implicit privilege-elevation command. Set elevation.mode=prompt on a target whose elevationPolicy is prompt to request native user authorization.",
+      { evidence: { commandSha256: sha256(command), policy: "explicit-user-authorization", providerDispatchCount: 0 } },
     );
   }
 }
@@ -331,13 +333,14 @@ export function commandRisk(
   command: string,
   targetOrContext?: string | CommandRiskContext,
 ): AuthorityRiskClass {
-  assertNoElevationCommand(command);
   const context = typeof targetOrContext === "string"
     ? {
         targetId: targetOrContext,
         targetTransport: targetOrContext === "local" ? "local" as const : "ssh" as const,
       }
     : targetOrContext ?? {};
+  if (context.elevationMode === "prompt") return "R3";
+  assertNoElevationCommand(command);
   const parsed = parseLiteralShellCommands(command);
   if (parsed.unsafeDynamicExecution) return "R3";
   if (parsed.commands.some((tokens) => structuralCommandRisk(tokens) === "R3")) return "R3";
@@ -443,6 +446,10 @@ export function execAction(
       targetTransport: binding.targetTransport,
       targetPlatform: binding.targetPlatform,
       shellDialect: binding.shellDialect,
+      elevationMode: input.elevation?.mode ?? "none",
+      elevationScope: input.elevation?.scope ?? "operation",
+      elevationTimeoutMs: input.elevation?.timeoutMs,
+      elevationReasonSha256: input.elevation?.reason === undefined ? undefined : sha256(input.elevation.reason),
     }),
   };
 }
@@ -1052,6 +1059,10 @@ function authorityRiskValue(value: unknown): AuthorityRiskClass | undefined {
   return value === "R0" || value === "R1" || value === "R2" || value === "R3"
     ? value
     : undefined;
+}
+
+function elevationModeValue(value: unknown): ElevationMode | undefined {
+  return value === "none" || value === "prompt" ? value : undefined;
 }
 
 function transportValue(value: unknown): "local" | "ssh" | undefined {

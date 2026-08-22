@@ -222,7 +222,7 @@ const targetSchema = z.strictObject({
   user: singleLine(256).optional(),
   platform: z.enum(["macos", "linux", "windows", "unknown"]),
   defaultCwd: pathText.optional(),
-  elevationPolicy: singleLine(32),
+  elevationPolicy: z.enum(["deny", "prompt"]),
   capabilities: capabilitiesSchema.optional(),
 }).superRefine((target, context) => {
   if (target.transport === "ssh" && !target.host) {
@@ -545,11 +545,8 @@ function validateUnifiedReferences(config: UnifiedConfigDocument, configPath: st
     for (const alias of target.aliases ?? []) {
       registerSelector(targetSelectors, alias, target.targetId, "target", configPath);
     }
-    if (target.elevationPolicy !== "deny") {
-      throw new Error(
-        `Invalid unified configuration ${configPath}: target ${target.targetId} elevationPolicy must be deny`,
-      );
-    }
+    // Both policies are explicit. `prompt` only advertises intent; runtime capability
+    // remains unavailable until a verified user-authorization provider is installed.
   }
   for (const target of targets) {
     if (target.aliasOf && !targetIds.has(target.aliasOf)) {
@@ -626,6 +623,7 @@ function materializedTargetFile(targets: readonly UnifiedTargetConfig[]): Record
         ...(target.defaultCwd ?? endpointTarget.defaultCwd
           ? { defaultCwd: target.defaultCwd ?? endpointTarget.defaultCwd }
           : {}),
+        elevationPolicy: target.elevationPolicy ?? endpointTarget.elevationPolicy,
         ...(capabilities ? { capabilities: { ...capabilities } } : {}),
         gui: {
           mode: guiEnabled

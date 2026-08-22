@@ -692,8 +692,10 @@
           },
           "elevationPolicy": {
             "type": "string",
-            "minLength": 1,
-            "maxLength": 32
+            "enum": [
+              "deny",
+              "prompt"
+            ]
           },
           "capabilities": {
             "type": "object",

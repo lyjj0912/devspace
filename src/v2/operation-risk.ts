@@ -22,7 +22,7 @@ export function personalOperationRisk(
       if (operation === "remove" && record(input)?.disposition === "permanent") return "R3";
       return ["move", "remove", "sync"].includes(operation) ? "R2" : "R1";
     case "exec":
-      return "R2";
+      return record(record(input)?.elevation)?.mode === "prompt" ? "R3" : "R2";
     case "process":
       if (["poll", "wait", "list", "restart_status"].includes(operation)) return "R0";
       if (operation === "restart_broker") return "R3";

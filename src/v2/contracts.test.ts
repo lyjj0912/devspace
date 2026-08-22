@@ -199,10 +199,7 @@ test("common request metadata is strict and stays out of repeated tool argument 
   const fields = [
     "requestId",
     "transactionId",
-    "taskInstanceId",
-    "authorityId",
     "expectedSchemaGeneration",
-    "expectedAuthorityContractGeneration",
     "expectedTargetGeneration",
     "expectedRouteGeneration",
   ];
@@ -210,10 +207,7 @@ test("common request metadata is strict and stays out of repeated tool argument 
   assert.deepEqual(universalRequestMetaSchema.parse({
     requestId: "request-1",
     transactionId: "transaction-1",
-    taskInstanceId: "task-1",
-    authorityId: "authority-1",
     expectedSchemaGeneration: `sha256:${"a".repeat(64)}`,
-    expectedAuthorityContractGeneration: `sha256:${"b".repeat(64)}`,
     expectedTargetGeneration: "target-generation",
     expectedRouteGeneration: "route-generation",
   }).requestId, "request-1");
@@ -221,11 +215,7 @@ test("common request metadata is strict and stays out of repeated tool argument 
   for (const contract of Object.values(UNIVERSAL_TOOL_CONTRACTS)) {
     for (const field of [
       "requestId",
-      "transactionId",
-      "taskInstanceId",
-      "authorityId",
       "expectedSchemaGeneration",
-      "expectedAuthorityContractGeneration",
       "expectedTargetGeneration",
       "expectedRouteGeneration",
     ]) {
@@ -237,7 +227,6 @@ test("common request metadata is strict and stays out of repeated tool argument 
     operationId: "op-1",
     data: { value: true },
     observedSchemaGeneration: `sha256:${"a".repeat(64)}`,
-    observedAuthorityContractGeneration: `sha256:${"b".repeat(64)}`,
   }).success, true);
   assert.equal(universalResultEnvelopeSchema.safeParse({
     ok: true,
@@ -248,10 +237,10 @@ test("common request metadata is strict and stays out of repeated tool argument 
   }).success, false);
 });
 
-test("base profile capability manifest excludes unsupported conditional profiles", () => {
+test("personal profile capability manifest excludes unsupported conditional profiles", () => {
   const capabilities = buildCapabilityContract();
   assert.equal(capabilities.productProfile, BASE_PRODUCT_PROFILE);
-  assert.deepEqual(SUPPORTED_PRODUCT_PROFILES, ["BASE_SINGLE_OWNER"]);
+  assert.deepEqual(SUPPORTED_PRODUCT_PROFILES, [BASE_PRODUCT_PROFILE]);
   assert.equal(capabilities.resourceUriVersion, RESOURCE_URI_VERSION);
   assert.deepEqual(capabilities.supportedOperations, UNIVERSAL_TOOL_OPERATIONS);
   assert.doesNotMatch(
@@ -260,7 +249,7 @@ test("base profile capability manifest excludes unsupported conditional profiles
   );
 });
 
-test("contracts expose only user-account authority", async () => {
+test("contracts expose explicit prompt elevation without exposing credentials or an admin scope", async () => {
   assert.deepEqual(UNIVERSAL_OWNER_SCOPES, [
     "devspace.read",
     "devspace.write",
@@ -272,6 +261,22 @@ test("contracts expose only user-account authority", async () => {
   for (const contract of Object.values(UNIVERSAL_TOOL_CONTRACTS)) {
     assert.ok(!("privilege" in contract.inputSchema));
   }
+  const execInput = z.strictObject(UNIVERSAL_TOOL_CONTRACTS.exec.inputSchema);
+  assert.equal(execInput.safeParse({ command: "id", elevation: { mode: "none" } }).success, true);
+  assert.equal(execInput.safeParse({
+    command: "id",
+    elevation: {
+      mode: "prompt",
+      reason: "Read a protected task-owned fixture",
+      scope: "operation",
+      timeoutMs: 120_000,
+    },
+  }).success, true);
+  assert.equal(execInput.safeParse({ command: "id", elevation: { mode: "prompt" } }).success, false);
+  assert.equal(execInput.safeParse({
+    command: "id",
+    elevation: { mode: "none", reason: "unexpected" },
+  }).success, false);
   assert.deepEqual(Object.keys(UNIVERSAL_TOOL_CONTRACTS.gui.inputSchema), [
     "operation",
     "target",
@@ -289,7 +294,7 @@ test("contracts expose only user-account authority", async () => {
     "../../contracts/errors.schema.json",
   ]) {
     const source = await readFile(new URL(path, import.meta.url), "utf8");
-    assert.doesNotMatch(source, /devspace\.admin|ADMIN_UNAVAILABLE|["']privilege["']/u, path);
+    assert.doesNotMatch(source, /devspace\.admin|ADMIN_UNAVAILABLE|["']privilege["']|passwordMaterial/u, path);
   }
 });
 

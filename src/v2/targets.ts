@@ -6,6 +6,8 @@ import { promisify } from "node:util";
 import * as z from "zod/v4";
 import { requireCapabilityCallContext, type CapabilityCallContext } from "./capability-call-context.js";
 import type { SignedSnapshotCursorStore } from "./cursor-capability.js";
+import type { ElevationPolicy } from "./contracts.js";
+import { configuredElevationCapability } from "./elevation.js";
 import { UniversalBrokerError } from "./errors.js";
 import { macosUserOnlyProfile, windowsIntegrityIsElevated, windowsNonElevatedPrelude } from "./no-elevation.js";
 
@@ -52,6 +54,7 @@ export interface TargetDefinition {
   shell: "auto" | "sh" | "bash" | "zsh" | "powershell" | "cmd";
   defaultCwd?: string;
   envProfile?: string;
+  elevationPolicy: ElevationPolicy;
   probeTtlMs: number;
   durableProcess: {
     mode: "none" | "tmux" | "systemd-run" | "launchd" | "task-scheduler";
@@ -123,6 +126,7 @@ const targetSchema = z.strictObject({
   shell: z.enum(["auto", "sh", "bash", "zsh", "powershell", "cmd"]).optional(),
   defaultCwd: z.string().min(1).optional(),
   envProfile: z.string().min(1).optional(),
+  elevationPolicy: z.enum(["deny", "prompt"]).optional(),
   probeTtlMs: z.number().int().min(1_000).max(3_600_000).optional(),
   durableProcess: z.strictObject({
     mode: z.enum(["none", "tmux", "systemd-run", "launchd", "task-scheduler"]),
@@ -712,6 +716,7 @@ function normalizeTargets(
         shell: target.shell ?? "auto",
         defaultCwd: target.defaultCwd,
         envProfile: target.envProfile,
+        elevationPolicy: target.elevationPolicy ?? "deny",
         probeTtlMs: target.probeTtlMs ?? DEFAULT_PROBE_TTL_MS,
         durableProcess,
         gui,
@@ -767,6 +772,7 @@ function defaultLocalTarget(): TargetDefinition {
     expectedHostname: hostname(),
     platform: currentPlatform(),
     shell: "auto",
+    elevationPolicy: "deny",
     probeTtlMs: DEFAULT_PROBE_TTL_MS,
     durableProcess: { mode: "none" },
     gui: { mode: "none" },
@@ -805,6 +811,7 @@ export function targetSummary(target: TargetDefinition): Record<string, unknown>
     platform: target.platform,
     guiMode: target.gui.mode,
     durableProcessMode: target.durableProcess.mode,
+    elevation: configuredElevationCapability(target.elevationPolicy, target.platform),
     capabilities: {
       ...target.configuredCapabilities,
       filesystem: unavailableFilesystemPrimitives(),

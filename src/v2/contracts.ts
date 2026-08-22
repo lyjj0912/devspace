@@ -18,6 +18,22 @@ export type UniversalToolName = (typeof UNIVERSAL_TOOL_NAMES)[number];
 export const UNIVERSAL_AUTHORITY_RISKS = ["R0", "R1", "R2", "R3"] as const;
 export type AuthorityRiskClass = (typeof UNIVERSAL_AUTHORITY_RISKS)[number];
 
+export const UNIVERSAL_ELEVATION_MODES = ["none", "prompt"] as const;
+export type ElevationMode = (typeof UNIVERSAL_ELEVATION_MODES)[number];
+export const UNIVERSAL_ELEVATION_POLICIES = ["deny", "prompt"] as const;
+export type ElevationPolicy = (typeof UNIVERSAL_ELEVATION_POLICIES)[number];
+export const UNIVERSAL_AUTHORIZATION_STATES = [
+  "NOT_REQUIRED",
+  "PENDING",
+  "APPROVED",
+  "DENIED",
+  "CANCELED",
+  "TIMED_OUT",
+  "EXPIRED",
+  "RESULT_UNKNOWN",
+] as const;
+export type AuthorizationState = (typeof UNIVERSAL_AUTHORIZATION_STATES)[number];
+
 export const UNIVERSAL_TOOL_OPERATIONS = {
   target: ["list", "resolve", "probe"],
   context: ["open", "search", "diff", "close"],
@@ -101,7 +117,12 @@ export const UNIVERSAL_ERROR_CODES = [
   "GUI_GENERATION_MISMATCH",
   "SCHEMA_STALE",
   "ELEVATION_BLOCKED",
+  "ELEVATION_REQUIRED",
   "ELEVATION_DENIED",
+  "ELEVATION_CANCELED",
+  "ELEVATION_TIMED_OUT",
+  "ELEVATION_UNAVAILABLE",
+  "ELEVATION_RESULT_UNKNOWN",
   "SYNC_PLAN_STALE",
   "SYNC_CONFLICT",
   "RESTART_ACK_NOT_FLUSHED",
@@ -146,8 +167,8 @@ export const UNIVERSAL_BROKER_INSTRUCTIONS = [
   "Resolve named machines and environments with target instead of guessing identifiers.",
   "Use context only for project instructions, Git state, and a default target/path; it is not a security boundary.",
   "Use fs for local or remote files, exec plus process for commands, mcp for arbitrary configured MCP servers, artifact for file exchange, and gui only for operating-system UI that has no better protocol.",
-  "DevSpace never installs, injects, or reuses privilege-elevation credentials. Commands and file operations run only as the configured target user; any operating-system authorization must be approved directly by the user outside DevSpace.",
-  "DevSpace blocks privilege-elevation commands at validation and execution boundaries. Privileged work is manual and outside DevSpace.",
+  "DevSpace runs ordinary work with the configured user account and never asks the model for an operating-system password or stores authorization secrets.",
+  "When a target explicitly permits prompt elevation, DevSpace may request a native operating-system authorization UI and must bind that approval to one exact operation; unapproved or implicit elevation remains blocked.",
   "Do not automatically replay a mutation when its dispatch state is unknown; read back its result first.",
   "Large results are returned through resource handles rather than repeated in tool text.",
 ].join(" ");
@@ -367,6 +388,24 @@ const fsContract = {
   },
 } satisfies UniversalToolContract;
 
+const executionElevationInputSchema = z.strictObject({
+  mode: z.enum(UNIVERSAL_ELEVATION_MODES),
+  reason: z.string().min(1).max(2_000).optional(),
+  scope: z.literal("operation").optional(),
+  timeoutMs: z.number().int().min(1_000).max(120_000).optional(),
+}).superRefine((elevation, context) => {
+  if (elevation.mode === "prompt" && !elevation.reason?.trim()) {
+    context.addIssue({ code: "custom", path: ["reason"], message: "prompt elevation requires a reason" });
+  }
+  if (elevation.mode === "none") {
+    for (const field of ["reason", "scope", "timeoutMs"] as const) {
+      if (elevation[field] !== undefined) {
+        context.addIssue({ code: "custom", path: [field], message: "none elevation accepts only mode" });
+      }
+    }
+  }
+});
+
 const execContract = {
   title: "Execute",
   description: "Run a command.",
@@ -381,6 +420,7 @@ const execContract = {
     maxOutputChars: z.number().int().min(1).max(1_000_000).optional(),
     envProfile: z.string().min(1).optional(),
     durable: z.boolean().optional(),
+    elevation: executionElevationInputSchema.optional(),
   },
   annotations: {
     readOnlyHint: false,

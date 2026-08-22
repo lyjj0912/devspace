@@ -181,7 +181,7 @@ test("target registry validates SSH prerequisites and offline probes are cached"
   assert.equal(calls, 1);
 });
 
-test("target registry rejects legacy elevation fields and modes", async (t) => {
+test("target registry accepts explicit elevation policy and rejects legacy elevation fields", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "devspace-v2-targets-authority-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));
   const configPath = join(root, "targets.json");
@@ -192,9 +192,27 @@ test("target registry rejects legacy elevation fields and modes", async (t) => {
     platform: "linux",
   };
 
+  await writeFile(configPath, JSON.stringify({
+    version: 1,
+    targets: { remote: { ...target, elevationPolicy: "prompt" } },
+  }));
+  const explicit = await new TargetRegistry({ configPath }).inspect();
+  const remote = explicit.targets.find((entry) => entry.id === "remote");
+  assert.equal(remote?.elevationPolicy, "prompt");
+  assert.deepEqual((await new TargetRegistry({ configPath }).list()).targets
+    .find((entry) => entry.targetId === "remote")?.elevation, {
+    policy: "prompt",
+    configured: true,
+    requiresUserInteraction: true,
+    mechanism: "linux-polkit",
+    available: false,
+    reason: "A user-authorized execution provider has not been verified for this target.",
+  });
+
   for (const forbidden of [
     { ...target, privilege: "admin" },
     { ...target, helper: { mode: "sudo-n" } },
+    { ...target, elevationPolicy: "sudo" },
   ]) {
     await writeFile(configPath, JSON.stringify({ version: 1, targets: { remote: forbidden } }));
     await assert.rejects(

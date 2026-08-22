@@ -241,7 +241,12 @@
                   "GUI_GENERATION_MISMATCH",
                   "SCHEMA_STALE",
                   "ELEVATION_BLOCKED",
+                  "ELEVATION_REQUIRED",
                   "ELEVATION_DENIED",
+                  "ELEVATION_CANCELED",
+                  "ELEVATION_TIMED_OUT",
+                  "ELEVATION_UNAVAILABLE",
+                  "ELEVATION_RESULT_UNKNOWN",
                   "SYNC_PLAN_STALE",
                   "SYNC_CONFLICT",
                   "RESTART_ACK_NOT_FLUSHED",
@@ -739,6 +744,36 @@
                   },
                   "durable": {
                     "type": "boolean"
+                  },
+                  "elevation": {
+                    "type": "object",
+                    "properties": {
+                      "mode": {
+                        "type": "string",
+                        "enum": [
+                          "none",
+                          "prompt"
+                        ]
+                      },
+                      "reason": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 2000
+                      },
+                      "scope": {
+                        "type": "string",
+                        "const": "operation"
+                      },
+                      "timeoutMs": {
+                        "type": "integer",
+                        "minimum": 1000,
+                        "maximum": 120000
+                      }
+                    },
+                    "required": [
+                      "mode"
+                    ],
+                    "additionalProperties": false
                   }
                 },
                 "required": [

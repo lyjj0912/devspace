@@ -2753,6 +2753,20 @@ test("R0 actions cannot be wrapped in authority and elevation commands fail clos
   assert.doesNotThrow(() => assertNoElevationCommand("printf \"sudo id\""));
   assert.doesNotThrow(() => assertNoElevationCommand("printf 'sudo id'"));
   assert.doesNotThrow(() => assertNoElevationCommand("printf '$(sudo id)'"));
+  assert.equal(commandRisk("sudo -n id", {
+    targetId: "local",
+    targetTransport: "local",
+    targetPlatform: "macos",
+    shellDialect: "zsh",
+    elevationMode: "prompt",
+  }), "R3");
+  assert.equal(commandRisk("git status --short", {
+    targetId: "local",
+    targetTransport: "local",
+    targetPlatform: "macos",
+    shellDialect: "zsh",
+    elevationMode: "prompt",
+  }), "R3");
   assert.equal(commandRisk("git status --short", "local"), "R0");
   assert.equal(commandRisk("git branch new-name", "local"), "R2");
   assert.equal(commandRisk("git diff --output=file", "local"), "R2");

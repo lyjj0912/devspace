@@ -53,6 +53,8 @@ test("personal OAuth-scoped fs, exec, and process mutations dispatch directly wi
     effectiveCwd: root,
     mode: "foreground",
     tty: false,
+    elevationMode: "none",
+    elevationPolicy: "deny",
     classifierGeneration: "sha256:" + "1".repeat(64),
     launchRisk: "R3",
   };

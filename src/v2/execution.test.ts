@@ -71,6 +71,85 @@ test("exec auto returns a completed local result and preserves resource output",
   assert.equal(resource.nextOffset, undefined);
 });
 
+
+test("exec separates implicit elevation denial from explicit prompt-provider availability before spawn", async (t) => {
+  let deniedSpawnCalls = 0;
+  const denied = await createFixture(t, {
+    spawnProcess: (() => {
+      deniedSpawnCalls += 1;
+      throw new Error("elevation denial must happen before spawn");
+    }) as NonNullable<ExecutionPlaneOptions["spawnProcess"]>,
+  });
+
+  await assert.rejects(
+    denied.execution.execute({
+      target: "local",
+      cwd: denied.root,
+      command: "sudo -n id",
+    }),
+    (error: unknown) => error instanceof UniversalBrokerError
+      && error.code === "ELEVATION_BLOCKED"
+      && error.evidence?.providerDispatchCount === 0,
+  );
+  await assert.rejects(
+    denied.execution.execute({
+      target: "local",
+      cwd: denied.root,
+      command: "id",
+      elevation: {
+        mode: "prompt",
+        reason: "Read a protected task-owned fixture",
+      },
+    }),
+    (error: unknown) => error instanceof UniversalBrokerError
+      && error.code === "ELEVATION_UNAVAILABLE"
+      && error.evidence?.elevationPolicy === "deny"
+      && error.evidence?.providerDispatchCount === 0,
+  );
+  assert.equal(deniedSpawnCalls, 0);
+  assert.equal(denied.execution.stats().processes, 0);
+
+  let promptSpawnCalls = 0;
+  const prompt = await createFixture(t, {
+    localElevationPolicy: "prompt",
+    spawnProcess: (() => {
+      promptSpawnCalls += 1;
+      throw new Error("unverified prompt provider must not spawn");
+    }) as NonNullable<ExecutionPlaneOptions["spawnProcess"]>,
+  });
+  const input = {
+    target: "local",
+    cwd: prompt.root,
+    command: "id",
+    elevation: {
+      mode: "prompt" as const,
+      reason: "Read a protected task-owned fixture",
+      scope: "operation" as const,
+      timeoutMs: 120_000,
+    },
+  };
+  const target = await prompt.targets.resolveWithGeneration("local");
+  const binding = await prompt.execution.prepareExecutionBinding(
+    input,
+    target.target,
+    target.generation,
+  );
+  assert.equal(binding.elevationMode, "prompt");
+  assert.equal(binding.elevationPolicy, "prompt");
+  assert.equal(binding.launchRisk, "R3");
+
+  await assert.rejects(
+    prompt.execution.execute(input, binding),
+    (error: unknown) => error instanceof UniversalBrokerError
+      && error.code === "ELEVATION_UNAVAILABLE"
+      && error.evidence?.elevationMode === "prompt"
+      && error.evidence?.providerDispatchCount === 0
+      && typeof error.evidence?.reasonSha256 === "string",
+  );
+  assert.equal(promptSpawnCalls, 0);
+  assert.equal(prompt.execution.stats().processes, 0);
+});
+
 test("exec background converts to a managed process and process wait returns output", async (t) => {
   const fixture = await createFixture(t);
   const started = await fixture.execution.execute({
@@ -1118,6 +1197,8 @@ test("exec rejects a changed target binding before process creation or spawn", a
     effectiveCwd: fixture.root,
     mode: "auto" as const,
     tty: false,
+    elevationMode: "none" as const,
+    elevationPolicy: "deny" as const,
     classifierGeneration: EXEC_RISK_CLASSIFIER_GENERATION,
     launchRisk: "R1" as const,
   };
@@ -1334,6 +1415,7 @@ async function createFixture(
   overrides: Partial<{
     maxProcessRecords: number;
     maxRunningProcesses: number;
+    localElevationPolicy: "deny" | "prompt";
     processBufferCharacters: number;
     processOutputMaxBytes: number;
     completedProcessTtlMs: number;
@@ -1397,6 +1479,7 @@ async function createFixture(
         platform: "macos",
         shell: "zsh",
         defaultCwd: root,
+        elevationPolicy: overrides.localElevationPolicy ?? "deny",
         ...(overrides.durableAdapter
           ? {
               capabilities: { durableProcess: true },
