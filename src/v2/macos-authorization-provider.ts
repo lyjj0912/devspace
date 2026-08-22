@@ -35,6 +35,9 @@ export interface MacOsAuthorizationProviderOptions {
   agentSha256: string;
   helperPath: string;
   helperSha256: string;
+  approvalAppPath?: string;
+  approvalAppExecutablePath?: string;
+  approvalAppSha256?: string;
   workRoot: string;
   expectedUid?: number;
   spawnProcess?: typeof spawn;
@@ -55,6 +58,9 @@ export class MacOsAuthorizationProvider implements UserAuthorizationProvider {
   private readonly workRoot: string;
   private readonly agentSha256: string;
   private readonly helperSha256: string;
+  private readonly approvalAppPath?: string;
+  private readonly approvalAppExecutablePath?: string;
+  private readonly approvalAppSha256?: string;
   private readonly expectedUid: number;
   private readonly spawnProcess: typeof spawn;
   private readonly verifyCodeSignature: (path: string) => void;
@@ -69,6 +75,24 @@ export class MacOsAuthorizationProvider implements UserAuthorizationProvider {
     this.workRoot = requireCanonicalAbsoluteParent(options.workRoot, "workRoot");
     this.agentSha256 = requireDigest(options.agentSha256, "agentSha256");
     this.helperSha256 = requireDigest(options.helperSha256, "helperSha256");
+    const approvalValues = [
+      options.approvalAppPath,
+      options.approvalAppExecutablePath,
+      options.approvalAppSha256,
+    ];
+    if (approvalValues.some((value) => value !== undefined)
+        && approvalValues.some((value) => value === undefined)) {
+      throw unavailable("approval app path, executable path, and SHA-256 must be configured together.");
+    }
+    this.approvalAppPath = options.approvalAppPath
+      ? requireCanonicalAbsolute(options.approvalAppPath, "approvalAppPath")
+      : undefined;
+    this.approvalAppExecutablePath = options.approvalAppExecutablePath
+      ? requireCanonicalAbsolute(options.approvalAppExecutablePath, "approvalAppExecutablePath")
+      : undefined;
+    this.approvalAppSha256 = options.approvalAppSha256
+      ? requireDigest(options.approvalAppSha256, "approvalAppSha256")
+      : undefined;
     this.expectedUid = options.expectedUid ?? process.getuid?.() ?? -1;
     if (!Number.isSafeInteger(this.expectedUid) || this.expectedUid < 1) {
       throw unavailable("macOS authorization provider requires a non-root user UID.");
@@ -82,6 +106,9 @@ export class MacOsAuthorizationProvider implements UserAuthorizationProvider {
       agentSha256: this.agentSha256,
       helperPath: this.helperPath,
       helperSha256: this.helperSha256,
+      approvalAppPath: this.approvalAppPath,
+      approvalAppExecutablePath: this.approvalAppExecutablePath,
+      approvalAppSha256: this.approvalAppSha256,
       expectedUid: this.expectedUid,
     });
   }
@@ -98,6 +125,13 @@ export class MacOsAuthorizationProvider implements UserAuthorizationProvider {
     try {
       await this.verifyExecutable(this.agentPath, this.agentSha256, "approval agent");
       await this.verifyExecutable(this.helperPath, this.helperSha256, "privileged helper");
+      if (this.approvalAppPath && this.approvalAppExecutablePath && this.approvalAppSha256) {
+        await this.verifyApplicationBundle(
+          this.approvalAppPath,
+          this.approvalAppExecutablePath,
+          this.approvalAppSha256,
+        );
+      }
       await mkdir(this.workRoot, { recursive: true, mode: 0o700 });
       await chmod(this.workRoot, 0o700);
       const workState = await lstat(this.workRoot);
@@ -144,6 +178,13 @@ export class MacOsAuthorizationProvider implements UserAuthorizationProvider {
     const nonce = randomUUID();
     const prompt = boundedPrompt(request);
     const child = this.spawnProcess(this.agentPath, [
+      ...(this.approvalAppPath && this.approvalAppExecutablePath && this.approvalAppSha256
+        ? [
+          "--approval-app", this.approvalAppPath,
+          "--approval-app-executable", this.approvalAppExecutablePath,
+          "--approval-app-sha256", this.approvalAppSha256,
+        ]
+        : []),
       "--helper", this.helperPath,
       "--helper-sha256", this.helperSha256,
       "--descriptor-digest", request.descriptor.descriptorDigest,
@@ -287,6 +328,36 @@ export class MacOsAuthorizationProvider implements UserAuthorizationProvider {
     }
     if (await fileDigest(canonical) !== expectedSha256) throw new Error(`${label} digest changed`);
     this.verifyCodeSignature(canonical);
+  }
+
+  private async verifyApplicationBundle(
+    appPath: string,
+    executablePath: string,
+    expectedSha256: string,
+  ): Promise<void> {
+    const canonicalApp = await realpath(appPath);
+    if (canonicalApp !== appPath) throw new Error("approval app path changed through canonicalization");
+    const appState = await lstat(canonicalApp);
+    if (!appState.isDirectory() || appState.isSymbolicLink()
+        || appState.uid !== this.expectedUid || (appState.mode & 0o022) !== 0) {
+      throw new Error("approval app identity or mode is invalid");
+    }
+    const canonicalExecutable = await requireCanonicalOwnedPath(
+      executablePath,
+      this.expectedUid,
+      "approval app executable",
+    );
+    if (!canonicalExecutable.startsWith(`${canonicalApp}/Contents/MacOS/`)) {
+      throw new Error("approval app executable is outside the pinned bundle");
+    }
+    const state = await lstat(canonicalExecutable);
+    if ((state.mode & 0o100) === 0 || (state.mode & 0o022) !== 0) {
+      throw new Error("approval app executable mode is unsafe");
+    }
+    if (await fileDigest(canonicalExecutable) !== expectedSha256) {
+      throw new Error("approval app executable digest changed");
+    }
+    this.verifyCodeSignature(canonicalApp);
   }
 
   private unavailableCapability(reason: string): UserAuthorizationProviderCapability {

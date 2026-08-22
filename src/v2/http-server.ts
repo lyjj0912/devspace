@@ -307,6 +307,9 @@ export function createUniversalBrokerNextServer(
         agentSha256: config.macosAuthorization.agentSha256,
         helperPath: config.macosAuthorization.helperPath,
         helperSha256: config.macosAuthorization.helperSha256,
+        approvalAppPath: config.macosAuthorization.approvalAppPath,
+        approvalAppExecutablePath: config.macosAuthorization.approvalAppExecutablePath,
+        approvalAppSha256: config.macosAuthorization.approvalAppSha256,
         workRoot: config.macosAuthorization.workRoot,
       })
     : undefined;

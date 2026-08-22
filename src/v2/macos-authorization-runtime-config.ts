@@ -9,6 +9,9 @@ export interface MacOsAuthorizationRuntimeConfig {
   agentSha256: string;
   helperPath: string;
   helperSha256: string;
+  approvalAppPath: string;
+  approvalAppExecutablePath: string;
+  approvalAppSha256: string;
   workRoot: string;
 }
 
@@ -35,6 +38,9 @@ export function loadUserAuthorizationRuntimeConfiguration(
     "DEVSPACE_NEXT_MACOS_AUTHORIZATION_AGENT_SHA256",
     "DEVSPACE_NEXT_MACOS_PRIVILEGED_HELPER",
     "DEVSPACE_NEXT_MACOS_PRIVILEGED_HELPER_SHA256",
+    "DEVSPACE_NEXT_MACOS_APPROVAL_APP",
+    "DEVSPACE_NEXT_MACOS_APPROVAL_APP_EXECUTABLE",
+    "DEVSPACE_NEXT_MACOS_APPROVAL_APP_SHA256",
     "DEVSPACE_NEXT_MACOS_AUTHORIZATION_WORK_ROOT",
   ] as const;
   const configured = names.filter((name) => Boolean(environment[name]?.trim()));
@@ -69,6 +75,18 @@ export function loadUserAuthorizationRuntimeConfiguration(
       helperSha256: digest(
         environment.DEVSPACE_NEXT_MACOS_PRIVILEGED_HELPER_SHA256!,
         "DEVSPACE_NEXT_MACOS_PRIVILEGED_HELPER_SHA256",
+      ),
+      approvalAppPath: absolutePath(
+        environment.DEVSPACE_NEXT_MACOS_APPROVAL_APP!,
+        "DEVSPACE_NEXT_MACOS_APPROVAL_APP",
+      ),
+      approvalAppExecutablePath: absolutePath(
+        environment.DEVSPACE_NEXT_MACOS_APPROVAL_APP_EXECUTABLE!,
+        "DEVSPACE_NEXT_MACOS_APPROVAL_APP_EXECUTABLE",
+      ),
+      approvalAppSha256: digest(
+        environment.DEVSPACE_NEXT_MACOS_APPROVAL_APP_SHA256!,
+        "DEVSPACE_NEXT_MACOS_APPROVAL_APP_SHA256",
       ),
       workRoot: absolutePath(
         environment.DEVSPACE_NEXT_MACOS_AUTHORIZATION_WORK_ROOT!,
