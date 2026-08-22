@@ -29,6 +29,12 @@ try {
   ], { encoding: "utf8", timeout: 10_000 });
   assert.equal(selfTest.status, 0, `${selfTest.stdout}\n${selfTest.stderr}`);
   assert.match(selfTest.stdout, /DEVSPACE_AUTHORIZATION_SELF_TEST\tPASS/u);
+  const approvalSource = await readFile(join(sourceRoot, "devspace-approval-agent.c"), "utf8");
+  assert.match(
+    approvalSource,
+    /kAuthorizationRightExecute,[\s\S]*strlen\(canonical_helper\),[\s\S]*canonical_helper/u,
+    "execute right is not bound to the exact helper path",
+  );
   const nonRoot = spawnSync(helper, [], { encoding: "utf8", timeout: 10_000 });
   assert.equal(nonRoot.status, 77);
   assert.match(nonRoot.stderr, /requires effective uid 0/u);

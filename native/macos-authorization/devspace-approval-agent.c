@@ -1,8 +1,36 @@
 #include "devspace-auth-common.h"
+#import <AppKit/AppKit.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <Security/Authorization.h>
 #include <Security/AuthorizationTags.h>
 #include <poll.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+
+static int connect_relay_socket(const char *path) {
+  if (path == NULL) return 0;
+  if (path[0] != '/' || strchr(path, '\n') != NULL || strchr(path, '\r') != NULL) return 64;
+  struct sockaddr_un address;
+  memset(&address, 0, sizeof(address));
+  address.sun_family = AF_UNIX;
+  size_t length = strlen(path);
+  if (length >= sizeof(address.sun_path)) return 64;
+  memcpy(address.sun_path, path, length + 1);
+  int descriptor = socket(AF_UNIX, SOCK_STREAM, 0);
+  if (descriptor < 0) return 69;
+  if (connect(descriptor, (struct sockaddr *)&address, sizeof(address)) != 0) {
+    close(descriptor);
+    return 69;
+  }
+  if (dup2(descriptor, STDIN_FILENO) < 0
+      || dup2(descriptor, STDOUT_FILENO) < 0
+      || dup2(descriptor, STDERR_FILENO) < 0) {
+    close(descriptor);
+    return 69;
+  }
+  if (descriptor > STDERR_FILENO) close(descriptor);
+  return 0;
+}
 
 static const char *authorization_state(OSStatus status) {
   if (status == errAuthorizationCanceled) return "CANCELED";
@@ -36,7 +64,10 @@ static int self_test(const char *helper, const char *helper_digest) {
   return 0;
 }
 
-int main(int argc, char *argv[]) {
+static int devspace_authorization_main(int argc, char *argv[]) {
+  const char *relay_socket = devspace_argument(argc, argv, "--relay-socket");
+  int relay_status = connect_relay_socket(relay_socket);
+  if (relay_status != 0) return relay_status;
   const char *helper = devspace_argument(argc, argv, "--helper");
   const char *helper_digest = devspace_argument(argc, argv, "--helper-sha256");
   if (helper == NULL || !devspace_safe_digest(helper_digest)) {
@@ -74,11 +105,17 @@ int main(int argc, char *argv[]) {
     &authorization
   );
   if (status != errAuthorizationSuccess || authorization == NULL) {
+    fprintf(stderr, "authorization_create_status=%d\n", (int)status);
     devspace_emit_result("RESULT_UNKNOWN", descriptor_digest, NULL);
     return 69;
   }
 
-  AuthorizationItem right = { kAuthorizationRightExecute, 0, NULL, 0 };
+  AuthorizationItem right = {
+    kAuthorizationRightExecute,
+    (UInt32)strlen(canonical_helper),
+    canonical_helper,
+    0
+  };
   AuthorizationRights rights = { 1, &right };
   AuthorizationItem environment_item = {
     kAuthorizationEnvironmentPrompt,
@@ -92,6 +129,7 @@ int main(int argc, char *argv[]) {
     | kAuthorizationFlagPreAuthorize;
   status = AuthorizationCopyRights(authorization, &rights, &environment, flags, NULL);
   if (status != errAuthorizationSuccess) {
+    fprintf(stderr, "authorization_copy_rights_status=%d\n", (int)status);
     devspace_emit_result(authorization_state(status), descriptor_digest, NULL);
     AuthorizationFree(authorization, kAuthorizationFlagDestroyRights);
     return status == errAuthorizationCanceled || status == errAuthorizationDenied ? 77 : 69;
@@ -181,4 +219,13 @@ int main(int argc, char *argv[]) {
   fclose(communications);
   AuthorizationFree(authorization, kAuthorizationFlagDestroyRights);
   return helper_exit;
+}
+
+int main(int argc, char *argv[]) {
+  @autoreleasepool {
+    NSApplication *application = [NSApplication sharedApplication];
+    [application setActivationPolicy:NSApplicationActivationPolicyAccessory];
+    [application activateIgnoringOtherApps:YES];
+    return devspace_authorization_main(argc, argv);
+  }
 }

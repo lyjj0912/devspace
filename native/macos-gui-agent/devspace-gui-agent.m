@@ -245,6 +245,18 @@ static BOOL parseInteger(const char *value, NSInteger minimum, NSInteger maximum
   return YES;
 }
 
+static BOOL parseDouble(const char *value, double minimum, double maximum, double *output) {
+  if (value == NULL || *value == '\0') return NO;
+  char *end = NULL;
+  double parsed = strtod(value, &end);
+  if (end == value || *end != '\0' || !isfinite(parsed)
+      || parsed < minimum || parsed > maximum) {
+    return NO;
+  }
+  *output = parsed;
+  return YES;
+}
+
 static CGEventFlags flagsFromModifiers(NSString *value) {
   CGEventFlags flags = 0;
   for (NSString *modifier in [value componentsSeparatedByString:@","]) {
@@ -296,6 +308,217 @@ static BOOL postKeyCode(CGKeyCode keyCode, CGEventFlags flags) {
   CFRelease(down);
   CFRelease(up);
   return YES;
+}
+
+static BOOL insertTextIntoFocusedElement(pid_t pid, NSString *text) {
+  if (pid <= 0 || text == nil || text.length > 1024) return NO;
+  AXUIElementRef application = AXUIElementCreateApplication(pid);
+  if (application == NULL) return NO;
+  CFTypeRef focusedValue = NULL;
+  AXError focusedStatus = AXUIElementCopyAttributeValue(
+    application,
+    kAXFocusedUIElementAttribute,
+    &focusedValue
+  );
+  CFRelease(application);
+  if (focusedStatus != kAXErrorSuccess || focusedValue == NULL
+      || CFGetTypeID(focusedValue) != AXUIElementGetTypeID()) {
+    if (focusedValue != NULL) CFRelease(focusedValue);
+    return NO;
+  }
+  AXUIElementRef focused = (AXUIElementRef)focusedValue;
+  id currentValue = copyAttribute(focused, kAXValueAttribute);
+  if (![currentValue isKindOfClass:[NSString class]]) {
+    CFRelease(focused);
+    return NO;
+  }
+  NSString *source = currentValue;
+  NSRange selected = NSMakeRange(source.length, 0);
+  id selectedValue = copyAttribute(focused, kAXSelectedTextRangeAttribute);
+  if (selectedValue != nil
+      && CFGetTypeID((__bridge CFTypeRef)selectedValue) == AXValueGetTypeID()) {
+    CFRange range = CFRangeMake((CFIndex)source.length, 0);
+    if (AXValueGetValue((__bridge AXValueRef)selectedValue, kAXValueCFRangeType, &range)
+        && range.location >= 0 && range.length >= 0
+        && (NSUInteger)range.location <= source.length
+        && (NSUInteger)range.length <= source.length - (NSUInteger)range.location) {
+      selected = NSMakeRange((NSUInteger)range.location, (NSUInteger)range.length);
+    }
+  }
+  NSString *updated = [source stringByReplacingCharactersInRange:selected withString:text];
+  AXError setStatus = AXUIElementSetAttributeValue(
+    focused,
+    kAXValueAttribute,
+    (__bridge CFTypeRef)updated
+  );
+  BOOL verified = NO;
+  if (setStatus == kAXErrorSuccess) {
+    id observed = copyAttribute(focused, kAXValueAttribute);
+    verified = [observed isKindOfClass:[NSString class]] && [observed isEqualToString:updated];
+  }
+  CFRelease(focused);
+  return verified;
+}
+
+static BOOL focusedWindowFrameForPid(pid_t pid, CGRect *frameOut) {
+  if (pid <= 0 || frameOut == NULL) return NO;
+  AXUIElementRef application = AXUIElementCreateApplication(pid);
+  if (application == NULL) return NO;
+  AXUIElementRef window = focusedWindow(application);
+  CFRelease(application);
+  if (window == NULL) return NO;
+  id positionValue = copyAttribute(window, kAXPositionAttribute);
+  id sizeValue = copyAttribute(window, kAXSizeAttribute);
+  CGPoint position = CGPointZero;
+  CGSize size = CGSizeZero;
+  BOOL valid = positionValue != nil && sizeValue != nil
+    && CFGetTypeID((__bridge CFTypeRef)positionValue) == AXValueGetTypeID()
+    && CFGetTypeID((__bridge CFTypeRef)sizeValue) == AXValueGetTypeID()
+    && AXValueGetValue((__bridge AXValueRef)positionValue, kAXValueCGPointType, &position)
+    && AXValueGetValue((__bridge AXValueRef)sizeValue, kAXValueCGSizeType, &size)
+    && size.width > 0 && size.height > 0;
+  CFRelease(window);
+  if (!valid) return NO;
+  *frameOut = CGRectMake(position.x, position.y, size.width, size.height);
+  return YES;
+}
+
+static BOOL activateApplicationPid(pid_t pid) {
+  NSRunningApplication *application = [NSRunningApplication runningApplicationWithProcessIdentifier:pid];
+  if (application == nil || application.terminated) return NO;
+  if (!application.active && ![application activateWithOptions:NSApplicationActivateAllWindows]) return NO;
+  [NSThread sleepForTimeInterval:0.08];
+  return !application.terminated;
+}
+
+static BOOL pointInsideFocusedWindow(pid_t pid, CGPoint point) {
+  CGRect frame = CGRectZero;
+  return focusedWindowFrameForPid(pid, &frame) && CGRectContainsPoint(frame, point);
+}
+
+static BOOL postMouseClick(pid_t pid, CGPoint point, NSInteger clickCount, NSString *buttonName) {
+  if (!activateApplicationPid(pid) || !pointInsideFocusedWindow(pid, point)) return NO;
+  CGMouseButton button = kCGMouseButtonLeft;
+  CGEventType downType = kCGEventLeftMouseDown;
+  CGEventType upType = kCGEventLeftMouseUp;
+  if ([buttonName isEqualToString:@"right"]) {
+    button = kCGMouseButtonRight;
+    downType = kCGEventRightMouseDown;
+    upType = kCGEventRightMouseUp;
+  } else if ([buttonName isEqualToString:@"middle"]) {
+    button = kCGMouseButtonCenter;
+    downType = kCGEventOtherMouseDown;
+    upType = kCGEventOtherMouseUp;
+  } else if (![buttonName isEqualToString:@"left"]) {
+    return NO;
+  }
+  CGEventRef move = CGEventCreateMouseEvent(NULL, kCGEventMouseMoved, point, button);
+  if (move == NULL) return NO;
+  CGEventPost(kCGHIDEventTap, move);
+  CFRelease(move);
+  for (NSInteger index = 1; index <= clickCount; index += 1) {
+    CGEventRef down = CGEventCreateMouseEvent(NULL, downType, point, button);
+    CGEventRef up = CGEventCreateMouseEvent(NULL, upType, point, button);
+    if (down == NULL || up == NULL) {
+      if (down != NULL) CFRelease(down);
+      if (up != NULL) CFRelease(up);
+      return NO;
+    }
+    CGEventSetIntegerValueField(down, kCGMouseEventClickState, index);
+    CGEventSetIntegerValueField(up, kCGMouseEventClickState, index);
+    CGEventPost(kCGHIDEventTap, down);
+    CGEventPost(kCGHIDEventTap, up);
+    CFRelease(down);
+    CFRelease(up);
+    [NSThread sleepForTimeInterval:0.04];
+  }
+  return YES;
+}
+
+static BOOL postMouseDrag(pid_t pid, CGPoint from, CGPoint to) {
+  if (!activateApplicationPid(pid)
+      || !pointInsideFocusedWindow(pid, from)
+      || !pointInsideFocusedWindow(pid, to)) {
+    return NO;
+  }
+  CGEventRef move = CGEventCreateMouseEvent(NULL, kCGEventMouseMoved, from, kCGMouseButtonLeft);
+  CGEventRef down = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseDown, from, kCGMouseButtonLeft);
+  if (move == NULL || down == NULL) {
+    if (move != NULL) CFRelease(move);
+    if (down != NULL) CFRelease(down);
+    return NO;
+  }
+  CGEventPost(kCGHIDEventTap, move);
+  CGEventPost(kCGHIDEventTap, down);
+  CFRelease(move);
+  CFRelease(down);
+  const NSInteger steps = 12;
+  for (NSInteger step = 1; step <= steps; step += 1) {
+    CGFloat ratio = (CGFloat)step / (CGFloat)steps;
+    CGPoint current = CGPointMake(from.x + (to.x - from.x) * ratio,
+                                  from.y + (to.y - from.y) * ratio);
+    CGEventRef dragged = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseDragged,
+                                                 current, kCGMouseButtonLeft);
+    if (dragged == NULL) return NO;
+    CGEventPost(kCGHIDEventTap, dragged);
+    CFRelease(dragged);
+    [NSThread sleepForTimeInterval:0.01];
+  }
+  CGEventRef up = CGEventCreateMouseEvent(NULL, kCGEventLeftMouseUp, to, kCGMouseButtonLeft);
+  if (up == NULL) return NO;
+  CGEventPost(kCGHIDEventTap, up);
+  CFRelease(up);
+  return YES;
+}
+
+static BOOL selectTextRange(AXUIElementRef element, NSString *encodedRequest) {
+  if (element == NULL || encodedRequest.length == 0) return NO;
+  NSData *data = [encodedRequest dataUsingEncoding:NSUTF8StringEncoding];
+  id parsed = data == nil ? nil : [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+  if (![parsed isKindOfClass:[NSDictionary class]]) return NO;
+  NSDictionary *request = parsed;
+  NSString *target = boundedString(request[@"text"], 16384);
+  NSString *prefix = boundedString(request[@"prefix"], 16384);
+  NSString *suffix = boundedString(request[@"suffix"], 16384);
+  NSString *selection = boundedString(request[@"selection"], 64);
+  if (target.length == 0) return NO;
+  if (selection.length == 0) selection = @"text";
+  if (![@[@"text", @"cursor_before", @"cursor_after"] containsObject:selection]) return NO;
+  id value = copyAttribute(element, kAXValueAttribute);
+  if (![value isKindOfClass:[NSString class]]) return NO;
+  NSString *source = value;
+  NSMutableArray<NSValue *> *matches = [NSMutableArray array];
+  NSRange remaining = NSMakeRange(0, source.length);
+  while (remaining.location <= source.length) {
+    NSRange found = [source rangeOfString:target options:0 range:remaining];
+    if (found.location == NSNotFound) break;
+    BOOL prefixMatches = prefix.length == 0
+      || (found.location >= prefix.length
+          && [[source substringWithRange:NSMakeRange(found.location - prefix.length,
+                                                     prefix.length)] isEqualToString:prefix]);
+    NSUInteger suffixLocation = NSMaxRange(found);
+    BOOL suffixMatches = suffix.length == 0
+      || (suffixLocation + suffix.length <= source.length
+          && [[source substringWithRange:NSMakeRange(suffixLocation,
+                                                     suffix.length)] isEqualToString:suffix]);
+    if (prefixMatches && suffixMatches) [matches addObject:[NSValue valueWithRange:found]];
+    NSUInteger next = found.location + MAX((NSUInteger)1, found.length);
+    if (next > source.length) break;
+    remaining = NSMakeRange(next, source.length - next);
+  }
+  if (matches.count != 1) return NO;
+  NSRange selected = matches.firstObject.rangeValue;
+  if ([selection isEqualToString:@"cursor_before"]) selected.length = 0;
+  else if ([selection isEqualToString:@"cursor_after"]) {
+    selected.location = NSMaxRange(selected);
+    selected.length = 0;
+  }
+  CFRange range = CFRangeMake((CFIndex)selected.location, (CFIndex)selected.length);
+  AXValueRef rangeValue = AXValueCreate(kAXValueCFRangeType, &range);
+  if (rangeValue == NULL) return NO;
+  AXError status = AXUIElementSetAttributeValue(element, kAXSelectedTextRangeAttribute, rangeValue);
+  CFRelease(rangeValue);
+  return status == kAXErrorSuccess;
 }
 
 static BOOL expectedMatches(NSDictionary *descriptor, NSString *windowTitle,
@@ -369,8 +592,12 @@ static int handleAct(int argc, const char *argv[]) {
   } else if ([actionType isEqualToString:@"focus"] && element != NULL) {
     axStatus = AXUIElementSetAttributeValue(element, kAXFocusedAttribute, kCFBooleanTrue);
     performed = axStatus == kAXErrorSuccess;
+  } else if ([actionType isEqualToString:@"select_text"] && element != NULL) {
+    performed = selectTextRange(element, value);
   } else if ([actionType isEqualToString:@"keystroke"]) {
-    performed = postUnicodeText(value, flags);
+    performed = flags == 0
+      ? insertTextIntoFocusedElement((pid_t)pid, value)
+      : postUnicodeText(value, flags);
   } else if ([actionType isEqualToString:@"key_code"] && keyCode >= 0) {
     performed = postKeyCode((CGKeyCode)keyCode, flags);
   }
@@ -411,14 +638,53 @@ static NSString *sha256Data(NSData *data) {
   return hex;
 }
 
-static int handleCapture(NSString *format, NSInteger quality, NSInteger maximumWidth) {
+static CGWindowID largestOnScreenWindowForPid(pid_t pid) {
+  if (pid <= 0) return kCGNullWindowID;
+  CFArrayRef copied = CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly,
+                                                 kCGNullWindowID);
+  if (copied == NULL) return kCGNullWindowID;
+  NSArray *windows = CFBridgingRelease(copied);
+  CGWindowID selected = kCGNullWindowID;
+  CGFloat selectedArea = 0;
+  for (NSDictionary *window in windows) {
+    NSNumber *ownerPid = window[(id)kCGWindowOwnerPID];
+    NSNumber *layer = window[(id)kCGWindowLayer];
+    NSNumber *windowNumber = window[(id)kCGWindowNumber];
+    NSDictionary *boundsDictionary = window[(id)kCGWindowBounds];
+    if (ownerPid.intValue != pid || layer.integerValue != 0 || windowNumber == nil
+        || ![boundsDictionary isKindOfClass:[NSDictionary class]]) {
+      continue;
+    }
+    CGRect bounds = CGRectZero;
+    if (!CGRectMakeWithDictionaryRepresentation((__bridge CFDictionaryRef)boundsDictionary,
+                                                &bounds)) {
+      continue;
+    }
+    CGFloat area = MAX((CGFloat)0, bounds.size.width) * MAX((CGFloat)0, bounds.size.height);
+    if (area > selectedArea) {
+      selectedArea = area;
+      selected = (CGWindowID)windowNumber.unsignedIntValue;
+    }
+  }
+  return selected;
+}
+
+static int handleCapture(NSString *format, NSInteger quality, NSInteger maximumWidth,
+                         pid_t requestedPid) {
   if (!CGPreflightScreenCaptureAccess()) {
     return emitResult(NO, nil, @"CAPABILITY_UNAVAILABLE", @"Screen Recording access is unavailable.");
   }
-  CGImageRef source = CGWindowListCreateImage(CGRectInfinite,
-                                               kCGWindowListOptionOnScreenOnly,
-                                               kCGNullWindowID,
-                                               kCGWindowImageDefault);
+  CGWindowID windowId = largestOnScreenWindowForPid(requestedPid);
+  if (requestedPid > 0 && windowId == kCGNullWindowID) {
+    return emitResult(NO, nil, @"CAPABILITY_UNAVAILABLE",
+                      @"The requested application has no capturable on-screen window.");
+  }
+  CGImageRef source = CGWindowListCreateImage(
+    CGRectInfinite,
+    requestedPid > 0 ? kCGWindowListOptionIncludingWindow : kCGWindowListOptionOnScreenOnly,
+    requestedPid > 0 ? windowId : kCGNullWindowID,
+    requestedPid > 0 ? kCGWindowImageBoundsIgnoreFraming : kCGWindowImageDefault
+  );
   if (source == NULL) return emitResult(NO, nil, @"CAPABILITY_UNAVAILABLE", @"Screen capture returned no image.");
   CGImageRef image = scaledImage(source, (size_t)maximumWidth);
   CGImageRelease(source);
@@ -448,6 +714,8 @@ static int handleCapture(NSString *format, NSInteger quality, NSInteger maximumW
     @"sha256": sha256Data(data),
     @"width": @(width),
     @"height": @(height),
+    @"pid": @(requestedPid),
+    @"windowId": @(windowId),
   }, nil, nil);
 }
 
@@ -462,12 +730,111 @@ static NSDictionary *capabilitiesPayload(void) {
   };
 }
 
+static NSArray<NSDictionary *> *runningApplicationsPayload(void) {
+  NSMutableArray<NSDictionary *> *applications = [NSMutableArray array];
+  for (NSRunningApplication *application in NSWorkspace.sharedWorkspace.runningApplications) {
+    if (application.terminated
+        || application.activationPolicy != NSApplicationActivationPolicyRegular
+        || [application.bundleIdentifier isEqualToString:DevSpaceBundleIdentifier]) {
+      continue;
+    }
+    NSString *bundleIdentifier = boundedString(application.bundleIdentifier, 240);
+    NSString *displayName = boundedString(application.localizedName, 240);
+    NSString *applicationPath = boundedString(application.bundleURL.path, 1024);
+    [applications addObject:@{
+      @"id": bundleIdentifier.length > 0 ? bundleIdentifier : displayName,
+      @"bundleIdentifier": bundleIdentifier,
+      @"displayName": displayName,
+      @"appPath": applicationPath,
+      @"pid": @(application.processIdentifier),
+      @"isRunning": @YES,
+      @"isFrontmost": @(application.active),
+      @"lastUsedDate": [NSNull null],
+      @"useCount": [NSNull null],
+    }];
+    if (applications.count >= 1000) break;
+  }
+  [applications sortUsingComparator:^NSComparisonResult(NSDictionary *left, NSDictionary *right) {
+    BOOL leftFrontmost = [left[@"isFrontmost"] boolValue];
+    BOOL rightFrontmost = [right[@"isFrontmost"] boolValue];
+    if (leftFrontmost != rightFrontmost) return leftFrontmost ? NSOrderedAscending : NSOrderedDescending;
+    NSString *leftName = left[@"displayName"] ?: @"";
+    NSString *rightName = right[@"displayName"] ?: @"";
+    return [leftName localizedCaseInsensitiveCompare:rightName];
+  }];
+  return applications;
+}
+
+static int handleActivate(pid_t pid) {
+  NSRunningApplication *application = [NSRunningApplication runningApplicationWithProcessIdentifier:pid];
+  if (application == nil || application.terminated) {
+    return emitResult(NO, nil, @"PATH_NOT_FOUND", @"The requested application process is unavailable.");
+  }
+  BOOL activated = [application activateWithOptions:NSApplicationActivateAllWindows];
+  return activated
+    ? emitResult(YES, @{
+        @"pid": @(pid),
+        @"bundleIdentifier": boundedString(application.bundleIdentifier, 240),
+        @"activated": @YES,
+      }, nil, nil)
+    : emitResult(NO, nil, @"CAPABILITY_UNAVAILABLE", @"The requested application could not be activated.");
+}
+
 int main(int argc, const char *argv[]) {
   @autoreleasepool {
     if (argc < 2) return emitResult(NO, nil, @"INVALID_ARGUMENT", @"GUI operation is required.");
     NSString *operation = [NSString stringWithUTF8String:argv[1]];
     if ([operation isEqualToString:@"capabilities"] && argc == 2) {
       return emitResult(YES, capabilitiesPayload(), nil, nil);
+    }
+    if ([operation isEqualToString:@"list-apps"] && argc == 2) {
+      return emitResult(YES, @{@"apps": runningApplicationsPayload()}, nil, nil);
+    }
+    if ([operation isEqualToString:@"activate"] && argc == 3) {
+      NSInteger requestedPid = 0;
+      if (!parseInteger(argv[2], 1, INT32_MAX, &requestedPid)) {
+        return emitResult(NO, nil, @"INVALID_ARGUMENT", @"GUI activation process identifier is invalid.");
+      }
+      return handleActivate((pid_t)requestedPid);
+    }
+    if ([operation isEqualToString:@"pointer-click"] && argc == 7) {
+      NSInteger requestedPid = 0, clickCount = 0;
+      double x = 0, y = 0;
+      NSString *button = [NSString stringWithUTF8String:argv[6]];
+      if (!parseInteger(argv[2], 1, INT32_MAX, &requestedPid)
+          || !parseDouble(argv[3], -100000, 100000, &x)
+          || !parseDouble(argv[4], -100000, 100000, &y)
+          || !parseInteger(argv[5], 1, 3, &clickCount)
+          || button == nil) {
+        return emitResult(NO, nil, @"INVALID_ARGUMENT", @"GUI pointer-click arguments are invalid.");
+      }
+      BOOL performed = postMouseClick((pid_t)requestedPid, CGPointMake(x, y), clickCount, button);
+      return performed
+        ? emitResult(YES, @{@"performed": @YES, @"pid": @(requestedPid),
+                            @"x": @(x), @"y": @(y), @"clickCount": @(clickCount),
+                            @"button": button}, nil, nil)
+        : emitResult(NO, nil, @"GUI_STATE_CHANGED",
+                     @"Pointer click was outside the current focused window or could not be posted.");
+    }
+    if ([operation isEqualToString:@"pointer-drag"] && argc == 7) {
+      NSInteger requestedPid = 0;
+      double fromX = 0, fromY = 0, toX = 0, toY = 0;
+      if (!parseInteger(argv[2], 1, INT32_MAX, &requestedPid)
+          || !parseDouble(argv[3], -100000, 100000, &fromX)
+          || !parseDouble(argv[4], -100000, 100000, &fromY)
+          || !parseDouble(argv[5], -100000, 100000, &toX)
+          || !parseDouble(argv[6], -100000, 100000, &toY)) {
+        return emitResult(NO, nil, @"INVALID_ARGUMENT", @"GUI pointer-drag arguments are invalid.");
+      }
+      BOOL performed = postMouseDrag((pid_t)requestedPid,
+                                      CGPointMake(fromX, fromY),
+                                      CGPointMake(toX, toY));
+      return performed
+        ? emitResult(YES, @{@"performed": @YES, @"pid": @(requestedPid),
+                            @"from": @[@(fromX), @(fromY)],
+                            @"to": @[@(toX), @(toY)]}, nil, nil)
+        : emitResult(NO, nil, @"GUI_STATE_CHANGED",
+                     @"Pointer drag was outside the current focused window or could not be posted.");
     }
     if ([operation isEqualToString:@"request-access"] && argc == 3) {
       NSString *permissions = [NSString stringWithUTF8String:argv[2]];
@@ -516,15 +883,16 @@ int main(int argc, const char *argv[]) {
     if ([operation isEqualToString:@"act"]) {
       return handleAct(argc - 1, argv + 1);
     }
-    if ([operation isEqualToString:@"capture"] && argc == 5) {
+    if ([operation isEqualToString:@"capture"] && (argc == 5 || argc == 6)) {
       NSString *format = [NSString stringWithUTF8String:argv[2]];
-      NSInteger quality = 0, maximumWidth = 0;
+      NSInteger quality = 0, maximumWidth = 0, requestedPid = 0;
       if ((!([format isEqualToString:@"jpeg"] || [format isEqualToString:@"png"]))
           || !parseInteger(argv[3], 1, 100, &quality)
-          || !parseInteger(argv[4], 320, 2560, &maximumWidth)) {
+          || !parseInteger(argv[4], 320, 2560, &maximumWidth)
+          || (argc == 6 && !parseInteger(argv[5], 1, INT32_MAX, &requestedPid))) {
         return emitResult(NO, nil, @"INVALID_ARGUMENT", @"GUI capture arguments are invalid.");
       }
-      return handleCapture(format, quality, maximumWidth);
+      return handleCapture(format, quality, maximumWidth, (pid_t)requestedPid);
     }
     return emitResult(NO, nil, @"INVALID_ARGUMENT", @"Unsupported GUI operation or argument shape.");
   }

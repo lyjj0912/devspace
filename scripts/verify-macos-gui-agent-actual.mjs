@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
+import { realpathSync } from "node:fs";
 import {
   chmod,
   mkdir,
@@ -27,6 +28,8 @@ const taskRoot = join(
 const evidenceRoot = join(taskRoot, "runs", "phase4d-gui-tcc-actual-20260822");
 const workingRoot = "/private/tmp/codex-parity-gui-20260822-actual-01";
 const reportPath = join(evidenceRoot, "ACTUAL-GUI-TCC.json");
+const capturePath = join(evidenceRoot, "CAPTURE.jpg");
+const verificationPath = join(evidenceRoot, "EVIDENCE-VERIFICATION.json");
 const marker = "__DEVSPACE_V2_GUI_JSON__";
 const fixtureBundleIdentifier = "com.devspace.gui-fixture.actual20260822";
 class ActualBlockedError extends Error {}
@@ -44,6 +47,17 @@ let report = {
   startedAt,
   endedAt: startedAt,
   repositoryRevision: gitRevision(),
+  sourceRevision: gitRevision(),
+  runtimeUnderTestRevision: gitRevision(),
+  testCommands: [
+    "node scripts/verify-macos-user-authorization-native.mjs",
+    "node --test scripts/build-macos-gui-agent.test.mjs scripts/devspace-computer-use-mcp.test.mjs",
+    "npm run typecheck",
+    "npm run build",
+    "npm run generate:v2 (byte-stable generated contract parity)",
+    "npm test",
+    "DEVSPACE_MACOS_CODESIGN_IDENTITY='Cozy Connect Local Development' node scripts/verify-macos-gui-agent-actual.mjs",
+  ],
   steps: [],
   cleanup,
 };
@@ -126,6 +140,9 @@ try {
   record("request-access", requested.ok ? "PASS" : "FAIL", requested.data ?? requested);
 
   const after = runAgent(agent, ["capabilities"]);
+  const agentIdentityAfterRequest = codeIdentity(agentApp, agent);
+  assert.deepEqual(agentIdentityAfterRequest, agentIdentity, "GUI agent identity changed during TCC request");
+  report.agentIdentityAfterRequest = agentIdentityAfterRequest;
   report.permissionsAfter = after.data;
   if (after.data?.accessibility !== true || after.data?.screenCapture !== true) {
     report.status = "BLOCKED_TCC";
@@ -222,7 +239,7 @@ try {
   ), "applied status readback");
   record("accessibility-readback", "PASS", elementSummary(status));
 
-  const capture = runAgent(agent, ["capture", "jpeg", "40", "640"], 30_000);
+  const capture = runAgent(agent, ["capture", "jpeg", "40", "640", String(fixturePid)], 30_000);
   assert.equal(capture.ok, true, JSON.stringify(capture));
   const captureBytes = Buffer.from(String(capture.data.contentBase64 ?? ""), "base64");
   assert.ok(captureBytes.length > 0);
@@ -230,13 +247,23 @@ try {
   const captureSha256 = `sha256:${createHash("sha256").update(captureBytes).digest("hex")}`;
   assert.equal(captureSha256, capture.data.sha256);
   assert.equal(capture.data.mimeType, "image/jpeg");
+  assert.equal(capture.data.pid, fixturePid);
+  assert.ok(captureBytes.length >= 1_024 && captureBytes.length <= 2 * 1024 * 1024);
+  assert.equal(captureBytes[0], 0xff);
+  assert.equal(captureBytes[1], 0xd8);
+  assert.equal(captureBytes.at(-2), 0xff);
+  assert.equal(captureBytes.at(-1), 0xd9);
+  await writeFile(capturePath, captureBytes, { mode: 0o600 });
+  await chmod(capturePath, 0o600);
   report.capture = {
     mimeType: capture.data.mimeType,
     size: capture.data.size,
     sha256: capture.data.sha256,
     width: capture.data.width,
     height: capture.data.height,
-    retained: false,
+    pid: capture.data.pid,
+    path: capturePath,
+    retained: true,
   };
   record("capture", "PASS", report.capture);
 
@@ -287,6 +314,37 @@ try {
   await chmod(evidenceRoot, 0o700);
   await writeFile(reportPath, `${JSON.stringify(report, null, 2)}\n`, { mode: 0o600 });
   await chmod(reportPath, 0o600);
+  if (report.status === "PASS") {
+    const reportBytes = await readFile(reportPath);
+    const retainedCapture = await readFile(capturePath);
+    const verification = {
+      schemaVersion: 1,
+      status: "PASS",
+      verifiedAt: new Date().toISOString(),
+      verifier: "scripts/verify-macos-gui-agent-actual.mjs",
+      repositoryRevision: report.repositoryRevision,
+      report: {
+        path: reportPath,
+        sha256: `sha256:${createHash("sha256").update(reportBytes).digest("hex")}`,
+        size: reportBytes.length,
+      },
+      capture: {
+        path: capturePath,
+        sha256: `sha256:${createHash("sha256").update(retainedCapture).digest("hex")}`,
+        size: retainedCapture.length,
+      },
+      assertions: {
+        stableAgentIdentity: JSON.stringify(report.agent) === JSON.stringify(report.agentIdentityAfterRequest),
+        fixturePidBoundCapture: report.capture?.pid === report.steps.find((step) => step.step === "fixture-launch")?.evidence?.pid,
+        cleanupComplete: cleanup.fixtureTerminated === true && cleanup.workingRootRemoved === true,
+      },
+    };
+    assert.ok(Object.values(verification.assertions).every(Boolean));
+    assert.equal(verification.capture.sha256, report.capture.sha256);
+    assert.equal(verification.capture.size, report.capture.size);
+    await writeFile(verificationPath, `${JSON.stringify(verification, null, 2)}\n`, { mode: 0o600 });
+    await chmod(verificationPath, 0o600);
+  }
   process.stdout.write(`${JSON.stringify({ status: report.status, reportPath, cleanup })}\n`);
 }
 
@@ -376,6 +434,11 @@ async function waitForJson(path, predicate, timeoutMs) {
 }
 
 function codeIdentity(appPath, executablePath) {
+  const verification = spawnSync("/usr/bin/codesign", ["--verify", "--deep", "--strict", appPath], {
+    encoding: "utf8",
+    timeout: 10_000,
+  });
+  assert.equal(verification.status, 0, verification.stderr);
   const signature = spawnSync("/usr/bin/codesign", ["-dvvv", "--requirements", "-", appPath], {
     encoding: "utf8",
     timeout: 10_000,
@@ -389,12 +452,22 @@ function codeIdentity(appPath, executablePath) {
     timeout: 10_000,
   });
   assert.equal(executableBytes.status, 0, executableBytes.stderr);
+  const appState = spawnSync("/usr/bin/stat", ["-f", "%Su:%Sg:%Lp", appPath], { encoding: "utf8" });
+  const executableState = spawnSync("/usr/bin/stat", ["-f", "%Su:%Sg:%Lp", executablePath], { encoding: "utf8" });
+  const bundleIdentifier = spawnSync("/usr/bin/defaults", ["read", join(appPath, "Contents", "Info"), "CFBundleIdentifier"], { encoding: "utf8" });
+  assert.equal(appState.status, 0, appState.stderr);
+  assert.equal(executableState.status, 0, executableState.stderr);
+  assert.equal(bundleIdentifier.status, 0, bundleIdentifier.stderr);
   return {
-    appPath,
-    executablePath,
+    appPath: realpathSync(appPath),
+    executablePath: realpathSync(executablePath),
     executableSha256: `sha256:${executableBytes.stdout.trim().split(/\s+/u)[0]}`,
+    bundleIdentifier: bundleIdentifier.stdout.trim(),
     authority: authority ?? null,
     designatedRequirement: requirement ?? null,
+    appOwnerGroupMode: appState.stdout.trim(),
+    executableOwnerGroupMode: executableState.stdout.trim(),
+    codeSignatureVerified: true,
   };
 }
 
