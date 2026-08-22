@@ -321,7 +321,11 @@ function validateGuiAgentWords(words: string[]): void {
     return;
   }
   if (operation === "observe") {
-    if (words.length !== 3 || !boundedDecimal(words[2], 1, 1_000)) {
+    if (
+      (words.length !== 3 && words.length !== 4)
+      || !boundedDecimal(words[2], 1, 1_000)
+      || (words.length === 4 && !boundedDecimal(words[3], 1, 2_147_483_647))
+    ) {
       throw internalExecutionViolation("GUI agent observe arguments are invalid");
     }
     return;

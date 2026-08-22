@@ -167,7 +167,7 @@ try {
     initialValue: readyState.value,
   });
 
-  const observation = await waitForObservation(agent, fixtureBundleIdentifier, 15_000);
+  const observation = await waitForObservation(agent, fixtureBundleIdentifier, fixturePid, 15_000);
   const observed = observation.data;
   const input = findElement(observed, (element) => (
     element.role === "AXTextField"
@@ -195,7 +195,7 @@ try {
   assert.equal(setValue.ok, true, JSON.stringify(setValue));
   record("set-value", "PASS", setValue.data);
 
-  const afterValue = await waitForObservation(agent, fixtureBundleIdentifier, 5_000);
+  const afterValue = await waitForObservation(agent, fixtureBundleIdentifier, fixturePid, 5_000);
   const buttonAfterValue = findElement(afterValue.data, (element) => (
     element.role === "AXButton"
     && (element.name === "Apply" || element.description === "Apply")
@@ -215,7 +215,7 @@ try {
     value: appliedState.value,
   });
 
-  const afterPress = await waitForObservation(agent, fixtureBundleIdentifier, 5_000);
+  const afterPress = await waitForObservation(agent, fixtureBundleIdentifier, fixturePid, 5_000);
   const status = findElement(afterPress.data, (element) => (
     (element.name === "devspace-status" || element.description === "DevSpace Status")
     && element.value === `Applied: ${actualValue}`
@@ -345,15 +345,19 @@ function actArguments(observation, element, action) {
   ];
 }
 
-async function waitForObservation(agent, bundleIdentifier, timeoutMs) {
+async function waitForObservation(agent, bundleIdentifier, applicationPid, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   let last;
   while (Date.now() < deadline) {
-    last = runAgent(agent, ["observe", "250"]);
-    if (last.ok && last.data?.application?.bundleIdentifier === bundleIdentifier) return last;
+    last = runAgent(agent, ["observe", "250", String(applicationPid)]);
+    if (
+      last.ok
+      && last.data?.application?.bundleIdentifier === bundleIdentifier
+      && last.data?.application?.pid === applicationPid
+    ) return last;
     await delay(100);
   }
-  throw new Error(`Fixture did not become the observed foreground application: ${JSON.stringify(last)}`);
+  throw new Error(`Fixture process did not become observable: ${JSON.stringify(last)}`);
 }
 
 async function waitForJson(path, predicate, timeoutMs) {

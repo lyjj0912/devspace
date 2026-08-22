@@ -45,6 +45,10 @@ test("pinned GUI agent accepts only exact bounded protocol commands", async (t) 
     { executable: executablePath, args: ["observe", "100"] },
   );
   assert.deepEqual(
+    internalExecutionSpec(policy, `${executablePath} observe 100 12345`, { verifyLocalScript: true }),
+    { executable: executablePath, args: ["observe", "100", "12345"] },
+  );
+  assert.deepEqual(
     internalExecutionSpec(policy, `${executablePath} capture jpeg 70 1600`, { verifyLocalScript: true }),
     { executable: executablePath, args: ["capture", "jpeg", "70", "1600"] },
   );
@@ -54,6 +58,9 @@ test("pinned GUI agent accepts only exact bounded protocol commands", async (t) 
     `${executablePath} request-access accessibility,sudo`,
     `${executablePath} observe 0`,
     `${executablePath} observe 1001`,
+    `${executablePath} observe 100 0`,
+    `${executablePath} observe 100 2147483648`,
+    `${executablePath} observe 100 not-a-pid`,
     `${executablePath} capture gif 70 1600`,
     `${executablePath} capture jpeg 0 1600`,
     `${executablePath} capture jpeg 70 99999`,

@@ -493,13 +493,24 @@ int main(int argc, const char *argv[]) {
         @"restartRequired": @((requestAccessibility && !accessibility) || (requestCapture && !screenCapture)),
       }, nil, nil);
     }
-    if ([operation isEqualToString:@"observe"] && argc == 3) {
+    if ([operation isEqualToString:@"observe"] && (argc == 3 || argc == 4)) {
       NSInteger maximum = 0;
-      if (!parseInteger(argv[2], 1, 1000, &maximum)) {
-        return emitResult(NO, nil, @"INVALID_ARGUMENT", @"GUI observe maximum is invalid.");
+      NSInteger requestedPid = 0;
+      if (!parseInteger(argv[2], 1, 1000, &maximum)
+          || (argc == 4 && !parseInteger(argv[3], 1, INT32_MAX, &requestedPid))) {
+        return emitResult(NO, nil, @"INVALID_ARGUMENT", @"GUI observe maximum or process identifier is invalid.");
       }
-      NSDictionary *observation = observeApplication(0, (NSUInteger)maximum, NULL);
-      if (observation == nil) return emitResult(NO, nil, @"CAPABILITY_UNAVAILABLE", @"Accessibility access or a foreground application is unavailable.");
+      NSDictionary *observation = observeApplication((pid_t)requestedPid, (NSUInteger)maximum, NULL);
+      if (observation == nil) {
+        return emitResult(
+          NO,
+          nil,
+          @"CAPABILITY_UNAVAILABLE",
+          requestedPid > 0
+            ? @"Accessibility access or the requested application process is unavailable."
+            : @"Accessibility access or a foreground application is unavailable."
+        );
+      }
       return emitResult(YES, observation, nil, nil);
     }
     if ([operation isEqualToString:@"act"]) {
