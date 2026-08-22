@@ -1,0 +1,60 @@
+{
+  "capturedAt": "2026-08-22T15:30:16Z",
+  "phase4": null,
+  "masterFinal": null,
+  "phases": {
+    "phase5": {
+      "latest": null,
+      "attempts": [],
+      "started": false
+    },
+    "phase6": {
+      "latest": null,
+      "attempts": [],
+      "started": false
+    },
+    "phase7": {
+      "latest": null,
+      "attempts": [],
+      "started": false
+    },
+    "phase8": {
+      "latest": null,
+      "attempts": [],
+      "started": false
+    },
+    "phase9": {
+      "latest": null,
+      "attempts": [],
+      "started": false
+    },
+    "phase10": {
+      "latest": null,
+      "attempts": [],
+      "started": false
+    },
+    "phase11": {
+      "latest": null,
+      "attempts": [],
+      "started": false
+    }
+  },
+  "git": {
+    "head": "dd98dad5718c9added3fbe196fc33639d64fa425",
+    "upstream": "dd98dad5718c9added3fbe196fc33639d64fa425",
+    "dirtyPaths": [
+      "native/macos-gui-agent/devspace-gui-agent.m",
+      "scripts/devspace-computer-use-mcp.mjs"
+    ],
+    "recent": [
+      "dd98dad5718c9added3fbe196fc33639d64fa425\tfix: bind GUI observation to the target process",
+      "d516a582ef1b1d820024c97fd067bf29d9bb329f\tfeat: add native authorization and signed GUI agent",
+      "47325fbd433ce0f62dc3ab125b6d751a47591266\tfeat: define explicit prompt elevation contract",
+      "cf5a409e6c609ade6f9ab2d32e68669e980213a0\tfix: make OAuth connector configuration explicit",
+      "a435f452b1baa10bb4455ee7064dce3b674ed03e\tchore: refresh runtime contract identity",
+      "a604271981d3352675f8718703bdcb3aa1f0e04d\tfix: scope replay protection to MCP sessions",
+      "8c1c14dada76e8f416bffe9f35abb7a87ba451a3\tfix: run isolated candidate on parallel endpoints",
+      "644a4c4e83765524d66c9e23cc734d50c405cf0d\tfix: omit unsupported candidate endpoint overrides"
+    ]
+  }
+}
