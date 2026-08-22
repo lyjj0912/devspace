@@ -16,13 +16,38 @@ test("capability call context is immutable and carries only trusted stable ident
   const context = createCapabilityCallContextFromTrustedPrincipal({
     principalKeyFingerprint: PRINCIPAL.toUpperCase(),
     requestId: "request-1",
+    explicitRequestId: "request-1",
+    requestNamespace: "transport:session-a",
     receivedAt: "2026-08-19T00:00:00.000Z",
   });
   assert.equal(Object.isFrozen(context), true);
   assert.equal(context.principalKeyFingerprint, PRINCIPAL);
+  assert.equal(context.requestId, "request-1");
+  assert.equal(context.explicitRequestId, "request-1");
+  assert.equal(context.requestNamespace, "transport:session-a");
   assert.throws(
     () => { (context as { principalKeyFingerprint: string }).principalKeyFingerprint = "0".repeat(64); },
     TypeError,
+  );
+});
+
+test("explicit request identity is distinguished from an implicit JSON-RPC correlation ID", () => {
+  const implicit = createCapabilityCallContextFromTrustedPrincipal({
+    principalKeyFingerprint: PRINCIPAL,
+    requestId: "1",
+    requestNamespace: "transport:new-session",
+  });
+  assert.equal(implicit.requestId, "1");
+  assert.equal(implicit.explicitRequestId, undefined);
+  assert.equal(implicit.requestNamespace, "transport:new-session");
+
+  assert.throws(
+    () => createCapabilityCallContextFromTrustedPrincipal({
+      principalKeyFingerprint: PRINCIPAL,
+      requestId: "correlation",
+      explicitRequestId: "different-explicit-id",
+    }),
+    hasCode("AUTHENTICATION_FAILED"),
   );
 });
 

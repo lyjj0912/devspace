@@ -116,8 +116,10 @@
         "gui": {
           "const": [
             "capabilities",
+            "request_access",
             "observe",
             "act",
+            "capture",
             "wait"
           ]
         }

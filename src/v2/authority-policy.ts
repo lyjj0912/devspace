@@ -171,7 +171,9 @@ export function minimumAuthorityRisk(action: AuthorityActionDescriptor): Authori
     case "artifact":
       return artifactRisk(action.operation, action.parameters);
     case "gui":
-      return action.operation === "act" ? "R3" : "R0";
+      return action.operation === "act"
+        ? "R3"
+        : action.operation === "request_access" ? "R1" : "R0";
   }
 }
 

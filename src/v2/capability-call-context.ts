@@ -14,6 +14,8 @@ declare const capabilityCallContextBrand: unique symbol;
 export type CapabilityCallContext = Readonly<{
   principalKeyFingerprint: string;
   requestId?: string;
+  explicitRequestId?: string;
+  requestNamespace?: string;
   receivedAt?: string;
   [capabilityCallContextBrand]: true;
 }>;
@@ -23,6 +25,8 @@ export type CapabilityCallContextProvider = () => CapabilityCallContext | undefi
 export interface TrustedCapabilityPrincipal {
   principalKeyFingerprint: string;
   requestId?: string;
+  explicitRequestId?: string;
+  requestNamespace?: string;
   receivedAt?: string;
 }
 
@@ -36,9 +40,26 @@ export function createCapabilityCallContextFromTrustedPrincipal(
       "A full SHA-256 stable principal fingerprint is required for capability ownership.",
     );
   }
+  const requestId = principal.requestId
+    ? requireBoundedText(principal.requestId, "requestId", 512)
+    : undefined;
+  const explicitRequestId = principal.explicitRequestId
+    ? requireBoundedText(principal.explicitRequestId, "explicitRequestId", 512)
+    : undefined;
+  const requestNamespace = principal.requestNamespace
+    ? requireBoundedText(principal.requestNamespace, "requestNamespace", 1_024)
+    : undefined;
+  if (explicitRequestId && requestId && explicitRequestId !== requestId) {
+    throw new UniversalBrokerError(
+      "AUTHENTICATION_FAILED",
+      "Explicit request identity must match the trusted correlation request ID.",
+    );
+  }
   const context = Object.freeze({
     principalKeyFingerprint,
-    ...(principal.requestId ? { requestId: requireBoundedText(principal.requestId, "requestId") } : {}),
+    ...(requestId ? { requestId } : {}),
+    ...(explicitRequestId ? { explicitRequestId } : {}),
+    ...(requestNamespace ? { requestNamespace } : {}),
     ...(principal.receivedAt ? { receivedAt: requireTimestamp(principal.receivedAt) } : {}),
   }) as CapabilityCallContext;
   trustedContexts.add(context);
@@ -75,9 +96,9 @@ export function currentCapabilityCallContext(): CapabilityCallContext | undefine
 export const asyncLocalCapabilityCallContextProvider: CapabilityCallContextProvider =
   currentCapabilityCallContext;
 
-function requireBoundedText(value: string, field: string): string {
+function requireBoundedText(value: string, field: string, maximumCharacters = 256): string {
   const normalized = value.trim();
-  if (!normalized || normalized.length > 256) {
+  if (!normalized || normalized.length > maximumCharacters || /[\0\r\n]/u.test(normalized)) {
     throw new UniversalBrokerError(
       "AUTHENTICATION_FAILED",
       `Trusted capability ${field} is invalid.`,

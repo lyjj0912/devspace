@@ -723,6 +723,32 @@
               }
             },
             "additionalProperties": false
+          },
+          "gui": {
+            "type": "object",
+            "properties": {
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "none",
+                  "local-ipc",
+                  "ssh-stdio"
+                ]
+              },
+              "command": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 4096
+              },
+              "sha256": {
+                "type": "string",
+                "pattern": "^[a-f0-9]{64}$"
+              }
+            },
+            "required": [
+              "mode"
+            ],
+            "additionalProperties": false
           }
         },
         "required": [

@@ -37,6 +37,7 @@ test("personal OAuth-scoped fs, exec, and process mutations dispatch directly wi
   const targets = new TargetRegistry({ configPath: targetsPath });
   const contexts = {} as ContextRegistry;
   const calls: string[] = [];
+  const executionContexts: CapabilityCallContext[] = [];
   const filesystem = {
     async execute(_input: unknown, callContext?: CapabilityCallContext) {
       assert.ok(callContext?.principalKeyFingerprint);
@@ -59,8 +60,15 @@ test("personal OAuth-scoped fs, exec, and process mutations dispatch directly wi
     launchRisk: "R3",
   };
   const execution = {
-    async prepareExecutionBinding(_input: unknown, _target: unknown, generation: string) {
+    async prepareExecutionBinding(
+      _input: unknown,
+      _target: unknown,
+      generation: string,
+      callContext?: CapabilityCallContext,
+    ) {
       assert.equal(generation, prepared.targetGeneration);
+      assert.ok(callContext);
+      executionContexts.push(callContext);
       return prepared;
     },
     async execute(_input: unknown, binding: PreparedExecExecutionBinding | undefined, _dispatch: unknown, callContext?: CapabilityCallContext) {
@@ -131,6 +139,13 @@ test("personal OAuth-scoped fs, exec, and process mutations dispatch directly wi
     assert.notEqual(result.isError, true, JSON.stringify(result.structuredContent));
     assert.equal((result.structuredContent as { ok?: unknown })?.ok, true);
   }
+  const explicitExec = await client.callTool({
+    name: "exec",
+    arguments: { target: "local", cwd: root, command: "printf explicit", mode: "foreground" },
+    _meta: { devspace: { requestId: "explicit-authorization-request" } },
+  });
+  assert.notEqual(explicitExec.isError, true, JSON.stringify(explicitExec.structuredContent));
+
   const restartStatus = await client.callTool({
     name: "process",
     arguments: { operation: "restart_status", transactionId: restartTransactionId },
@@ -140,6 +155,19 @@ test("personal OAuth-scoped fs, exec, and process mutations dispatch directly wi
     (restartStatus.structuredContent as { data?: { transactionId?: string } })?.data?.transactionId,
     restartTransactionId,
   );
-  assert.deepEqual(calls, ["fs.write", "exec.run", "process.forget", "process.restart_status"]);
+  assert.deepEqual(calls, [
+    "fs.write",
+    "exec.run",
+    "process.forget",
+    "exec.run",
+    "process.restart_status",
+  ]);
+  assert.equal(executionContexts.length, 2);
+  assert.equal(executionContexts[0]?.explicitRequestId, undefined);
+  assert.ok(executionContexts[0]?.requestId);
+  assert.match(executionContexts[0]?.requestNamespace ?? "", /^mcp-(?:session|request):/u);
+  assert.equal(executionContexts[1]?.requestId, "explicit-authorization-request");
+  assert.equal(executionContexts[1]?.explicitRequestId, "explicit-authorization-request");
+  assert.equal(executionContexts[1]?.requestNamespace, "devspace-request");
   assert.equal(legacyStoreTouches, 0);
 });

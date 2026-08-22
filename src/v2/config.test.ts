@@ -130,6 +130,36 @@ test("personal production config binds canonical routes and may isolate OAuth st
   );
 });
 
+test("personal environment config binds explicit macOS authorization runtime identity", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-personal-macos-authorization-config-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const base = baseConfig(root);
+  const disabled = loadUniversalBrokerNextConfig(base, OWNER_ENV);
+  const enabled = loadUniversalBrokerNextConfig(base, {
+    ...OWNER_ENV,
+    DEVSPACE_NEXT_MACOS_AUTHORIZATION_ENABLED: "true",
+    DEVSPACE_NEXT_USER_AUTHORIZATION_STORE: join(root, "authorization.sqlite"),
+    DEVSPACE_NEXT_MACOS_AUTHORIZATION_AGENT: join(root, "release", "devspace-approval-agent"),
+    DEVSPACE_NEXT_MACOS_AUTHORIZATION_AGENT_SHA256: `sha256:${"a".repeat(64)}`,
+    DEVSPACE_NEXT_MACOS_PRIVILEGED_HELPER: join(root, "release", "devspace-privileged-helper"),
+    DEVSPACE_NEXT_MACOS_PRIVILEGED_HELPER_SHA256: `sha256:${"b".repeat(64)}`,
+    DEVSPACE_NEXT_MACOS_AUTHORIZATION_WORK_ROOT: join(root, "authorization-work"),
+  });
+  assert.equal(enabled.userAuthorizationStorePath, join(root, "authorization.sqlite"));
+  assert.equal(enabled.macosAuthorization?.provider, "macos-authorization-services-v1");
+  assert.equal(enabled.macosAuthorization?.agentSha256, `sha256:${"a".repeat(64)}`);
+  assert.equal(enabled.macosAuthorization?.helperSha256, `sha256:${"b".repeat(64)}`);
+  assert.notEqual(enabled.configDigest, disabled.configDigest);
+  assert.throws(
+    () => loadUniversalBrokerNextConfig(base, {
+      ...OWNER_ENV,
+      DEVSPACE_NEXT_MACOS_AUTHORIZATION_ENABLED: "true",
+      DEVSPACE_NEXT_MACOS_AUTHORIZATION_AGENT: join(root, "agent"),
+    }),
+    /configuration is incomplete/u,
+  );
+});
+
 test("personal environment config accepts bounded resource overrides", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "devspace-personal-explicit-config-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -270,16 +300,22 @@ test("personal unified config materializes prompt elevation without claiming pro
       sshHost?: string;
       elevationPolicy: "deny" | "prompt";
       capabilities?: Record<string, boolean>;
-      gui?: { mode?: string };
+      gui?: { mode?: string; command?: string; sha256?: string };
     }>;
   };
   assert.equal(materializedTargets.targets.local?.elevationPolicy, "prompt");
   assert.equal(materializedTargets.targets.company?.elevationPolicy, "deny");
   assert.equal(materializedTargets.targets.local?.gui?.mode, "local-ipc");
+  assert.equal(materializedTargets.targets.local?.gui?.command, join(root, "DevSpace GUI Agent.app/Contents/MacOS/devspace-gui-agent"));
+  assert.equal(materializedTargets.targets.local?.gui?.sha256, "a".repeat(64));
 
   const targetRegistry = new TargetRegistry({ configPath: first.targetConfigPath });
   const targetSnapshot = await targetRegistry.inspect();
   assert.equal(targetSnapshot.targets.find((target) => target.id === "local")?.elevationPolicy, "prompt");
+  assert.equal(
+    targetSnapshot.targets.find((target) => target.id === "local")?.gui.sha256,
+    "a".repeat(64),
+  );
   assert.deepEqual((await targetRegistry.list()).targets.find((target) => target.targetId === "local")?.elevation, {
     policy: "prompt",
     configured: true,
@@ -367,6 +403,14 @@ test("personal unified validation rejects legacy authority and unsafe references
   const promptElevation = personalUnifiedConfig(root);
   promptElevation.targets[0]!.elevationPolicy = "prompt";
   assert.doesNotThrow(await load(promptElevation));
+
+  const partialGuiIdentity = personalUnifiedConfig(root);
+  delete (partialGuiIdentity.targets[0]!.gui as { sha256?: string }).sha256;
+  assert.throws(await load(partialGuiIdentity), /command and sha256 must be configured together/u);
+
+  const incompatibleGuiMode = personalUnifiedConfig(root);
+  incompatibleGuiMode.targets[0]!.gui!.mode = "ssh-stdio";
+  assert.throws(await load(incompatibleGuiMode), /local targets cannot use ssh-stdio/u);
 
   const missingConnector = personalUnifiedConfig(root);
   delete (missingConnector as { connector?: unknown }).connector;
@@ -540,6 +584,11 @@ function personalUnifiedConfig(root: string) {
         defaultCwd: root,
         elevationPolicy: "prompt",
         capabilities: { fs: true, exec: true, pty: true, mcp: true, artifact: true, gui: true },
+        gui: {
+          mode: "local-ipc",
+          command: join(root, "DevSpace GUI Agent.app/Contents/MacOS/devspace-gui-agent"),
+          sha256: "a".repeat(64),
+        },
       },
       {
         targetId: "company",

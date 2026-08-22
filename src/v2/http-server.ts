@@ -86,6 +86,8 @@ import {
   publicRuntimeHealth,
 } from "./runtime-identity.js";
 import type { RuntimeIdentity } from "./contracts.js";
+import { MacOsAuthorizationProvider } from "./macos-authorization-provider.js";
+import { UserAuthorizationStore } from "./user-authorization-store.js";
 import {
   baseMutableSqliteStoreRequirements,
   ensureFilesystemSyncSqliteSchemaV1,
@@ -296,6 +298,18 @@ export function createUniversalBrokerNextServer(
     cursorStore: cursors,
     metrics,
   });
+  const userAuthorizationStore = config.macosAuthorization
+    ? new UserAuthorizationStore(config.userAuthorizationStorePath)
+    : undefined;
+  const userAuthorizationProvider = config.macosAuthorization
+    ? new MacOsAuthorizationProvider({
+        agentPath: config.macosAuthorization.agentPath,
+        agentSha256: config.macosAuthorization.agentSha256,
+        helperPath: config.macosAuthorization.helperPath,
+        helperSha256: config.macosAuthorization.helperSha256,
+        workRoot: config.macosAuthorization.workRoot,
+      })
+    : undefined;
   const execution = new UniversalExecutionPlane({
     targets,
     contexts,
@@ -312,6 +326,10 @@ export function createUniversalBrokerNextServer(
     cursorStore: cursors,
     resourceContinuation,
     metrics,
+    runtimeIdentity,
+    ...(userAuthorizationStore && userAuthorizationProvider
+      ? { userAuthorizationStore, userAuthorizationProvider }
+      : {}),
   });
   const internalRunner = new BoundedInternalOneShotRunner(
     execution,

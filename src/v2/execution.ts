@@ -37,8 +37,18 @@ import {
   EXEC_RISK_CLASSIFIER_GENERATION,
   type ProcessAuthorityBinding,
 } from "./authority-policy.js";
-import type { AuthorityRiskClass, AuthorizationState, ElevationMode, ElevationPolicy } from "./contracts.js";
-import { normalizeExecutionElevation, type ExecuteElevationRequest } from "./elevation.js";
+import type {
+  AuthorityRiskClass,
+  AuthorizationState,
+  ElevationMode,
+  ElevationPolicy,
+  RuntimeIdentity,
+} from "./contracts.js";
+import {
+  normalizeExecutionElevation,
+  type ExecuteElevationRequest,
+  type NormalizedExecutionElevation,
+} from "./elevation.js";
 import type { OperationAuthorityDispatchController } from "./authority.js";
 import {
   createCapabilityCallContextFromTrustedPrincipal,
@@ -95,6 +105,9 @@ import {
   type ProcessStateStore,
   type WritableProcessRecord,
 } from "./process-state.js";
+import type { UserAuthorizationProvider } from "./user-authorization.js";
+import { UserAuthorizationCoordinator } from "./user-authorization-coordinator.js";
+import type { UserAuthorizationStore } from "./user-authorization-store.js";
 
 const DEFAULT_AUTO_YIELD_MS = 10_000;
 const DEFAULT_FOREGROUND_YIELD_MS = 10_000;
@@ -199,6 +212,12 @@ export interface UniversalProcessSnapshot extends Record<string, unknown> {
   durable?: boolean;
   elevationMode?: ElevationMode;
   authorizationState?: AuthorizationState;
+  authorizationOperationId?: string;
+  authorizationActionDigest?: string;
+  authorizationDescriptorDigest?: string;
+  authorizationReceiptDigest?: string;
+  authorizationProviderId?: string;
+  authorizationProviderGeneration?: string;
   pid?: number;
   exitCode?: number;
   signal?: string;
@@ -259,6 +278,9 @@ export interface ExecutionPlaneOptions {
   cursorStore?: SignedSnapshotCursorStore;
   resourceContinuation?: SignedResourceContinuation;
   metrics?: UniversalBrokerMetrics;
+  runtimeIdentity?: RuntimeIdentity;
+  userAuthorizationStore?: UserAuthorizationStore;
+  userAuthorizationProvider?: UserAuthorizationProvider;
 }
 
 interface ProcessHandle {
@@ -282,6 +304,12 @@ interface ProcessEntry {
   launchRisk: AuthorityRiskClass;
   elevationMode: ElevationMode;
   authorizationState: AuthorizationState;
+  authorizationOperationId?: string;
+  authorizationActionDigest?: string;
+  authorizationDescriptorDigest?: string;
+  authorizationReceiptDigest?: string;
+  authorizationProviderId?: string;
+  authorizationProviderGeneration?: string;
   state: UniversalProcessState;
   startedAtMs: number;
   endedAtMs?: number;
@@ -338,6 +366,8 @@ export class UniversalExecutionPlane {
   private readonly stateStore: ProcessStateStore;
   private readonly metrics?: UniversalBrokerMetrics;
   private readonly resourceContinuation: SignedResourceContinuation;
+  private readonly runtimeIdentity?: RuntimeIdentity;
+  private readonly userAuthorizationCoordinator?: UserAuthorizationCoordinator;
   private readonly pendingStateWrites = new Set<Promise<void>>();
   private readonly pendingStateWritesByProcess = new Map<string, Set<Promise<void>>>();
   private readonly stateWriteTailByProcess = new Map<string, Promise<void>>();
@@ -408,6 +438,29 @@ export class UniversalExecutionPlane {
     this.metrics = options.metrics;
     this.resourceContinuation = options.resourceContinuation
       ?? createEphemeralResourceContinuation({ now: this.now });
+    this.runtimeIdentity = options.runtimeIdentity;
+    const authorizationConfigured = options.userAuthorizationStore !== undefined
+      || options.userAuthorizationProvider !== undefined;
+    if (authorizationConfigured && (!options.userAuthorizationStore || !options.userAuthorizationProvider)) {
+      throw new UniversalBrokerError(
+        "PRECONDITION_FAILED",
+        "User authorization store and provider must be configured together.",
+        { evidence: { providerDispatchCount: 0 } },
+      );
+    }
+    if (authorizationConfigured && !this.runtimeIdentity) {
+      throw new UniversalBrokerError(
+        "PRECONDITION_FAILED",
+        "User-authorized execution requires an exact runtime identity.",
+        { evidence: { providerDispatchCount: 0 } },
+      );
+    }
+    this.userAuthorizationCoordinator = options.userAuthorizationStore && options.userAuthorizationProvider
+      ? new UserAuthorizationCoordinator(
+          options.userAuthorizationStore,
+          options.userAuthorizationProvider,
+        )
+      : undefined;
   }
 
   async prepareExecutionBinding(
@@ -492,19 +545,28 @@ export class UniversalExecutionPlane {
           },
         );
       }
-      throw new UniversalBrokerError(
-        "ELEVATION_UNAVAILABLE",
-        `Target ${resolved.target.id} permits prompt elevation, but no verified user-authorization provider is installed in this runtime.`,
-        {
-          evidence: {
-            targetId: resolved.target.id,
-            targetGeneration: resolved.targetGeneration,
-            elevationMode: elevation.mode,
-            reasonSha256: elevation.reasonSha256,
-            providerDispatchCount: 0,
+      if (input.durable === true) {
+        throw new UniversalBrokerError(
+          "ELEVATION_UNAVAILABLE",
+          "Prompt-authorized execution does not support durable process-manager launch.",
+          { evidence: { targetId: resolved.target.id, providerDispatchCount: 0 } },
+        );
+      }
+      if (!this.userAuthorizationCoordinator || !this.runtimeIdentity) {
+        throw new UniversalBrokerError(
+          "ELEVATION_UNAVAILABLE",
+          `Target ${resolved.target.id} permits prompt elevation, but no verified user-authorization provider is installed in this runtime.`,
+          {
+            evidence: {
+              targetId: resolved.target.id,
+              targetGeneration: resolved.targetGeneration,
+              elevationMode: elevation.mode,
+              reasonSha256: elevation.reasonSha256,
+              providerDispatchCount: 0,
+            },
           },
-        },
-      );
+        );
+      }
     }
     const observedBinding = prepareExecExecutionBinding(
       input,
@@ -539,6 +601,7 @@ export class UniversalExecutionPlane {
       const exitPromise = new Promise<void>((resolvePromise) => {
         resolveExit = resolvePromise;
       });
+      const prompt = elevation.mode === "prompt";
       const entry: ProcessEntry = {
         processId,
         principalKeyFingerprint: owner.principalKeyFingerprint,
@@ -549,8 +612,9 @@ export class UniversalExecutionPlane {
         tty: input.tty === true,
         launchRisk,
         elevationMode: elevation.mode,
-        authorizationState: "NOT_REQUIRED",
-        state: "STARTING",
+        authorizationState: prompt ? "PENDING" : "NOT_REQUIRED",
+        ...(prompt ? { authorizationOperationId: processId } : {}),
+        state: prompt ? "WAITING_AUTHORIZATION" : "STARTING",
         startedAtMs: this.now(),
         durable: input.durable === true,
         dispatched: false,
@@ -564,8 +628,24 @@ export class UniversalExecutionPlane {
       };
       reservation.commit(() => this.entries.set(processId, entry));
       const startingStateWrite = this.persistEntry(entry);
-      if (entry.durable || launchRisk !== "R0") await startingStateWrite;
+      if (prompt || entry.durable || launchRisk !== "R0") await startingStateWrite;
       else void startingStateWrite.catch(() => undefined);
+
+      if (prompt) {
+        const authorization = this.startAuthorizedExecution(
+          entry,
+          input,
+          resolved,
+          owner,
+          elevation as NormalizedExecutionElevation & { mode: "prompt" },
+          dispatch,
+        );
+        void authorization.catch(() => undefined);
+        const mode = input.mode ?? "auto";
+        const yieldMs = executionYield(mode, input.yieldMs);
+        if (yieldMs > 0) await waitForExit(entry, yieldMs);
+        return validateExecutionSnapshot(this.snapshot(entry, input.maxOutputChars));
+      }
 
       try {
         const spec = await this.commandSpec(resolved, input, processId);
@@ -602,8 +682,7 @@ export class UniversalExecutionPlane {
       const mode = input.mode ?? "auto";
       const yieldMs = executionYield(mode, input.yieldMs);
       if (yieldMs > 0) await waitForExit(entry, yieldMs);
-      const snapshot = this.snapshot(entry, input.maxOutputChars);
-      return validateExecutionSnapshot(snapshot);
+      return validateExecutionSnapshot(this.snapshot(entry, input.maxOutputChars));
     } finally {
       reservation.release();
     }
@@ -783,14 +862,16 @@ export class UniversalExecutionPlane {
 
     switch (input.operation) {
       case "poll":
-        if (entry.state === "RUNNING" || entry.state === "STARTING") {
+        if (isRunning(entry)) {
           await waitForExit(entry, boundedWait(input.waitMs ?? 0));
         }
+        if (!isRunning(entry) && entry.outputClose) await entry.outputClose;
         return this.snapshot(entry, input.maxOutputChars);
       case "wait":
-        if (entry.state === "RUNNING" || entry.state === "STARTING") {
+        if (isRunning(entry)) {
           await waitForExit(entry, boundedWait(input.waitMs ?? MAX_WAIT_MS));
         }
+        if (!isRunning(entry) && entry.outputClose) await entry.outputClose;
         return this.snapshot(entry, input.maxOutputChars);
       case "write": {
         if (!isRunning(entry)) {
@@ -1023,6 +1104,7 @@ export class UniversalExecutionPlane {
         .filter((pending): pending is Promise<void> => pending !== undefined),
     );
     await this.drainPendingStateWrites();
+    await this.userAuthorizationCoordinator?.close();
   }
 
   stats(): Record<string, unknown> {
@@ -1147,6 +1229,139 @@ export class UniversalExecutionPlane {
       sshControlDir: this.options.sshControlDir,
       sshExecutable: this.options.sshExecutable ?? "ssh",
     });
+  }
+
+  private async startAuthorizedExecution(
+    entry: ProcessEntry,
+    input: ExecuteCommandInput,
+    resolved: ResolvedExecution,
+    owner: CapabilityCallContext,
+    elevation: NormalizedExecutionElevation & { mode: "prompt" },
+    dispatch?: OperationAuthorityDispatchController,
+  ): Promise<void> {
+    const coordinator = this.userAuthorizationCoordinator;
+    const runtimeIdentity = this.runtimeIdentity;
+    if (!coordinator || !runtimeIdentity) {
+      this.finishAuthorizationFailure(entry, new UniversalBrokerError(
+        "ELEVATION_UNAVAILABLE",
+        "The user-authorization runtime is unavailable.",
+        { evidence: { authorizationOperationId: entry.processId, providerDispatchCount: 0 } },
+      ));
+      return;
+    }
+    try {
+      const effectiveCommand = commandWithSourceFile(input.command, resolved.sourceFile);
+      const authorized = await coordinator.authorizeAndLaunch({
+        authorizationOperationId: entry.processId,
+        callContext: owner,
+        target: {
+          id: resolved.target.id,
+          generation: authorizationDigest(resolved.targetGeneration),
+          transport: resolved.target.transport,
+          platform: resolved.target.platform,
+        },
+        runtimeIdentity,
+        command: effectiveCommand,
+        cwd: resolved.cwd,
+        mode: input.mode ?? "auto",
+        tty: input.tty === true,
+        ...(input.envProfile ? { envProfile: input.envProfile } : {}),
+        ...(Object.keys(resolved.environment).length > 0
+          ? { environment: { ...resolved.environment } }
+          : {}),
+        elevation,
+        issuedAt: new Date(this.now()).toISOString(),
+      });
+      entry.authorizationOperationId = authorized.descriptor.authorizationOperationId;
+      entry.authorizationActionDigest = authorized.descriptor.actionDigest;
+      entry.authorizationDescriptorDigest = authorized.descriptor.descriptorDigest;
+      entry.authorizationReceiptDigest = authorized.receipt.receiptDigest;
+      entry.authorizationProviderId = authorized.receipt.providerId;
+      entry.authorizationProviderGeneration = authorized.receipt.providerGeneration;
+      entry.authorizationState = "APPROVED";
+      entry.state = "STARTING";
+      dispatch?.claim();
+      this.startAuthorizedPipe(entry, authorized.process, dispatch);
+      if (entry.state === "STARTING") entry.state = "RUNNING";
+      await this.persistEntry(entry);
+    } catch (error) {
+      this.finishAuthorizationFailure(entry, error);
+      await this.persistEntry(entry).catch(() => undefined);
+    }
+  }
+
+  private startAuthorizedPipe(
+    entry: ProcessEntry,
+    child: ChildProcessWithoutNullStreams,
+    dispatch?: OperationAuthorityDispatchController,
+  ): void {
+    const detached = false;
+    dispatch?.markDispatched();
+    entry.dispatched = true;
+    entry.handle = {
+      pid: child.pid,
+      write: (data) => writeWritable(child.stdin, data),
+      kill: (signal) => terminateProcessTree(child, signal, detached),
+    };
+    this.attachReadableOutput(entry, child.stdout, "stdout");
+    this.attachReadableOutput(entry, child.stderr, "stderr");
+    child.once("error", (error) => this.finishSpawnFailure(entry, error));
+    child.once("close", (code, signal) => this.finish(entry, code, signal ?? undefined));
+    if (child.exitCode !== null || child.signalCode !== null) {
+      queueMicrotask(() => this.finish(entry, child.exitCode, child.signalCode ?? undefined));
+    }
+  }
+
+  private finishAuthorizationFailure(entry: ProcessEntry, error: unknown): void {
+    if (!isRunning(entry)) return;
+    const normalized = error instanceof UniversalBrokerError
+      ? error
+      : new UniversalBrokerError(
+          "ELEVATION_RESULT_UNKNOWN",
+          "The user-authorization provider failed without a bounded result.",
+          { evidence: { providerDispatchCount: entry.dispatched ? 1 : 0 } },
+        );
+    const evidence = normalized.evidence ?? {};
+    if (typeof evidence.authorizationOperationId === "string") {
+      entry.authorizationOperationId = evidence.authorizationOperationId;
+    }
+    if (isSha256Digest(evidence.actionDigest)) entry.authorizationActionDigest = evidence.actionDigest;
+    if (isSha256Digest(evidence.descriptorDigest)) {
+      entry.authorizationDescriptorDigest = evidence.descriptorDigest;
+    }
+    if (isSha256Digest(evidence.receiptDigest)) entry.authorizationReceiptDigest = evidence.receiptDigest;
+    if (typeof evidence.providerId === "string") entry.authorizationProviderId = evidence.providerId;
+    if (isSha256Digest(evidence.providerGeneration)) {
+      entry.authorizationProviderGeneration = evidence.providerGeneration;
+    }
+    switch (normalized.code) {
+      case "ELEVATION_DENIED":
+        entry.authorizationState = "DENIED";
+        entry.state = "FAILED";
+        break;
+      case "ELEVATION_CANCELED":
+        entry.authorizationState = "CANCELED";
+        entry.state = "FAILED";
+        break;
+      case "ELEVATION_TIMED_OUT":
+        entry.authorizationState = "TIMED_OUT";
+        entry.state = "FAILED";
+        break;
+      case "ELEVATION_RESULT_UNKNOWN":
+        entry.authorizationState = "RESULT_UNKNOWN";
+        entry.state = "UNKNOWN";
+        break;
+      default:
+        entry.state = "FAILED";
+        break;
+    }
+    entry.endedAtMs = this.now();
+    entry.errorCode = normalized.code;
+    entry.errorMessage = boundedError(normalized);
+    void this.appendSpoolOutput(entry, "stderr", Buffer.from(`${entry.errorMessage}\n`, "utf8"));
+    entry.outputClose = entry.output.close();
+    entry.resolveExit();
+    this.scheduleCleanup(entry);
   }
 
   private startPipe(
@@ -1401,6 +1616,24 @@ export class UniversalExecutionPlane {
       durable: entry.durable,
       elevationMode: entry.elevationMode,
       authorizationState: entry.authorizationState,
+      ...(entry.authorizationOperationId
+        ? { authorizationOperationId: entry.authorizationOperationId }
+        : {}),
+      ...(entry.authorizationActionDigest
+        ? { authorizationActionDigest: entry.authorizationActionDigest }
+        : {}),
+      ...(entry.authorizationDescriptorDigest
+        ? { authorizationDescriptorDigest: entry.authorizationDescriptorDigest }
+        : {}),
+      ...(entry.authorizationReceiptDigest
+        ? { authorizationReceiptDigest: entry.authorizationReceiptDigest }
+        : {}),
+      ...(entry.authorizationProviderId
+        ? { authorizationProviderId: entry.authorizationProviderId }
+        : {}),
+      ...(entry.authorizationProviderGeneration
+        ? { authorizationProviderGeneration: entry.authorizationProviderGeneration }
+        : {}),
       ...(entry.handle?.pid !== undefined ? { pid: entry.handle.pid } : {}),
       ...(entry.exitCode !== undefined ? { exitCode: entry.exitCode } : {}),
       ...(entry.signal ? { signal: entry.signal } : {}),
@@ -1427,6 +1660,24 @@ export class UniversalExecutionPlane {
       durable: entry.durable,
       elevationMode: entry.elevationMode,
       authorizationState: entry.authorizationState,
+      ...(entry.authorizationOperationId
+        ? { authorizationOperationId: entry.authorizationOperationId }
+        : {}),
+      ...(entry.authorizationActionDigest
+        ? { authorizationActionDigest: entry.authorizationActionDigest }
+        : {}),
+      ...(entry.authorizationDescriptorDigest
+        ? { authorizationDescriptorDigest: entry.authorizationDescriptorDigest }
+        : {}),
+      ...(entry.authorizationReceiptDigest
+        ? { authorizationReceiptDigest: entry.authorizationReceiptDigest }
+        : {}),
+      ...(entry.authorizationProviderId
+        ? { authorizationProviderId: entry.authorizationProviderId }
+        : {}),
+      ...(entry.authorizationProviderGeneration
+        ? { authorizationProviderGeneration: entry.authorizationProviderGeneration }
+        : {}),
       ...(entry.handle?.pid !== undefined ? { pid: entry.handle.pid } : {}),
       startedAt: new Date(entry.startedAtMs).toISOString(),
       ...(entry.endedAtMs ? { endedAt: new Date(entry.endedAtMs).toISOString() } : {}),
@@ -1590,6 +1841,12 @@ export class UniversalExecutionPlane {
         launchRisk: record.launchRisk,
         elevationMode: record.elevationMode ?? "none",
         authorizationState: record.authorizationState ?? "NOT_REQUIRED",
+        authorizationOperationId: record.authorizationOperationId,
+        authorizationActionDigest: record.authorizationActionDigest,
+        authorizationDescriptorDigest: record.authorizationDescriptorDigest,
+        authorizationReceiptDigest: record.authorizationReceiptDigest,
+        authorizationProviderId: record.authorizationProviderId,
+        authorizationProviderGeneration: record.authorizationProviderGeneration,
         state: persistentState(record.state),
         startedAtMs: record.startedAtMs,
         endedAtMs: record.endedAtMs,
@@ -1718,6 +1975,12 @@ export class UniversalExecutionPlane {
       launchRisk: entry.launchRisk,
       elevationMode: entry.elevationMode,
       authorizationState: entry.authorizationState,
+      authorizationOperationId: entry.authorizationOperationId,
+      authorizationActionDigest: entry.authorizationActionDigest,
+      authorizationDescriptorDigest: entry.authorizationDescriptorDigest,
+      authorizationReceiptDigest: entry.authorizationReceiptDigest,
+      authorizationProviderId: entry.authorizationProviderId,
+      authorizationProviderGeneration: entry.authorizationProviderGeneration,
       state: entry.state,
       startedAtMs: entry.startedAtMs,
       endedAtMs: entry.endedAtMs,
@@ -2462,7 +2725,9 @@ function validateExecutionSnapshot(
   }
   if (snapshot.state === "UNKNOWN") {
     throw new UniversalBrokerError(
-      "EXECUTION_STATE_UNKNOWN",
+      snapshot.errorCode === "ELEVATION_RESULT_UNKNOWN"
+        ? "ELEVATION_RESULT_UNKNOWN"
+        : "EXECUTION_STATE_UNKNOWN",
       snapshot.errorMessage ?? "Command dispatch state is unknown and was not retried.",
       { evidence: compactProcessEvidence(snapshot) },
     );
@@ -2551,6 +2816,21 @@ function boundedError(error: unknown): string {
   const message = error instanceof Error ? error.message : String(error);
   const normalized = message.replace(/\s+/g, " ").trim();
   return normalized.length <= 300 ? normalized : `${normalized.slice(0, 297)}...`;
+}
+
+function isSha256Digest(value: unknown): value is string {
+  return typeof value === "string" && /^sha256:[a-f0-9]{64}$/u.test(value);
+}
+
+function authorizationDigest(value: string): string {
+  const normalized = value.trim().toLowerCase();
+  if (/^sha256:[a-f0-9]{64}$/u.test(normalized)) return normalized;
+  if (/^[a-f0-9]{64}$/u.test(normalized)) return `sha256:${normalized}`;
+  throw new UniversalBrokerError(
+    "STATE_CORRUPTED",
+    "Target generation is not a SHA-256 identity.",
+    { evidence: { providerDispatchCount: 0 } },
+  );
 }
 
 function isNodeError(error: unknown, code: string): boolean {

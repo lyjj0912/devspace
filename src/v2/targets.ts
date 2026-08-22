@@ -62,6 +62,7 @@ export interface TargetDefinition {
   gui: {
     mode: "none" | "local-ipc" | "ssh-stdio";
     command?: string;
+    sha256?: string;
   };
   configuredCapabilities: ConfiguredTargetCapabilities;
   endpointFingerprint: string;
@@ -134,6 +135,7 @@ const targetSchema = z.strictObject({
   gui: z.strictObject({
     mode: z.enum(["none", "local-ipc", "ssh-stdio"]),
     command: z.string().min(1).optional(),
+    sha256: z.string().regex(/^[a-f0-9]{64}$/u).optional(),
   }).optional(),
   capabilities: z.strictObject({
     fs: z.boolean().optional(),
@@ -157,6 +159,36 @@ const targetSchema = z.strictObject({
       code: "custom",
       path: ["gui", "mode"],
       message: "local targets cannot use ssh-stdio GUI mode",
+    });
+  }
+  const hasGuiCommand = target.gui?.command !== undefined;
+  const hasGuiSha256 = target.gui?.sha256 !== undefined;
+  if (hasGuiCommand !== hasGuiSha256) {
+    context.addIssue({
+      code: "custom",
+      path: ["gui"],
+      message: "GUI agent command and sha256 must be configured together",
+    });
+  }
+  if ((hasGuiCommand || hasGuiSha256) && target.platform !== "macos") {
+    context.addIssue({
+      code: "custom",
+      path: ["gui"],
+      message: "A signed GUI agent is supported only on macOS",
+    });
+  }
+  if ((hasGuiCommand || hasGuiSha256) && target.gui?.mode === "none") {
+    context.addIssue({
+      code: "custom",
+      path: ["gui", "mode"],
+      message: "A signed GUI agent cannot use gui.mode=none",
+    });
+  }
+  if (target.gui?.command && !target.gui.command.startsWith("/")) {
+    context.addIssue({
+      code: "custom",
+      path: ["gui", "command"],
+      message: "GUI agent command must be an absolute path",
     });
   }
 });

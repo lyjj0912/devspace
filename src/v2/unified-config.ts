@@ -211,6 +211,29 @@ const capabilitiesSchema = z.strictObject({
   durableProcess: z.boolean().optional(),
 });
 
+const targetGuiSchema = z.strictObject({
+  mode: z.enum(["none", "local-ipc", "ssh-stdio"]),
+  command: pathText.optional(),
+  sha256: z.string().regex(/^[a-f0-9]{64}$/u).optional(),
+}).superRefine((gui, context) => {
+  const hasCommand = gui.command !== undefined;
+  const hasSha256 = gui.sha256 !== undefined;
+  if (hasCommand !== hasSha256) {
+    context.addIssue({
+      code: "custom",
+      path: [],
+      message: "GUI agent command and sha256 must be configured together",
+    });
+  }
+  if ((hasCommand || hasSha256) && gui.mode === "none") {
+    context.addIssue({
+      code: "custom",
+      path: ["mode"],
+      message: "A signed GUI agent cannot use gui.mode=none",
+    });
+  }
+});
+
 const targetSchema = z.strictObject({
   targetId: identifier,
   displayName: singleLine(128),
@@ -224,9 +247,22 @@ const targetSchema = z.strictObject({
   defaultCwd: pathText.optional(),
   elevationPolicy: z.enum(["deny", "prompt"]),
   capabilities: capabilitiesSchema.optional(),
+  gui: targetGuiSchema.optional(),
 }).superRefine((target, context) => {
   if (target.transport === "ssh" && !target.host) {
     context.addIssue({ code: "custom", path: ["host"], message: "host is required for SSH targets" });
+  }
+  if (target.gui?.command !== undefined && !isAbsolute(target.gui.command)) {
+    context.addIssue({ code: "custom", path: ["gui", "command"], message: "GUI agent command must be absolute" });
+  }
+  if (target.gui?.command !== undefined && target.platform !== "macos") {
+    context.addIssue({ code: "custom", path: ["gui"], message: "A signed GUI agent is supported only on macOS" });
+  }
+  if (target.transport === "local" && target.gui?.mode === "ssh-stdio") {
+    context.addIssue({ code: "custom", path: ["gui", "mode"], message: "local targets cannot use ssh-stdio GUI mode" });
+  }
+  if (target.transport === "ssh" && target.gui?.mode === "local-ipc") {
+    context.addIssue({ code: "custom", path: ["gui", "mode"], message: "SSH targets cannot use local-ipc GUI mode" });
   }
 });
 
@@ -610,7 +646,14 @@ function materializedTargetFile(targets: readonly UnifiedTargetConfig[]): Record
     .map((target) => {
       const endpointTarget = effectiveEndpointTarget(target, targetById);
       const capabilities = target.capabilities ?? endpointTarget.capabilities;
-      const guiEnabled = capabilities?.gui === true;
+      const configuredGui = target.gui ?? endpointTarget.gui;
+      const guiEnabled = configuredGui?.mode !== undefined
+        ? configuredGui.mode !== "none"
+        : capabilities?.gui === true;
+      const guiMode = configuredGui?.mode
+        ?? (guiEnabled
+          ? endpointTarget.transport === "local" ? "local-ipc" : "ssh-stdio"
+          : "none");
       const durableEnabled = capabilities?.durableProcess === true;
       const value = {
         displayName: target.displayName,
@@ -626,9 +669,9 @@ function materializedTargetFile(targets: readonly UnifiedTargetConfig[]): Record
         elevationPolicy: target.elevationPolicy ?? endpointTarget.elevationPolicy,
         ...(capabilities ? { capabilities: { ...capabilities } } : {}),
         gui: {
-          mode: guiEnabled
-            ? endpointTarget.transport === "local" ? "local-ipc" : "ssh-stdio"
-            : "none",
+          mode: guiMode,
+          ...(configuredGui?.command ? { command: configuredGui.command } : {}),
+          ...(configuredGui?.sha256 ? { sha256: configuredGui.sha256 } : {}),
         },
         durableProcess: {
           mode: durableEnabled

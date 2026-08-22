@@ -1525,11 +1525,25 @@ function requireAuthenticatedPrincipal(
     );
   }
   const principalKeyFingerprint = authorityPrincipal(extra);
+  const parsedRequestMeta = universalRequestMetaSchema.safeParse(extra._meta?.devspace);
+  const explicitRequestId = parsedRequestMeta.success
+    ? parsedRequestMeta.data.requestId?.trim()
+    : undefined;
+  const requestNamespace = explicitRequestId
+    ? "devspace-request"
+    : extra.sessionId
+      ? `mcp-session:${extra.sessionId}`
+      : `mcp-request:${randomUUID()}`;
   return {
     authInfo,
     principalKeyFingerprint,
     callContext: createCapabilityCallContextFromTrustedPrincipal({
       principalKeyFingerprint,
+      ...(explicitRequestId
+        ? { requestId: explicitRequestId, explicitRequestId }
+        : extra.requestId !== undefined ? { requestId: String(extra.requestId) } : {}),
+      requestNamespace,
+      receivedAt: new Date().toISOString(),
     }),
   };
 }

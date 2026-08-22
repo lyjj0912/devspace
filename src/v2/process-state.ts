@@ -19,6 +19,12 @@ export interface PersistentProcessRecord {
   launchRisk: AuthorityRiskClass;
   elevationMode?: ElevationMode;
   authorizationState?: AuthorizationState;
+  authorizationOperationId?: string;
+  authorizationActionDigest?: string;
+  authorizationDescriptorDigest?: string;
+  authorizationReceiptDigest?: string;
+  authorizationProviderId?: string;
+  authorizationProviderGeneration?: string;
   state: string;
   startedAtMs: number;
   endedAtMs?: number;
@@ -150,6 +156,18 @@ function assertRecord(record: PersistentProcessRecord, path: string): void {
       "EXPIRED",
       "RESULT_UNKNOWN",
     ].includes(record.authorizationState))
+    || (record.authorizationOperationId !== undefined
+      && !/^proc_[a-zA-Z0-9-]+$/u.test(record.authorizationOperationId))
+    || (record.authorizationActionDigest !== undefined
+      && !isSha256Identity(record.authorizationActionDigest))
+    || (record.authorizationDescriptorDigest !== undefined
+      && !isSha256Identity(record.authorizationDescriptorDigest))
+    || (record.authorizationReceiptDigest !== undefined
+      && !isSha256Identity(record.authorizationReceiptDigest))
+    || (record.authorizationProviderId !== undefined
+      && !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/u.test(record.authorizationProviderId))
+    || (record.authorizationProviderGeneration !== undefined
+      && !isSha256Identity(record.authorizationProviderGeneration))
     || (record.outputGeneration !== undefined && !isSha256Identity(record.outputGeneration))
     || (record.outputIdentity !== undefined && !isSha256Identity(record.outputIdentity))
     || (record.outputTruncated !== undefined && typeof record.outputTruncated !== "boolean")

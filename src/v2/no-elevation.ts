@@ -10,7 +10,19 @@ export interface GuiInternalExecutionPolicy {
   scriptSha256: string;
 }
 
-export type InternalExecutionPolicy = "filesystem" | "artifact" | "mcp" | "system" | GuiInternalExecutionPolicy;
+export interface GuiAgentInternalExecutionPolicy {
+  kind: "gui-agent";
+  executablePath: string;
+  executableSha256: string;
+}
+
+export type InternalExecutionPolicy =
+  | "filesystem"
+  | "artifact"
+  | "mcp"
+  | "system"
+  | GuiInternalExecutionPolicy
+  | GuiAgentInternalExecutionPolicy;
 
 export interface ExecutableSpec {
   executable: string;
@@ -103,6 +115,21 @@ export function internalExecutionSpec(
   options: { verifyLocalScript?: boolean } = {},
 ): ExecutableSpec | undefined {
   if (!policy || typeof policy === "string") return undefined;
+  if (policy.kind === "gui-agent") {
+    if (!policy.executablePath.startsWith("/") || /[\0\r\n]/u.test(policy.executablePath)) {
+      throw internalExecutionViolation("GUI agent path is not an absolute single-line path");
+    }
+    if (!/^[a-f0-9]{64}$/u.test(policy.executableSha256)) {
+      throw internalExecutionViolation("GUI agent executable hash is invalid");
+    }
+    if (options.verifyLocalScript) verifyLocalGuiAgent(policy);
+    const words = restrictedPosixWords(command);
+    if (words[0] !== policy.executablePath) {
+      throw internalExecutionViolation("GUI execution does not match the pinned native agent path");
+    }
+    validateGuiAgentWords(words);
+    return { executable: words[0], args: words.slice(1) };
+  }
   if (policy.kind !== "gui") {
     throw internalExecutionViolation("unsupported internal execution policy");
   }
@@ -191,9 +218,11 @@ export function posixRemoteUserOnlyRunner(
   const pinnedShell = pinnedPosixShell(shell);
   const exact = internalExecutionSpec(internalPolicy, command);
   if (exact) {
-    const policy = internalPolicy as GuiInternalExecutionPolicy;
-    const quotedPath = shellQuote(policy.scriptPath);
-    const quotedHash = shellQuote(policy.scriptSha256);
+    const policy = internalPolicy as GuiInternalExecutionPolicy | GuiAgentInternalExecutionPolicy;
+    const exactPath = policy.kind === "gui" ? policy.scriptPath : policy.executablePath;
+    const exactSha256 = policy.kind === "gui" ? policy.scriptSha256 : policy.executableSha256;
+    const quotedPath = shellQuote(exactPath);
+    const quotedHash = shellQuote(exactSha256);
     const exactCommand = [exact.executable, ...exact.args].map(shellQuote).join(" ");
     const exactScript = [
       `[ -f ${quotedPath} ] && [ ! -L ${quotedPath} ] || exit 78`,
@@ -246,6 +275,86 @@ function pinnedPosixShell(shell: string): "/bin/sh" | "/bin/bash" | "/bin/zsh" {
         { evidence: { shell } },
       );
   }
+}
+
+function verifyLocalGuiAgent(policy: GuiAgentInternalExecutionPolicy): void {
+  let metadata: ReturnType<typeof lstatSync>;
+  try {
+    metadata = lstatSync(policy.executablePath);
+  } catch {
+    throw internalExecutionViolation("GUI agent executable is unavailable");
+  }
+  if (!metadata.isFile() || metadata.isSymbolicLink()) {
+    throw internalExecutionViolation("GUI agent executable is not a regular file");
+  }
+  if (realpathSync(policy.executablePath) !== policy.executablePath) {
+    throw internalExecutionViolation("GUI agent executable path is not canonical");
+  }
+  const uid = process.getuid?.();
+  if (uid !== undefined && metadata.uid !== uid) {
+    throw internalExecutionViolation("GUI agent executable is not owned by the service account");
+  }
+  if ((metadata.mode & 0o022) !== 0) {
+    throw internalExecutionViolation("GUI agent executable is group- or world-writable");
+  }
+  const actualSha256 = createHash("sha256")
+    .update(readFileSync(policy.executablePath))
+    .digest("hex");
+  if (actualSha256 !== policy.executableSha256) {
+    throw internalExecutionViolation("GUI agent executable hash changed");
+  }
+}
+
+function validateGuiAgentWords(words: string[]): void {
+  const operation = words[1];
+  if (operation === "capabilities") {
+    if (words.length !== 2) throw internalExecutionViolation("GUI agent capabilities arguments are invalid");
+    return;
+  }
+  if (operation === "request-access") {
+    if (words.length !== 3 || !/^(?:accessibility|screen_capture)(?:,(?:accessibility|screen_capture))?$/u.test(words[2]!)) {
+      throw internalExecutionViolation("GUI agent permission request is invalid");
+    }
+    if (new Set(words[2]!.split(",")).size !== words[2]!.split(",").length) {
+      throw internalExecutionViolation("GUI agent permission request contains duplicates");
+    }
+    return;
+  }
+  if (operation === "observe") {
+    if (words.length !== 3 || !boundedDecimal(words[2], 1, 1_000)) {
+      throw internalExecutionViolation("GUI agent observe arguments are invalid");
+    }
+    return;
+  }
+  if (operation === "capture") {
+    if (words.length !== 5 || !/^(?:jpeg|png)$/u.test(words[2]!)
+        || !boundedDecimal(words[3], 1, 100)
+        || !boundedDecimal(words[4], 320, 2_560)) {
+      throw internalExecutionViolation("GUI agent capture arguments are invalid");
+    }
+    return;
+  }
+  if (operation === "act") {
+    validateGuiAgentActWords(words);
+    return;
+  }
+  throw internalExecutionViolation("GUI agent operation is unsupported");
+}
+
+function validateGuiAgentActWords(words: string[]): void {
+  if (words.length !== 14) throw internalExecutionViolation("GUI agent act argument count is invalid");
+  if (!boundedDecimal(words[2], -1, 1_000)) throw internalExecutionViolation("GUI element index is invalid");
+  if (!new Set(["perform", "press", "click", "set_value", "focus", "keystroke", "key_code"]).has(words[3]!)) {
+    throw internalExecutionViolation("GUI action type is invalid");
+  }
+  for (const index of [4, 5, 9, 10, 11, 12, 13]) {
+    if (!boundedBase64(words[index])) throw internalExecutionViolation("GUI encoded argument is invalid");
+  }
+  if (!/^(?:(?:command|option|control|shift)(?:,(?:command|option|control|shift))*)?$/u.test(words[6]!)) {
+    throw internalExecutionViolation("GUI modifier list is invalid");
+  }
+  if (!boundedDecimal(words[7], -1, 255)) throw internalExecutionViolation("GUI key code is invalid");
+  if (!boundedDecimal(words[8], 0, 2_147_483_647)) throw internalExecutionViolation("GUI process identifier is invalid");
 }
 
 function verifyLocalGuiScript(policy: GuiInternalExecutionPolicy): void {

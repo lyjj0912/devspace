@@ -65,7 +65,7 @@ export const UNIVERSAL_TOOL_OPERATIONS = {
     "close",
   ],
   artifact: ["receive", "publish", "copy"],
-  gui: ["capabilities", "observe", "act", "wait"],
+  gui: ["capabilities", "request_access", "observe", "act", "capture", "wait"],
 } as const satisfies Record<UniversalToolName, readonly [string, ...string[]]>;
 
 export const UNIVERSAL_OWNER_SCOPES = [
@@ -507,6 +507,10 @@ const guiContract = {
     action: genericRecordSchema.optional(),
     timeoutMs: z.number().int().min(0).max(120_000).optional(),
     maxElements: z.number().int().min(1).max(1_000).optional(),
+  permissions: z.array(z.enum(["accessibility", "screen_capture"])).min(1).max(2).optional(),
+  format: z.enum(["jpeg", "png"]).optional(),
+  quality: z.number().int().min(1).max(100).optional(),
+  maxWidth: z.number().int().min(320).max(2_560).optional(),
     focusPolicy: z.enum(["preserve", "allow"]).optional(),
   },
   annotations: {

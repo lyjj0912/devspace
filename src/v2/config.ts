@@ -26,6 +26,11 @@ import {
 } from "./resource-defaults.js";
 import { RUNTIME_SCHEMA_GENERATION } from "./runtime-contract-identity.js";
 import {
+  bindUserAuthorizationConfigurationDigest,
+  loadUserAuthorizationRuntimeConfiguration,
+  type MacOsAuthorizationRuntimeConfig,
+} from "./macos-authorization-runtime-config.js";
+import {
   canonicalConfigDigest,
   loadUnifiedConfigSource,
   materializeUnifiedRegistries,
@@ -89,6 +94,8 @@ export interface UniversalBrokerNextConfig {
   artifactPathPrefix: string;
   stateDir: string;
   authorityStorePath: string;
+  userAuthorizationStorePath: string;
+  macosAuthorization?: MacOsAuthorizationRuntimeConfig;
   connectorActivationJournalPath: string;
   lifecycleFinalizationStorePath: string;
   lifecycleFinalizationControlPath: string;
@@ -217,6 +224,8 @@ export function loadUniversalBrokerNextConfig(
 }
 
 type EnvironmentUniversalBrokerNextConfig = Omit<UniversalBrokerNextConfig,
+  | "userAuthorizationStorePath"
+  | "macosAuthorization"
   | "authorityMode"
   | "authorityApprovalAssurance"
   | "authorityStateDirectory"
@@ -1053,8 +1062,15 @@ function finalizeUniversalBrokerConfig(
     },
   }) as Readonly<Record<string, unknown>>;
 
+  const userAuthorization = loadUserAuthorizationRuntimeConfiguration(env, config.stateDir);
+  const boundConfigDigest = bindUserAuthorizationConfigurationDigest(
+    canonicalConfigDigest(canonicalConfig),
+    userAuthorization,
+  );
+
   return {
     ...config,
+    ...userAuthorization,
     targetConfigPath,
     mcpRouteConfigPath,
     oauth,
@@ -1089,7 +1105,7 @@ function finalizeUniversalBrokerConfig(
     configProfile: profile,
     ...(source ? { configSourcePath: source.path } : {}),
     canonicalConfig,
-    configDigest: canonicalConfigDigest(canonicalConfig),
+    configDigest: boundConfigDigest,
   };
 }
 

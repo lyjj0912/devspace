@@ -319,7 +319,20 @@ function personalContract(scopes, contracts) {
     process: ["operation", "processId", "chars", "signal", "columns", "rows", "transactionId", "reason", "waitMs", "maxOutputChars", "cursor", "limit"],
     mcp: ["operation", "route", "query", "name", "arguments", "uri", "cursor", "limit", "responsePolicy"],
     artifact: ["operation", "source", "destination", "overwrite", "maxBytes", "ttlSeconds"],
-    gui: ["operation", "target", "sessionId", "generation", "action", "timeoutMs", "maxElements", "focusPolicy"],
+    gui: [
+      "operation",
+      "target",
+      "sessionId",
+      "generation",
+      "action",
+      "timeoutMs",
+      "maxElements",
+      "permissions",
+      "format",
+      "quality",
+      "maxWidth",
+      "focusPolicy",
+    ],
   };
   const scopeStable = JSON.stringify(scopes) === JSON.stringify(expectedScopes);
   const inputDrift = Object.entries(expectedInputs).flatMap(([name, expected]) => {

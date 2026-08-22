@@ -35,7 +35,13 @@ const MAXIMUM_WAIT_MS = 120_000;
 const OBSERVATION_PAYLOAD_BUDGET = 12_000;
 const NODE_TIMEOUT_MS = 60_000;
 
-export type UniversalGuiOperation = "capabilities" | "observe" | "act" | "wait";
+export type UniversalGuiOperation =
+  | "capabilities"
+  | "request_access"
+  | "observe"
+  | "act"
+  | "capture"
+  | "wait";
 
 export interface UniversalGuiInput {
   operation: UniversalGuiOperation;
@@ -45,6 +51,10 @@ export interface UniversalGuiInput {
   action?: Record<string, unknown>;
   timeoutMs?: number;
   maxElements?: number;
+  permissions?: Array<"accessibility" | "screen_capture">;
+  format?: "jpeg" | "png";
+  quality?: number;
+  maxWidth?: number;
   focusPolicy?: "preserve" | "allow";
 }
 
@@ -87,8 +97,12 @@ export interface GuiObservation {
 }
 
 export interface GuiNodeRequest {
-  operation: "capabilities" | "observe" | "act";
+  operation: "capabilities" | "request_access" | "observe" | "act" | "capture";
   maxElements?: number;
+  permissions?: Array<"accessibility" | "screen_capture">;
+  format?: "jpeg" | "png";
+  quality?: number;
+  maxWidth?: number;
   elementIndex?: number;
   actionType?: string;
   actionName?: string;
@@ -211,6 +225,10 @@ export class UniversalGuiService {
     switch (input.operation) {
       case "capabilities":
         return this.capabilities(input.target, owner);
+      case "request_access":
+        return this.requestAccess(input, owner);
+      case "capture":
+        return this.capture(input, owner);
       case "observe":
         return this.observe(input, owner);
       case "act":
@@ -323,11 +341,43 @@ export class UniversalGuiService {
       available,
       guiMode: target.gui.mode,
       ...node,
-      screenCapture: false,
+      screenCapture: node.screenCapture === true,
       ...(!available
         ? { reason: nodeReason ?? `macOS Accessibility UI scripting is disabled for target ${target.id}.` }
         : {}),
     };
+  }
+
+  private async requestAccess(
+    input: UniversalGuiInput,
+    owner: CapabilityCallContext,
+  ): Promise<Record<string, unknown>> {
+    const target = await this.targets.resolve(input.target ?? "local");
+    this.assertGuiTarget(target);
+    const permissions = normalizeGuiPermissions(input.permissions);
+    const result = await this.runner.call(target, {
+      operation: "request_access",
+      permissions,
+    }, owner);
+    return { targetId: target.id, permissions, ...result };
+  }
+
+  private async capture(
+    input: UniversalGuiInput,
+    owner: CapabilityCallContext,
+  ): Promise<Record<string, unknown>> {
+    const target = await this.targets.resolve(input.target ?? "local");
+    this.assertGuiTarget(target);
+    const format = input.format ?? "jpeg";
+    const quality = boundedInteger(input.quality, 70, 1, 100, "quality");
+    const maxWidth = boundedInteger(input.maxWidth, 1_600, 320, 2_560, "maxWidth");
+    const result = await this.runner.call(target, {
+      operation: "capture",
+      format,
+      quality,
+      maxWidth,
+    }, owner);
+    return { targetId: target.id, format, quality, maxWidth, ...result };
   }
 
   private async observe(
@@ -732,13 +782,20 @@ export class MacOsGuiNodeRunner implements GuiNodeRunner {
         `The built-in GUI node supports macOS only: ${target.id}`,
       );
     }
-    const scriptPath = await this.ensureInstalled(target, callContext);
     const args = guiNodeArguments(request);
+    const nativeAgent = target.gui.command && target.gui.sha256
+      ? { executablePath: target.gui.command, executableSha256: target.gui.sha256 }
+      : undefined;
+    const scriptPath = nativeAgent ? undefined : await this.ensureInstalled(target, callContext);
     const process = await this.internalRunner.run({
-      internalPolicy: { kind: "gui", scriptPath, scriptSha256: this.sourceSha256 },
+      internalPolicy: nativeAgent
+        ? { kind: "gui-agent", ...nativeAgent }
+        : { kind: "gui", scriptPath: scriptPath!, scriptSha256: this.sourceSha256 },
       target: target.id,
       cwd: target.defaultCwd,
-      command: ["/usr/bin/osascript", shellQuote(scriptPath), ...args.map(shellQuote)].join(" "),
+      command: nativeAgent
+        ? [nativeAgent.executablePath, ...args].map(shellQuote).join(" ")
+        : ["/usr/bin/osascript", shellQuote(scriptPath!), ...args.map(shellQuote)].join(" "),
       timeoutMs: NODE_TIMEOUT_MS,
       maxOutputChars: 1_000_000,
     }, callContext);
@@ -846,6 +903,17 @@ export class MacOsGuiNodeRunner implements GuiNodeRunner {
 
 function guiNodeArguments(request: GuiNodeRequest): string[] {
   if (request.operation === "capabilities") return ["capabilities"];
+  if (request.operation === "request_access") {
+    return ["request-access", normalizeGuiPermissions(request.permissions).join(",")];
+  }
+  if (request.operation === "capture") {
+    return [
+      "capture",
+      request.format ?? "jpeg",
+      String(request.quality ?? 70),
+      String(request.maxWidth ?? 1_600),
+    ];
+  }
   if (request.operation === "observe") {
     return ["observe", String(request.maxElements ?? DEFAULT_MAXIMUM_ELEMENTS)];
   }
@@ -868,6 +936,20 @@ function guiNodeArguments(request: GuiNodeRequest): string[] {
     base64(expected.description),
     base64(expected.subrole),
   ];
+}
+
+function normalizeGuiPermissions(
+  value: Array<"accessibility" | "screen_capture"> | undefined,
+): Array<"accessibility" | "screen_capture"> {
+  const permissions = value ?? ["accessibility", "screen_capture"];
+  const unique = [...new Set(permissions)];
+  if (unique.length < 1 || unique.length > 2
+    || unique.some((permission) => permission !== "accessibility" && permission !== "screen_capture")) {
+    throw new UniversalBrokerError("INVALID_ARGUMENT", "GUI permissions are invalid.", {
+      evidence: { providerDispatchCount: 0 },
+    });
+  }
+  return unique;
 }
 
 function normalizeObservation(value: Record<string, unknown>): GuiObservation {

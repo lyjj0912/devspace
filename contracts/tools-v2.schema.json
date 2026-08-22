@@ -1091,8 +1091,10 @@
             "operations": {
               "const": [
                 "capabilities",
+                "request_access",
                 "observe",
                 "act",
+                "capture",
                 "wait"
               ]
             },
@@ -1105,8 +1107,10 @@
                     "type": "string",
                     "enum": [
                       "capabilities",
+                      "request_access",
                       "observe",
                       "act",
+                      "capture",
                       "wait"
                     ]
                   },
@@ -1138,6 +1142,35 @@
                     "type": "integer",
                     "minimum": 1,
                     "maximum": 1000
+                  },
+                  "permissions": {
+                    "minItems": 1,
+                    "maxItems": 2,
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "enum": [
+                        "accessibility",
+                        "screen_capture"
+                      ]
+                    }
+                  },
+                  "format": {
+                    "type": "string",
+                    "enum": [
+                      "jpeg",
+                      "png"
+                    ]
+                  },
+                  "quality": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 100
+                  },
+                  "maxWidth": {
+                    "type": "integer",
+                    "minimum": 320,
+                    "maximum": 2560
                   },
                   "focusPolicy": {
                     "type": "string",
