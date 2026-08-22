@@ -19,10 +19,17 @@ try {
   });
   assert.equal(build.error, undefined, build.error?.message);
   assert.equal(build.status, 0, `${build.stdout}\n${build.stderr}`);
-  const agent = join(root, "devspace-approval-agent");
+  const approvalApp = join(root, "DevSpace Approval Agent.app");
+  const approvalExecutable = join(
+    approvalApp,
+    "Contents",
+    "MacOS",
+    "devspace-approval-agent",
+  );
+  const relay = join(root, "devspace-approval-relay");
   const helper = join(root, "devspace-privileged-helper");
   const helperSha = `sha256:${createHash("sha256").update(await readFile(helper)).digest("hex")}`;
-  const selfTest = spawnSync(agent, [
+  const selfTest = spawnSync(approvalExecutable, [
     "--self-test", "yes",
     "--helper", helper,
     "--helper-sha256", helperSha,
@@ -35,6 +42,12 @@ try {
     /kAuthorizationRightExecute,[\s\S]*strlen\(canonical_helper\),[\s\S]*canonical_helper/u,
     "execute right is not bound to the exact helper path",
   );
+  const relayNonRoot = spawnSync(relay, [], { encoding: "utf8", timeout: 10_000 });
+  assert.equal(relayNonRoot.status, 64);
+  const appVerification = spawnSync("/usr/bin/codesign", [
+    "--verify", "--deep", "--strict", approvalApp,
+  ], { encoding: "utf8", timeout: 10_000 });
+  assert.equal(appVerification.status, 0, appVerification.stderr);
   const nonRoot = spawnSync(helper, [], { encoding: "utf8", timeout: 10_000 });
   assert.equal(nonRoot.status, 77);
   assert.match(nonRoot.stderr, /requires effective uid 0/u);

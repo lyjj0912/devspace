@@ -27,6 +27,9 @@ test("authorization runtime configuration requires a complete explicit native pr
     DEVSPACE_NEXT_MACOS_AUTHORIZATION_AGENT_SHA256: DIGEST_A,
     DEVSPACE_NEXT_MACOS_PRIVILEGED_HELPER: "/private/tmp/release/devspace-privileged-helper",
     DEVSPACE_NEXT_MACOS_PRIVILEGED_HELPER_SHA256: DIGEST_B,
+    DEVSPACE_NEXT_MACOS_APPROVAL_APP: "/private/tmp/release/DevSpace Approval Agent.app",
+    DEVSPACE_NEXT_MACOS_APPROVAL_APP_EXECUTABLE: "/private/tmp/release/DevSpace Approval Agent.app/Contents/MacOS/devspace-approval-agent",
+    DEVSPACE_NEXT_MACOS_APPROVAL_APP_SHA256: DIGEST_A,
     DEVSPACE_NEXT_MACOS_AUTHORIZATION_WORK_ROOT: join(STATE, "authorization-work"),
   };
   const first = loadUserAuthorizationRuntimeConfiguration(environment, STATE);
@@ -37,6 +40,8 @@ test("authorization runtime configuration requires a complete explicit native pr
   assert.equal(first.macosAuthorization?.provider, "macos-authorization-services-v1");
   assert.equal(first.macosAuthorization?.agentSha256, DIGEST_A);
   assert.equal(first.macosAuthorization?.helperSha256, DIGEST_B);
+  assert.equal(first.macosAuthorization?.approvalAppSha256, DIGEST_A);
+  assert.match(first.macosAuthorization?.approvalAppExecutablePath ?? "", /DevSpace Approval Agent\.app/u);
   assert.match(bindUserAuthorizationConfigurationDigest(BASE_DIGEST, first), /^sha256:[a-f0-9]{64}$/u);
   assert.equal(
     bindUserAuthorizationConfigurationDigest(BASE_DIGEST, first),
