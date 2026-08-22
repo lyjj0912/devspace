@@ -140,7 +140,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     metrics?: UniversalBrokerMetrics,
   ) {
     this.resourceServerUrl = resourceUrlFromServerUrl(resourceServerUrl);
-    this.canonicalConnector = config.canonicalConnector ?? canonicalConnectorFromEnvironment(process.env);
+    this.canonicalConnector = config.canonicalConnector;
     if (this.canonicalConnector) validateCanonicalConnector(this.canonicalConnector);
     this.oauthStore = new SqliteOAuthStore(stateDir, metrics);
     this.clientsStore = new SqliteOAuthClientsStore(
@@ -448,19 +448,6 @@ function authorizationFormFields(
 
 function hashToken(token: string): string {
   return createHash("sha256").update(token).digest("base64url");
-}
-
-function canonicalConnectorFromEnvironment(env: NodeJS.ProcessEnv): OAuthConfig["canonicalConnector"] {
-  const name = env.DEVSPACE_OAUTH_CANONICAL_CONNECTOR_NAME ?? env.DEVSPACE_NEXT_CANONICAL_CONNECTOR_NAME;
-  const epoch = env.DEVSPACE_OAUTH_CONNECTOR_INSTALLATION_EPOCH;
-  const schemaGeneration = env.DEVSPACE_EXPECTED_SCHEMA_GENERATION;
-  if (!name) return undefined;
-  if (!epoch || !schemaGeneration) {
-    throw new Error("Canonical connector binding requires name, installation epoch, and schema generation together.");
-  }
-  const connector = { name, installationEpoch: Number(epoch), schemaGeneration };
-  validateCanonicalConnector(connector);
-  return connector;
 }
 
 function validateCanonicalConnector(connector: NonNullable<OAuthConfig["canonicalConnector"]>): void {

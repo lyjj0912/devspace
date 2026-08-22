@@ -64,6 +64,7 @@ try {
   testConnectorReadinessSummary(join(root, "connector-readiness"));
   testActivationPreimageConflictPreservesActive(join(root, "connector-preimage-conflict"));
   testReferenceAwareDrainAndRetirement(join(root, "connector-drain"));
+  testProviderIgnoresAmbientConnectorEnvironment(join(root, "provider-ambient-environment"));
   await testProviderRestartRotationAndRevocation(join(root, "provider"));
   await testProviderTokenIssuanceNeverActivatesConnector(join(root, "provider-connector-binding"));
 } finally {
@@ -1292,6 +1293,30 @@ function testReferenceAwareDrainAndRetirement(stateDir: string): void {
     assert.equal(store.accessTokenBindingIsCurrent(secondToken, forcedDeadline + 1), false);
   } finally {
     store.close();
+  }
+}
+
+function testProviderIgnoresAmbientConnectorEnvironment(stateDir: string): void {
+  const keys = [
+    "DEVSPACE_OAUTH_CANONICAL_CONNECTOR_NAME",
+    "DEVSPACE_NEXT_CANONICAL_CONNECTOR_NAME",
+    "DEVSPACE_OAUTH_CONNECTOR_INSTALLATION_EPOCH",
+    "DEVSPACE_EXPECTED_SCHEMA_GENERATION",
+  ] as const;
+  const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  process.env.DEVSPACE_OAUTH_CANONICAL_CONNECTOR_NAME = "ambient-connector-must-not-leak";
+  process.env.DEVSPACE_OAUTH_CONNECTOR_INSTALLATION_EPOCH = "99";
+  process.env.DEVSPACE_EXPECTED_SCHEMA_GENERATION = `sha256:${"e".repeat(64)}`;
+  const provider = new SingleUserOAuthProvider(oauthConfig, mcpUrl, stateDir);
+  try {
+    assert.deepEqual(provider.connectorReadiness().invalidStates, ["CANONICAL_NAME_UNCONFIGURED"]);
+  } finally {
+    provider.close();
+    for (const key of keys) {
+      const value = previous[key];
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
   }
 }
 
