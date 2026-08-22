@@ -1053,6 +1053,7 @@ export function createUniversalBrokerNextServer(
           metrics,
           operationAudit,
           requestReplayGuard,
+          requestReplayScope: requestId,
           acceptanceRunId,
         });
         await server.connect(transport);
@@ -1084,6 +1085,7 @@ export function createUniversalBrokerNextServer(
           metrics,
           operationAudit,
           requestReplayGuard,
+          requestReplayScope: requestId,
           acceptanceRunId,
         });
         await ephemeralServer.connect(transport);

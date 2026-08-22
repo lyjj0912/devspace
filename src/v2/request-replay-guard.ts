@@ -4,6 +4,7 @@ import { UniversalBrokerError } from "./errors.js";
 export interface ToolRequestReplayIdentity {
   principalFingerprint: string;
   scopes: readonly string[];
+  requestNamespace: string;
   requestId: string | number;
   tool: string;
   arguments: unknown;
@@ -199,6 +200,7 @@ function replayKey(identity: ToolRequestReplayIdentity): string {
   return digestCanonical({
     principalFingerprint: identity.principalFingerprint,
     scopes: [...new Set(identity.scopes)].sort(),
+    requestNamespace: identity.requestNamespace,
     requestId: identity.requestId,
   });
 }

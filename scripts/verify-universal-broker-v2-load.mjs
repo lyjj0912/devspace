@@ -60,6 +60,8 @@ try {
     { UniversalArtifactService },
     { UniversalGuiService },
     { UNIVERSAL_OWNER_SCOPES, UNIVERSAL_TOOL_CONTRACTS },
+    { createCapabilityCallContextFromTrustedPrincipal },
+    { SignedSnapshotCursorStore },
   ] = await Promise.all([
     import(pathToFileURL(join(root, "dist/config.js")).href),
     import(pathToFileURL(join(root, "dist/mcp-sessions.js")).href),
@@ -72,6 +74,8 @@ try {
     import(pathToFileURL(join(root, "dist/v2/artifact-service.js")).href),
     import(pathToFileURL(join(root, "dist/v2/gui.js")).href),
     import(pathToFileURL(join(root, "dist/v2/contracts.js")).href),
+    import(pathToFileURL(join(root, "dist/v2/capability-call-context.js")).href),
+    import(pathToFileURL(join(root, "dist/v2/cursor-capability.js")).href),
   ]);
 
   report.checks.sessionChurn = await sessionChurn(McpSessionRegistry, counts.sessions);
@@ -84,6 +88,10 @@ try {
     DEVSPACE_OAUTH_OWNER_TOKEN: "load-test-owner-token-12345678901234567890",
     DEVSPACE_PUBLIC_BASE_URL: "http://127.0.0.1:17676",
     DEVSPACE_LOG_LEVEL: "silent",
+  });
+  const loadCallContext = createCapabilityCallContextFromTrustedPrincipal({
+    principalKeyFingerprint: "1".repeat(64),
+    requestId: "universal-broker-v2-load",
   });
   const fixtureSsh = await writeSshFixture(temporary);
   const targetConfig = join(temporary, "targets.json");
@@ -152,6 +160,11 @@ try {
   });
   const filesystem = new UniversalFilesystemService(targets, contexts, execution, {
     sshControlDir: join(temporary, "fs-control-".repeat(12)),
+    cursorStore: new SignedSnapshotCursorStore({
+      currentKey: { keyId: "load-current", secret: Buffer.alloc(32, 0x4c) },
+      ttlMs: 60_000,
+      maximumSnapshotsPerPrincipal: 128,
+    }),
     sftpPut: async ({ localPath, remotePath }) => {
       await mkdir(dirname(remotePath), { recursive: true });
       await copyFile(localPath, remotePath);
@@ -174,7 +187,7 @@ try {
     sleep: async () => undefined,
   });
   try {
-    report.checks.userAuthority = authorityContract(
+    report.checks.personalContract = personalContract(
       UNIVERSAL_OWNER_SCOPES,
       UNIVERSAL_TOOL_CONTRACTS,
     );
@@ -198,7 +211,12 @@ try {
     report.checks.gui = await guiLoad(gui, guiRunner);
     report.checks.concurrentProcesses = await concurrentProcessQuota(execution);
     report.checks.largeOutput = await largeOutput(execution, counts.outputBytes);
-    report.checks.largeDirectory = await largeDirectory(filesystem, temporary, counts.directoryEntries);
+    report.checks.largeDirectory = await largeDirectory(
+      filesystem,
+      temporary,
+      counts.directoryEntries,
+      loadCallContext,
+    );
     const executionStats = execution.stats();
     report.checks.executionSteadyState = {
       passed: executionStats.processes === 0
@@ -284,7 +302,7 @@ try {
   await rm(temporary, { recursive: true, force: true });
 }
 
-function authorityContract(scopes, contracts) {
+function personalContract(scopes, contracts) {
   const expectedScopes = [
     "devspace.read",
     "devspace.write",
@@ -295,13 +313,13 @@ function authorityContract(scopes, contracts) {
   ];
   const expectedInputs = {
     target: ["operation", "selector", "targetId", "refresh", "cursor", "limit"],
-    context: ["operation", "contextId", "target", "path", "mode", "baseRef", "task", "query", "maxCharacters", "authorityId", "taskInstanceId", "taskLabel", "taskId", "authorityText", "actions", "correctionText", "expiresInSeconds", "cursor", "limit"],
-    fs: ["operation", "target", "contextId", "path", "destination", "content", "patch", "query", "recursive", "overwrite", "expectedSha256", "disposition", "trashId", "finalSymlink", "authorityId", "cursor", "limit"],
-    exec: ["target", "contextId", "cwd", "command", "tty", "mode", "yieldMs", "maxOutputChars", "envProfile", "durable", "authorityId"],
-    process: ["operation", "processId", "chars", "signal", "columns", "rows", "authorityId", "transactionId", "reason", "delayMs", "waitMs", "maxOutputChars", "cursor", "limit"],
-    mcp: ["operation", "route", "query", "name", "arguments", "uri", "cursor", "limit", "responsePolicy", "authorityId"],
-    artifact: ["operation", "source", "destination", "overwrite", "maxBytes", "ttlSeconds", "authorityId"],
-    gui: ["operation", "target", "sessionId", "generation", "action", "timeoutMs", "maxElements", "focusPolicy", "authorityId"],
+    context: ["operation", "contextId", "target", "path", "mode", "baseRef", "task", "query", "maxCharacters", "cursor", "limit"],
+    fs: ["operation", "target", "contextId", "path", "destination", "content", "patch", "query", "recursive", "overwrite", "expectedSha256", "disposition", "sync", "finalSymlink", "offset", "cursor", "limit"],
+    exec: ["target", "contextId", "cwd", "command", "tty", "mode", "yieldMs", "maxOutputChars", "envProfile", "durable"],
+    process: ["operation", "processId", "chars", "signal", "columns", "rows", "transactionId", "reason", "waitMs", "maxOutputChars", "cursor", "limit"],
+    mcp: ["operation", "route", "query", "name", "arguments", "uri", "cursor", "limit", "responsePolicy"],
+    artifact: ["operation", "source", "destination", "overwrite", "maxBytes", "ttlSeconds"],
+    gui: ["operation", "target", "sessionId", "generation", "action", "timeoutMs", "maxElements", "focusPolicy"],
   };
   const scopeStable = JSON.stringify(scopes) === JSON.stringify(expectedScopes);
   const inputDrift = Object.entries(expectedInputs).flatMap(([name, expected]) => {
@@ -787,7 +805,7 @@ async function largeOutput(execution, bytes) {
   return result;
 }
 
-async function largeDirectory(filesystem, temporary, count) {
+async function largeDirectory(filesystem, temporary, count, callContext) {
   const directory = join(temporary, "large-directory");
   await mkdir(directory);
   const creator = [
@@ -807,7 +825,7 @@ async function largeDirectory(filesystem, temporary, count) {
     target: "local",
     path: directory,
     limit: 1_000,
-  });
+  }, callContext);
   return {
     passed: listed.totalEntries === count && Array.isArray(listed.entries) && listed.entries.length === 1_000,
     entries: count,

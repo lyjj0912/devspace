@@ -89,6 +89,7 @@ export interface UniversalBrokerServices {
   metrics?: UniversalBrokerMetrics;
   operationAudit?: OperationAuditSink;
   requestReplayGuard?: UniversalToolRequestReplayGuard;
+  requestReplayScope?: string;
   acceptanceRunId?: string;
 }
 
@@ -98,6 +99,7 @@ interface UniversalBrokerRequestBoundary {
   operationAudit?: OperationAuditSink;
   authorityPrincipal?: AuthorityPrincipalResolver;
   requestReplayGuard?: UniversalToolRequestReplayGuard;
+  requestReplayScope?: string;
   acceptanceRunId?: string;
 }
 
@@ -127,6 +129,7 @@ export function createUniversalBrokerMcpServer(
     operationAudit: services.operationAudit,
     authorityPrincipal,
     requestReplayGuard: services.requestReplayGuard,
+    requestReplayScope: services.requestReplayScope,
     acceptanceRunId: services.acceptanceRunId,
   };
 
@@ -1047,6 +1050,7 @@ function registerContextDiffResource(
 type AuthorityRequestExtra = AuthorityRequestIdentity & {
   _meta?: Record<string, unknown>;
   requestId?: string | number;
+  sessionId?: string;
 };
 type AuthorityPrincipalResolver = (extra: AuthorityRequestExtra) => string;
 
@@ -1161,10 +1165,23 @@ function toolRequestReplayIdentity(
   }
   const principalFingerprint = boundary.authorityPrincipal?.(extra);
   if (!principalFingerprint) return undefined;
+  const parsedMeta = universalRequestMetaSchema.safeParse(extra._meta?.devspace);
+  const explicitRequestId = parsedMeta.success ? parsedMeta.data.requestId : undefined;
+  // JSON-RPC IDs are scoped to one MCP transport. Only the explicit DevSpace request ID is
+  // stable enough to coalesce the same logical mutation across stateful/stateless transports.
+  const requestNamespace = explicitRequestId
+    ? "devspace-request"
+    : extra.sessionId
+      ? `mcp-session:${extra.sessionId}`
+      : boundary.requestReplayScope
+        ? `mcp-transport:${boundary.requestReplayScope}`
+        : undefined;
+  if (!requestNamespace) return undefined;
   return {
     principalFingerprint,
     scopes: Array.isArray(extra.authInfo.scopes) ? extra.authInfo.scopes : [],
-    requestId: extra.requestId,
+    requestNamespace,
+    requestId: explicitRequestId ?? extra.requestId,
     tool,
     arguments: input,
     ...(extra._meta?.devspace === undefined ? {} : { meta: extra._meta.devspace }),

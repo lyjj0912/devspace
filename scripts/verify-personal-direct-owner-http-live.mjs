@@ -145,6 +145,9 @@ export async function verifyPersonalHttpLive(input) {
       method: "tools/call",
       params: {
         name: "exec",
+        _meta: {
+          devspace: { requestId: "live-mixed-stateful-sessionless-exec" },
+        },
         arguments: {
           target,
           cwd: disposableRoot,

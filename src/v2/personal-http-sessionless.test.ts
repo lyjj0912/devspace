@@ -232,6 +232,9 @@ test("mixed stateful and sessionless retries share one mutation result", {
     method: "tools/call",
     params: {
       name: "exec",
+      _meta: {
+        devspace: { requestId: "chatgpt-mixed-stateful-sessionless-retry" },
+      },
       arguments: {
         target: "local",
         cwd: fixture.root,
@@ -271,6 +274,46 @@ test("mixed stateful and sessionless retries share one mutation result", {
     headers: statefulHeaders,
   });
   assert.equal(closed.status, 200);
+});
+
+test("distinct MCP sessions may reuse a JSON-RPC id for different tool arguments", {
+  timeout: 20_000,
+}, async (t) => {
+  const fixture = await createPersonalHttpFixture(t);
+  const headers = authenticatedHeaders(fixture.accessToken);
+  const firstSession = await initializeStatefulSession(
+    fixture.endpoint,
+    headers,
+    "personal-reused-id-first",
+  );
+  const secondSession = await initializeStatefulSession(
+    fixture.endpoint,
+    headers,
+    "personal-reused-id-second",
+  );
+
+  const first = await postJsonRpc(fixture.endpoint, firstSession, {
+    jsonrpc: "2.0",
+    id: 1,
+    method: "tools/call",
+    params: { name: "target", arguments: { operation: "list" } },
+  });
+  const second = await postJsonRpc(fixture.endpoint, secondSession, {
+    jsonrpc: "2.0",
+    id: 1,
+    method: "tools/call",
+    params: { name: "target", arguments: { operation: "list", refresh: true } },
+  });
+  for (const result of [first, second]) {
+    assert.equal(result.response.status, 200, JSON.stringify(result.body));
+    assert.equal(result.body.result?.structuredContent?.ok, true, JSON.stringify(result.body));
+  }
+  assert.equal(fixture.requestReplayGuard.stats().conflicts, 0);
+
+  for (const sessionHeaders of [firstSession, secondSession]) {
+    const closed = await fetch(fixture.endpoint, { method: "DELETE", headers: sessionHeaders });
+    assert.equal(closed.status, 200);
+  }
 });
 
 async function createPersonalHttpFixture(t: test.TestContext) {

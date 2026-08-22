@@ -6,6 +6,7 @@ import { UniversalToolRequestReplayGuard } from "./request-replay-guard.js";
 const base = {
   principalFingerprint: "a".repeat(64),
   scopes: ["devspace.read", "devspace.write"],
+  requestNamespace: "mcp-session:one",
   requestId: "rpc-1",
   tool: "fs",
   arguments: { operation: "write", path: "/tmp/example", content: "one" },
@@ -105,6 +106,19 @@ test("principal and scope identities never share replay state", async () => {
     [first.value.sequence, differentPrincipal.value.sequence, differentScopes.value.sequence],
     [1, 2, 3],
   );
+});
+
+test("different MCP request namespaces may reuse one JSON-RPC id independently", async () => {
+  const guard = new UniversalToolRequestReplayGuard();
+  let dispatches = 0;
+  const first = await guard.execute(base, async () => ({ sequence: ++dispatches }));
+  const second = await guard.execute({
+    ...base,
+    requestNamespace: "mcp-session:two",
+    arguments: { ...base.arguments, content: "two" },
+  }, async () => ({ sequence: ++dispatches }));
+  assert.deepEqual([first.value.sequence, second.value.sequence], [1, 2]);
+  assert.equal(guard.stats().conflicts, 0);
 });
 
 test("normal terminal entries expire while UNKNOWN results retain a longer no-replay tombstone", async () => {
